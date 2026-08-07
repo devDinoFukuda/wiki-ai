@@ -36,6 +36,7 @@ sem extensão nem pasta. Leia com `{{WK}} docs <slug>`, não com a ferramenta de
 | `ingest codebase` | Pipeline de repositório legado — operação da skill, **não** subcomando do CLI | `ingest-codebase` | `{{WK}} code --repo <r> --store <s> surface --topic <slug>` (início do pipeline) |
 | `promote` | Roda o portão de promoção (`inbox/`->`raw/`)| `promote`           | `{{WK}} promote --store <s>` |
 | `compile` | (Re)gera a wiki a partir de `raw/`          | `compile`           | `{{WK}} compile <topic> --store <s>` |
+| `docx`    | Gera `wiki-docx/` (DOCX) a partir de `raw/` promovido | `docx`              | `{{WK}} docx [<topico>] [--store <path>] [--out-dir wiki-docx] [--no-prune]` |
 | `lint`    | Audita integridade (somente leitura)        | `lint`              | `{{WK}} lint --store <s>` |
 | `query`   | Consulta a wiki (teste local de leitura)    | `retrieval`         | `{{WK}} index search -c wiki -n <n>` |
 | `reindex` | Atualiza o índice de busca                  | `retrieval`         | `{{WK}} index reindex --store <s>` |

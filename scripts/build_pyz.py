@@ -34,6 +34,7 @@ DOCS = {
     ),
     "promote": ("operations/promote.md", "operations/promote.md", "Operação: promote"),
     "compile": ("operations/compile.md", "operations/compile.md", "Operação: compile"),
+    "docx": ("operations/docx.md", "operations/docx.md", "Operação: docx"),
     "lint": ("operations/lint.md", "operations/lint.md", "Operação: lint"),
     "retrieval": (
         "references/retrieval.md",

@@ -25,6 +25,11 @@ wiki-ai/
 │   ├── <topic>/<source_type>/<id>.md
 │   └── index.md
 │
+├── wiki-docx/             # GERADO por `wk docx`. Derivado, nunca fonte-verdade,
+│                           # não publicável. Binário: NÃO recebe front matter e
+│                           # NÃO entra no `index.db`.
+│   └── <topic>/<source_type>/<arquivo>.docx
+│
 ├── log.md                 # log append-only de OPERAÇÕES (não de interações)
 └── quarantine.md          # itens rejeitados na promoção + motivo
 ```

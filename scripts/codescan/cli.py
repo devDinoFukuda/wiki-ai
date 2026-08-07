@@ -790,73 +790,32 @@ def _audit_error(report: dict) -> str | None:
 
 
 def _stage_artifact_quality(wd: str, stage: str, artifact: str) -> str | None:
+    """Gate de qualidade de `done <stage>` para os artefatos SDD nomeados.
+
+    Antes desta unificação (BQ5) esta função mantinha uma tabela própria de
+    limiares/seções, duplicada e divergente da tabela usada por `audit`
+    (`sdd_mod.RULES`/`ArtifactRule`) — um artefato podia passar em `audit` e
+    falhar em `done`, ou vice-versa, sem que a mensagem de erro explicasse que
+    havia duas regras concorrentes para o mesmo caminho. Agora os limiares e
+    seções vêm de `sdd_mod.rule_for_rel`, a MESMA tabela que `audit` consulta
+    via `_audit_stage`; só a formatação da mensagem (`_quality_errors`, usada
+    também pelos gates por item de módulos/specs) permanece local a `done`.
+    """
     rel = os.path.relpath(artifact, wd).replace("\\", "/")
-    rules: dict[str, dict] = {
-        "sdd/code-analysis.md": {
-            "kind": "code-analysis.md",
-            "min_chars": 1800,
-            "min_citations": 5,
-            "sections": (
-                ("Visão geral",),
-                ("Módulos",),
-                ("Fluxos",),
-                ("Riscos",),
-                ("Rastreabilidade",),
-            ),
-        },
-        "sdd/domain.md": {
-            "kind": "domain.md",
-            "min_chars": 1400,
-            "min_citations": 4,
-            "sections": (
-                ("Glossário",),
-                ("Regras de negócio",),
-                ("Máquinas de estado", "Estados"),
-                ("Lacunas",),
-            ),
-        },
-        "sdd/architecture.md": {
-            "kind": "architecture.md",
-            "min_chars": 1800,
-            "min_citations": 5,
-            "sections": (
-                ("Visão geral",),
-                ("Containers",),
-                ("Integrações",),
-                ("Decisões", "Decisões arquiteturais"),
-                ("Riscos",),
-                ("Rastreabilidade",),
-            ),
-        },
-        "sdd/c4-context.md": {
-            "kind": "c4-context.md",
-            "min_chars": 450,
-            "min_citations": 0,
-            "sections": (("Contexto",),),
-        },
-        "sdd/confidence-report.md": {
-            "kind": "confidence-report.md",
-            "min_chars": 700,
-            "min_citations": 0,
-            "sections": (
-                ("Contagem",),
-                ("Rebaixados",),
-                ("Lacunas",),
-            ),
-        },
-    }
-    rule = rules.get(rel)
+    rule = sdd_mod.rule_for_rel(rel)
     if not rule:
         return None
     with open(artifact, encoding="utf-8-sig", errors="replace") as f:
         text = f.read()
     errors = _quality_errors(
         text,
-        kind=rule["kind"],
-        min_chars=rule["min_chars"],
-        min_citations=rule["min_citations"],
-        required_sections=rule["sections"],
-        require_confidence=rule["min_citations"] > 0,
+        kind=os.path.basename(rel),
+        min_chars=rule.min_bytes,
+        min_citations=rule.min_citations,
+        required_sections=tuple(
+            section if isinstance(section, tuple) else (section,) for section in rule.sections
+        ),
+        require_confidence=rule.min_citations > 0,
     )
     if errors:
         return "; ".join(errors)
@@ -1302,6 +1261,48 @@ def _validate_input_freshness(wd: str, stage: str, input_path: str) -> str | Non
     return None
 
 
+def _merge_input_items(stage: str, text: str) -> list[str]:
+    """Extrai os nomes de item que `agentmerge_mod.merge_agent_output` vai
+    gravar a partir de `text`, reusando o parser interno de cada stage
+    (read-only: nenhum arquivo é escrito aqui). Best-effort: entrada malformada
+    devolve lista vazia — o próprio `merge_agent_output` reporta o erro real."""
+    try:
+        if stage == "modules":
+            return [item for item, _content in agentmerge_mod._parse_modules(text)]
+        if stage == "specs":
+            units, named_docs = agentmerge_mod._parse_specs(text)
+            return [item for item, _files in units] + [name for name, _content in named_docs]
+        if stage in agentmerge_mod.NAMED_STAGE_HEADER_RE:
+            return [name for name, _content in agentmerge_mod._parse_named_blocks(stage, text)]
+    except agentmerge_mod.MergeError:
+        return []
+    return []
+
+
+def _merge_redo_conflict_error(wd: str, stage: str, input_path: str) -> str | None:
+    """Recusa re-merge de item(ns) que já têm um run `current` registrado
+    (BQ4 ponto 5): sem isto, reescrever a resposta do subagente e rodar
+    `merge-agent-output` de novo invalidava silenciosamente a trilha anterior
+    em vez de passar pelo caminho suportado (`redo`)."""
+    try:
+        with open(input_path, encoding="utf-8-sig", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    items = _merge_input_items(stage, text)
+    if not items:
+        return None
+    current = sdd_mod.current_run_items(wd, stage)
+    conflicts = sorted({item for item in items if item in current})
+    if not conflicts:
+        return None
+    sample = ", ".join(conflicts[:5])
+    return (
+        f"item já mergeado; rode `wk code ... redo {stage} --item <item>` antes de refazer "
+        f"(itens em conflito: {sample})"
+    )
+
+
 def cmd_merge_agent_output(a) -> int:
     wd = _wd(a)
     if not os.path.isfile(a.input):
@@ -1324,9 +1325,33 @@ def cmd_merge_agent_output(a) -> int:
             "acao": _sdd_brief_hint(a.stage),
         }, ensure_ascii=False), file=sys.stderr)
         return 2
+    redo_conflict = _merge_redo_conflict_error(wd, a.stage, a.input)
+    if redo_conflict:
+        print(json.dumps({
+            "error": redo_conflict,
+            "acao": _sdd_brief_hint(a.stage),
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
     try:
         result = agentmerge_mod.merge_agent_output(wd, a.stage, a.input, agent=a.agent)
     except agentmerge_mod.MergeError as e:
+        print(json.dumps({
+            "error": str(e),
+            "acao": _sdd_brief_hint(a.stage),
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_redo(a) -> int:
+    """Reabre um stage/item para refazer o merge sem apagar a trilha de
+    auditoria: marca `superseded` os runs `current` cobertos e devolve o(s)
+    item(ns) para `pending` em state.json (BQ4)."""
+    wd = _wd(a)
+    try:
+        result = sdd_mod.redo_stage(wd, a.stage, item=a.item)
+    except ValueError as e:
         print(json.dumps({
             "error": str(e),
             "acao": _sdd_brief_hint(a.stage),
@@ -2110,6 +2135,14 @@ def main(argv=None) -> int:
     mo.add_argument("--input", required=True, help="arquivo de resposta do subagente")
     mo.add_argument("--agent", help="identificador do subagente que gerou o input")
     mo.set_defaults(fn=cmd_merge_agent_output)
+
+    rd = sub.add_parser(
+        "redo",
+        help="reabre stage/item: marca runs current como superseded (preserva trilha) e devolve done->pending",
+    )
+    rd.add_argument("stage", choices=("modules", "rules", "architecture", "specs", "synth"))
+    rd.add_argument("--item", help="reabre só este item; sem --item, reabre todos os itens current do stage")
+    rd.set_defaults(fn=cmd_redo)
 
     rs = sub.add_parser("run-stage", help="prepara manifesto determinístico para subagentes")
     rs.add_argument("stage", choices=("modules", "rules", "architecture", "specs", "synth"))

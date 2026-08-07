@@ -60,6 +60,11 @@ Na primeira conversa, diga ao agente onde o store está:
 O store do Wiki AI é ./store — inbox, raw e wiki ficam lá dentro.
 ```
 
+`store init` não cria `wiki-docx/` — essa árvore só existe sob demanda: `wk
+docx` a cria na primeira execução, em paralelo a `wiki/`, com os mesmos
+documentos em formato `.docx` (para bibliotecas SharePoint/Copilot Studio,
+que não aceitam `.md`). Ver `schema.md` §1 para a estrutura completa do store.
+
 ## 2.1. Permissão da engine sobre o store (obrigatório)
 
 Sem este passo, o agente principal e os subagentes **não têm acesso** ao
@@ -359,12 +364,12 @@ evidência `arquivo:linha`.
 
 Depois: `publish`, `promote` e `compile` normais.
 
-> **Estágio `synth` no pipeline de código:** completar `done synth` exige
-> `agent-runs/synth.json` (mesma prova de proveniência dos demais estágios),
-> mas o `merge-agent-output`/`run-stage` do `codescan` atualmente só aceitam
-> `stage` em `modules|rules|architecture|specs` — `synth` não está entre as
-> opções aceitas. Trate isto como lacuna conhecida do pipeline, não invente um
-> comando que o CLI recusa.
+> **Estágio `synth` no pipeline de código:** `run-stage synth` e
+> `merge-agent-output synth` são aceitos normalmente pelo `codescan` atual —
+> os blocos esperados são `=== SYNTH: confirmed ===` / `=== SYNTH: inferred
+> ===`, gravados em `sdd/confirmed.md` / `sdd/inferred.md`. Completar `done
+> synth` exige `agent-runs/synth.json` (mesma prova de proveniência dos
+> demais estágios).
 
 **É aqui que o valor aparece.** A spec diz `MAX_RETRIES = 5` em
 `PaymentProcessor.cs:3` 🟢. A Maria disse "3x" na transferência. Nenhuma das
@@ -427,10 +432,11 @@ que *você* nomeou no Azure, não o nome do modelo.
 
 # O que não está pronto
 
-- **Estágio `synth` do pipeline de código não tem `run-stage`/`merge-agent-output`
-  no CLI atual** (ver nota em B4). `agent-runs/synth.json` é exigido pelo
-  `audit`/`done synth`, mas não há stage `synth` nas opções aceitas por esses
-  dois subcomandos — só `modules|rules|architecture|specs`.
+- **Estágio `synth` do pipeline de código tem `run-stage`/`merge-agent-output`
+  no CLI atual** (ver nota em B4). Blocos `=== SYNTH: confirmed ===` /
+  `=== SYNTH: inferred ===` gravam `sdd/confirmed.md` / `sdd/inferred.md`.
+  `agent-runs/synth.json` é exigido pelo `audit`/`done synth`, como nos
+  demais estágios.
 - **Azure OpenAI não validado.** Ver acima.
 - **Estágio 4 do codebase divide por confiança, não por tipo.** Num rescan você
   vê uma reescrita, não um diff. Dói quando o repo for reanalisado.

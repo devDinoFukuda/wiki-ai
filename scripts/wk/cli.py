@@ -996,7 +996,11 @@ def cmd_compile(a) -> int:
     os.makedirs(wiki_root, exist_ok=True)
 
     pages = []
-    page_entries: list[tuple[dict, str]] = []
+    # (fonte, rel_page, href): rel_page é store-relativo (contrato de saída,
+    # em `pages`); href é relativo a `wiki_root` — usado só nos links dentro
+    # de `wiki/index.md`, que mora em `wiki/` (BQ1: usar rel_page ali gerava
+    # `wiki/wiki/<topic>/...`, um nível a mais, e quebrava todo link).
+    page_entries: list[tuple[dict, str, str]] = []
 
     for s in sources:
         topic_slug = _slug(s["topic"])
@@ -1022,15 +1026,16 @@ def cmd_compile(a) -> int:
         text += "\n" + "\n".join(body).rstrip() + "\n"
         _write_md(path, text)
         rel_page = os.path.relpath(path, store_root).replace("\\", "/")
+        href = os.path.relpath(path, wiki_root).replace("\\", "/")
         pages.append(rel_page)
-        page_entries.append((s, rel_page))
+        page_entries.append((s, rel_page, href))
 
     source_ids = [str(s["id"]) for s in sources if s.get("id")]
     compile_ts = _utc_now()
 
     by_topic: dict[str, list[tuple[dict, str]]] = {}
-    for s, rel_page in page_entries:
-        by_topic.setdefault(s["topic"], []).append((s, rel_page))
+    for s, rel_page, href in page_entries:
+        by_topic.setdefault(s["topic"], []).append((s, href))
 
     index_body = ["# Wiki Index", ""]
     if a.topic:
@@ -1041,9 +1046,9 @@ def cmd_compile(a) -> int:
         entries = by_topic[topic]
         index_body.append(f"## {topic} ({len(entries)})")
         index_body.append("")
-        for s, rel_page in entries:
+        for s, href in entries:
             atualizado = s.get("captured_at") or compile_ts
-            index_body.append(f"- [{s['id']}]({rel_page}) | `{s['source_type']}` | atualizado {atualizado}")
+            index_body.append(f"- [{s['id']}]({href}) | `{s['source_type']}` | atualizado {atualizado}")
         index_body.append("")
     index_text = _frontmatter_for_wiki("wiki-index", a.topic or "index", source_ids)
     index_text += "\n" + "\n".join(index_body).rstrip() + "\n"
@@ -1065,6 +1070,123 @@ def cmd_compile(a) -> int:
         out["reindex_error"] = reindex_error
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 1 if reindex_error else 0
+
+
+def _docx_prune_root(out_root: str, topic: str | None) -> str:
+    """Raiz da poda de órfãos: `out_root` inteiro sem filtro de topic; com
+    filtro, apenas a subárvore `out_root/<topic>` (topic pode ter `/`, daí
+    o split). Escopar assim evita que a poda apague `.docx` de outros
+    topics quando a execução só gerou um subconjunto (defeito reportado:
+    `wk docx <topic>` removia órfãos de topics não filtrados).
+
+    `_slug` é obrigatório aqui: `dest_dir` grava em `_slug(s["topic"])`, então
+    usar o topic cru erraria a subárvore em qualquer topic que o slug altere
+    (maiúscula, espaço, acento). `_slug` preserva `/`, daí o split depois."""
+    if not topic:
+        return out_root
+    return os.path.join(out_root, *_slug(topic).split("/"))
+
+
+def cmd_docx(a) -> int:
+    """Uma página .docx por documento promovido: wiki-docx/<topic>/<source_type>/<arquivo>.
+
+    Árvore paralela a wiki/, lida direto de raw/ (não de wiki/compilado) e não
+    entra em STORE_TREE (decisão M4, docs/plano-wiki-docx.md) — criada sob
+    demanda, mesmo padrão de `wiki_root` em cmd_compile. Escrita sempre
+    sobrescreve o path determinístico; nunca `_unique_dest` (essa função
+    acumularia `-2.docx`/`-3.docx` a cada execução, ver C1 do plano funcional).
+    """
+    from wk import docx_meta, docxgen
+
+    store_root = _store_root(a)
+    sources = _promoted_raw_sources(store_root, a.topic)
+    out_root = os.path.join(store_root, a.out_dir)
+    os.makedirs(out_root, exist_ok=True)
+
+    gerados: list[dict] = []
+    pulados: list[dict] = []
+    gerado_abs: set[str] = set()
+    taken: set[str] = set()
+
+    for s in sorted(sources, key=lambda s: s["id"]):
+        try:
+            filename = docx_meta.docx_filename_unique(s, taken)
+            taken.add(filename[: -len(".docx")])
+            dest_dir = os.path.join(out_root, _slug(s["topic"]), _slug(s["source_type"]))
+            os.makedirs(dest_dir, exist_ok=True)
+            path = os.path.join(dest_dir, filename)
+            data, avisos = docxgen.build_document(s)
+            with open(path, "wb") as f:
+                f.write(data)
+        except Exception as exc:
+            pulados.append({"id": s["id"], "motivo": str(exc)})
+            continue
+        gerado_abs.add(os.path.abspath(path))
+        gerados.append(
+            {
+                "path": os.path.relpath(path, store_root).replace(os.sep, "/"),
+                "id": s["id"],
+                "source_type": s["source_type"],
+                "avisos": avisos,
+            }
+        )
+
+    removidos: list[dict] = []
+    if not a.no_prune:
+        # Poda escopada ao filtro (ver _docx_prune_root): sem `a.topic` varre
+        # `out_root` inteiro como antes; com `a.topic` varre só a subárvore
+        # daquele topic, para não apagar `.docx` órfãos de outros topics.
+        prune_root = _docx_prune_root(out_root, a.topic)
+        out_root_abs = os.path.abspath(out_root)
+        if os.path.isdir(prune_root):
+            existentes = []
+            for dirpath, dirnames, filenames in os.walk(prune_root):
+                dirnames[:] = sorted(dirnames)
+                for fn in sorted(filenames):
+                    if fn.endswith(".docx"):
+                        existentes.append(os.path.join(dirpath, fn))
+            for orfao in sorted(existentes):
+                if os.path.abspath(orfao) not in gerado_abs:
+                    os.remove(orfao)
+                    removidos.append(
+                        {"path": os.path.relpath(orfao, store_root).replace(os.sep, "/"), "motivo": "orfao"}
+                    )
+
+            for dirpath, _dirnames, _filenames in os.walk(prune_root, topdown=False):
+                if os.path.abspath(dirpath) == out_root_abs:
+                    continue
+                try:
+                    if not os.listdir(dirpath):
+                        os.rmdir(dirpath)
+                except OSError:
+                    pass
+
+            if a.topic:
+                # topic com "/" gera diretórios-pai intermediários (ex.:
+                # codebases/exemplo -> pai "codebases"); limpa-os também,
+                # parando antes de out_root.
+                parent = os.path.dirname(os.path.abspath(prune_root))
+                while parent != out_root_abs and parent.startswith(out_root_abs + os.sep):
+                    try:
+                        if os.listdir(parent):
+                            break
+                        os.rmdir(parent)
+                    except OSError:
+                        break
+                    parent = os.path.dirname(parent)
+
+    _append_log(
+        store_root,
+        f"## [{_utc_now()}] docx | {len(gerados)} documentos | {len(sources)} fontes | {len(removidos)} removidos",
+    )
+    out = {
+        "documentos": gerados,
+        "fontes": len(sources),
+        "removidos": removidos,
+        "pulados": pulados,
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 1 if pulados else 0
 
 
 def _audit_index(store_root: str, path_filter: str | None = None) -> dict:
@@ -1216,9 +1338,13 @@ _INGEST_TEXT_EXTS = {".txt"}
 _INGEST_SUBTITLE_EXTS = {".vtt", ".srt"}
 _INGEST_HTML_EXTS = {".html", ".htm"}
 _INGEST_CODEBLOCK_EXTS = {".xml", ".json"}
+# .xmi: exportação nativa de ferramentas UML (Enterprise Architect, StarUML,
+# MagicDraw). Mesmo conteúdo estrutural de .xml (XMI é um dialeto XML); roteia
+# para o mesmo `_convert_xml_architecture`, sem duplicar o conversor.
+_INGEST_XMI_EXTS = {".xmi"}
 _INGEST_SUPPORTED_EXTS = (
     _INGEST_MD_EXTS | _INGEST_TEXT_EXTS | _INGEST_SUBTITLE_EXTS
-    | _INGEST_HTML_EXTS | _INGEST_CODEBLOCK_EXTS
+    | _INGEST_HTML_EXTS | _INGEST_CODEBLOCK_EXTS | _INGEST_XMI_EXTS
 )
 
 # Fontes binárias/planilha: não há conversão mecânica sensata (llm-wiki manda
@@ -1570,7 +1696,7 @@ def _convert_to_markdown(path: str) -> tuple[str, str | None]:
         return _convert_subtitles(text), None
     if ext in _INGEST_HTML_EXTS:
         return _convert_html(text), None
-    if ext == ".xml":
+    if ext == ".xml" or ext in _INGEST_XMI_EXTS:
         return _convert_xml_architecture(text), None
     if ext in _INGEST_CODEBLOCK_EXTS:
         return _convert_codeblock(text, ext), None
@@ -1623,6 +1749,27 @@ def _ingest_reserved_guard(argv: list[str]) -> dict | None:
         ),
         "comando_correto": "wk code --repo <caminho> --store <store> surface --topic <slug>",
     }
+
+
+def _docx_gerado_por_wk(path: str) -> bool:
+    """True se `path` for um .docx gerado por `wk docx` (guarda de reingestão, M7).
+
+    `wk docx` marca `docProps/core.xml` com `dc:identifier` ==
+    docx_meta.DOCX_GERADO_IDENTIFIER ("wk-docx-gerado"). Falha ao ler o zip
+    (arquivo corrompido, sem core.xml, não é zip, etc.) NÃO bloqueia — um
+    .docx legítimo qualquer pode ser ilegível por outros motivos; só a
+    marcação exata bloqueia.
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            core = zf.read("docProps/core.xml")
+        root = ET.fromstring(core)
+    except Exception:
+        return False
+    el = root.find("{http://purl.org/dc/elements/1.1/}identifier")
+    return el is not None and (el.text or "").strip() == "wk-docx-gerado"
 
 
 def _ingest_asset(
@@ -1698,6 +1845,22 @@ def cmd_ingest(a) -> int:
     doc_id = f"sb-ingest-{_slug(stem)}-{token}"
 
     ext = os.path.splitext(a.file)[1].lower()
+    if ext == ".docx" and _docx_gerado_por_wk(a.file):
+        print(
+            json.dumps(
+                {
+                    "error": (
+                        f"'{a.file}' é um .docx gerado por `wk docx` — não pode ser "
+                        "reingerido como fonte original (proveniência falsa). A "
+                        "fonte é o `.md` correspondente em raw/; rode `wk docx` de "
+                        "novo se precisar regenerar o .docx."
+                    )
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     asset_rel = None
     if ext in _INGEST_ASSET_EXTS:
         dest, asset_rel = _ingest_asset(
@@ -1929,6 +2092,12 @@ def _run_index(argv: list[str]) -> int:
     from sbindex.cli import main as sbindex_main
 
     rest, g = _split_globals(argv, ("store",))
+    # BQ3: aplica o default de query só depois de `--store`/`--store=V` já
+    # extraído de `rest` (podem vir em qualquer posição, ver _split_globals) —
+    # senão o scanner de `_default_search_query` confundiria o valor do
+    # `--store` com a query posicional.
+    if rest and rest[0] == "search":
+        rest = ["search"] + _default_search_query(rest[1:])
     return sbindex_main(["--store", _store(g), *rest])
 
 
@@ -2003,13 +2172,20 @@ def _build_parser() -> argparse.ArgumentParser:
     co.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     co.set_defaults(fn=cmd_compile)
 
+    dx = sub.add_parser("docx", help="gera wiki-docx/ (DOCX) a partir de raw/ promovido")
+    dx.add_argument("topic", nargs="?", help="filtro opcional por topic")
+    dx.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    dx.add_argument("--out-dir", default="wiki-docx", help="pasta de saída dentro do store")
+    dx.add_argument("--no-prune", action="store_true", help="não remove .docx órfão")
+    dx.set_defaults(fn=cmd_docx)
+
     li = sub.add_parser("lint", help="audita o índice e escreve wiki/_lint-report.md")
     li.add_argument("path", nargs="?", help="filtro opcional por caminho")
     li.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     li.set_defaults(fn=cmd_lint)
 
     ig = sub.add_parser("ingest", help="converte arquivo externo em inbox/ com proveniência")
-    ig.add_argument("file", help="arquivo a converter (.md/.txt/.vtt/.srt/.html/.xml/.json)")
+    ig.add_argument("file", help="arquivo a converter (.md/.txt/.vtt/.srt/.html/.xml/.xmi/.json)")
     ig.add_argument("--source-type", dest="source_type", required=True,
                     help="human-transcript | human-doc | code-repo | agent-output | web-clip")
     ig.add_argument("--origin", required=True, help="proveniência concreta (pessoa, agente, link)")
@@ -2031,8 +2207,22 @@ def _build_parser() -> argparse.ArgumentParser:
     ):
         g = sub.add_parser(name, help=help_, add_help=False)
         g.add_argument("args", nargs=argparse.REMAINDER)
+    se = sub.add_parser(
+        "search",
+        help="busca híbrida no store (prefixos lex:/vec:/hyde:; sem prefixo em linha única -> lex:)",
+        add_help=False,
+    )
+    se.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help=(
+            "query document: linhas 'lex: termo', 'vec: descrição' e/ou 'hyde: parágrafo' "
+            "(prefixos aceitos pelo motor); texto livre de uma linha sem prefixo recebe "
+            "'lex:' automaticamente (default; único modo sem embeddings configurados); "
+            "omita para ler do stdin"
+        ),
+    )
     for name, help_ in (
-        ("search", "busca híbrida no store"),
         ("get", "recupera documento ou trecho"),
         ("audit", "regras determinísticas L1/L2/L5"),
     ):
@@ -2042,6 +2232,40 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 _PASSTHROUGH_INDEX = ("search", "get", "audit")
+
+# Prefixos de modo aceitos pelo motor (scripts/sbindex/cli.py:parse_query_doc,
+# confirmado em código: lex/vec/hyde). Texto livre de uma linha sem nenhum
+# deles falha no motor com "linha inválida no query document" — o --help de
+# `wk search` não deixa isso óbvio, então aplicamos o default aqui.
+_SEARCH_MODE_PREFIXES = ("lex:", "vec:", "hyde:")
+# Flags do subcomando `search` do motor (sbindex/cli.py) que consomem o
+# próximo token como valor — necessário para achar o positional `query` sem
+# reimplementar o parsing do motor.
+_SEARCH_FLAGS_WITH_VALUE = ("-c", "--collection", "--filter", "-n", "--format")
+_SEARCH_FLAGS_BOOL = ("--full", "-h", "--help")
+
+
+def _default_search_query(argv_rest: list[str]) -> list[str]:
+    """Prefixa `lex:` numa query de texto livre de uma linha, sem prefixo de
+    modo conhecido. Query multi-linha (documento de query real, com `\\n`) ou
+    já prefixada não é tocada; query omitida (lida do stdin) também não."""
+    out = list(argv_rest)
+    i = 0
+    while i < len(out):
+        tok = out[i]
+        if tok in _SEARCH_FLAGS_WITH_VALUE:
+            i += 2
+            continue
+        if tok in _SEARCH_FLAGS_BOOL:
+            i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        if tok and "\n" not in tok and not tok.startswith(_SEARCH_MODE_PREFIXES):
+            out[i] = f"lex:{tok}"
+        break
+    return out
 
 
 def _force_utf8_stdout() -> None:

@@ -50,13 +50,52 @@ def _ascii(text: str) -> str:
     return "".join(ch for ch in raw if unicodedata.category(ch) != "Mn")
 
 
-def _mermaid_label(text: str, limit: int = 64) -> str:
+def _shorten(text: str, limit: int) -> str:
+    """Trunca preservando INÍCIO e FIM (não só o início). Pacotes Java
+    divergem no sufixo (ex.: br.com.acme...quote.application vs
+    ...quote.domain) — truncar só à esquerda preserva o prefixo comum e
+    descarta justo a parte discriminante. `tail` recebe 2/3 do espaço
+    disponível (prioriza o sufixo); `head` fica com o 1/3 restante.
+    Espelha `coupling_generic.py::_shorten` — mesmo formato nos dois
+    motores."""
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    tail = (limit - 1) * 2 // 3
+    head = limit - 1 - tail
+    return text[:head] + "…" + text[len(text) - tail:]
+
+
+def _mermaid_label_pair(text: str, limit: int = 64) -> tuple[str, str]:
+    """Rótulo sanitizado para Mermaid: (completo, encurtado)."""
     label = re.sub(r"[\r\n\t]+", " ", str(text))
     label = re.sub(r"\s+", " ", label).strip() or "modulo"
     label = label.replace("\\", "/").replace('"', "'")
-    if len(label) > limit:
-        label = label[: limit - 3].rstrip() + "..."
+    return label, _shorten(label, limit)
+
+
+def _mermaid_label(text: str, limit: int = 64) -> str:
+    _full, label = _mermaid_label_pair(text, limit)
     return label
+
+
+def _legend_block(pairs: dict[str, str]) -> list[str]:
+    """Tabela de legenda logo após um bloco Mermaid: rótulo encurtado →
+    nome completo. Só emitida se algum rótulo foi de fato encurtado;
+    ordenada pelo nome completo (determinismo)."""
+    if not pairs:
+        return []
+    lines = [
+        "Legenda dos rótulos abreviados:",
+        "",
+        "| Rótulo no diagrama | Nome completo |",
+        "|---|---|",
+    ]
+    for full in sorted(pairs):
+        lines.append(f"| `{pairs[full]}` | `{full}` |")
+    lines.append("")
+    return lines
 
 
 def _leaf(path: str) -> str:
@@ -80,11 +119,15 @@ def _mermaid_point_name(index: int) -> str:
     return f"P{index:03d}"
 
 
-def _mermaid_node_label(row: dict) -> str:
+def _mermaid_node_leaf(row: dict) -> tuple[str, str]:
+    """Leaf do módulo sanitizado para Mermaid: (completo, encurtado)."""
     leaf = _leaf(row["module"])
     leaf = re.sub(r"[^A-Za-z0-9_.-]+", " ", leaf).strip() or "modulo"
-    if len(leaf) > 36:
-        leaf = leaf[:33] + "..."
+    return leaf, _shorten(leaf, 36)
+
+
+def _mermaid_node_label(row: dict) -> str:
+    _full, leaf = _mermaid_node_leaf(row)
     instability = row.get("instability")
     abstractness = row.get("abstractness")
     i = "NA" if instability is None else f"{instability:.2f}"
@@ -120,9 +163,11 @@ def _module_ids(mods: list[dict]) -> dict[str, str]:
 
 
 def _mermaid_for_cycles(cycles: list[list[str]], id_prefix: str,
-                         max_cycles: int = 15, max_nodes: int = 80) -> str:
+                         max_cycles: int = 15, max_nodes: int = 80
+                         ) -> tuple[str, dict[str, str]]:
+    """Devolve (corpo mermaid, legenda {completo: encurtado})."""
     if not cycles:
-        return ""
+        return "", {}
     node_order: dict[str, None] = {}
     edge_order: dict[tuple[str, str], None] = {}
     truncated_cycles = len(cycles) > max_cycles
@@ -138,10 +183,14 @@ def _mermaid_for_cycles(cycles: list[list[str]], id_prefix: str,
     ids = {name: f"{id_prefix}{idx:03d}" for idx, name in enumerate(nodes, start=1)}
     edges = [(a, b) for (a, b) in edge_order if a in node_set and b in node_set]
     if not edges:
-        return ""
+        return "", {}
     lines = ["```mermaid", "flowchart LR"]
+    legend: dict[str, str] = {}
     for name in nodes:
-        lines.append(f'  {ids[name]}["{_mermaid_label(name, limit=40)}"]')
+        full, label = _mermaid_label_pair(name, limit=40)
+        lines.append(f'  {ids[name]}["{label}"]')
+        if label != full:
+            legend[full] = label
     for a, b in edges:
         lines.append(f"  {ids[a]} --> {ids[b]}")
     lines.append("```")
@@ -153,7 +202,7 @@ def _mermaid_for_cycles(cycles: list[list[str]], id_prefix: str,
     body = "\n".join(lines)
     if notes:
         body += "\n\n" + "\n".join(notes)
-    return body
+    return body, legend
 
 
 # --- API -----------------------------------------------------------------
@@ -261,6 +310,7 @@ def render(surface: dict, analysis: dict, topic: str | None, now: str) -> str:
         grouped: dict[str, list[tuple[int, dict]]] = {}
         for idx, r in enumerate(diagram_pts, start=1):
             grouped.setdefault(_zone_key(r["zone"]), []).append((idx, r))
+        plano_legend: dict[str, str] = {}
         for zid, title in (
             ("dor", "Dor"),
             ("transicao", "Transicao"),
@@ -277,10 +327,14 @@ def render(surface: dict, analysis: dict, topic: str | None, now: str) -> str:
                 node = _mermaid_point_name(idx)
                 out.append(f'    {node}["{_mermaid_node_label(r)}"]')
                 out.append(f"    {hub} --> {node}")
+                full, short = _mermaid_node_leaf(r)
+                if short != full:
+                    plano_legend[full] = short
             out.append("  end")
             nodes = ",".join([hub] + [_mermaid_point_name(idx) for idx, _r in rows])
             out.append(f"  class {nodes} {zid}")
         out += ["```", ""]
+        out += _legend_block(plano_legend)
     else:
         out += [
             "## Plano Abstração × Instabilidade",
@@ -305,11 +359,16 @@ def render(surface: dict, analysis: dict, topic: str | None, now: str) -> str:
                 "```mermaid",
                 "flowchart LR",
             ]
+            grafo_legend: dict[str, str] = {}
             for module, node in ids.items():
-                out.append(f'  {node}["{_mermaid_label(module)}"]')
+                full, label = _mermaid_label_pair(module)
+                out.append(f'  {node}["{label}"]')
+                if label != full:
+                    grafo_legend[full] = label
             for s, d in filtered_edges:
                 out.append(f"  {ids[s]} --> {ids[d]}")
             out += ["```", ""]
+            out += _legend_block(grafo_legend)
 
     # --- 4. Dependências circulares --------------------------------------------
     out += ["## Dependências circulares", ""]
@@ -320,9 +379,10 @@ def render(surface: dict, analysis: dict, topic: str | None, now: str) -> str:
     else:
         out.append("Nenhuma dependência circular detectada entre classes.")
     out.append("")
-    mermaid_cc = _mermaid_for_cycles(cycles_classes, "CC")
+    mermaid_cc, cc_legend = _mermaid_for_cycles(cycles_classes, "CC")
     if mermaid_cc:
         out += ["#### Grafo dos ciclos (classes)", "", mermaid_cc, ""]
+        out += _legend_block(cc_legend)
 
     out += ["### Pacotes", ""]
     if cycles_packages:
@@ -331,9 +391,10 @@ def render(surface: dict, analysis: dict, topic: str | None, now: str) -> str:
     else:
         out.append("Nenhuma dependência circular detectada entre pacotes.")
     out.append("")
-    mermaid_pc = _mermaid_for_cycles(cycles_packages, "PC")
+    mermaid_pc, pc_legend = _mermaid_for_cycles(cycles_packages, "PC")
     if mermaid_pc:
         out += ["#### Grafo dos ciclos (pacotes)", "", mermaid_pc, ""]
+        out += _legend_block(pc_legend)
 
     # --- 5. Tabela de métricas — por classe -------------------------------------
     out += [

@@ -67,11 +67,24 @@ MATRIX_MARKERS = ("codigo", "regra", "requisito", "design", "tarefa")
 
 @dataclass(frozen=True)
 class ArtifactRule:
+    """Regra única de qualidade por artefato SDD — fonte de verdade compartilhada
+    por `done` (cli.py) e `audit` (sdd.py). Antes desta unificação existiam duas
+    tabelas independentes (cli.py `_stage_artifact_quality` + este `RULES`) com
+    limiares e seções divergentes para os mesmos 5 artefatos nomeados; ver
+    inventário/decisões no relatório de merge dos gates.
+
+    `sections` aceita, por posição, uma string (seção obrigatória única) OU uma
+    tupla de aliases equivalentes — ex.: `("Decisões", "Decisões arquiteturais")`
+    tolera sinônimo legítimo sem duplicar a regra. `min_bytes`, apesar do nome,
+    sempre mediu contagem de caracteres (`len(text.strip())`), nunca bytes reais
+    — mantido por compatibilidade com o campo já persistido/testado.
+    """
+
     rel: str
     levels: tuple[str, ...] = LEVELS
     min_bytes: int = 600
     min_citations: int = 1
-    sections: tuple[str, ...] = ()
+    sections: tuple[str | tuple[str, ...], ...] = ()
     glob: bool = False
 
 
@@ -79,9 +92,9 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
     "modules": (
         ArtifactRule(
             "sdd/code-analysis.md",
-            min_bytes=1200,
-            min_citations=3,
-            sections=("Visão geral", "Módulos", "Fluxos", "Riscos"),
+            min_bytes=1800,
+            min_citations=5,
+            sections=("Visão geral", "Módulos", "Fluxos", "Riscos", "Rastreabilidade"),
         ),
         ArtifactRule(
             "sdd/data-dictionary.md",
@@ -107,8 +120,8 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
     "rules": (
         ArtifactRule(
             "sdd/domain.md",
-            min_bytes=1000,
-            min_citations=3,
+            min_bytes=1400,
+            min_citations=4,
             sections=("Glossário", "Regras de negócio", "Lacunas"),
         ),
         ArtifactRule(
@@ -136,13 +149,13 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
     "architecture": (
         ArtifactRule(
             "sdd/architecture.md",
-            min_bytes=1200,
-            min_citations=3,
-            sections=("Visão geral", "Containers", "Integrações", "Riscos"),
+            min_bytes=1800,
+            min_citations=5,
+            sections=("Visão geral", "Containers", "Integrações", "Riscos", "Rastreabilidade"),
         ),
         ArtifactRule(
             "sdd/c4-context.md",
-            min_bytes=300,
+            min_bytes=450,
             min_citations=0,
             sections=("Contexto",),
         ),
@@ -194,7 +207,7 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
         ArtifactRule("sdd/specs/*/tasks.md", min_bytes=500, min_citations=1, glob=True),
         ArtifactRule(
             "sdd/confidence-report.md",
-            min_bytes=300,
+            min_bytes=700,
             min_citations=0,
             sections=("Contagem", "Rebaixados", "Lacunas"),
         ),
@@ -363,6 +376,19 @@ def doc_level(st: dict) -> str:
 
 def stage_rules(stage: str, level: str) -> list[ArtifactRule]:
     return [r for r in RULES.get(stage, ()) if level in r.levels]
+
+
+def rule_for_rel(rel: str) -> ArtifactRule | None:
+    """Lookup por caminho relativo exato (não-glob) na tabela única `RULES`.
+
+    Usado por `cli.py::_stage_artifact_quality` para consumir os mesmos
+    limiares/seções que `audit` já aplica via `_audit_stage`, eliminando a
+    tabela duplicada que existia só em cli.py."""
+    for rules in RULES.values():
+        for rule in rules:
+            if not rule.glob and rule.rel == rel:
+                return rule
+    return None
 
 
 def rel_path(wd: str, rel: str) -> str:
@@ -662,7 +688,32 @@ def _source_tree_error(wd: str) -> str | None:
 
 
 AGENT_RUNS_SCHEMA = "wiki-ai.agent-runs.v2"
+# Emitida por `redo` quando o manifesto passa a carregar status/supersedes
+# explícitos por run (BQ4). v2 continua sendo o schema emitido normalmente
+# por `merge-agent-output` (agentmerge.py) e segue válido/current mesmo sem
+# esses campos — ver AGENT_RUNS_ACCEPTED_SCHEMAS e AGENT_RUN_STATUSES.
+AGENT_RUNS_VERSIONED_SCHEMA = "wiki-ai.agent-runs.v3"
 AGENT_RUNS_LEGACY_SCHEMA = "wiki-ai.agent-runs.v1"
+AGENT_RUNS_ACCEPTED_SCHEMAS = (AGENT_RUNS_SCHEMA, AGENT_RUNS_VERSIONED_SCHEMA)
+AGENT_RUN_STATUSES = ("current", "superseded")
+
+
+def _run_status(run: dict) -> str:
+    """Runs sem `status` (schema v2 legado/migrável ou runs nunca tocados por
+    `redo`) são tratados como `current` — mesmo comportamento de sempre."""
+    status = run.get("status")
+    return status if status in AGENT_RUN_STATUSES else "current"
+
+
+def _run_item_names(run: dict) -> set[str]:
+    out: set[str] = set()
+    for item in run.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("item") or "").strip().replace("\\", "/").strip("/")
+        if name:
+            out.add(name)
+    return out
 
 
 def _resolve_manifest_path(wd: str, value) -> str | None:
@@ -741,9 +792,10 @@ def _agent_run_blockers(wd: str, stage: str, st: dict) -> list[str]:
         ]
 
     blockers: list[str] = []
-    if schema != AGENT_RUNS_SCHEMA:
+    if schema not in AGENT_RUNS_ACCEPTED_SCHEMAS:
         blockers.append(
-            f"P0: agent-runs schema inválido para stage {stage}: esperado {AGENT_RUNS_SCHEMA}, obtido {schema!r}"
+            f"P0: agent-runs schema inválido para stage {stage}: esperado "
+            f"{AGENT_RUNS_SCHEMA} ou {AGENT_RUNS_VERSIONED_SCHEMA}, obtido {schema!r}"
         )
     if data.get("stage") != stage:
         blockers.append(f"P0: agent-runs stage incompatível: esperado {stage}")
@@ -760,6 +812,15 @@ def _agent_run_blockers(wd: str, stage: str, st: dict) -> list[str]:
             continue
         if run.get("stage") != stage:
             blockers.append(f"P0: agent-runs registro com stage incompatível em {stage}#{idx}")
+
+        # BQ4 (versionamento de runs): um run marcado `superseded` (via `redo`)
+        # fica preservado na trilha para sempre, mas NUNCA é reconferido contra
+        # o disco atual — só o run `current` de cada item é prova de
+        # integridade. Sem isto, reescrever um artefato após `redo` reabria o
+        # mesmo P0 "artefato alterado após o merge" que motivou o redo.
+        if _run_status(run) != "current":
+            continue
+
         blockers.extend(_agent_run_input_blockers(wd, stage, idx, run))
 
         items = run.get("items")
@@ -792,6 +853,119 @@ def _agent_run_blockers(wd: str, stage: str, st: dict) -> list[str]:
         if missing:
             blockers.append(f"P0: agent-runs não cobre itens done em {stage}: {', '.join(missing[:10])}")
     return blockers
+
+
+def _agent_runs_path(wd: str, stage: str) -> str:
+    return os.path.join(wd, "agent-runs", f"{stage}.json")
+
+
+def _load_agent_runs(wd: str, stage: str) -> dict | None:
+    path = _agent_runs_path(wd, stage)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def current_run_items(wd: str, stage: str) -> dict[str, int]:
+    """Mapa item -> id (1-based) do run `current` mais recente que o cobre.
+
+    Usado por `cli.py::cmd_merge_agent_output` para recusar re-merge de um
+    item que já tem um run vigente (BQ4 ponto 5): sem isto, reescrever a
+    resposta do subagente e rodar `merge-agent-output` de novo silenciosamente
+    invalidava a trilha anterior em vez de apontar para `redo`."""
+    data = _load_agent_runs(wd, stage)
+    if not data:
+        return {}
+    runs = data.get("runs")
+    if not isinstance(runs, list):
+        return {}
+    mapping: dict[str, int] = {}
+    for idx, run in enumerate(runs, start=1):
+        if not isinstance(run, dict) or _run_status(run) != "current":
+            continue
+        for name in _run_item_names(run):
+            mapping[name] = idx
+    return mapping
+
+
+def redo_stage(wd: str, stage: str, item: str | None = None) -> dict:
+    """Marca `superseded` os runs `current` do stage (ou só os que cobrem
+    `item`, se informado) e reabre o(s) item(ns) correspondente(s) em
+    `state.json` (done -> pending). Nunca remove/reescreve o conteúdo de um
+    run antigo — só o campo `status` muda — preservando a trilha de auditoria
+    por inteiro (BQ4). Determinístico e idempotente: sem run `current` a
+    superar, é um no-op que devolve listas vazias, nunca erro.
+    """
+    path = _agent_runs_path(wd, stage)
+    data = _load_agent_runs(wd, stage)
+    if data is None:
+        raise ValueError(
+            f"agent-runs ausente ou ilegível para stage {stage}: rode run-stage/merge-agent-output antes de redo"
+        )
+    runs = data.get("runs")
+    if not isinstance(runs, list) or not runs:
+        raise ValueError(f"agent-runs sem registros para stage {stage}: nada para reabrir")
+
+    target: str | None = None
+    if item is not None:
+        target = str(item).strip().replace("\\", "/").strip("/")
+        if not target:
+            raise ValueError("--item vazio")
+        ever_covered = set()
+        for run in runs:
+            if isinstance(run, dict):
+                ever_covered |= _run_item_names(run)
+        if target not in ever_covered:
+            raise ValueError(f"item nunca coberto por nenhum run de {stage}: {target}")
+
+    superseded_ids: list[int] = []
+    items_reopened: set[str] = set()
+    for idx, run in enumerate(runs, start=1):
+        if not isinstance(run, dict):
+            continue
+        run.setdefault("id", idx)
+        if _run_status(run) != "current":
+            run["status"] = _run_status(run)
+            continue
+        run_items = _run_item_names(run)
+        if target is not None and target not in run_items:
+            continue
+        run["status"] = "superseded"
+        run.setdefault("supersedes", None)
+        superseded_ids.append(idx)
+        items_reopened.update({target} if target is not None else run_items)
+
+    # Normaliza id/status/supersedes explícitos em TODOS os runs (inclusive os
+    # que já eram current e continuam current): a partir daqui o arquivo
+    # carrega o schema versionado por inteiro, não só nos runs tocados agora.
+    for idx, run in enumerate(runs, start=1):
+        if not isinstance(run, dict):
+            continue
+        run.setdefault("id", idx)
+        run.setdefault("status", "current")
+        run.setdefault("supersedes", None)
+
+    data["runs"] = runs
+    data["stage"] = stage
+    data["schema"] = AGENT_RUNS_VERSIONED_SCHEMA
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+    for name in sorted(items_reopened):
+        st_mod.mark_item(wd, stage, name, done=False)
+
+    return {
+        "stage": stage,
+        "item": target,
+        "itens_reabertos": sorted(items_reopened),
+        "runs_superseded": {"quantidade": len(superseded_ids), "ids": superseded_ids},
+        "proximo_passo": f"run-stage {stage}",
+    }
 
 
 def merged_artifacts(wd: str, stage: str) -> set[str]:
@@ -1133,9 +1307,14 @@ def _audit_file(path: str, rule: ArtifactRule, wd: str | None = None) -> dict:
         )
         score -= 15
     for section in rule.sections:
-        if f"## {section}".lower() not in lower and f"# {section}".lower() not in lower:
+        # `section` é uma string (seção única) ou uma tupla de aliases
+        # sinônimos — ex.: ("Decisões", "Decisões arquiteturais"). Qualquer
+        # alias presente satisfaz a regra; a mensagem cita todos os aliases.
+        aliases = section if isinstance(section, tuple) else (section,)
+        if not any(f"## {alias}".lower() in lower or f"# {alias}".lower() in lower for alias in aliases):
+            label = "/".join(aliases)
             warnings.append(
-                f"seção ausente: {section} em {rel} (obrigatória; observado ausente, esperado presente)"
+                f"seção ausente: {label} em {rel} (obrigatória; observado ausente, esperado presente)"
             )
             score -= 5
     if rule.sections and not any(w.startswith("seção ausente") for w in warnings):

@@ -281,11 +281,30 @@ def _mermaid_point_line(index: int, instability: float, abstractness: float) -> 
     return f"  {name}: [{instability:.2f}, {abstractness:.2f}]"
 
 
-def _mermaid_node_label(row: dict) -> str:
+def _shorten(text: str, limit: int) -> str:
+    """Trunca preservando INÍCIO e FIM (não só o início). Pacotes Java
+    divergem no sufixo (ex.: br.com.acme...quote.application vs
+    ...quote.domain) — truncar só à esquerda preserva o prefixo comum e
+    descarta justo a parte discriminante. `tail` recebe 2/3 do espaço
+    disponível (prioriza o sufixo); `head` fica com o 1/3 restante."""
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    tail = (limit - 1) * 2 // 3
+    head = limit - 1 - tail
+    return text[:head] + "…" + text[len(text) - tail:]
+
+
+def _mermaid_node_leaf(row: dict) -> tuple[str, str]:
+    """Leaf do módulo sanitizado para Mermaid: (completo, encurtado)."""
     leaf = _leaf(row["module"])
     leaf = re.sub(r"[^A-Za-z0-9_.-]+", " ", leaf).strip() or "modulo"
-    if len(leaf) > 36:
-        leaf = leaf[:33] + "..."
+    return leaf, _shorten(leaf, 36)
+
+
+def _mermaid_node_label(row: dict) -> str:
+    _full, leaf = _mermaid_node_leaf(row)
     instability = row.get("instability")
     abstractness = row.get("abstractness")
     i = "NA" if instability is None else f"{instability:.2f}"
@@ -293,13 +312,35 @@ def _mermaid_node_label(row: dict) -> str:
     return f"{leaf} | I={i} A={a}"
 
 
-def _mermaid_label(text: str, limit: int = 64) -> str:
+def _mermaid_label_pair(text: str, limit: int = 64) -> tuple[str, str]:
+    """Rótulo sanitizado para Mermaid: (completo, encurtado)."""
     label = re.sub(r"[\r\n\t]+", " ", str(text))
     label = re.sub(r"\s+", " ", label).strip() or "modulo"
     label = label.replace("\\", "/").replace('"', "'")
-    if len(label) > limit:
-        label = label[: limit - 3].rstrip() + "..."
+    return label, _shorten(label, limit)
+
+
+def _mermaid_label(text: str, limit: int = 64) -> str:
+    _full, label = _mermaid_label_pair(text, limit)
     return label
+
+
+def _legend_block(pairs: dict[str, str]) -> list[str]:
+    """Tabela de legenda logo após um bloco Mermaid: rótulo encurtado →
+    nome completo. Só emitida se algum rótulo foi de fato encurtado;
+    ordenada pelo nome completo (determinismo)."""
+    if not pairs:
+        return []
+    lines = [
+        "Legenda dos rótulos abreviados:",
+        "",
+        "| Rótulo no diagrama | Nome completo |",
+        "|---|---|",
+    ]
+    for full in sorted(pairs):
+        lines.append(f"| `{pairs[full]}` | `{full}` |")
+    lines.append("")
+    return lines
 
 
 def _zone_key(zone: str) -> str:
@@ -393,6 +434,7 @@ def render(surface: dict, analysis: dict, topic: str | None, now: str) -> str:
         grouped: dict[str, list[tuple[int, dict]]] = {}
         for idx, r in enumerate(diagram_pts, start=1):
             grouped.setdefault(_zone_key(r["zone"]), []).append((idx, r))
+        plano_legend: dict[str, str] = {}
         for zid, title in (
             ("dor", "Dor"),
             ("transicao", "Transicao"),
@@ -410,10 +452,14 @@ def render(surface: dict, analysis: dict, topic: str | None, now: str) -> str:
                 node = _mermaid_point_name(idx)
                 out.append(f'    {node}["{_mermaid_node_label(r)}"]')
                 out.append(f"    {hub} --> {node}")
+                full, short = _mermaid_node_leaf(r)
+                if short != full:
+                    plano_legend[full] = short
             out.append("  end")
             nodes = ",".join([hub] + [_mermaid_point_name(idx) for idx, _r in rows])
             out.append(f"  class {nodes} {zid}")
         out += ["```", ""]
+        out += _legend_block(plano_legend)
 
     if len(mods) >= 2:
         ids = _module_ids(mods)
@@ -423,12 +469,17 @@ def render(surface: dict, analysis: dict, topic: str | None, now: str) -> str:
             "```mermaid",
             "flowchart LR",
         ]
+        grafo_legend: dict[str, str] = {}
         for module, node in ids.items():
-            out.append(f'  {node}["{_mermaid_label(_leaf(module))}"]')
+            full, label = _mermaid_label_pair(_leaf(module))
+            out.append(f'  {node}["{label}"]')
+            if label != full:
+                grafo_legend[full] = label
         for src, dst in analysis.get("edges", []):
             if src in ids and dst in ids:
                 out.append(f"  {ids[src]} --> {ids[dst]}")
         out += ["```", ""]
+        out += _legend_block(grafo_legend)
         if not analysis.get("edges") and analysis.get("unresolved_internal_imports", 0):
             out += [
                 "## Aviso de resolução de imports",
