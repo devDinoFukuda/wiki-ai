@@ -10,6 +10,7 @@ Reversa (github.com/sandeco/reversa, MIT © sandeco). Vive em `<workdir>/sdd/`.
 ├── inventory.md              # export (determinístico)      🟢 code-repo
 ├── dependencies.md           # export (determinístico)      🟢 code-repo
 ├── coupling.md               # coupling (determinístico)    🟢 code-repo (zona 🟡)
+├── coupling.html             # coupling, só motor Java       local (não publica)
 ├── code-analysis.md          # estágio modules              agent-output
 ├── data-dictionary.md        # estágio modules              agent-output
 ├── domain.md                 # estágio rules                agent-output
@@ -58,10 +59,14 @@ reprova como P0 se divergirem (mantenha só `sdd/`).
 Proveniência (coluna direita): todo artefato carrega o frontmatter de
 `templates/source-frontmatter.yaml`, aplicado no momento do `wk publish`
 (não pelo `codescan` em si — ver §6). `inventory.md`/`dependencies.md`/`coupling.md`
-saem determinísticos como `code-repo` (auto-promovem; em `coupling.md`, Ce/Ca/I são
-🟢 e abstração/zona são 🟡 inline). Todo o resto — `confirmed.md`/`inferred.md`
-inclusos — é `agent-output` e passa pelo portão com aprovação humana, mesmo
-citando `arquivo:linha`.
+saem determinísticos como `code-repo` (auto-promovem; em `coupling.md`, Ce/Ca/I/
+ciclos são 🟢 — fato de grafo — e A/zona/classe-deus/especulativa são 🟡 —
+heurística — inline; `coupling.md` usa o motor Java quando o repo tem Java,
+senão o motor genérico multi-linguagem — ver §1.6). Todo o resto —
+`confirmed.md`/`inferred.md` inclusos — é `agent-output` e passa pelo portão
+com aprovação humana, mesmo citando `arquivo:linha`. `coupling.html` (só
+gerado com o motor Java) não é artefato SDD: fica no workdir para inspeção
+local, não recebe frontmatter e nunca é publicado/promovido.
 
 `confirmed.md`/`inferred.md` são síntese para ingestão, não substituem a árvore
 SDD. Um pipeline que produz apenas `modules/*.md` + `confirmed.md` não cumpriu o
@@ -90,7 +95,8 @@ Sinais de reprovação imediata:
 - spec vazia, órfã, `_unit` ou não registrada no estado;
 - stage `done` sem `agent-runs/<stage>.json` obrigatório;
 - diagrama Mermaid vazio, ilegível, denso em uma linha ou com erro estrutural;
-- `coupling.md` sem grafo Mermaid quando há dois ou mais módulos;
+- `coupling.md` sem grafo Mermaid quando há dois ou mais módulos (vale para
+  os dois motores);
 - `coupling.md` sem aresta quando a análise encontrou dependência interna;
 - eco de log, diff, `Ran command`, `Edited`, `Write` ou `Wrote` em saída de subagente;
 - `Overview`, `Responsibility`, `Requirements`, `Technical Design`,
@@ -271,6 +277,31 @@ Permitido:
 - erro essencial com arquivo/linha quando houver.
 
 ## 1.6 Gates Mermaid e coupling
+
+`coupling.md` tem dois motores, escolhidos automaticamente pelo dispatcher
+(`scripts/codescan/coupling.py`) — os gates abaixo valem para os dois:
+
+- **motor Java** (repo com Java relevante): parser regex do corpo de cada
+  classe (não AST) — grafo por classe **e** por pacote, ciclos, classe-deus
+  (Ce **e** WMC máx outliers simultâneos), implementação concreta
+  sobre-dependida (Ca outlier em classe concreta), abstração especulativa
+  (interface/abstrata com ≤1 implementação e nenhum consumidor real).
+  Limiares são estatísticos (Q3 + 1.5·IQR sobre a distribuição real do
+  próprio projeto), nunca número fixo. Limitação do parser por regex: import
+  wildcard (`import pkg.*`) pode superestimar Ce; resolução por identificador
+  no mesmo pacote (Java não exige import dentro do próprio pacote) pode gerar
+  falso positivo raro. Gera também `coupling.html` (mapa interativo, local,
+  não publicável — ver §1 e §6). Racional completo de cada sinal e limiar
+  (com validação contra dado real): `references/coupling-java.md`.
+- **motor genérico multi-linguagem** (fallback: repo sem Java, ou repo Java
+  onde nenhuma classe sobrevive às exclusões da config): Ce/Ca/I/A/D/zona por
+  MÓDULO do surface, qualquer linguagem de `surface.py::LANGUAGES`, um único
+  parser de import por regex-família.
+
+Semáforo em ambos: Ce/Ca/I/ciclos são 🟢 (fato de grafo, reprodutível);
+A/zona/classe-deus/hotspot/especulativa são 🟡 (heurística — depende de
+"interface/abstract" reconhecido por regex e, no motor Java, de limiar
+estatístico).
 
 Mermaid obrigatório:
 - labels quoted;
@@ -580,6 +611,8 @@ destes dois artefatos e do `confirmed.md`/`inferred.md` do estágio synth.
 
 `inventory.md`/`dependencies.md`/`coupling.md` já saem do `export`/`coupling`
 com frontmatter próprio (`source_type: code-repo`, `confidence: reviewed`).
+`coupling.html` (só com o motor Java) não é `.md`, não tem frontmatter e não
+é considerado artefato SDD — fica no workdir, fora do fluxo de publicação.
 Os demais artefatos escritos por `merge-agent-output` (`modules/*.md`,
 `sdd/domain.md`, `sdd/architecture.md`, `sdd/confirmed.md`, etc.) **não têm
 frontmatter nenhum no workdir** — são conteúdo puro. Proveniência real
@@ -599,7 +632,9 @@ nega `Write`/`Edit` direto no store):
 `publish` classifica sozinho: `sdd/inventory.md`, `sdd/dependencies.md` e
 `sdd/coupling.md` → `code-repo` em `inbox/code-notes/`; todo o resto de
 `sdd/**/*.md` e `modules/*.md` → `agent-output` em `inbox/agent-output/`.
-`origin` grava `"codescan <repo> — <caminho-relativo-ao-workdir>"`;
+`sdd/coupling.html`, quando existe, não entra em nenhuma das duas categorias
+— `publish` não o leva para `inbox/`. `origin` grava
+`"codescan <repo> — <caminho-relativo-ao-workdir>"`;
 `confidence` só é definido depois, pelo `promote`. Scripts auxiliares
 temporários (`*.py`) não são artefatos SDD e não podem ir para `inbox/`;
 `publish` já os exclui automaticamente, junto com `state.json` e

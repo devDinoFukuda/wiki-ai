@@ -87,7 +87,8 @@ Antes de qualquer `done`, o pai deve rejeitar e marcar como `failed`/`degraded` 
 - spec vazia, órfã ou não registrada no estado;
 - Mermaid sem grafo válido, sem arestas/nós, denso ou com label inválido;
 - Mermaid strict é gate estrutural interno; parser/renderizador externo não é obrigatório para fechar o fluxo;
-- `coupling.md` sem grafo quando houver módulos/dependências internas;
+- `coupling.md` sem grafo quando houver módulos/dependências internas (vale
+  para os dois motores — Java e genérico);
 - saída com eco de log, diff, `Ran command`, `Edited`, `Write` ou `Wrote`;
 - texto majoritariamente em inglês;
 - seções canônicas ausentes;
@@ -233,9 +234,14 @@ Formato SYNTH (um bloco por artefato canônico do estágio synth):
 {{WK}} code --repo <repo> export --topic <slug>
 ```
 `export` gera 3 artefatos `code-repo`: `sdd/inventory.md`, `sdd/dependencies.md`
-e `sdd/coupling.md` (zonas de design — Ce/Ca/I 🟢, abstração/zona 🟡). Default
-de saída é `<workdir>/sdd`; `--output <dir>` recusa qualquer destino dentro de
-`raw/` ou `wiki/` do store (esses só mudam via `publish`/`promote`).
+e `sdd/coupling.md` (zonas de design — Ce/Ca/I 🟢, abstração/zona 🟡). Motor
+Java (classe e pacote, ciclos, classe-deus, hotspot de Ca, abstração
+especulativa; limiares por outlier IQR) quando o repo tem Java; motor
+genérico multi-linguagem caso contrário. Com Java, `export` também grava
+`sdd/coupling.html` — mapa interativo, artefato LOCAL de inspeção (não
+`code-repo`, não entra em `inbox/`). Default de saída é `<workdir>/sdd`;
+`--output <dir>` recusa qualquer destino dentro de `raw/` ou `wiki/` do
+store (esses só mudam via `publish`/`promote`).
 Ler os `warnings`. Decidir com o usuário e registrar:
 ```bash
 {{WK}} code --repo <repo> config --doc-level <essencial|completo|detalhado> --granularity <module|endpoint|use-case|hybrid|feature>
@@ -422,7 +428,8 @@ no contrato do código.
 
 `sdd/confirmed.md` → só 🟢 com `arquivo:linha`; ao publicar/promover, mesmo
 sendo o artefato mais verificável da síntese, entra como `agent-output` (só
-`inventory.md`/`dependencies.md`/`coupling.md` do `export` são `code-repo`).
+`inventory.md`/`dependencies.md`/`coupling.md` do `export` são `code-repo`;
+`coupling.html`, quando existe, não é artefato SDD e nunca entra aqui).
 `sdd/inferred.md` → 🟡, `agent-output`, nunca auto-promove.
 
 O CLI aceita `synth` em `run-stage`/`merge-agent-output`
@@ -457,7 +464,9 @@ Depois, leve a árvore inteira para `inbox/` com `publish` (§6 do
 `sdd/coupling.md` como `code-repo` em `inbox/code-notes/`; todo o resto de
 `sdd/**/*.md` e `modules/*.md` (síntese incluída) como `agent-output` em
 `inbox/agent-output/`. Scripts auxiliares (`*.py`), `state.json` e
-`surface.json` nunca entram — o comando já os exclui.
+`surface.json` nunca entram — o comando já os exclui. `sdd/coupling.html`
+(quando o motor Java rodou) também não entra: não é `.md`, não é artefato
+SDD publicável, fica só no workdir para inspeção local.
 Depois: `promote`, `compile`. Repo remoto: `cleanup` para apagar o clone.
 
 ## Retomada

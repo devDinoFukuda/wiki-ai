@@ -250,7 +250,10 @@ python wk.pyz code --repo /caminho/do/legado \
 módulos, churn e autores. **Leia os `warnings`** — "sem git" significa que
 você perdeu churn, que é o que aponta onde cavar. `export` materializa
 `sdd/inventory.md`, `sdd/dependencies.md` e `sdd/coupling.md` (grafo de
-acoplamento), todos com proveniência `code-repo`.
+acoplamento — motor Java especializado quando o repo tem Java, motor
+genérico multi-linguagem caso contrário; com Java, também grava
+`sdd/coupling.html` local para inspeção interativa), todos com proveniência
+`code-repo` (o `.html` não conta — é local, não publica).
 
 Depois, registre as duas decisões de escopo (o agente pergunta):
 
@@ -331,6 +334,7 @@ python wk.pyz publish --workdir "$WK_STORE/.codescan/<repo>-<hash>" --topic paga
 | `sdd/confirmed.md` | `agent-output` | **não** — só `sdd/inventory.md`, `sdd/dependencies.md`, `sdd/coupling.md` viram `code-repo`; o resto da árvore, `confirmed.md` incluso, é `agent-output` |
 | `sdd/inferred.md` | `agent-output` | **não** |
 | `sdd/inventory.md`, `sdd/dependencies.md`, `sdd/coupling.md` | `code-repo` | **sim** — determinísticos, saem do `export` |
+| `sdd/coupling.html` (só quando o motor Java roda) | — | **não é artefato SDD** — não entra em `written`, não vai para `inbox/`, `publish` não o leva; é só inspeção local |
 | demais artefatos `sdd/` (C4, ERD, specs...) e `modules/*.md` | `agent-output` | **não** — síntese de agente, mesmo citando código |
 
 Não existe `questions.md` no código: as 🔴 (perguntas ao humano) ficam

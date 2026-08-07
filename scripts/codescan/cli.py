@@ -1621,9 +1621,14 @@ def cmd_export(a) -> int:
     """Todos os artefatos SDD determinísticos: inventory, dependencies, coupling.
 
     Sem LLM. inventory/dependencies vêm do surface.json; coupling caminha o repo
-    para o grafo de imports (Ce/Ca/I 🟢) + zonas de design (🟡). Os três saem
-    `source_type: code-repo`, prontos para o inbox/. Obrigatório no estágio 1 —
-    não é passo opcional.
+    para o grafo de imports (Ce/Ca/I 🟢) + zonas de design (🟡) — motor Java
+    (classe e pacote, ciclos, classe-deus, hotspot de Ca, abstração
+    especulativa) quando o repo tem Java, motor genérico multi-linguagem
+    caso contrário (ver `coupling.py`). Os três (`inventory.md`,
+    `dependencies.md`, `coupling.md`) saem `source_type: code-repo`, prontos
+    para o inbox/. Obrigatório no estágio 1 — não é passo opcional. Quando o
+    motor Java roda, também é escrito `coupling.html` — um artefato LOCAL de
+    inspeção interativa (não entra em `written`/inbox, não publica).
     """
     import time
 
@@ -1655,7 +1660,28 @@ def cmd_export(a) -> int:
         zones: dict = {}
         for r in analysis["modules"]:
             zones[r["zone"]] = zones.get(r["zone"], 0) + 1
-        coupling_info = {"edges": len(analysis["edges"]), "zonas": zones}
+        coupling_info = {
+            "engine": analysis.get("engine"),
+            "edges": len(analysis["edges"]),
+            "zonas": zones,
+        }
+        summary = analysis.get("summary")
+        if analysis.get("engine") == "java" and summary:
+            coupling_info.update({
+                "ciclos_pacotes": summary.get("cycles_packages"),
+                "ciclos_classes": summary.get("cycles_classes"),
+                "classes_deus": summary.get("god_classes"),
+                "hotspots": summary.get("concrete_hotspots"),
+                "especulativas": summary.get("speculative_abstractions"),
+            })
+        # coupling.html: artefato LOCAL de inspeção (não publicável, não
+        # entra em `written`/SDD) — só existe para o motor Java.
+        html_out = cp_mod.render_html(surface, analysis, now)
+        if html_out is not None:
+            html_art = os.path.join(outdir, "coupling.html")
+            with open(html_art, "w", encoding="utf-8", newline="\n") as f:
+                f.write(html_out)
+            coupling_info["html"] = html_art
     else:
         coupling_info = {"skipped": "repo indisponível para coupling"}
 

@@ -126,7 +126,12 @@ $WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" export --topic "$WK_TOPIC
 
 Esperado: `"ok":true`, `"cmd":"export"`; grava `sdd/inventory.md`,
 `sdd/dependencies.md`, `sdd/coupling.md` no workdir. Passo obrigatório do
-estágio 1, não opcional.
+estágio 1, não opcional. `coupling.md` usa o motor Java (classe e pacote,
+ciclos, classe-deus, hotspot de Ca, abstração especulativa; limiares por
+outlier IQR) quando o repo tem Java, e o motor genérico multi-linguagem
+(Ce/Ca/I por módulo) caso contrário — quando o motor Java roda, o export
+também grava `sdd/coupling.html` (mapa interativo, artefato LOCAL de
+inspeção; não entra em `inbox/`, não publica).
 
 Se falhar: erro `rode surface primeiro` → repita 2.1. Nunca use `--output`
 apontando para `raw/`/`wiki/` do store (bloqueado — use o fluxo de
@@ -617,7 +622,7 @@ surface/state — use os comandos acima.
 | `wk check --engine <e> [--store --repo]` | compara disco vs. embutido; valida permissões |
 | `wk store init [caminho]` | cria `inbox/`/`raw/`/`wiki/` do store |
 | `wk code ... surface --topic <slug>` | estágio 1: mapa determinístico do repo |
-| `wk code ... export --topic <slug>` | inventory/dependencies/coupling (sem LLM) |
+| `wk code ... export --topic <slug>` | inventory/dependencies/coupling — sem LLM; coupling usa motor Java ou genérico conforme o repo, e grava `coupling.html` local quando Java |
 | `wk code ... config --doc-level --granularity` | grava decisões do SDD (obrigatório antes de plan) |
 | `wk code ... plan` | lista módulos a cavar, por LOC |
 | `wk code ... pending <stage> --items <lista>` | registra pendências de um estágio |

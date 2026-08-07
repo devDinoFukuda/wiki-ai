@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from codescan import coupling as cp
+from codescan import coupling_generic
 from codescan.surface import scan
 
 
@@ -49,6 +50,12 @@ class TestZone(unittest.TestCase):
 
 class TestAnalyzeSintetico(unittest.TestCase):
     def test_grafo_e_instabilidade(self):
+        """Fixtures são `.java`, então `cp.analyze` (dispatcher) roteia
+        legitimamente para o motor Java, que agrega por PACOTE Java (lido do
+        `package` do arquivo, aqui ausente/"(default)") — não por diretório
+        do surface como o motor genérico. Este teste quer validar
+        especificamente o motor genérico por diretório, então chama
+        `coupling_generic.analyze` direto, contornando o dispatcher."""
         with tempfile.TemporaryDirectory() as repo:
             # domain: ninguém importa de fora; concreto → estável + dor
             _w(repo, "src/main/java/app/domain/Order.java", "class Order {}\n")
@@ -60,7 +67,7 @@ class TestAnalyzeSintetico(unittest.TestCase):
                "import app.domain.Order;\ninterface OrderService {}\n")
             s = scan(repo, module_min_files=1)
             surface = {"modules": [{"path": m.path, "role": m.role} for m in s.modules]}
-            res = cp.analyze(repo, surface)
+            res = coupling_generic.analyze(repo, surface)
             by = {os.path.basename(r["module"]): r for r in res["modules"]}
 
             # domain: Ca alto, Ce=0 → I=0 → dor (concreto)
@@ -78,14 +85,20 @@ class TestAnalyzeSintetico(unittest.TestCase):
             self.assertGreater(by["service"]["abstractness"], 0.5)
 
     def test_render_frontmatter_e_mermaid(self):
+        """Fixtures são `.java` → `cp.analyze` roteia para o motor Java
+        legitimamente (ver docstring de `test_grafo_e_instabilidade`). Este
+        teste valida o Mermaid `flowchart` do RENDER GENÉRICO especificamente
+        (o motor Java tem seu próprio teste de render em
+        `test_coupling_java.py`), então usa `coupling_generic.analyze`/
+        `coupling_generic.render` direto, contornando o dispatcher."""
         with tempfile.TemporaryDirectory() as repo:
             _w(repo, "src/main/java/app/domain/Order.java", "class Order {}\n")
             _w(repo, "src/main/java/app/api/Api.java",
                "import app.domain.Order;\nclass Api {}\n")
             s = scan(repo, module_min_files=1)
             surface = {"repo": repo, "modules": [{"path": m.path, "role": m.role} for m in s.modules], "git": {}}
-            res = cp.analyze(repo, surface)
-            md = cp.render(surface, res, "t", "2026-07-22T00:00:00Z")
+            res = coupling_generic.analyze(repo, surface)
+            md = coupling_generic.render(surface, res, "t", "2026-07-22T00:00:00Z")
             self.assertTrue(md.startswith("---\n"))
             self.assertIn("source_type: code-repo", md)
             self.assertIn("```mermaid\nflowchart", md)
