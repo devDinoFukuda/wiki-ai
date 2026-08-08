@@ -137,6 +137,109 @@ def _ensure_status(status: str) -> None:
         raise ValueError(f"status inválido: {status}")
 
 
+# --- BUG B3 (causa-raiz): canonicalização de identificador de item ----------
+#
+# Antes desta correção, `mark_item`/`mark_item_status`/`set_pending`
+# comparavam itens por igualdade EXATA de string nos sets
+# done/pending/blocked/failed/degraded. No Windows, um item cujo caminho tem
+# diretórios aninhados chega com '\\' (nativo do SO, via
+# `os.path.relpath`/`surface.py`) por uma via e com '/' (normalizado, via
+# `sdd.redo_stage`/`agentmerge._normalize_item`) por outra — a mesma entidade
+# lógica virava DUAS entradas no mesmo set. A defesa vivia inteira em
+# `cli.py` (`_reconcile_stage_items`/`_resolve_stored_item`, chamadas antes/
+# depois de cada mutação); qualquer chamador que grave em state.json sem
+# passar por esse wrapper (ex.: `sdd.redo_stage`, que chama `mark_item`
+# direto) reabria o bug. Estas três funções abaixo replicam, NESTA camada
+# (a mais baixa: quem grava em disco), a mesma semântica de resolução já
+# estabelecida por `agentmerge._state_item_from_stage`/`cli._resolve_stored_
+# item` — para que a garantia de "sem duplicata" não dependa de nenhum
+# chamador específico fazer a coisa certa antes de chamar `state.py`.
+def _canon_item(value) -> str:
+    """Forma canônica (só para COMPARAÇÃO/dedup) de um identificador de
+    item: separador '/', sem barras duplicadas nem de borda. Aceita entrada
+    com '\\' (path colado do Windows) ou '/' indistintamente. NÃO é
+    necessariamente a grafia que fica persistida — ver `_resolve_item`."""
+    text = str(value).strip().replace("\\", "/")
+    return re.sub(r"/+", "/", text).strip("/")
+
+
+_ITEM_LIST_KEYS = ("done", "pending", *ITEM_PROBLEM_STATUSES)
+_ITEM_LIST_PRECEDENCE = ("pending", *ITEM_PROBLEM_STATUSES, "done")
+
+
+def _resolve_item(s: dict, item) -> str | None:
+    """Resolve `item` (aceita '\\' ou '/') para a grafia JÁ EXISTENTE em
+    qualquer lista de item do stage (done/pending/blocked/failed/degraded),
+    comparando pela forma canônica. Devolve `None` se nenhuma grafia prévia
+    casar — o chamador decide o default para item genuinamente novo (ver
+    nota de `set_pending` sobre por que esse default não pode ser '/' às
+    cegas para o stage `modules`)."""
+    wanted = _canon_item(item)
+    if not wanted:
+        return None
+    for key in _ITEM_LIST_KEYS:
+        for candidate in s.get(key) or []:
+            if _canon_item(candidate) == wanted:
+                return str(candidate)
+    return None
+
+
+def _reconcile_item_lists(s: dict) -> None:
+    """Colapsa, EM MEMÓRIA, grafias divergentes ('\\'/'/', ou duplicadas
+    dentro da mesma lista) do MESMO item lógico nas listas
+    done/pending/blocked/failed/degraded de `s` (mutação in-place).
+
+    Migração de estado legado (decisão): um `state.json` gravado antes desta
+    correção (grafia '\\' pura, ou mista com '/') é normalizado AQUI, em
+    memória, no início de toda operação de escrita (`mark_item`/
+    `mark_item_status`/`set_pending` chamam isto antes de mutar) — nunca por
+    um passo de migração isolado que reescreveria o arquivo em uma leitura
+    (`load()` continua sendo leitura pura, sem side effect em disco). Isso
+    evita tocar o disco em comandos somente-leitura (`state`, `next`,
+    `audit`) e só persiste a forma canônica na escrita que já ia acontecer de
+    qualquer forma — mesma decisão já tomada por `cli._reconcile_stage_items`
+    (fora do meu escopo de edição), replicada aqui para não depender
+    exclusivamente desse wrapper.
+
+    Resolução por precedência quando a MESMA forma canônica aparece em mais
+    de uma lista: pending > blocked > failed > degraded > done — um item
+    ainda pendente ou com problema não pode ficar registrado como `done` ao
+    mesmo tempo. Dentro da MESMA lista, colapsa grafias duplicadas do mesmo
+    item para uma única entrada (a primeira grafia encontrada)."""
+    by_canon: dict[str, dict[str, list[str]]] = {}
+    for key in _ITEM_LIST_KEYS:
+        for raw in s.get(key) or []:
+            canon = _canon_item(raw)
+            if not canon:
+                continue
+            by_canon.setdefault(canon, {}).setdefault(key, []).append(str(raw))
+
+    new_lists = {key: list(dict.fromkeys(s.get(key) or [])) for key in _ITEM_LIST_KEYS}
+    artifacts = s.get("artifacts") if isinstance(s.get("artifacts"), dict) else None
+    reasons = s.get("reasons") if isinstance(s.get("reasons"), dict) else None
+
+    for _canon, occurrences in by_canon.items():
+        all_raw = [raw for raws in occurrences.values() for raw in raws]
+        if len(occurrences) == 1 and len(set(all_raw)) == 1:
+            continue  # já canônico e único: nada a fazer
+        winning_key = next(k for k in _ITEM_LIST_PRECEDENCE if k in occurrences)
+        winning_raw = occurrences[winning_key][0]
+        for key, raws in occurrences.items():
+            for raw in set(raws):
+                if key == winning_key and raw == winning_raw:
+                    continue
+                if raw in new_lists[key]:
+                    new_lists[key].remove(raw)
+                for mapping in (artifacts, reasons):
+                    if mapping and raw in mapping:
+                        mapping.setdefault(winning_raw, mapping.pop(raw))
+        if winning_raw not in new_lists[winning_key]:
+            new_lists[winning_key].append(winning_raw)
+
+    for key in _ITEM_LIST_KEYS:
+        s[key] = new_lists[key]
+
+
 def _derive_item_stage_status(s: dict, stage: str | None = None) -> str:
     if s.get("failed"):
         return "failed"
@@ -181,23 +284,39 @@ def mark(wd: str, stage: str, status: str, artifact: str | None = None) -> dict:
 def mark_item(wd: str, stage: str, item: str, done: bool = True) -> dict:
     """Marca um item concluído/pendente. Concorrência-segura: agentes paralelos
     marcam módulos diferentes sem se sobrescrever (o read-modify-write inteiro
-    roda sob trava)."""
+    roda sob trava).
+
+    BUG B3 (causa-raiz): `item` é resolvido contra a grafia JÁ EXISTENTE nos
+    sets do stage (`_resolve_item`, aceita '\\' ou '/') ANTES de mutar — sem
+    isso, um chamador que sempre normaliza para '/' antes de chamar esta
+    função (ex.: `sdd.redo_stage`) criava uma segunda entrada ao lado de um
+    `done`/`pending` já gravado com '\\'. Sem grafia prévia (item
+    genuinamente novo), a forma persistida é a canônica '/' — este é o único
+    dos três pontos de escrita (`mark_item`/`mark_item_status`/`set_pending`)
+    onde isso é seguro por padrão: os únicos chamadores que passam item novo
+    para cá (`cli.cmd_done`/`cmd_problem_status`, já resolvidos por
+    `cli._resolve_stored_item`, e `sdd.redo_stage`) já usam/aceitam a forma
+    canônica. `set_pending` é diferente — ver nota lá."""
     with _lock(wd):
         st = load(wd) or {}
         s = st.setdefault("stages", {}).setdefault(stage, {"done": [], "pending": []})
+        _reconcile_item_lists(s)
+        resolved = _resolve_item(s, item)
+        if resolved is None:
+            resolved = _canon_item(item)
         d = set(s.get("done") or [])
         p = set(s.get("pending") or [])
         problem = {k: set(s.get(k) or []) for k in ITEM_PROBLEM_STATUSES}
         if done:
-            d.add(item)
-            p.discard(item)
+            d.add(resolved)
+            p.discard(resolved)
             for items in problem.values():
-                items.discard(item)
+                items.discard(resolved)
         else:
-            p.add(item)
-            d.discard(item)
+            p.add(resolved)
+            d.discard(resolved)
             for items in problem.values():
-                items.discard(item)
+                items.discard(resolved)
         s["done"], s["pending"] = sorted(d), sorted(p)
         for status, items in problem.items():
             s[status] = sorted(items)
@@ -225,19 +344,27 @@ def mark_item_status(
     with _lock(wd):
         st = load(wd) or {}
         s = st.setdefault("stages", {}).setdefault(stage, {"done": [], "pending": []})
+        _reconcile_item_lists(s)
+        # BUG B3 (causa-raiz): mesma resolução contra grafia existente que
+        # `mark_item` aplica — ver docstring lá. `artifacts`/`reasons` também
+        # passam a ser chaveados pela grafia RESOLVIDA (consistente entre
+        # chamadas), não pela entrada crua de cada chamada individual.
+        resolved = _resolve_item(s, item)
+        if resolved is None:
+            resolved = _canon_item(item)
         for key in ("done", "pending", *ITEM_PROBLEM_STATUSES):
             items = set(s.get(key) or [])
             if key == status:
-                items.add(item)
+                items.add(resolved)
             else:
-                items.discard(item)
+                items.discard(resolved)
             s[key] = sorted(items)
         if artifact:
             artifacts = s.setdefault("artifacts", {})
-            artifacts[item] = artifact
+            artifacts[resolved] = artifact
         if reason:
             reasons = s.setdefault("reasons", {})
-            reasons[item] = reason
+            reasons[resolved] = reason
         s["items_complete"] = bool(s.get("done") and not s.get("pending") and not any(s.get(k) for k in ITEM_PROBLEM_STATUSES))
         if not s["items_complete"]:
             s.pop("finalized", None)
@@ -286,15 +413,50 @@ def clear_stage_error(wd: str, stage: str) -> dict:
 
 
 def set_pending(wd: str, stage: str, items: list[str]) -> dict:
+    """Substitui a lista `pending` do stage (menos o que já está `done`).
+
+    BUG B3 (causa-raiz): itens de `items` são resolvidos contra a grafia já
+    existente em qualquer lista do stage (`_resolve_item`), e deduplicados
+    entre si pela forma canônica antes de gravar — sem isso, duas grafias do
+    MESMO item ('a\\b' e 'a/b') na mesma chamada viravam duas entradas.
+
+    DECISÃO (desvio deliberado de "grava sempre '/'"): um item genuinamente
+    NOVO (sem grafia prévia em nenhuma lista) é persistido com a grafia
+    CRUA recebida, não forçada para '/'. Motivo: `cli.cmd_plan` é o único
+    chamador que povoa `pending` do stage `modules` pela primeira vez, e
+    passa `Module.path` de surface.json — nativo do SO ('\\' no Windows para
+    diretório aninhado). Esse valor precisa sobreviver intacto porque
+    `agentmerge._state_item_from_stage` (fora do meu escopo) resolve o item
+    do bloco MODULE do subagente contra a grafia já gravada em `pending` e
+    reaproveita ESSA grafia em `done` — forçar '/' aqui faria a primeira
+    gravação de `pending` divergir do path nativo de `Module.path`, o que
+    não quebra a comparação (que já é canônica em `cli._plan_groups`), mas
+    muda a grafia que acaba persistida em `done` após o merge, quebrando a
+    suíte existente (`test_fix_lote_a.py::RedoPathSeparatorTest`) sem
+    corrigir bug nenhum. `mark_item`/`mark_item_status` não têm essa
+    restrição (ver suas docstrings) porque nenhum chamador deles depende de
+    preservar grafia nativa na primeira gravação."""
     with _lock(wd):
         st = load(wd) or {}
         s = st.setdefault("stages", {}).setdefault(stage, {})
+        _reconcile_item_lists(s)
         done = set(s.get("done") or [])
-        s["pending"] = sorted(set(items) - done)
+        done_canon = {_canon_item(x) for x in done}
+
+        resolved_items: list[str] = []
+        seen_canon: set[str] = set()
+        for raw in items:
+            canon = _canon_item(raw)
+            if not canon or canon in seen_canon:
+                continue
+            seen_canon.add(canon)
+            matched = _resolve_item(s, raw)
+            resolved_items.append(matched if matched is not None else raw)
+
+        s["pending"] = sorted(x for x in resolved_items if _canon_item(x) not in done_canon)
         s["done"] = sorted(done)
         for status in ITEM_PROBLEM_STATUSES:
-            problem = set(s.get(status) or [])
-            problem -= set(items)
+            problem = {x for x in (s.get(status) or []) if _canon_item(x) not in seen_canon}
             s[status] = sorted(problem)
         s["items_complete"] = bool(done and not s.get("pending") and not any(s.get(k) for k in ITEM_PROBLEM_STATUSES))
         if not s["items_complete"]:

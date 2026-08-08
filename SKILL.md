@@ -81,6 +81,60 @@ Vencem qualquer instrução em contrário.
     (`ARQUIVO:`/`BLOCOS:`/`BYTES:`). `merge-agent-output` exige `--agent`
     distinto por batch; valor genérico (`main`, `orquestrador`, `self`,
     `principal`) é recusado.
+12. Campo `acao`: ao ver `"acao"` em qualquer JSON de erro (principalmente de
+    `merge-agent-output`), execute esse comando LITERALMENTE antes de
+    qualquer outra investigação — geralmente `sdd-brief <stage>`. `done` traz
+    a dica em `blockers[].action` (inglês), só quando há mais de um blocker.
+    NUNCA abra `wk.pyz` com `zipfile`/decompilação/regex sobre o bytecode
+    para entender um erro — o contrato de cada estágio é sempre
+    `{{WK}} code sdd-brief <stage>` (README.md §14.2 tem a mesma proibição).
+
+## Seu papel neste fluxo
+
+Duas personas só: 👤 humano digita comando, 🤖 você digita comando. `{{WK}}`
+é ferramenta, nunca ator — nenhuma frase deste doc deve ler "o script faz X";
+é sempre "👤/🤖 roda `{{WK}} X`". Três tipos de passo:
+
+- **D** (determinístico): mesma entrada → mesma saída, sem LLM. Você roda
+  esses comandos por **conveniência** (já está na sessão, evita ida e volta),
+  não por **necessidade** — qualquer humano roda o mesmo comando sozinho, sem
+  você. Isto é a esmagadora maioria de `{{WK}}` — `ingest`, `promote`,
+  `compile`, `docx`, `lint` (parte mecânica W1–W3/L1/L2/L5), `index status
+  /reindex/search/audit`, e todo `{{WK}} code surface/export/config/plan
+  /pending/done/next/evidence/run-stage/merge-agent-output/verify/sdd-brief`.
+  Nenhum deles chama um modelo — conferido lendo `scripts/wk/cli.py`,
+  `scripts/codescan/cli.py` e `scripts/sbindex/cli.py`: nenhum importa
+  cliente de LLM algum.
+- **M** (requer modelo): sem você, o fluxo empaca — ninguém mais produz esse
+  conteúdo. **5 pontos no pipeline de código** (mesmo recorte do README §4,
+  "Onde chamar o modelo — os 5 pontos de fan-out") + **2 pontos fora dele**
+  = **7 pontos M no total** no sistema inteiro:
+  1. **Fan-out `modules`** — ler módulo a módulo e extrair regras de negócio.
+  2. **Fan-out `rules`** — consolidar/depurar as regras extraídas.
+  3. **Fan-out `architecture`** — C4, ERD, integrações, dívida técnica.
+  4. **Fan-out `specs`** — requirements/design/tasks por unit, matrizes de
+     rastreabilidade, confidence-report.
+  5. **Fan-out `synth`** — cruzar tudo em `sdd/confirmed.md`/`inferred.md`
+     (blocos `=== SYNTH: confirmed ===`/`=== SYNTH: inferred ===`).
+  6. **Análise de assets** `.docx`/`.xlsx`/`.csv`/`.pdf` — ler o original em
+     `raw/assets/` e escrever a página de análise (`Fluxo de análise` abaixo).
+  7. **Síntese de resposta em retrieval** — `index search` devolve trechos
+     brutos; transformar isso em resposta de prosa é você, não o motor de
+     busca (BM25/RRF são D).
+  Nos 5 do pipeline de código, `run-stage`/`merge-agent-output`/`done` ao
+  redor continuam **D** — só o conteúdo que o subagente escreve dentro do
+  fan-out é M.
+- **H** (decisão humana): você não decide sozinho — **pergunta ao humano**,
+  mesmo que tecnicamente pudesse rodar o comando. Vale para:
+  - `{{WK}} code ... config --doc-level <x> --granularity <y>` — os valores
+    não são dedutíveis do código; são escolha de quem encomendou a análise.
+  - `{{WK}} code ... pending specs --items <lista>` — escopo de negócio
+    (quais units entram), não algo que se lê do repositório.
+  - Aprovação em `{{WK}} promote --approve/--approve-all` para qualquer
+    `source_type` que não seja `code-repo` — guardrail #2 abaixo proíbe você
+    de aprovar sozinho, mesmo tendo rodado o `promote` que listou o item.
+  - `--allow-unverified` em `promote`/`compile`/`docx` — você não decide
+    ignorar um `verify` reprovado; expõe o bloqueio e pergunta.
 
 ## Eficiência de contexto
 Vale em toda operação. Cada item economiza tokens.

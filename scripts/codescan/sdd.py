@@ -86,6 +86,12 @@ class ArtifactRule:
     min_citations: int = 1
     sections: tuple[str | tuple[str, ...], ...] = ()
     glob: bool = False
+    # Tipos de bloco ```mermaid``` aceitos como satisfazendo a exigência de
+    # diagrama (ex.: ("flowchart", "graph")). Vazio = artefato de texto puro,
+    # sem exigência de diagrama (default). Ver FIX2 (BQ-lote-B): artefatos
+    # "de diagrama" (c4-*, architecture, erd-complete) eram aprovados sem
+    # nenhum bloco mermaid porque `sections` só cobria prosa/tabelas.
+    require_diagram: tuple[str, ...] = ()
 
 
 RULES: dict[str, tuple[ArtifactRule, ...]] = {
@@ -152,12 +158,14 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
             min_bytes=1800,
             min_citations=5,
             sections=("Visão geral", "Containers", "Integrações", "Riscos", "Rastreabilidade"),
+            require_diagram=("flowchart", "graph"),
         ),
         ArtifactRule(
             "sdd/c4-context.md",
             min_bytes=450,
             min_citations=0,
             sections=("Contexto",),
+            require_diagram=("flowchart", "graph", "C4Context", "C4Container", "C4Component"),
         ),
         ArtifactRule(
             "sdd/c4-containers.md",
@@ -165,6 +173,7 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
             min_bytes=300,
             min_citations=0,
             sections=("Containers",),
+            require_diagram=("flowchart", "graph", "C4Context", "C4Container", "C4Component"),
         ),
         ArtifactRule(
             "sdd/c4-components.md",
@@ -172,6 +181,7 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
             min_bytes=300,
             min_citations=0,
             sections=("Componentes",),
+            require_diagram=("flowchart", "graph", "C4Context", "C4Container", "C4Component"),
         ),
         ArtifactRule(
             "sdd/coupling.md",
@@ -185,6 +195,7 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
             min_bytes=300,
             min_citations=0,
             sections=("Entidades",),
+            require_diagram=("erDiagram",),
         ),
         ArtifactRule(
             "sdd/traceability/spec-impact-matrix.md",
@@ -956,6 +967,22 @@ def redo_stage(wd: str, stage: str, item: str | None = None) -> dict:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
 
+    # BUG B3 (causa-raiz, TODO-1 resolvido): `name` aqui é SEMPRE a forma
+    # canônica '/' (vem de `target`/`_run_item_names`, ambos normalizados
+    # acima) — nunca resolvida contra a grafia '\\' que possa já estar
+    # gravada em `state.json` (ex.: `done` populado por um merge anterior a
+    # esta correção, ou por qualquer caminho que preserve separador nativo
+    # do SO). Isso costumava exigir uma resolução própria aqui, no mesmo
+    # padrão de `agentmerge._state_item_from_stage` (fora do escopo desta
+    # correção), para não criar uma segunda entrada ao lado da já existente.
+    #
+    # Não é mais necessário: `state.mark_item` (state.py, dentro do escopo
+    # desta correção) agora resolve `item` contra a grafia já existente em
+    # done/pending/blocked/failed/degraded do stage ANTES de mutar — a
+    # mesma garantia, agora na camada mais baixa (quem grava em disco),
+    # independente de `redo_stage` (ou qualquer outro chamador) já ter
+    # normalizado antes de chamar. `redo_stage` está correto por construção
+    # sem replicar a resolução aqui; adicioná-la de novo seria redundante.
     for name in sorted(items_reopened):
         st_mod.mark_item(wd, stage, name, done=False)
 
@@ -1085,7 +1112,17 @@ MERMAID_START_RE = re.compile(r"```mermaid[^\n]*\n", re.I)
 MERMAID_BLOCK_RE = re.compile(r"```mermaid[^\n]*\n(?P<body>.*?)\n```", re.I | re.S)
 QUADRANT_POINT_RE = re.compile(r"^\s*P\d{3}:\s*\[\s*(?:0|1|0?\.\d+|1\.0+)\s*,\s*(?:0|1|0?\.\d+|1\.0+)\s*\]\s*$")
 MERMAID_NODE_DEF_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*(?:\[|\(|\{)")
-MERMAID_NODE_ANY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*)\s*(\[\[?|\(\(?|\{)\s*(.*?)\s*(?:\]\]?|\)\)?|\})")
+# Label do nó: tenta primeiro o conteúdo integralmente entre aspas duplas —
+# aceita parênteses, dois-pontos, barras e acentos dentro do label sem
+# confundi-los com delimitadores de forma do nó — e só cai para o modo
+# "sem aspas" (rejeitado depois) quando o label de fato não está quoted.
+# Antes, o (.*?) genérico era ambíguo entre `]`/`)`/`}` de QUALQUER tipo de
+# abertura, então um label quoted como `A["Quote Service (v2)"]` era truncado
+# no primeiro ")" interno e reportado como "não quoted" — falso positivo
+# investigado e corrigido no FIX1(b) do lote B.
+MERMAID_NODE_ANY_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9_]*)\s*(\[\[?|\(\(?|\{)\s*(\"[^\"]*\"|[^\[\]\(\)\{\}]*)\s*(?:\]\]?|\)\)?|\})"
+)
 MERMAID_EDGE_RE = re.compile(r"(?:-->|---|-.->|==>)")
 _MERMAID_EDGE_LABEL = r"(?:\s*\|(?:\"[^\"]*\"|[^|\n]*)\|)?"
 MERMAID_EDGE_LINE_RE = re.compile(
@@ -1094,9 +1131,18 @@ MERMAID_EDGE_LINE_RE = re.compile(
     r"\s*[A-Za-z][A-Za-z0-9_]*(?:\s*(?:\[\[?.*?\]\]?|\(\(?.*?\)\)?|\{.*?\}))?)+\s*$"
 )
 MERMAID_EDGE_LABEL_PREFIX_RE = re.compile(r"^\s*\|(?:\"[^\"]*\"|[^|\n]*)\|\s*")
+# Rótulo inline de aresta (`-->|texto|`) não é uma definição de nó. Sem isto,
+# um rótulo como `-->|"200 OK (retry)"|` era escaneado por MERMAID_NODE_ANY_RE
+# e o token "OK (retry)" virava um falso "node/label não quoted" — investigado
+# e corrigido no FIX1(b). Âncorado na seta para não colidir com um "|"
+# legítimo dentro de outro label quoted na mesma linha.
+MERMAID_EDGE_INLINE_LABEL_RE = re.compile(r"(-->|---|-\.->|==>)\s*\|(?:\"[^\"]*\"|[^|\n]*)\|")
 MERMAID_BAD_LABEL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*\s*\[@")
 MERMAID_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 MERMAID_FRAGILE_RE = re.compile(r"[`;]")
+# Artefatos "de diagrama" cujo gate exige ao menos um bloco ```mermaid``` de um
+# dos tipos aceitos abaixo (ver FIX2 do lote B). Chave = ArtifactRule.rel.
+NO_DIAGRAM_ESCAPE_RE = re.compile(r"<!--\s*no-diagram:\s*(.+?)\s*-->", re.I)
 
 
 def _balanced_mermaid_line(line: str) -> bool:
@@ -1185,6 +1231,136 @@ def _mmdc_error(body: str, idx: int) -> str | None:
     return f"Mermaid mmdc reprovou bloco {idx}{detail}"
 
 
+def _mermaid_trecho(text: str, limit: int = 120) -> str:
+    """Trecho truncado (~120 chars) para anexar à mensagem de erro — ver
+    FIX1(a): sem isto o operador não tinha como saber QUAL linha/label
+    disparou a regra sem ler o arquivo inteiro e adivinhar."""
+    t = text.strip()
+    if len(t) > limit:
+        return t[: limit - 1].rstrip() + "…"
+    return t
+
+
+def _strip_line_comment(line: str) -> str:
+    """Remove um comentário `%% ...` fora de aspas, preservando o resto da
+    linha intacto. Sem isto, uma linha como `A["X"] --> B["Y"] %% nota (v2)`
+    tanto escapava do whitelist de aresta (que exige `$` no fim da linha)
+    quanto contaminava o scanner de nós com o parêntese do comentário."""
+    quote = False
+    escaped = False
+    for i, ch in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            quote = not quote
+            continue
+        if not quote and ch == "%" and line[i : i + 2] == "%%":
+            return line[:i].rstrip()
+    return line
+
+
+def _strip_edge_inline_labels(line: str) -> str:
+    """Remove o texto de rótulos inline de aresta (`-->|texto|`) antes do
+    scanner de definição de nó — ver FIX1(b)/MERMAID_EDGE_INLINE_LABEL_RE."""
+    return MERMAID_EDGE_INLINE_LABEL_RE.sub(lambda m: m.group(1), line)
+
+
+# Tokens de cardinalidade crow's-foot do erDiagram (matriz completa aceita
+# pelo Mermaid): zero/um/muitos de cada lado do relacionamento, incluindo a
+# forma tracejada (`..`) — ver BUG B1. Cada token tem exatamente 2 chars e é
+# removido do texto ANTES de contar `{`/`}`, porque `o{`/`|{`/`}o`/`}|` não
+# são abertura/fechamento de bloco de atributos, são notação de "muitos".
+ER_CARDINALITY_TOKEN_RE = re.compile(r"\|o|\|\||o\{|\|\{|\}o|\}\||o\|")
+
+# Tipos de diagrama cuja sintaxe usa bloco multi-linha delimitado por `{`/`}`
+# que NÃO fecha na mesma linha em que abre (atributos de entidade/classe,
+# estado composto, boundary do C4). Balanço por linha (o que o validador
+# fazia antes do dispatch por tipo) reprova todo bloco legítimo desse tipo.
+_BRACE_BLOCK_KIND_LABELS = {
+    "classDiagram": "classDiagram",
+    "stateDiagram": "stateDiagram",
+    "c4": "C4",
+}
+
+
+def _mermaid_kind(first_line: str) -> str:
+    """Classifica o tipo de diagrama pela primeira linha do bloco — usado
+    para decidir QUAIS checagens (sintaxe de flowchart, balanço de chaves
+    multi-linha, ou nenhuma) se aplicam. Ver BUG B1: antes do dispatch por
+    tipo, `_balanced_mermaid_line`/checagem de caractere frágil — semântica
+    de flowchart — rodava incondicionalmente sobre QUALQUER bloco mermaid,
+    reprovando `erDiagram` com cardinalidade `o{`/`}o`/`|{`/`}|` real."""
+    if first_line.startswith("quadrantChart"):
+        return "quadrantChart"
+    if first_line.startswith(("flowchart", "graph")):
+        return "flowchart"
+    if first_line.startswith("erDiagram"):
+        return "erDiagram"
+    if first_line.startswith("classDiagram"):
+        return "classDiagram"
+    if first_line.startswith(("stateDiagram-v2", "stateDiagram")):
+        return "stateDiagram"
+    if first_line.startswith("sequenceDiagram"):
+        return "sequenceDiagram"
+    if first_line.startswith(("C4Context", "C4Container", "C4Component", "C4Dynamic", "C4Deployment")):
+        return "c4"
+    return "other"
+
+
+def _multiline_brace_balance_errors(
+    lines: list[tuple[int, str]],
+    idx: int,
+    kind_label: str,
+    pattern_name: str,
+    strip_re: re.Pattern | None = None,
+) -> list[str]:
+    """Balanço de `{`/`}` através do BLOCO INTEIRO (não por linha) — usado
+    por tipos com bloco multi-linha (atributos de entidade/classe, estado
+    composto, boundary do C4). Checar por linha, como o validador fazia
+    incondicionalmente antes do dispatch por tipo, reprova toda entidade com
+    atributos ou todo estado composto real — a mesma causa-raiz do BUG B1,
+    replicada aqui para os demais tipos com sintaxe de bloco (item 4 do
+    pedido de correção)."""
+    errors: list[str] = []
+    depth = 0
+    for line_no, ln in lines:
+        scan = strip_re.sub("", ln) if strip_re else ln
+        depth += scan.count("{") - scan.count("}")
+        if depth < 0:
+            errors.append(
+                f"Mermaid {kind_label} com bloco fechado sem abertura correspondente no bloco {idx}, "
+                f"linha {line_no}: '{_mermaid_trecho(ln)}' (padrão: {pattern_name})"
+            )
+            depth = 0
+    if depth:
+        errors.append(
+            f"Mermaid {kind_label} com bloco aberto sem fechamento no bloco {idx} (padrão: {pattern_name})"
+        )
+    return errors
+
+
+def _er_diagram_errors(lines: list[tuple[int, str]], idx: int) -> list[str]:
+    """Validação própria e mínima de `erDiagram` (BUG B1): aceita toda a
+    matriz de cardinalidade crow's-foot (`||--||`, `||--o{`, `||--|{`,
+    `}o--||`, `}|--||`, `}o--o{`, `}|--|{`, `|o--o|`), a variante tracejada
+    (`..`), rótulo de relação quoted ou não-quoted, e bloco de atributos
+    `ENTIDADE { tipo nome PK }` — sem aplicar as regras de flowchart."""
+    body_lines = lines[1:]
+    errors = _multiline_brace_balance_errors(
+        body_lines, idx, "erDiagram", "erdiagram-bloco-atributos-desbalanceado", strip_re=ER_CARDINALITY_TOKEN_RE
+    )
+    body_norm = "\n".join(ln for _n, ln in body_lines)
+    if "{" not in body_norm and "--" not in body_norm and ".." not in body_norm:
+        errors.append(
+            f"Mermaid erDiagram sem entidades ou relacionamentos no bloco {idx} (padrão: erdiagram-sem-entidades)"
+        )
+    return errors
+
+
 def _mermaid_errors(text: str) -> list[str]:
     if not MERMAID_START_RE.search(text):
         return []
@@ -1195,36 +1371,68 @@ def _mermaid_errors(text: str) -> list[str]:
         errors.append("Mermaid com fence sem fechamento")
     for idx, block in enumerate(blocks, start=1):
         body = block.group("body")
-        lines = [ln.rstrip() for ln in body.splitlines() if ln.strip()]
+        # Linha absoluta (1-based) dentro do ARQUIVO inteiro, não do bloco —
+        # FIX1(a): a mensagem precisa apontar direto pro editor do operador.
+        body_start_line = text[: block.start("body")].count("\n") + 1
+        lines: list[tuple[int, str]] = [
+            (body_start_line + i, raw.rstrip())
+            for i, raw in enumerate(body.splitlines())
+            if raw.strip()
+        ]
         if not lines:
             errors.append(f"Mermaid bloco {idx} vazio")
             continue
-        for ln in lines:
-            if not _balanced_mermaid_line(ln):
-                errors.append(f"Mermaid com brackets/quotes desbalanceados no bloco {idx}")
-                break
-            outside = _outside_quotes(ln)
-            if MERMAID_FRAGILE_RE.search(outside) or "@" in outside:
-                errors.append(f"Mermaid com caractere frágil fora de label quoted no bloco {idx}")
-                break
-        first = lines[0].strip()
-        if first.startswith("quadrantChart"):
-            point_lines = [ln for ln in lines if re.match(r"^\s*P\d{3}:", ln)]
-            for ln in point_lines:
+        first = lines[0][1].strip()
+        kind = _mermaid_kind(first)
+        # `_balanced_mermaid_line`/caractere frágil são semântica de
+        # flowchart/graph/quadrantChart (label quoted vs. não-quoted). Rodar
+        # isso incondicionalmente sobre QUALQUER bloco — como o validador
+        # fazia antes do dispatch por tipo — reprova sintaxe legítima de
+        # outros tipos (ex.: cardinalidade crow's-foot `o{`/`}o`/`|{`/`}|` de
+        # `erDiagram`, que usa `{`/`}` para "muitos", não para bracket de
+        # label). Ver BUG B1.
+        if kind in ("flowchart", "quadrantChart"):
+            for line_no, ln in lines:
+                if not _balanced_mermaid_line(ln):
+                    errors.append(
+                        f"Mermaid com brackets/quotes desbalanceados no bloco {idx}, linha {line_no}: "
+                        f"'{_mermaid_trecho(ln)}' (padrão: brackets-quotes-desbalanceados)"
+                    )
+                    break
+                outside = _outside_quotes(ln)
+                frag = MERMAID_FRAGILE_RE.search(outside)
+                if frag or "@" in outside:
+                    trecho_matched = frag.group(0) if frag else "@"
+                    errors.append(
+                        f"Mermaid com caractere frágil fora de label quoted no bloco {idx}, linha {line_no}: "
+                        f"'{_mermaid_trecho(ln)}' -> trecho que casou '{trecho_matched}' "
+                        "(padrão: caractere-fragil-fora-de-quote)"
+                    )
+                    break
+        if kind == "quadrantChart":
+            point_lines = [(n, ln) for n, ln in lines if re.match(r"^\s*P\d{3}:", ln)]
+            for line_no, ln in point_lines:
                 if re.search(r"\]\s+P\d{3}\s*:", ln):
-                    errors.append(f"Mermaid quadrantChart com multiplos pontos na mesma linha no bloco {idx}")
+                    errors.append(
+                        f"Mermaid quadrantChart com multiplos pontos na mesma linha no bloco {idx}, "
+                        f"linha {line_no}: '{_mermaid_trecho(ln)}' (padrão: quadrant-multiplos-pontos)"
+                    )
                 if not QUADRANT_POINT_RE.match(ln):
-                    errors.append(f"Mermaid quadrantChart com ponto invalido no bloco {idx}")
-        elif first.startswith(("flowchart", "graph")):
-            statements = [
-                ln for ln in lines[1:]
+                    errors.append(
+                        f"Mermaid quadrantChart com ponto invalido no bloco {idx}, linha {line_no}: "
+                        f"'{_mermaid_trecho(ln)}' (padrão: quadrant-ponto-invalido)"
+                    )
+        elif kind == "flowchart":
+            statements: list[tuple[int, str]] = [
+                (line_no, _strip_line_comment(ln))
+                for line_no, ln in lines[1:]
                 if not ln.strip().startswith(("%%", "classDef", "class "))
             ]
             node_defs: list[str] = []
             defined_nodes: set[str] = set()
             edge_count = 0
             subgraph_depth = 0
-            for ln in statements:
+            for line_no, ln in statements:
                 stripped = ln.strip()
                 if stripped.startswith("subgraph "):
                     subgraph_depth += 1
@@ -1232,19 +1440,36 @@ def _mermaid_errors(text: str) -> list[str]:
                 if stripped == "end":
                     subgraph_depth -= 1
                     if subgraph_depth < 0:
-                        errors.append(f"Mermaid flowchart com end sem subgraph no bloco {idx}")
+                        errors.append(
+                            f"Mermaid flowchart com end sem subgraph no bloco {idx}, linha {line_no}: "
+                            f"'{_mermaid_trecho(ln)}' (padrão: end-sem-subgraph)"
+                        )
                         subgraph_depth = 0
                     continue
                 if MERMAID_EDGE_RE.search(ln) and not MERMAID_EDGE_LINE_RE.match(ln):
-                    errors.append(f"Mermaid flowchart com sintaxe de aresta fora do whitelist no bloco {idx}")
-                for node_id, _shape, label in MERMAID_NODE_ANY_RE.findall(ln):
+                    errors.append(
+                        f"Mermaid flowchart com sintaxe de aresta fora do whitelist no bloco {idx}, "
+                        f"linha {line_no}: '{_mermaid_trecho(ln)}' (padrão: aresta-fora-whitelist)"
+                    )
+                # Rótulos inline de aresta (`-->|texto|`) não são definição de
+                # nó: são removidos antes do scanner para não gerar falso
+                # positivo de "label não quoted" a partir do texto do rótulo
+                # da aresta (ex.: `-->|"200 OK (retry)"|`) — FIX1(b).
+                node_scan_ln = _strip_edge_inline_labels(ln)
+                for node_id, _shape, label in MERMAID_NODE_ANY_RE.findall(node_scan_ln):
                     if not MERMAID_ID_RE.match(node_id):
-                        errors.append(f"Mermaid flowchart com node id inválido no bloco {idx}: {node_id}")
+                        errors.append(
+                            f"Mermaid flowchart com node id inválido no bloco {idx}, linha {line_no}: "
+                            f"'{_mermaid_trecho(ln)}' -> node id '{node_id}' (padrão: node-id-invalido)"
+                        )
                     node_defs.append(node_id)
                     defined_nodes.add(node_id)
                     label = label.strip()
                     if not (len(label) >= 2 and label.startswith('"') and label.endswith('"')):
-                        errors.append(f"Mermaid flowchart com label nao quoted/sanitizado no bloco {idx}")
+                        errors.append(
+                            f"Mermaid flowchart com label nao quoted/sanitizado no bloco {idx}, linha {line_no}: "
+                            f"'{_mermaid_trecho(ln)}' -> label capturado '{label}' (padrão: label-nao-quoted)"
+                        )
                 if MERMAID_EDGE_RE.search(ln):
                     edge_count += len(MERMAID_EDGE_RE.findall(ln))
                     endpoints = [part for part in MERMAID_EDGE_RE.split(ln) if part.strip()]
@@ -1254,29 +1479,128 @@ def _mermaid_errors(text: str) -> list[str]:
                             defined_nodes.add(node_id)
                             continue
                         if node_id:
-                            errors.append(f"Mermaid flowchart com node referenciado sem definição no bloco {idx}: {node_id}")
+                            errors.append(
+                                f"Mermaid flowchart com node referenciado sem definição no bloco {idx}, "
+                                f"linha {line_no}: '{_mermaid_trecho(ln)}' -> node '{node_id}' "
+                                "(padrão: node-sem-definicao)"
+                            )
             if subgraph_depth:
-                errors.append(f"Mermaid flowchart com subgraph/end desbalanceado no bloco {idx}")
+                errors.append(
+                    f"Mermaid flowchart com subgraph/end desbalanceado no bloco {idx} "
+                    "(padrão: subgraph-end-desbalanceado)"
+                )
             if not node_defs or edge_count == 0:
-                errors.append(f"Mermaid flowchart sem nos/arestas no bloco {idx}")
+                errors.append(
+                    f"Mermaid flowchart sem nos/arestas no bloco {idx} (padrão: sem-nos-arestas)"
+                )
             duplicates = sorted({node for node in node_defs if node_defs.count(node) > 1})
             if duplicates:
-                errors.append(f"Mermaid flowchart com node id duplicado no bloco {idx}: {', '.join(duplicates[:5])}")
-            for ln in statements:
+                errors.append(
+                    f"Mermaid flowchart com node id duplicado no bloco {idx}: {', '.join(duplicates[:5])} "
+                    "(padrão: node-id-duplicado)"
+                )
+            for line_no, ln in statements:
                 if len(ln) > 140:
-                    errors.append(f"Mermaid flowchart com linha longa demais no bloco {idx}")
+                    errors.append(
+                        f"Mermaid flowchart com linha longa demais no bloco {idx}, linha {line_no}: "
+                        f"'{_mermaid_trecho(ln)}' (padrão: linha-longa)"
+                    )
                 if MERMAID_BAD_LABEL_RE.search(ln):
-                    errors.append(f"Mermaid flowchart com label nao quoted/sanitizado no bloco {idx}")
+                    errors.append(
+                        f"Mermaid flowchart com label nao quoted/sanitizado no bloco {idx}, linha {line_no}: "
+                        f"'{_mermaid_trecho(ln)}' (padrão: label-tecnica-invalida)"
+                    )
                 if ln.count("-->") + ln.count("---") + ln.count("-.->") > 2:
-                    errors.append(f"Mermaid flowchart denso demais em uma linha no bloco {idx}")
-        elif first.startswith("erDiagram"):
-            body_norm = "\n".join(lines[1:])
-            if "{" not in body_norm and not re.search(r"\|\|--|--\|\{|\}\|--|--o\{", body_norm):
-                errors.append(f"Mermaid erDiagram sem entidades ou relacionamentos no bloco {idx}")
+                    errors.append(
+                        f"Mermaid flowchart denso demais em uma linha no bloco {idx}, linha {line_no}: "
+                        f"'{_mermaid_trecho(ln)}' (padrão: aresta-densa)"
+                    )
+        elif kind == "erDiagram":
+            errors.extend(_er_diagram_errors(lines, idx))
+        elif kind in _BRACE_BLOCK_KIND_LABELS:
+            # classDiagram (corpo de classe), stateDiagram/-v2 (estado
+            # composto) e C4* (boundary) abrem bloco `{`/`}` multi-linha da
+            # mesma forma que erDiagram — mesma causa-raiz do BUG B1,
+            # corrigida aqui para os 3 tipos que o LOTE-F passou a gerar
+            # (item 4 do pedido de correção).
+            errors.extend(
+                _multiline_brace_balance_errors(
+                    lines[1:], idx, _BRACE_BLOCK_KIND_LABELS[kind], f"{kind}-bloco-desbalanceado"
+                )
+            )
+        # sequenceDiagram e tipos não reconhecidos ("other"): nenhuma
+        # checagem estrutural própria ainda — evita reintroduzir o mesmo
+        # vazamento de regra de flowchart (BUG B1) para sintaxe que este
+        # validador não modela. `_mmdc_error` (opt-in via
+        # WK_MERMAID_VALIDATE_MMDC=1) continua sendo o validador real de
+        # sintaxe quando o mmdc está disponível.
         mmdc_error = _mmdc_error(body, idx)
         if mmdc_error:
             errors.append(mmdc_error)
     return list(dict.fromkeys(errors))
+
+
+def _mermaid_block_types(text: str) -> list[str]:
+    """Tipo (primeiro token, ex.: `flowchart`, `erDiagram`, `C4Context`) de
+    cada bloco ```mermaid``` presente em `text`, na ordem em que aparecem."""
+    types: list[str] = []
+    for match in MERMAID_BLOCK_RE.finditer(text):
+        body_lines = [ln.strip() for ln in match.group("body").splitlines() if ln.strip()]
+        if not body_lines:
+            continue
+        head = re.match(r"[A-Za-z][A-Za-z0-9_-]*", body_lines[0])
+        if head:
+            types.append(head.group(0))
+    return types
+
+
+def _no_diagram_escape_reason(text: str) -> str | None:
+    """Motivo declarado no marcador de escape `<!-- no-diagram: <motivo> -->`,
+    ou `None` se ausente/sem motivo real. Ver FIX2: escape auditável e
+    explícito para não travar permanentemente um pipeline quando o diagrama
+    for genuinamente impossível de produzir (ex.: entidade única sem
+    relacionamentos ainda a mapear) — em vez de silenciosamente aceitar
+    ausência, exige uma justificativa visível na revisão/auditoria."""
+    match = NO_DIAGRAM_ESCAPE_RE.search(text)
+    if not match:
+        return None
+    reason = match.group(1).strip()
+    return reason or None
+
+
+def _diagram_requirement_issue(text: str, rule: ArtifactRule) -> tuple[str | None, str | None]:
+    """Verifica a exigência de diagrama de `rule.require_diagram`.
+
+    Retorna `(blocker, warning)` — no máximo um dos dois é não-`None`:
+    - nenhum bloco mermaid do tipo aceito e sem escape -> `blocker` (P1: gate
+      reprova, mensagem cita o(s) tipo(s) esperado(s) por artefato).
+    - nenhum bloco mermaid do tipo aceito mas com `<!-- no-diagram: motivo -->`
+      justificado -> `warning` (auditável, não bloqueia o `done`/`pass`).
+    - tipo aceito encontrado -> `(None, None)`.
+    """
+    if not rule.require_diagram:
+        return None, None
+    found = _mermaid_block_types(text)
+    if any(t in rule.require_diagram for t in found):
+        return None, None
+    expected = "/".join(rule.require_diagram)
+    reason = _no_diagram_escape_reason(text)
+    if reason:
+        return None, (
+            f"diagrama mermaid obrigatório ausente em {rule.rel}, com escape auditável declarado "
+            f"(<!-- no-diagram: {reason} -->); tipo esperado seria {expected}; revisar na próxima "
+            "iteração se a ausência ainda é genuinamente inevitável"
+        )
+    if found:
+        observado = "/".join(sorted(set(found)))
+        detail = f"observado bloco(s) de tipo incompatível: {observado}"
+    else:
+        detail = "nenhum bloco ```mermaid``` encontrado"
+    return (
+        f"diagrama mermaid obrigatório ausente em {rule.rel}: esperado bloco ```mermaid``` do tipo "
+        f"{expected}; {detail}. Se o diagrama for genuinamente impossível, documente o motivo com "
+        "`<!-- no-diagram: <motivo> -->` no artefato"
+    ), None
 
 
 def _audit_file(path: str, rule: ArtifactRule, wd: str | None = None) -> dict:
@@ -1369,6 +1693,15 @@ def _audit_file(path: str, rule: ArtifactRule, wd: str | None = None) -> dict:
         if re.search(r"^\s*m_[A-Za-z0-9_]+:", text, re.M):
             blockers.append("Mermaid quadrantChart com rótulo técnico frágil")
             score -= 20
+    diagram_blocker, diagram_warning = _diagram_requirement_issue(text, rule)
+    if diagram_blocker:
+        blockers.append(diagram_blocker)
+        score -= 25
+    elif diagram_warning:
+        warnings.append(diagram_warning)
+        score -= 5
+    elif rule.require_diagram:
+        checks["diagrama"] = True
     score = max(0, min(100, score))
     status = "pass" if score >= MIN_DONE_SCORE and not blockers else ("failed" if blockers else "degraded")
     return {

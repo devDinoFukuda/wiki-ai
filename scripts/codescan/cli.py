@@ -197,8 +197,17 @@ def _plan_groups(
     batches: int | None = None,
     max_bytes: int = agentpack_mod.DEFAULT_MAX_BYTES,
 ) -> list[list[dict]]:
-    pending = set(st.get("stages", {}).get("modules", {}).get("pending") or [])
-    mods = [m for m in surface.get("modules", []) if not pending or m.get("path") in pending]
+    pending_raw = st.get("stages", {}).get("modules", {}).get("pending") or []
+    # BUG B3: compara pela forma CANÔNICA nos dois lados, sem alterar o que
+    # fica gravado em `pending` (que precisa continuar batendo literalmente
+    # com `Module.path` de surface.json — nativo do SO, '\\' no Windows para
+    # diretórios aninhados; ver nota completa perto de `_normalize_item`).
+    # Sem isto, um `pending` reescrito em '/' pela normalização de
+    # `sdd.redo_stage` (fora do meu escopo) tornaria o módulo reaberto
+    # invisível para `_plan_groups` no próximo `run-stage`/`agent-pack`,
+    # mesmo com o path correto em surface.json.
+    pending = {_normalize_item(p) for p in pending_raw}
+    mods = [m for m in surface.get("modules", []) if not pending or _normalize_item(m.get("path", "")) in pending]
     if batches:
         n = max(1, min(batches, len(mods) or 1))
     else:
@@ -457,6 +466,147 @@ def _primary_blocker(blockers: list[dict]) -> tuple[str | list[str] | None, str 
 def _module_artifact(wd: str, item: str) -> str:
     slug = ex_mod._slug(item.replace("\\", "/"))
     return os.path.join(wd, "modules", f"{slug}.md")
+
+
+# --- BUG B3: identificador de item de stage — forma canônica única ---------
+#
+# Escolha de canônico: '/' (não '\\'). Justificativa:
+#   - `sdd.redo_stage`/`sdd._run_item_names` (sdd.py, fora do meu escopo de
+#     edição) já normalizam item para '/' incondicionalmente antes de tocar
+#     em state.json — se cli.py canonizasse para '\\' os dois lados nunca
+#     bateriam de jeito nenhum.
+#   - `agentmerge._normalize_item` (agentmerge.py, idem) também usa '/' como
+#     alvo quando não há grafia prévia em state.json para reconciliar.
+#   - `_stage_pending_items` (abaixo, já existente neste arquivo) já fazia
+#     `.replace("\\", "/")` para os stages não-`modules`; '/' já era o padrão
+#     de fato em metade do arquivo.
+#   - É a única forma portável entre SOs (citações `arquivo:linha`, agent-pack
+#     etc. já usam '/'); '\\' quebraria em qualquer runner não-Windows.
+#
+# `pending` do stage `modules` é o ÚNICO identificador que NÃO é canonizado
+# na gravação: ele precisa continuar batendo, caractere a caractere, com
+# `Module.path` de surface.json (surface.py, nativo do SO — '\\' no Windows
+# para diretórios aninhados), porque `_plan_groups` seleciona módulos por
+# esse valor. Em vez de reescrever `pending` (o que dessincronizaria de
+# surface.json), `_plan_groups` foi ajustado para comparar as DUAS formas já
+# normalizadas — sem alterar o que fica gravado.
+ITEM_LIST_KEYS = ("pending", "done", *st_mod.ITEM_PROBLEM_STATUSES)
+_ITEM_LIST_PRECEDENCE = ("pending", *st_mod.ITEM_PROBLEM_STATUSES, "done")
+
+
+def _normalize_item(value) -> str:
+    """Forma canônica de um identificador de item: separador '/', sem barras
+    duplicadas nem barra de borda. Aceita entrada com '\\' (colada de um
+    caminho Windows) ou '/' indistintamente."""
+    text = str(value).strip().replace("\\", "/")
+    return re.sub(r"/+", "/", text).strip("/")
+
+
+def _resolve_stored_item(stage_state: dict, item: str) -> str:
+    """Resolve `item` (aceita '\\' ou '/') para a grafia JÁ EXISTENTE em
+    qualquer lista de item do stage (done/pending/blocked/failed/degraded),
+    comparando pela forma canônica — sem isso, `done --item <com \\>` sobre
+    um item cuja grafia gravada é '/' (ou vice-versa) cria uma SEGUNDA
+    entrada em vez de casar com a existente (a própria causa-raiz do BUG B3
+    quando aplicada sem essa resolução). Sem grafia existente, devolve a
+    forma canônica ('/') — mesmo padrão que `agentmerge._state_item_from_stage`
+    já aplica no caminho de merge-agent-output (agentmerge.py, fora do meu
+    escopo), replicado aqui para os comandos que não passam por ele
+    (done/blocked/failed/degraded/redo)."""
+    wanted = _normalize_item(item)
+    if not wanted:
+        return wanted
+    for key in ITEM_LIST_KEYS:
+        for candidate in stage_state.get(key) or []:
+            if _normalize_item(candidate) == wanted:
+                return str(candidate)
+    return wanted
+
+
+def _reconcile_stage_items(wd: str, stage: str) -> bool:
+    """Deduplica identificadores de item que hoje coexistem sob grafias
+    diferentes ('\\' vs '/', ou duplicadas dentro da mesma lista) nas listas
+    de item de um stage (done/pending/blocked/failed/degraded) em
+    state.json.
+
+    BUG B3: `sdd.redo_stage` (sdd.py, fora do meu escopo) sempre normaliza o
+    item para '/' antes de chamar `state.mark_item(done=False)`. Se `done`
+    já tinha a grafia '\\' (gravada por um `done <stage> --item <com \\>`
+    anterior a este fix, ou por qualquer outra via fora do meu controle), o
+    `discard('/...')` de `mark_item` não casa com a entrada '\\...' — ela
+    fica órfã em `done` enquanto a forma '/' passa a existir em `pending`. Um
+    novo merge completa o item de novo (grafia '/', casando com o `pending`
+    reaberto) e `done` termina com as DUAS grafias para o mesmo módulo.
+
+    Resolução por PRECEDÊNCIA entre listas quando a MESMA forma canônica
+    aparece em mais de uma lista: pending > blocked > failed > degraded >
+    done. Um item ainda pendente ou com problema não pode ficar registrado
+    como `done` ao mesmo tempo — mantém a leitura "não terminou" em vez de
+    aceitar dois estados conflitantes em silêncio. Dentro da MESMA lista,
+    colapsa grafias duplicadas do mesmo item para a forma canônica.
+
+    DECISÃO: só reescreve state.json quando encontra divergência real
+    (grafias diferentes para o mesmo item, ou o mesmo item em mais de uma
+    lista) — nunca em stages já canônicos/sem duplicata. Chamada em todo
+    `done`/`blocked`/`failed`/`degraded`/`redo` (idempotente e barata: um
+    `state.json` já canônico não sofre nenhuma escrita), não em comandos só
+    de leitura (`state`, `next`, `audit`) — evita reescrever o arquivo "sem
+    necessidade" fora dos pontos de mutação, mantendo o histórico de mtime
+    do arquivo limpo quando nada mudou. Devolve True se persistiu mudança."""
+    with st_mod._lock(wd):
+        st = st_mod.load(wd)
+        if not st:
+            return False
+        s = st.get("stages", {}).get(stage)
+        if not isinstance(s, dict):
+            return False
+
+        by_canon: dict[str, dict[str, list[str]]] = {}
+        for key in ITEM_LIST_KEYS:
+            for raw in s.get(key) or []:
+                canon = _normalize_item(raw)
+                if not canon:
+                    continue
+                by_canon.setdefault(canon, {}).setdefault(key, []).append(str(raw))
+
+        new_lists = {key: list(dict.fromkeys(s.get(key) or [])) for key in ITEM_LIST_KEYS}
+        artifacts = s.get("artifacts") if isinstance(s.get("artifacts"), dict) else None
+        reasons = s.get("reasons") if isinstance(s.get("reasons"), dict) else None
+        changed = False
+
+        for canon, occurrences in by_canon.items():
+            all_raw = [raw for raws in occurrences.values() for raw in raws]
+            if len(occurrences) == 1 and len(set(all_raw)) == 1:
+                continue  # já canônico e único: nada a fazer
+            changed = True
+            winning_key = next(k for k in _ITEM_LIST_PRECEDENCE if k in occurrences)
+            winning_raw = occurrences[winning_key][0]
+            for key, raws in occurrences.items():
+                for raw in set(raws):
+                    if key == winning_key and raw == winning_raw:
+                        continue
+                    if raw in new_lists[key]:
+                        new_lists[key].remove(raw)
+                    for mapping in (artifacts, reasons):
+                        if mapping and raw in mapping:
+                            mapping.setdefault(winning_raw, mapping.pop(raw))
+            if winning_raw not in new_lists[winning_key]:
+                new_lists[winning_key].append(winning_raw)
+
+        if not changed:
+            return False
+
+        for key in ITEM_LIST_KEYS:
+            s[key] = sorted(new_lists[key])
+        s["items_complete"] = bool(
+            s.get("done") and not s.get("pending")
+            and not any(s.get(k) for k in st_mod.ITEM_PROBLEM_STATUSES)
+        )
+        if not s["items_complete"]:
+            s.pop("finalized", None)
+        s["status"] = st_mod._derive_item_stage_status(s, stage)
+        st_mod.save(wd, st)
+        return True
 
 
 CONFIDENCE_MARKERS = ("\U0001F7E2", "\U0001F7E1", "\U0001F534")
@@ -960,6 +1110,15 @@ def _validate_artifact_was_merged(wd: str, stage: str, artifact: str) -> str | N
 
 def cmd_done(a) -> int:
     wd = _wd(a)
+    # BUG B3: migra/deduplica grafias '\\'/'/' já gravadas para este stage
+    # antes de validar/mutar, e resolve --item (aceita as duas formas) para
+    # a grafia já existente em state.json — sem isso, `done --item` com
+    # separador diferente do gravado cria uma segunda entrada em vez de
+    # casar com a existente.
+    _reconcile_stage_items(wd, a.stage)
+    if a.item:
+        st_now = st_mod.load(wd) or {}
+        a.item = _resolve_stored_item(st_now.get("stages", {}).get(a.stage, {}), a.item)
     if a.item:
         artifact, error = _validate_item_done(wd, a.stage, a.item)
         blockers = [_blocker(wd, a.stage, artifact, f"{a.item}: {error}", item=a.item)] if error else []
@@ -999,6 +1158,11 @@ def cmd_done(a) -> int:
 
 def cmd_problem_status(a) -> int:
     wd = _wd(a)
+    # BUG B3: mesma migração/resolução de grafia aplicada em cmd_done.
+    _reconcile_stage_items(wd, a.stage)
+    if a.item:
+        st_now = st_mod.load(wd) or {}
+        a.item = _resolve_stored_item(st_now.get("stages", {}).get(a.stage, {}), a.item)
     try:
         if a.item:
             st = st_mod.mark_item_status(wd, a.stage, a.item, a.status, artifact=a.artifact)
@@ -1349,6 +1513,11 @@ def cmd_redo(a) -> int:
     auditoria: marca `superseded` os runs `current` cobertos e devolve o(s)
     item(ns) para `pending` em state.json (BQ4)."""
     wd = _wd(a)
+    # BUG B3: migra grafias divergentes já gravadas ANTES de redo — reduz o
+    # risco de sdd.redo_stage (que sempre normaliza `item` para '/' e chama
+    # state.mark_item com essa forma) falhar em casar contra uma entrada
+    # '\\' legada.
+    _reconcile_stage_items(wd, a.stage)
     try:
         result = sdd_mod.redo_stage(wd, a.stage, item=a.item)
     except ValueError as e:
@@ -1357,6 +1526,13 @@ def cmd_redo(a) -> int:
             "acao": _sdd_brief_hint(a.stage),
         }, ensure_ascii=False), file=sys.stderr)
         return 2
+    # sdd.redo_stage (sdd.py, fora do meu escopo) normaliza `item` para '/'
+    # incondicionalmente antes de chamar state.mark_item(done=False): se
+    # `done` só tinha a grafia '\\' para o mesmo módulo, o discard() interno
+    # não casa e o item reaberto acaba coexistindo como '\\' em `done` e '/'
+    # em `pending`. Reconciliar de novo AQUI, logo após o redo, é o único
+    # ponto em que cli.py consegue fechar essa lacuna sem editar sdd.py.
+    _reconcile_stage_items(wd, a.stage)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -1748,7 +1924,14 @@ def cmd_pending(a) -> int:
     O `plan` faz isso para `modules`; os estágios novos (architecture, specs)
     precisam do mesmo tracking para sobreviver a sessão morta.
     """
-    items = [s.strip() for s in (a.items or "").split(",") if s.strip()]
+    # BUG B3: aceita '\\' ou '/' na entrada e grava sempre a forma canônica
+    # ('/'). Seguro mesmo para o stage `modules` (normalmente povoado por
+    # `plan`, não por este comando): `_plan_groups` compara pending contra
+    # surface.json já pela forma normalizada dos dois lados (ver
+    # `_plan_groups`), então gravar '/' aqui não desincroniza a seleção de
+    # módulos do `run-stage`/`agent-pack`.
+    items = [_normalize_item(s) for s in (a.items or "").split(",") if s.strip()]
+    items = [i for i in items if i]
     if not items:
         print(json.dumps({"error": "informe --items a,b,c"}), file=sys.stderr)
         return 2
@@ -1984,6 +2167,63 @@ def _flag_reorder_hint(argv: list[str], subcommands: set[str]) -> dict | None:
     return {"flags": flags, "subcommand": subcommand_name, "corrected": corrected}
 
 
+# FIX 2 (lote A): `evidence` é um estágio válido em `sdd-brief` (via
+# `sdd_mod.BRIEF_STAGES = ("evidence",) + CRITICAL_STAGES`) mas NÃO nos quatro
+# subcomandos abaixo, que só operam sobre `sdd_mod.CRITICAL_STAGES` — evidence
+# é 100% determinístico (busca lexical, sem parser/AST) e não tem fan-out por
+# subagente, então não faz sentido em run-stage/merge-agent-output/agent-pack/
+# redo. Sem esta checagem, `argparse` só devolve `invalid choice: 'evidence'`,
+# sem indicar que o comando certo é `evidence --topic <topico>`.
+_STAGE_CMD_VALUE_FLAGS = {
+    "run-stage": ("--batches", "--max-bytes", "--max-files", "--max-lines"),
+    "merge-agent-output": ("--input", "--agent"),
+    "agent-pack": ("--batch", "--batches", "--max-bytes", "--max-files", "--max-lines", "--output"),
+    "redo": ("--item",),
+}
+
+
+def _evidence_stage_hint(argv: list[str]) -> dict | None:
+    """Detecta `evidence` usado como `stage` posicional de run-stage/
+    merge-agent-output/agent-pack/redo e devolve um erro acionável. Devolve
+    None quando não se aplica (deixa o argparse validar normalmente)."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _TOP_LEVEL_FLAGS_WITH_VALUE and i + 1 < len(argv):
+            i += 2
+            continue
+        if tok in _TOP_LEVEL_FLAGS_BOOL:
+            i += 1
+            continue
+        if tok in _STAGE_CMD_VALUE_FLAGS:
+            value_flags = _STAGE_CMD_VALUE_FLAGS[tok]
+            j = i + 1
+            while j < len(argv):
+                t = argv[j]
+                if t in value_flags and j + 1 < len(argv):
+                    j += 2
+                    continue
+                if t in _TOP_LEVEL_FLAGS_BOOL:
+                    j += 1
+                    continue
+                if t == "evidence":
+                    return {
+                        "error": (
+                            f"'evidence' não é um estágio válido para '{tok}' "
+                            f"(aceita apenas: {', '.join(sdd_mod.CRITICAL_STAGES)})"
+                        ),
+                        "acao": (
+                            "evidence é 100% determinístico e não tem fan-out por subagente; "
+                            "rode `wk code evidence --topic <topico>` diretamente"
+                        ),
+                    }
+                break  # primeiro token não reconhecido como flag = o `stage` real
+            i += 1
+            continue
+        i += 1
+    return None
+
+
 class _CliArgError(Exception):
     """Carrega a mensagem crua do argparse + o `prog` do parser que a gerou,
     para que `main()` converta em JSON acionável em vez de deixar o argparse
@@ -2121,7 +2361,7 @@ def main(argv=None) -> int:
     ev.set_defaults(fn=cmd_evidence)
 
     ap = sub.add_parser("agent-pack", help="gera pacote deterministico para subagente sem copiar repo")
-    ap.add_argument("stage", choices=("modules", "rules", "architecture", "specs", "synth"))
+    ap.add_argument("stage", choices=sdd_mod.CRITICAL_STAGES)
     ap.add_argument("--batch", type=int, required=True, help="batch 1..N emitido por plan")
     ap.add_argument("--batches", type=int, help="mesmo override usado no plan")
     ap.add_argument("--max-bytes", type=int, default=agentpack_mod.DEFAULT_MAX_BYTES, help="bytes máximos por pack")
@@ -2131,7 +2371,7 @@ def main(argv=None) -> int:
     ap.set_defaults(fn=cmd_agent_pack)
 
     mo = sub.add_parser("merge-agent-output", help="integra saída parseável de subagente")
-    mo.add_argument("stage", choices=("modules", "rules", "architecture", "specs", "synth"))
+    mo.add_argument("stage", choices=sdd_mod.CRITICAL_STAGES)
     mo.add_argument("--input", required=True, help="arquivo de resposta do subagente")
     mo.add_argument("--agent", help="identificador do subagente que gerou o input")
     mo.set_defaults(fn=cmd_merge_agent_output)
@@ -2140,12 +2380,12 @@ def main(argv=None) -> int:
         "redo",
         help="reabre stage/item: marca runs current como superseded (preserva trilha) e devolve done->pending",
     )
-    rd.add_argument("stage", choices=("modules", "rules", "architecture", "specs", "synth"))
+    rd.add_argument("stage", choices=sdd_mod.CRITICAL_STAGES)
     rd.add_argument("--item", help="reabre só este item; sem --item, reabre todos os itens current do stage")
     rd.set_defaults(fn=cmd_redo)
 
     rs = sub.add_parser("run-stage", help="prepara manifesto determinístico para subagentes")
-    rs.add_argument("stage", choices=("modules", "rules", "architecture", "specs", "synth"))
+    rs.add_argument("stage", choices=sdd_mod.CRITICAL_STAGES)
     rs.add_argument("--batches", type=int, help="override de batches para modules")
     rs.add_argument("--max-bytes", type=int, default=agentpack_mod.DEFAULT_MAX_BYTES)
     rs.add_argument("--max-files", type=int, default=agentpack_mod.DEFAULT_MAX_FILES_PER_MODULE)
@@ -2189,6 +2429,10 @@ def main(argv=None) -> int:
         _sp.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     if not any(tok in ("-h", "--help") for tok in argv_list):
+        evidence_hint = _evidence_stage_hint(argv_list)
+        if evidence_hint:
+            print(json.dumps(evidence_hint, ensure_ascii=False), file=sys.stderr)
+            return 2
         hint = _flag_reorder_hint(argv_list, set(sub.choices.keys()))
         if hint:
             corrected_cmd = "wk code " + " ".join(hint["corrected"])
@@ -2227,7 +2471,24 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 2
-    a.store = store_value
+    # FIX 1 (lote A): `--store` relativo deixava `wd` (workdir) relativo, e todo
+    # caminho gravado em agent-runs/<stage>.json a partir de `wd` (ex.: output de
+    # run-stage, artifact de merge-agent-output) também ficava relativo. Ao ler de
+    # volta, sdd._resolve_manifest_path() só reconhece um valor como "já absoluto"
+    # via os.path.isabs(); um valor relativo é tratado como relativo-a-wd e
+    # rejuntado com wd — duplicando o prefixo (ex.:
+    # "store/.codescan/<h>/store/.codescan/<h>/modules/<slug>.md"), path
+    # inexistente. Tornar `a.store` sempre absoluto aqui (única linha que
+    # resolve o argumento antes do dispatch) faz `wd` ser sempre absoluto, então
+    # todo caminho derivado de `os.path.join(wd, ...)` já nasce absoluto e o
+    # isabs() de _resolve_manifest_path para de reinterpretar como relativo.
+    # `--repo` NÃO tem o mesmo problema: `_ensure_repo`/`state.workdir` já
+    # aplicam `os.path.abspath` internamente antes de usar o valor para
+    # resolver caminho ou montar a chave de hash do workdir; `a.repo` só
+    # aparece cru como rótulo (`repo_label`) ou texto de mensagem, nunca é
+    # rejuntado como se fosse relativo a outra base. Não alteramos `a.repo`
+    # aqui para não arriscar mudar o rótulo exibido em saídas legíveis.
+    a.store = os.path.abspath(store_value)
 
     # Corpo completo é o padrão do `wk code` (--verbose é aceito só como
     # no-op de compatibilidade). `--quiet` é opt-in explícito para o resumo

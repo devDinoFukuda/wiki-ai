@@ -89,8 +89,9 @@ def cmd_reindex(a) -> int:
     )
     if skipped_embed:
         out["warning"] = (
-            "embeddings não configurados: índice em modo LÉXICO. "
-            "vec/hyde retornam vazio. Defina AZURE_OPENAI_* ou use --lex-only."
+            "embeddings não configurados: índice em modo léxico. "
+            "vec/hyde exigem embeddings e falham com erro (exit 2) nesse modo; "
+            "apenas lex funciona. Defina AZURE_OPENAI_* ou use --lex-only."
         )
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0

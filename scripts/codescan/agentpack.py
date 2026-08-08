@@ -6,6 +6,7 @@ O pacote entrega evidência operacional ranqueada, não cópia do repositório.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import re
@@ -13,6 +14,13 @@ from dataclasses import dataclass
 from typing import Iterable
 
 
+# NOTA (fix lote C, item 1): DEFAULT_MAX_BYTES e todo `limits.max_bytes` sao
+# comparados contra `compact_json_size()` (forma compacta, sem indentacao) —
+# essa e a metrica de custo real de token/orcamento do pack. O ARQUIVO no
+# disco, gravado por `dump_compact_json`, usa `indent=2` para ser legivel por
+# subagentes (ver fix lote C, item 1). As duas coisas sao deliberadamente
+# distintas: mudar a serializacao em disco NAO deve mudar quanto conteudo
+# cabe no pack.
 DEFAULT_MAX_BYTES = 45_000
 DEFAULT_MAX_FILES_PER_MODULE = 4
 DEFAULT_MAX_LINES_PER_FILE = 40
@@ -37,15 +45,37 @@ ROLE_WEIGHTS = (
 )
 
 # Material de entrada por estágio (sdd-contract §1.3): lido do proprio workdir
-# (artefatos ja gravados por merge-agent-output), nunca do repo. Ordem das
-# tuplas define a ordem de leitura no pack.
+# (artefatos ja gravados por merge-agent-output), nunca do repo. A ordem das
+# tuplas abaixo e apenas leitura humana; a ordem REAL de leitura no pack (e,
+# portanto, de prioridade no orcamento de bytes) e decidida por
+# `_stage_input_files`, que sempre devolve as fontes de STAGE_REQUIRED_GLOBS
+# antes das demais (fix lote C, item 2) — por isso os `sdd/*.md` ja aparecem
+# primeiro aqui tambem, para os dois ficarem coerentes.
+_GLOB_SDD_DOMAIN = "sdd/domain.md"
+_GLOB_SDD_STATE_MACHINES = "sdd/state-machines.md"
+_GLOB_SDD_PERMISSIONS = "sdd/permissions.md"
+_GLOB_SDD_ARCHITECTURE = "sdd/architecture.md"
+_GLOB_MODULES = "modules/*.md"
+
 STAGE_INPUT_GLOBS: dict[str, tuple[str, ...]] = {
-    "rules": ("modules/*.md",),
+    "rules": (_GLOB_MODULES,),
     "architecture": (
-        "modules/*.md", "sdd/domain.md", "sdd/state-machines.md", "sdd/permissions.md",
+        _GLOB_SDD_DOMAIN, _GLOB_SDD_STATE_MACHINES, _GLOB_SDD_PERMISSIONS, _GLOB_MODULES,
     ),
-    "specs": ("modules/*.md", "sdd/architecture.md", "sdd/domain.md"),
+    "specs": (_GLOB_SDD_ARCHITECTURE, _GLOB_SDD_DOMAIN, _GLOB_MODULES),
     "synth": ("sdd/*.md",),
+}
+
+# Globs cujas fontes sao dependencia OBRIGATORIA do estagio (sdd-contract
+# §1.3) e por isso tem prioridade de orcamento sobre o preenchimento
+# oportunista com `modules/*.md`: `_stage_input_files` sempre devolve estas
+# fontes primeiro, reservando efetivamente o orcamento de bytes para elas
+# antes que qualquer module-doc seja considerado (fix lote C, itens 2 e 4 —
+# a prioridade explicita aqui cobre o item 4, ja que o teto de bytes deixa
+# de depender da ordem de declaracao em STAGE_INPUT_GLOBS).
+STAGE_REQUIRED_GLOBS: dict[str, frozenset[str]] = {
+    "architecture": frozenset({_GLOB_SDD_DOMAIN, _GLOB_SDD_STATE_MACHINES, _GLOB_SDD_PERMISSIONS}),
+    "specs": frozenset({_GLOB_SDD_ARCHITECTURE, _GLOB_SDD_DOMAIN}),
 }
 
 SIGNAL_PATTERNS = (
@@ -65,13 +95,30 @@ class PackLimits:
 
 
 def compact_json_size(obj: object) -> int:
+    """Mede o custo em bytes da forma COMPACTA (sem indentacao) de `obj`.
+
+    Esta e a UNICA metrica usada para orcamento (`limits.max_bytes`): reflete
+    o custo real de token do conteudo, independente de como o arquivo e
+    gravado em disco. Nao mude esta funcao para medir a forma indentada —
+    isso reduziria a capacidade util do pack em ~30% sem motivo (fix lote C,
+    item 1)."""
     return len(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
 def dump_compact_json(path: str, obj: object) -> None:
+    """Grava `obj` como JSON indentado (`indent=2`) em disco.
+
+    O nome historico (`dump_compact_json`) foi mantido porque `cli.py` chama
+    esta funcao por nome e este arquivo nao pode alterar `cli.py` — mas o
+    formato gravado NAO e mais compacto: um pack em linha unica era
+    interpretado por subagentes como conteudo truncado, abortando batches
+    inteiros (fix lote C, item 1). O orcamento de bytes continua medido por
+    `compact_json_size`, que e independente desta serializacao — ver nota em
+    `DEFAULT_MAX_BYTES`."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
 
 def estimate_module_bytes(module: dict, limits: PackLimits | None = None) -> int:
@@ -197,7 +244,8 @@ def build_agent_pack(
             "max_bytes": limits.max_bytes,
             "max_files_per_module": limits.max_files_per_module,
             "max_lines_per_file": limits.max_lines_per_file,
-            "format": "compact-json",
+            "format": "json-indent2",
+            "budget_measured_as": "compact-json",
         },
         "rules": [
             "PT-BR tecnico; sem prosa metodologica; sem eco de comando/log/diff/codigo.",
@@ -247,23 +295,73 @@ def build_agent_pack(
     return pack
 
 
-def _stage_input_files(wd: str, stage: str) -> list[str]:
+def _file_sha256(full: str) -> str | None:
+    """Hash sha256 do conteudo bruto (bytes) de `full`, ou None se o arquivo
+    nao puder ser lido. `None` nunca participa de dedup (cada leitura
+    malsucedida e tratada como unica, nunca "duplicata" de outra)."""
+    h = hashlib.sha256()
+    try:
+        with open(full, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _stage_input_files(wd: str, stage: str) -> tuple[list[tuple[str, str]], list[dict]]:
     """Resolve o material de entrada do estagio (sdd-contract §1.3), lido do
     proprio workdir (artefatos ja gravados por merge-agent-output) — nunca do
-    repo. Ordem estavel: segue STAGE_INPUT_GLOBS, glob ordenado por nome."""
+    repo.
+
+    Prioridade (fix lote C, itens 2 e 4): as fontes de STAGE_REQUIRED_GLOBS
+    (deps obrigatorias do estagio, ex. `sdd/domain.md` para `architecture`)
+    sao sempre devolvidas ANTES das fontes de preenchimento oportunista
+    (`modules/*.md`), independente da ordem declarada em STAGE_INPUT_GLOBS.
+    Como `build_stage_pack` consome esta lista em ordem e para de incluir
+    assim que o orcamento de bytes estoura, essa ordem reserva efetivamente
+    o orcamento para as deps antes do fill — sem isso, uma enxurrada de
+    module-docs esgotava o budget e os `sdd/*.md` eram descartados por
+    inteiro (caso real: `architecture-batch-01.json`, `dropped:32`, nenhum
+    `sdd/*.md` presente em `sources`).
+
+    Dedup (fix lote C, item 3): alem do path relativo, deduplica por hash
+    sha256 do conteudo — arquivos byte-identicos sob slugs de nome
+    diferentes (observado em producao: 21 pares de `modules/*.md`
+    byte-identicos sob slugs distintos) entram apenas uma vez no pack. A
+    ocorrencia mantida e a primeira na ordem de prioridade+nome-de-arquivo
+    (deterministica); as demais sao devolvidas em `duplicates` para virar
+    metrica (`duplicates_dropped`) sem competir por orcamento nem duplicar
+    excertos identicos no pack.
+
+    Retorna (`fontes`, `duplicatas`), onde `fontes` e uma lista de
+    `(caminho_relativo, glob_de_origem)` e `duplicatas` uma lista de dicts
+    `{"path", "reason", "duplicate_of"}`."""
     patterns = STAGE_INPUT_GLOBS.get(stage, ())
-    seen: set[str] = set()
-    files: list[str] = []
+    required_globs = STAGE_REQUIRED_GLOBS.get(stage, frozenset())
+    required: list[tuple[str, str]] = []
+    fill: list[tuple[str, str]] = []
+    seen_rel: set[str] = set()
+    seen_hash: dict[str, str] = {}
+    duplicates: list[dict] = []
     for pattern in patterns:
+        bucket = required if pattern in required_globs else fill
         for full in sorted(glob.glob(os.path.join(wd, pattern))):
             if not os.path.isfile(full):
                 continue
             rel = os.path.relpath(full, wd).replace("\\", "/")
-            if rel in seen:
+            if rel in seen_rel:
                 continue
-            seen.add(rel)
-            files.append(rel)
-    return files
+            seen_rel.add(rel)
+            digest = _file_sha256(full)
+            if digest is not None:
+                kept = seen_hash.get(digest)
+                if kept is not None:
+                    duplicates.append({"path": rel, "reason": "duplicate-content", "duplicate_of": kept})
+                    continue
+                seen_hash[digest] = rel
+            bucket.append((rel, pattern))
+    return required + fill, duplicates
 
 
 def build_stage_pack(
@@ -294,7 +392,8 @@ def build_stage_pack(
         "budget": {
             "max_bytes": limits.max_bytes,
             "max_lines_per_file": limits.max_lines_per_file,
-            "format": "compact-json",
+            "format": "json-indent2",
+            "budget_measured_as": "compact-json",
         },
         "rules": [
             "PT-BR tecnico; sem prosa metodologica; sem eco de comando/log/diff/codigo.",
@@ -305,7 +404,9 @@ def build_stage_pack(
         "sources": packed_sources,
         "dropped": dropped,
     }
-    for rel in _stage_input_files(wd, stage):
+    stage_files, duplicates = _stage_input_files(wd, stage)
+    dropped_by_glob: dict[str, int] = {}
+    for rel, source_glob in stage_files:
         full = os.path.join(wd, *rel.split("/"))
         lines = _read_lines(full)
         if not lines:
@@ -321,12 +422,17 @@ def build_stage_pack(
         if compact_json_size(candidate) <= limits.max_bytes or not packed_sources:
             packed_sources.append(item)
         else:
-            dropped.append({"path": rel, "reason": "budget"})
+            dropped.append({"path": rel, "reason": "budget", "glob": source_glob})
+            dropped_by_glob[source_glob] = dropped_by_glob.get(source_glob, 0) + 1
+    for dup in duplicates:
+        dropped.append(dup)
     pack["metrics"] = {
         "bytes": compact_json_size(pack),
         "sources": len(packed_sources),
         "files": len(packed_sources),
         "dropped": len(dropped),
+        "dropped_by_glob": dropped_by_glob,
+        "duplicates_dropped": len(duplicates),
     }
     while compact_json_size(pack) > limits.max_bytes and packed_sources:
         largest = max(packed_sources, key=lambda s: len(s.get("content", "")))

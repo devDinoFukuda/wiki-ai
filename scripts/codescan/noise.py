@@ -77,6 +77,78 @@ def validate_agent_output(text: str) -> list[str]:
     return _validate(text, agent=True)
 
 
+MAX_VIOLATION_SNIPPET_LEN = 120
+AGENT_OUTPUT_MAX_LINES = 220
+LONG_STACKTRACE_MAX_LINES = 12
+
+
+def _truncate_snippet(text: str, limit: int = MAX_VIOLATION_SNIPPET_LEN) -> str:
+    stripped = text.strip()
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[: limit - 1].rstrip() + "…"
+
+
+def detect_violations(text: str, *, agent: bool) -> list[dict]:
+    """Detecta violações do contrato de ruído com diagnóstico acionável.
+
+    Ao contrário de `_validate`/`validate_agent_output` (que só devolvem o
+    nome da regra deduplicado), isto reporta CADA linha ofensiva — um log
+    ecoado de centenas de linhas com "Ran command"/"Edited" repetidos gera
+    uma violação por ocorrência, não uma só. Cada item traz `regra`, `linha`
+    (1-indexed; `None` quando a violação é agregada, sem uma única linha
+    ofensiva, como `agent_output_too_long`), `trecho` (texto truncado a
+    ~120 chars, ou a medição "N linhas, limite M" para violações agregadas)
+    e `padrao` (o regex, ou descrição da regra, que casou). Existe para que
+    `agentmerge._reject_noise` consiga apontar exatamente o que rejeitar em
+    vez de só o código da regra — ver FIX 1 do lote D: sem isso, o operador
+    reescrevia a saída inteira por tentativa e erro porque não sabia qual
+    linha (ou quanto excesso de linhas) disparou a rejeição. O chamador deve
+    truncar a lista (ex.: ~10 primeiras) e reportar o total à parte.
+    """
+
+    violations: list[dict] = []
+    for lineno, line in enumerate(_lines(text), start=1):
+        if not line.strip():
+            continue
+        for code, pattern in FORBIDDEN_PATTERNS:
+            if pattern.search(line):
+                violations.append({
+                    "regra": code,
+                    "linha": lineno,
+                    "trecho": _truncate_snippet(line),
+                    "padrao": pattern.pattern,
+                })
+    nonblank = len([line for line in _lines(text) if line.strip()])
+    if _is_long_log(text):
+        violations.append({
+            "regra": "long_log_echo",
+            "linha": None,
+            "trecho": f"{nonblank} linhas, padrão de log detectado em metade ou mais",
+            "padrao": LOG_LINE_RE.pattern,
+        })
+    if _is_long_stacktrace(text):
+        violations.append({
+            "regra": "long_stacktrace_echo",
+            "linha": None,
+            "trecho": f"{nonblank} linhas, limite {LONG_STACKTRACE_MAX_LINES}",
+            "padrao": STACKTRACE_RE.pattern,
+        })
+    if agent and nonblank > AGENT_OUTPUT_MAX_LINES:
+        violations.append({
+            "regra": "agent_output_too_long",
+            "linha": None,
+            "trecho": f"{nonblank} linhas, limite {AGENT_OUTPUT_MAX_LINES}",
+            "padrao": f"linhas não vazias > {AGENT_OUTPUT_MAX_LINES}",
+        })
+    # Linhas ofensivas em ordem de leitura primeiro (mais úteis truncadas nas
+    # ~10 primeiras); agregadas (sem linha única) por último, por nome de regra.
+    violations.sort(
+        key=lambda v: (0, v["linha"], v["regra"]) if v["linha"] is not None else (1, 0, v["regra"])
+    )
+    return violations
+
+
 def receipt_contract() -> dict:
     """Contrato do recibo de 3 linhas devolvido pelo subagente no `run-stage`.
 

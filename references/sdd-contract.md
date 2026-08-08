@@ -10,7 +10,7 @@ Reversa (github.com/sandeco/reversa, MIT © sandeco). Vive em `<workdir>/sdd/`.
 ├── inventory.md              # export (determinístico)      🟢 code-repo
 ├── dependencies.md           # export (determinístico)      🟢 code-repo
 ├── coupling.md               # coupling (determinístico)    🟢 code-repo (zona 🟡)
-├── coupling.html             # coupling, só motor Java       local (não publica)
+├── coupling.html             # coupling, só motor Java       code-repo (asset+stub)
 ├── code-analysis.md          # estágio modules              agent-output
 ├── data-dictionary.md        # estágio modules              agent-output
 ├── domain.md                 # estágio rules                agent-output
@@ -611,8 +611,14 @@ destes dois artefatos e do `confirmed.md`/`inferred.md` do estágio synth.
 
 `inventory.md`/`dependencies.md`/`coupling.md` já saem do `export`/`coupling`
 com frontmatter próprio (`source_type: code-repo`, `confidence: reviewed`).
-`coupling.html` (só com o motor Java) não é `.md`, não tem frontmatter e não
-é considerado artefato SDD — fica no workdir, fora do fluxo de publicação.
+`coupling.html` (só com o motor Java) não é `.md` e não tem frontmatter, mas
+**é publicado** — `publish` trata `.html` como asset: copia os bytes
+originais para `raw/assets/<doc_id>.html` e grava um stub `.md` de
+proveniência (`source_type: code-repo`, `doc_id` com sufixo `-html` para
+não colidir com o `doc_id` de `coupling.md`). `wk compile` copia o asset
+para `wiki/<topic>/<source_type>/<id>.html` e linka a partir da página da
+fonte e da página de overview do tópico; `wk docx` nunca converte esse
+`.html` — pula explicitamente (`ignorados_asset_html`).
 Os demais artefatos escritos por `merge-agent-output` (`modules/*.md`,
 `sdd/domain.md`, `sdd/architecture.md`, `sdd/confirmed.md`, etc.) **não têm
 frontmatter nenhum no workdir** — são conteúdo puro. Proveniência real
@@ -629,12 +635,13 @@ nega `Write`/`Edit` direto no store):
 {{WK}} publish --workdir <workdir> --topic <slug> --store <store>
 ```
 
-`publish` classifica sozinho: `sdd/inventory.md`, `sdd/dependencies.md` e
-`sdd/coupling.md` → `code-repo` em `inbox/code-notes/`; todo o resto de
-`sdd/**/*.md` e `modules/*.md` → `agent-output` em `inbox/agent-output/`.
-`sdd/coupling.html`, quando existe, não entra em nenhuma das duas categorias
-— `publish` não o leva para `inbox/`. `origin` grava
-`"codescan <repo> — <caminho-relativo-ao-workdir>"`;
+`publish` classifica sozinho: `sdd/inventory.md`, `sdd/dependencies.md`,
+`sdd/coupling.md` e `sdd/coupling.html` → `code-repo` em
+`inbox/code-notes/`; todo o resto de `sdd/**/*.md` e `modules/*.md` →
+`agent-output` em `inbox/agent-output/`. `sdd/coupling.html`, quando
+existe, entra como **asset**: bytes originais em `raw/assets/<doc_id>.html`
+mais um stub `.md` (`doc_id` com sufixo `-html`) — não como Markdown puro.
+`origin` grava `"codescan <repo> — <caminho-relativo-ao-workdir>"`;
 `confidence` só é definido depois, pelo `promote`. Scripts auxiliares
 temporários (`*.py`) não são artefatos SDD e não podem ir para `inbox/`;
 `publish` já os exclui automaticamente, junto com `state.json` e

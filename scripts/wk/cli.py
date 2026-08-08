@@ -28,6 +28,7 @@ import shutil
 import sys
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 
 from . import __version__
 
@@ -421,6 +422,91 @@ def _detect_shell() -> dict:
     }
 
 
+# ---------- FIX 5: detecta `wk.pyz` desatualizado em relação ao `scripts/` ----------
+
+_BUILD_MANIFEST_NAME = "_build_manifest.json"
+
+
+def _source_sha256(scripts_dir: str) -> str:
+    """Hash agregado determinístico de `wk/`, `codescan/`, `sbindex/` sob
+    `scripts_dir` — mesmos pacotes/exclusões (`__pycache__`, `tests`) que
+    `build_pyz.py:stage()` empacota no `.pyz`.
+
+    Duplicado de propósito a partir de `build_pyz.py:_source_sha256`: o
+    `.pyz` não empacota `build_pyz.py` (só `wk/`, `codescan/`, `sbindex/`),
+    então este arquivo — rodando OU de dentro do `.pyz` OU de um `scripts/`
+    solto — não pode importá-lo. Qualquer mudança aqui exige a mesma mudança
+    lá, senão o comparador de `doctor` nunca bate mesmo com fonte idêntica.
+    """
+    entries = []
+    for pkg in ("wk", "codescan", "sbindex"):
+        pkg_dir = os.path.join(scripts_dir, pkg)
+        if not os.path.isdir(pkg_dir):
+            continue
+        for dirpath, dirnames, filenames in os.walk(pkg_dir):
+            dirnames[:] = sorted(d for d in dirnames if d not in ("__pycache__", "tests"))
+            for fn in sorted(filenames):
+                if not fn.endswith(".py"):
+                    continue
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, scripts_dir).replace("\\", "/")
+                with open(full, "rb") as f:
+                    digest = hashlib.sha256(f.read()).hexdigest()
+                entries.append(f"{rel}:{digest}")
+    entries.sort()
+    return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+
+
+def _archive_path() -> str | None:
+    """Caminho absoluto do `.pyz` em execução, ou None se rodando de
+    código-fonte solto (não de um zipapp) — mesma lógica de descoberta de
+    `_self_invocation` (sobe diretórios até achar um caminho existente),
+    diferenciando pelo resultado ser ou não um arquivo zip de verdade."""
+    archive = getattr(sys.modules.get("__main__"), "__file__", None) or sys.argv[0]
+    root = os.environ.get("WK_ARCHIVE") or archive
+    while root and not os.path.exists(root):
+        parent = os.path.dirname(root)
+        if parent == root:
+            return None
+        root = parent
+    if root and os.path.isfile(root) and zipfile.is_zipfile(root):
+        return os.path.abspath(root)
+    return None
+
+
+def _check_pyz_freshness(archive: str) -> dict:
+    """Compara o `source_sha256` embutido no `.pyz` (`_build_manifest.json`,
+    gravado por `build_pyz.py`) com o hash do `scripts/` irmão do arquivo
+    `.pyz` em disco (layout padrão do repo: `wk.pyz` na raiz, `scripts/` ao
+    lado). Degrada sem alarme falso quando não há fonte ao lado do `.pyz`
+    (instalação só-`.pyz`, sem o repo) ou o manifesto não existe (build
+    anterior ao FIX 5).
+    """
+    manifest_raw = _read_asset(_BUILD_MANIFEST_NAME)
+    if not manifest_raw:
+        return {"pyz": archive, "fonte_disponivel": False, "manifesto_ausente": True}
+    try:
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+    except ValueError:
+        return {"pyz": archive, "fonte_disponivel": False, "manifesto_ausente": True}
+    embedded_hash = manifest.get("source_sha256")
+    candidate_scripts = os.path.join(os.path.dirname(archive), "scripts")
+    if not embedded_hash or not os.path.isdir(os.path.join(candidate_scripts, "wk")):
+        return {"pyz": archive, "fonte_disponivel": False}
+    current_hash = _source_sha256(candidate_scripts)
+    desatualizado = current_hash != embedded_hash
+    out = {
+        "pyz": archive,
+        "built_at": manifest.get("built_at"),
+        "fonte_disponivel": True,
+        "fonte_dir": candidate_scripts,
+        "pyz_desatualizado": desatualizado,
+    }
+    if desatualizado:
+        out["acao"] = "rode python scripts/build_pyz.py"
+    return out
+
+
 def _index_doc_count(db_path: str) -> tuple[int | None, str | None]:
     """(contagem, erro). Não usa `sbindex.store.connect` direto: ela cria o
     schema/arquivo se faltar, e `doctor` só deve LER um índice que já existe."""
@@ -446,6 +532,15 @@ def cmd_doctor(a) -> int:
     shell_info = _detect_shell()
     python_info = {"executavel": sys.executable, "versao": sys.version.split()[0]}
     wk_info = {"versao": __version__, "executavel": _self_invocation()}
+
+    # FIX 5: só é possível checar quando rodando de um `.pyz`; de código-fonte
+    # solto não há artefato para desatualizar. Nunca vira `bloqueio`/afeta o
+    # exit code — é diagnóstico, não portão; ver DECISÕES no relatório.
+    pyz_archive = _archive_path()
+    wk_info["pyz"] = _check_pyz_freshness(pyz_archive) if pyz_archive else {
+        "fonte_disponivel": False,
+        "nota": "não está rodando a partir de um .pyz (código-fonte solto)",
+    }
 
     store_root = _store_root(a)
     store_existe = os.path.isdir(store_root)
@@ -853,6 +948,8 @@ def cmd_promote(a) -> int:
     human: list[dict] = []
     quarantine: list[dict] = []
     approval_lines: list[str] = []
+    verify_blocked: list[dict] = []
+    verify_overridden: list[dict] = []
 
     for path in targets:
         text = _read_md(path)
@@ -867,6 +964,36 @@ def cmd_promote(a) -> int:
                 {"id": source_id, "path": rel, "motivo": "; ".join(gaps)}
             )
             continue
+
+        # FIX 3: bloqueia por item (não pelo comando inteiro) — cada fonte
+        # carrega seu próprio `topic`; só as que vêm de um workdir de codescan
+        # com verify falhado são afetadas. Fontes não-codescan (transcrições,
+        # docs, ou sem topic) nunca passam por aqui.
+        item_topic = meta.get("topic")
+        if item_topic:
+            vfailed = _failed_verify_workdirs(store_root, item_topic)
+            if vfailed:
+                if not a.allow_unverified:
+                    verify_blocked.append(
+                        {
+                            "id": source_id,
+                            "path": rel,
+                            "topic": item_topic,
+                            "motivo": "verify falhou para o workdir de codescan deste topic",
+                            "workdirs": vfailed,
+                            "acao": (
+                                "rode `wk code --repo <repo> verify --artifact "
+                                "<workdir>/sdd/confirmed.md` e corrija as citações "
+                                "reprovadas; ou promova mesmo assim com "
+                                "--allow-unverified (decisão humana explícita, "
+                                "registrada no log)"
+                            ),
+                        }
+                    )
+                    continue
+                verify_overridden.append(
+                    {"id": source_id, "path": rel, "topic": item_topic, "workdirs": vfailed}
+                )
 
         is_approved = os.path.abspath(path) in approved_paths
 
@@ -925,6 +1052,17 @@ def cmd_promote(a) -> int:
         )
         for line in approval_lines:
             _append_log(store_root, line)
+    if verify_overridden:
+        _append_log(
+            store_root,
+            f"## [{_utc_now()}] promote --allow-unverified | "
+            f"{len(verify_overridden)} promovidos com verify falhado | {approved_by}",
+        )
+        for item in verify_overridden:
+            _append_log(
+                store_root,
+                f"- override verify: {item.get('id') or '(sem-id)'} | {item['path']} | topic {item['topic']}",
+            )
     reindexed = False
     reindex_error = None
     if promoted:
@@ -934,8 +1072,11 @@ def cmd_promote(a) -> int:
         "promovidos": promoted,
         "decisao_humana": human,
         "quarentena": quarantine,
+        "bloqueados_verify": verify_blocked,
         "reindexed": reindexed,
     }
+    if verify_overridden:
+        out["verify_override"] = verify_overridden
     if reindex_error:
         out["reindex_error"] = reindex_error
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -983,14 +1124,281 @@ def _frontmatter_for_wiki(page_id: str, topic: str, source_ids: list[str]) -> st
     ).rstrip()
 
 
+# ---------- FIX 2: síntese por tópico (overview embutido, não só lista de links) ----------
+
+# `publish` grava `origin: "codescan <repo> — <caminho-relativo-ao-workdir>"`
+# (cmd_publish). Usamos esse caminho — nunca o nome do tópico/repo — para
+# identificar QUAL artefato SDD uma fonte representa: generaliza para
+# qualquer execução do codescan, sem hardcode do tópico de exemplo.
+_ORIGIN_CODESCAN_RE = re.compile(r"^codescan .+ — (.+)$")
+
+
+def _codescan_artifact_rel(origin: str | None) -> str | None:
+    if not origin:
+        return None
+    m = _ORIGIN_CODESCAN_RE.match(origin)
+    return m.group(1) if m else None
+
+
+def _first_heading_title(body: str) -> str:
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            return line[2:].strip()
+        if line:
+            break
+    return ""
+
+
+def _md_headings(body: str, level: int) -> list[str]:
+    prefix = "#" * level + " "
+    return [ln[len(prefix):].strip() for ln in body.splitlines() if ln.startswith(prefix)]
+
+
+def _truncate(text: str, n: int = 200) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def _adr_summary(body: str) -> tuple[str, str, str]:
+    """(título, status, decisão em 1 linha) extraídos do corpo de um ADR
+    (`# ADR-NNN — Título`, opcional `Status: ...`, primeira bullet de `##
+    Decisão`). 100% textual, sem heurística de LLM."""
+    title = _first_heading_title(body)
+    status = "—"
+    for line in body.splitlines():
+        s = line.strip().lstrip("- ").strip()
+        if s.lower().startswith("status:"):
+            status = s.split(":", 1)[1].strip()
+            break
+    decisao = ""
+    in_decision = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            in_decision = re.sub(r"^#+\s*", "", stripped).lower().startswith("decis")
+            continue
+        if in_decision and stripped.startswith("-"):
+            decisao = stripped.lstrip("- ").strip()
+            break
+    return title, status, _truncate(decisao, 160)
+
+
+def _build_topic_overview(
+    topic: str,
+    sources: list[dict],
+    base_dir: str,
+    page_abspath_by_id: dict[str, str],
+    asset_abspath_by_id: dict[str, str],
+) -> tuple[str, list[str]]:
+    """Página de síntese por tópico: embute conteúdo-chave (arquitetura, C4,
+    ADRs, edge cases, diagramas, confiança) em vez de só linkar — FIX 2.
+    100% determinístico (texto puro, sem chamada a LLM); tolerante a
+    artefatos ausentes (pula a seção, registra em `## Lacunas de síntese`).
+
+    `base_dir` é o diretório onde a página será gravada (usado para calcular
+    hrefs relativos corretos a partir de `page_abspath_by_id`/
+    `asset_abspath_by_id`, que guardam caminhos absolutos).
+    """
+    lacunas: list[str] = []
+    by_rel: dict[str, dict] = {}
+    for s in sources:
+        rel = _codescan_artifact_rel(s.get("origin"))
+        if rel and rel not in by_rel:  # primeira ocorrência é suficiente
+            by_rel[rel] = s
+
+    def href_for(source: dict) -> str:
+        p = page_abspath_by_id.get(source.get("id"))
+        return os.path.relpath(p, base_dir).replace("\\", "/") if p else "#"
+
+    def rel_sorted(pred) -> list[dict]:
+        matches = [s for s in sources if pred(_codescan_artifact_rel(s.get("origin")) or "")]
+        return sorted(matches, key=lambda s: _codescan_artifact_rel(s["origin"]) or "")
+
+    lines = [f"# Visão geral — {topic}", ""]
+    lines.append(
+        "Síntese determinística dos artefatos SDD promovidos para este tópico, "
+        "gerada por `wk compile` (sem chamada a LLM)."
+    )
+    lines.append("")
+
+    # --- Arquitetura ---
+    lines.append("## Arquitetura")
+    lines.append("")
+    arch = by_rel.get("sdd/architecture.md")
+    if arch:
+        lines.append(arch["body"].strip())
+        lines.append("")
+    else:
+        lacunas.append("Arquitetura: `sdd/architecture.md` ausente entre as fontes promovidas.")
+    for label, rel in (
+        ("Contexto (C4)", "sdd/c4-context.md"),
+        ("Containers (C4)", "sdd/c4-containers.md"),
+        ("Componentes (C4)", "sdd/c4-components.md"),
+    ):
+        c4 = by_rel.get(rel)
+        if c4:
+            lines.append(f"### {label}")
+            lines.append("")
+            lines.append(c4["body"].strip())
+            lines.append("")
+        else:
+            lacunas.append(f"Arquitetura: `{rel}` ausente entre as fontes promovidas.")
+
+    # --- Decisões (ADRs) ---
+    lines.append("## Decisões")
+    lines.append("")
+    adrs = rel_sorted(lambda rel: rel.startswith("sdd/adrs/"))
+    if adrs:
+        lines.append("| ADR | Status | Decisão |")
+        lines.append("|---|---|---|")
+        for s in adrs:
+            titulo, status, decisao = _adr_summary(s["body"])
+            lines.append(f"| [{titulo or s['id']}]({href_for(s)}) | {status} | {decisao or '—'} |")
+        lines.append("")
+    else:
+        lacunas.append("Decisões: nenhum ADR (`sdd/adrs/*.md`) entre as fontes promovidas.")
+
+    # --- Análise de código ---
+    lines.append("## Análise de código")
+    lines.append("")
+    ca = by_rel.get("sdd/code-analysis.md")
+    if ca:
+        headings = _md_headings(ca["body"], level=3)
+        modulos = [h[len("Módulo: "):].strip() if h.startswith("Módulo: ") else h for h in headings]
+        lines.append(f"{len(modulos)} módulo(s) consolidados (índice; ver artefato completo para o detalhe).")
+        lines.append("")
+        for m in modulos:
+            lines.append(f"- {m}")
+        if modulos:
+            lines.append("")
+        nbytes = len(ca["body"].encode("utf-8"))
+        lines.append(f"Artefato completo: [{ca['id']}]({href_for(ca)}) ({nbytes} bytes).")
+        lines.append("")
+    else:
+        lacunas.append("Análise de código: `sdd/code-analysis.md` ausente entre as fontes promovidas.")
+
+    # --- Edge cases ---
+    lines.append("## Edge cases")
+    lines.append("")
+    edge_cases = rel_sorted(lambda rel: rel.startswith("sdd/specs/") and rel.endswith("/edge-cases.md"))
+    if edge_cases:
+        for s in edge_cases:
+            rel = _codescan_artifact_rel(s["origin"]) or ""
+            parts = rel.split("/")
+            unit = parts[2] if len(parts) > 2 else rel
+            lines.append(f"### {unit}")
+            lines.append("")
+            lines.append(s["body"].strip())
+            lines.append("")
+    else:
+        lacunas.append("Edge cases: nenhum `sdd/specs/*/edge-cases.md` entre as fontes promovidas.")
+
+    # --- Diagramas ---
+    lines.append("## Diagramas")
+    lines.append("")
+    flow_index = by_rel.get("sdd/flowcharts/_index.md")
+    if flow_index:
+        lines.append("### Fluxo consolidado")
+        lines.append("")
+        lines.append(flow_index["body"].strip())
+        lines.append("")
+    flowcharts = rel_sorted(
+        lambda rel: rel.startswith("sdd/flowcharts/") and rel != "sdd/flowcharts/_index.md"
+    )
+    sequences = rel_sorted(lambda rel: rel.startswith("sdd/sequences/"))
+    if flowcharts:
+        lines.append("### Outros flowcharts")
+        lines.append("")
+        for s in flowcharts:
+            lines.append(f"- [{s['id']}]({href_for(s)})")
+        lines.append("")
+    if sequences:
+        lines.append("### Sequências")
+        lines.append("")
+        for s in sequences:
+            lines.append(f"- [{s['id']}]({href_for(s)})")
+        lines.append("")
+    if not flow_index and not flowcharts and not sequences:
+        lacunas.append("Diagramas: nenhum flowchart/sequence entre as fontes promovidas.")
+    html_asset_id = next((s["id"] for s in sources if s.get("id") in asset_abspath_by_id), None)
+    if html_asset_id:
+        href = os.path.relpath(asset_abspath_by_id[html_asset_id], base_dir).replace("\\", "/")
+        lines.append(f"- Visualização interativa de acoplamento: [{os.path.basename(href)}]({href})")
+        lines.append("")
+    else:
+        lacunas.append("Diagramas: nenhum asset HTML de acoplamento (`coupling.html`) publicado para este tópico.")
+
+    # --- Confiança ---
+    lines.append("## Confiança")
+    lines.append("")
+    conf = by_rel.get("sdd/confidence-report.md")
+    if conf:
+        lines.append(conf["body"].strip())
+        lines.append("")
+    else:
+        lacunas.append("Confiança: `sdd/confidence-report.md` ausente entre as fontes promovidas.")
+    gaps_doc = by_rel.get("sdd/gaps.md")
+    if gaps_doc:
+        lines.append("### Lacunas (`gaps.md`)")
+        lines.append("")
+        lines.append(gaps_doc["body"].strip())
+        lines.append("")
+    else:
+        lacunas.append("Confiança: `sdd/gaps.md` ausente entre as fontes promovidas.")
+    # B2 (validação E2E): confirmed.md/inferred.md são canônicos sob sdd/
+    # (codescan/sdd.py:262-263 ArtifactRule + linha 1076-1078 — cópia solta na
+    # raiz do workdir é P0 no audit do codescan, nunca a fonte real); a chave
+    # tinha que levar o mesmo prefixo "sdd/" que `_codescan_artifact_rel`
+    # sempre produz a partir do `origin` gravado por `wk publish`.
+    confirmed = by_rel.get("sdd/confirmed.md")
+    inferred = by_rel.get("sdd/inferred.md")
+    if confirmed or inferred:
+        lines.append("### Confirmado vs. inferido")
+        lines.append("")
+        if confirmed:
+            n = len(confirmed["body"].splitlines())
+            lines.append(f"- Confirmado: [{confirmed['id']}]({href_for(confirmed)}) ({n} linhas).")
+        else:
+            lacunas.append("Confiança: `confirmed.md` ausente entre as fontes promovidas.")
+        if inferred:
+            n = len(inferred["body"].splitlines())
+            lines.append(f"- Inferido: [{inferred['id']}]({href_for(inferred)}) ({n} linhas).")
+        else:
+            lacunas.append("Confiança: `inferred.md` ausente entre as fontes promovidas.")
+        lines.append("")
+    else:
+        lacunas.append("Confiança: nem `confirmed.md` nem `inferred.md` entre as fontes promovidas.")
+
+    if lacunas:
+        lines.append("## Lacunas de síntese")
+        lines.append("")
+        for item in lacunas:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n", lacunas
+
+
 def cmd_compile(a) -> int:
-    """Uma página por documento promovido: wiki/<topic>/<source_type>/<id>.md.
+    """Uma página por documento promovido: wiki/<topic>/<source_type>/<id>.md,
+    mais uma página de síntese por tópico (`wiki/<topic>/overview.md`, FIX 2)
+    que embute o conteúdo-chave (arquitetura, ADRs, edge cases, diagramas,
+    confiança) e é linkada em destaque no topo de `wiki/index.md`.
 
     Granularidade por grupo (topic, source_type) colapsava dezenas de módulos
     e specs numa página só; aqui cada fonte promovida vira sua própria página,
     e `wiki/index.md` agrega todas com link.
     """
     store_root = _store_root(a)
+
+    # FIX 3: bloqueia compile de um topic (ou de todos, sem filtro) cujo
+    # workdir de codescan teve `verify` reprovado — salvo --allow-unverified.
+    verify_block, verify_overridden = _verify_gate_scope(store_root, a.topic, a.allow_unverified)
+    if verify_block:
+        print(json.dumps(verify_block, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 3
+
     sources = _promoted_raw_sources(store_root, a.topic)
     wiki_root = os.path.join(store_root, "wiki")
     os.makedirs(wiki_root, exist_ok=True)
@@ -1001,13 +1409,29 @@ def cmd_compile(a) -> int:
     # de `wiki/index.md`, que mora em `wiki/` (BQ1: usar rel_page ali gerava
     # `wiki/wiki/<topic>/...`, um nível a mais, e quebrava todo link).
     page_entries: list[tuple[dict, str, str]] = []
+    page_abspath_by_id: dict[str, str] = {}
+    asset_abspath_by_id: dict[str, str] = {}
 
     for s in sources:
         topic_slug = _slug(s["topic"])
         type_slug = _slug(s["source_type"])
         id_slug = _slug(str(s["id"] or "sem-id"))
         page_id = f"wiki-{topic_slug}-{type_slug}-{id_slug}"
-        path = os.path.join(wiki_root, topic_slug, type_slug, f"{id_slug}.md")
+        page_dir = os.path.join(wiki_root, topic_slug, type_slug)
+        path = os.path.join(page_dir, f"{id_slug}.md")
+
+        # FIX 1: fonte com asset HTML navegável anexado (publish/coupling.html)
+        # — copia o asset para dentro de wiki/, ao lado da página, e linka.
+        asset_href = None
+        if s.get("id"):
+            asset_src = os.path.join(store_root, "raw", "assets", f"{s['id']}.html")
+            if os.path.isfile(asset_src):
+                os.makedirs(page_dir, exist_ok=True)
+                asset_dest = os.path.join(page_dir, f"{id_slug}.html")
+                shutil.copyfile(asset_src, asset_dest)
+                asset_href = f"{id_slug}.html"
+                asset_abspath_by_id[s["id"]] = asset_dest
+
         body = [
             f"# {s['id']}",
             "",
@@ -1016,12 +1440,10 @@ def cmd_compile(a) -> int:
             f"- confidence: `{s['confidence'] or ''}`",
             f"- origem: {s['origin'] or ''}",
             f"- fonte: `{s['rel']}`",
-            "",
-            "## Conteúdo",
-            "",
-            s["body"],
-            "",
         ]
+        if asset_href:
+            body += ["", f"- asset navegável: [{asset_href}]({asset_href})"]
+        body += ["", "## Conteúdo", "", s["body"], ""]
         text = _frontmatter_for_wiki(page_id, s["topic"], [str(s["id"])] if s.get("id") else [])
         text += "\n" + "\n".join(body).rstrip() + "\n"
         _write_md(path, text)
@@ -1029,6 +1451,8 @@ def cmd_compile(a) -> int:
         href = os.path.relpath(path, wiki_root).replace("\\", "/")
         pages.append(rel_page)
         page_entries.append((s, rel_page, href))
+        if s.get("id"):
+            page_abspath_by_id[s["id"]] = path
 
     source_ids = [str(s["id"]) for s in sources if s.get("id")]
     compile_ts = _utc_now()
@@ -1037,9 +1461,41 @@ def cmd_compile(a) -> int:
     for s, rel_page, href in page_entries:
         by_topic.setdefault(s["topic"], []).append((s, href))
 
+    # FIX 2: página de síntese por tópico — só gerada quando há pelo menos uma
+    # fonte com `origin` no formato do `wk publish` (artefato de codescan
+    # reconhecível); um tópico só de fontes manuais (ingest de transcrições/
+    # docs, sem nenhum artefato SDD) não tem o que sintetizar — nada de página
+    # quase vazia só para existir.
+    overview_entries: list[tuple[str, str, list[str]]] = []  # (topic, href-a-partir-de-wiki_root, lacunas)
+    for topic, entries in sorted(by_topic.items()):
+        topic_sources = [s for s, _href in entries]
+        if not any(_codescan_artifact_rel(s.get("origin")) for s in topic_sources):
+            continue
+        topic_slug = _slug(topic)
+        overview_dir = os.path.join(wiki_root, topic_slug)
+        overview_path = os.path.join(overview_dir, "overview.md")
+        overview_body, lacunas = _build_topic_overview(
+            topic, topic_sources, overview_dir, page_abspath_by_id, asset_abspath_by_id
+        )
+        overview_source_ids = [str(s["id"]) for s in topic_sources if s.get("id")]
+        overview_page_id = f"wiki-{topic_slug}-overview"
+        overview_text = _frontmatter_for_wiki(overview_page_id, topic, overview_source_ids)
+        overview_text += "\n\n" + overview_body.rstrip() + "\n"
+        _write_md(overview_path, overview_text)
+        pages.append(os.path.relpath(overview_path, store_root).replace("\\", "/"))
+        overview_href = os.path.relpath(overview_path, wiki_root).replace("\\", "/")
+        overview_entries.append((topic, overview_href, lacunas))
+
     index_body = ["# Wiki Index", ""]
     if a.topic:
         index_body.extend([f"Tópico compilado: {a.topic}", ""])
+    if overview_entries:
+        index_body.append("## Visão geral por tópico")
+        index_body.append("")
+        for topic, href, lacunas in overview_entries:
+            aviso = f" — {len(lacunas)} lacuna(s) de síntese" if lacunas else ""
+            index_body.append(f"- **[{topic}]({href})**{aviso}")
+        index_body.append("")
     index_body.append(f"Total: {len(page_entries)} páginas em {len(by_topic)} tópico(s).")
     index_body.append("")
     for topic in sorted(by_topic):
@@ -1061,11 +1517,20 @@ def cmd_compile(a) -> int:
         store_root,
         f"## [{_utc_now()}] compile | {len(pages)} páginas | {len(sources)} fontes",
     )
+    if verify_overridden:
+        _append_log(
+            store_root,
+            f"## [{_utc_now()}] compile --allow-unverified | "
+            f"{len(verify_overridden)} workdir(s) com verify falhado, compilados mesmo assim",
+        )
     out = {
         "paginas": pages,
         "fontes": len(sources),
         "reindexed": reindexed,
+        "overview": [{"topic": t, "href": h, "lacunas": l} for t, h, l in overview_entries],
     }
+    if verify_overridden:
+        out["verify_override"] = verify_overridden
     if reindex_error:
         out["reindex_error"] = reindex_error
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1088,7 +1553,12 @@ def _docx_prune_root(out_root: str, topic: str | None) -> str:
 
 
 def cmd_docx(a) -> int:
-    """Uma página .docx por documento promovido: wiki-docx/<topic>/<source_type>/<arquivo>.
+    """Uma página .docx por documento promovido: wiki-docx/<topic>/<source_type>/<arquivo>,
+    mais um `.docx` agregador por tópico (`wiki-docx/<topic>/index.docx`, FIX 6)
+    espelhando a página de síntese do FIX 2 (`_build_topic_overview`), passada
+    pelo caminho normal de conversão (`docxgen.build_document`) — sem tocar
+    `docxgen.py`/`docx_md.py`/`docx_ooxml.py`/`docx_meta.py` (fora do escopo
+    deste agente; só a API pública `build_document(source: dict)` é chamada).
 
     Árvore paralela a wiki/, lida direto de raw/ (não de wiki/compilado) e não
     entra em STORE_TREE (decisão M4, docs/plano-wiki-docx.md) — criada sob
@@ -1099,16 +1569,41 @@ def cmd_docx(a) -> int:
     from wk import docx_meta, docxgen
 
     store_root = _store_root(a)
+
+    # FIX 3: bloqueia docx de um topic (ou de todos, sem filtro) cujo workdir
+    # de codescan teve `verify` reprovado — salvo --allow-unverified.
+    verify_block, verify_overridden = _verify_gate_scope(store_root, a.topic, a.allow_unverified)
+    if verify_block:
+        print(json.dumps(verify_block, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 3
+
     sources = _promoted_raw_sources(store_root, a.topic)
     out_root = os.path.join(store_root, a.out_dir)
     os.makedirs(out_root, exist_ok=True)
 
     gerados: list[dict] = []
     pulados: list[dict] = []
+    # FIX 1: skips intencionais (asset HTML sem equivalente .docx) — separado
+    # de `pulados` (falhas reais) para não inflar o exit code de um resultado
+    # esperado e bem-sucedido.
+    ignorados_asset_html: list[dict] = []
     gerado_abs: set[str] = set()
     taken: set[str] = set()
+    docx_path_by_id: dict[str, str] = {}
 
     for s in sorted(sources, key=lambda s: s["id"]):
+        # FIX 1: fonte-stub de asset HTML navegável (ex.: coupling.html
+        # publicado via `wk publish`) não vira .docx — o conteúdo real não é
+        # markdown; `docxgen.build_document` nunca chega a vê-lo.
+        if s.get("id") and os.path.isfile(os.path.join(store_root, "raw", "assets", f"{s['id']}.html")):
+            asset_rel = os.path.join("raw", "assets", f"{s['id']}.html")
+            ignorados_asset_html.append(
+                {
+                    "id": s["id"],
+                    "motivo": f"asset HTML navegável ({asset_rel.replace(os.sep, '/')}) — sem equivalente .docx",
+                }
+            )
+            continue
         try:
             filename = docx_meta.docx_filename_unique(s, taken)
             taken.add(filename[: -len(".docx")])
@@ -1122,12 +1617,63 @@ def cmd_docx(a) -> int:
             pulados.append({"id": s["id"], "motivo": str(exc)})
             continue
         gerado_abs.add(os.path.abspath(path))
+        if s.get("id"):
+            docx_path_by_id[s["id"]] = path
         gerados.append(
             {
                 "path": os.path.relpath(path, store_root).replace(os.sep, "/"),
                 "id": s["id"],
                 "source_type": s["source_type"],
                 "avisos": avisos,
+            }
+        )
+
+    # FIX 6: agregador por tópico — reusa a mesma síntese determinística do
+    # FIX 2 (`_build_topic_overview`), embrulhada num `source` sintético e
+    # convertida pelo caminho normal (`docxgen.build_document`). Nome fixo
+    # `index.docx`: `docx_filename`/`docx_filename_unique` derivam sempre
+    # `<topic-slug>-<subject>[-<scope>].docx` a partir de `source["id"]`
+    # (docx_meta.py), nunca "index.docx" — sem colisão possível com as fontes
+    # reais geradas acima.
+    agregados: list[dict] = []
+    by_topic_docx: dict[str, list[dict]] = {}
+    for s in sources:
+        by_topic_docx.setdefault(s["topic"], []).append(s)
+    for topic, topic_sources in sorted(by_topic_docx.items()):
+        # Mesma guarda do FIX 2 em cmd_compile: sem nenhuma fonte com origin
+        # de `wk publish`, não há artefato SDD para sintetizar.
+        if not any(_codescan_artifact_rel(s.get("origin")) for s in topic_sources):
+            continue
+        dest_dir = os.path.join(out_root, _slug(topic))
+        os.makedirs(dest_dir, exist_ok=True)
+        overview_text, lacunas = _build_topic_overview(
+            topic, topic_sources, dest_dir, docx_path_by_id, {}
+        )
+        agg_id = f"wk-docx-overview-{_slug(topic).replace('/', '-')}"
+        agg_source = {
+            "id": agg_id,
+            "topic": topic,
+            "source_type": "sintese",
+            "confidence": None,
+            "origin": "wk docx (síntese determinística por tópico, mesma consolidação do wiki compile)",
+            "captured_at": _utc_now(),
+            "rel": f"wiki/{_slug(topic)}/overview.md (equivalente)",
+            "body": overview_text,
+        }
+        try:
+            path = os.path.join(dest_dir, "index.docx")
+            data, avisos = docxgen.build_document(agg_source)
+            with open(path, "wb") as f:
+                f.write(data)
+        except Exception as exc:
+            pulados.append({"id": agg_id, "motivo": f"agregador: {exc}"})
+            continue
+        gerado_abs.add(os.path.abspath(path))
+        agregados.append(
+            {
+                "path": os.path.relpath(path, store_root).replace(os.sep, "/"),
+                "topic": topic,
+                "lacunas": lacunas,
             }
         )
 
@@ -1177,14 +1723,25 @@ def cmd_docx(a) -> int:
 
     _append_log(
         store_root,
-        f"## [{_utc_now()}] docx | {len(gerados)} documentos | {len(sources)} fontes | {len(removidos)} removidos",
+        f"## [{_utc_now()}] docx | {len(gerados)} documentos | {len(agregados)} agregadores | "
+        f"{len(sources)} fontes | {len(removidos)} removidos",
     )
+    if verify_overridden:
+        _append_log(
+            store_root,
+            f"## [{_utc_now()}] docx --allow-unverified | "
+            f"{len(verify_overridden)} workdir(s) com verify falhado, exportados mesmo assim",
+        )
     out = {
         "documentos": gerados,
+        "agregadores": agregados,
         "fontes": len(sources),
         "removidos": removidos,
         "pulados": pulados,
+        "ignorados_asset_html": ignorados_asset_html,
     }
+    if verify_overridden:
+        out["verify_override"] = verify_overridden
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 1 if pulados else 0
 
@@ -1901,15 +2458,77 @@ def cmd_ingest(a) -> int:
 # ---------- publish: leva a árvore SDD de um workdir do codescan a inbox/ ----------
 
 
-_PUBLISH_CODE_REPO_REL = {"sdd/inventory.md", "sdd/dependencies.md", "sdd/coupling.md"}
+_PUBLISH_CODE_REPO_REL = {
+    "sdd/inventory.md", "sdd/dependencies.md", "sdd/coupling.md",
+    # FIX 1: coupling.html é o mesmo dado de coupling.md (grafo de acoplamento),
+    # só que renderizado interativo pelo motor Java (coupling_java_html.py) —
+    # mesma origem determinística, mesma classificação code-repo. NOTA: isto
+    # reverte a decisão documentada em references/sdd-contract.md:613-615,635-636
+    # e INSTALL.md ("coupling.html ... não é artefato SDD, publish não o leva
+    # para inbox/"); a decisão de negócio mudou (evidência real: artefato de
+    # 106KB nunca chegava à wiki), mas a doc não foi atualizada aqui — fora do
+    # escopo deste agente (arquivos .md são de outro lote). Ver TODOs.
+    "sdd/coupling.html",
+}
 _PUBLISH_EXCLUDED_DIRNAMES = {"agent-packs", "agent-outputs", "agent-runs"}
 _PUBLISH_EXCLUDED_FILENAMES = {"state.json", "surface.json"}
+# FIX 1: extensões elegíveis em sdd/**. Só .html (não *.htm, não outros
+# binários) — é o único formato não-.md que o codescan hoje produz ali
+# (coupling.html, motor Java). modules/*.md e confirmed.md/inferred.md na
+# raiz continuam só .md (nenhum gerador hoje produz outra coisa ali).
+_PUBLISH_SDD_EXTS = (".md", ".html")
 
 
-def _publish_candidates(workdir: str) -> list[str]:
-    """Arquivos elegíveis: `sdd/**/*.md` e `modules/*.md`, mais confirmed.md/
-    inferred.md na raiz do workdir. Nunca `*.py`, `*.txt`, agent-packs/,
-    agent-outputs/, agent-runs/, state.json ou surface.json."""
+def _state_json(workdir: str) -> dict | None:
+    """Lê `<workdir>/state.json`. None se ausente/ilegível — chamadores devem
+    tratar como "sem informação", nunca como erro fatal (workdirs manuais ou
+    de versões antigas do codescan podem não ter o arquivo)."""
+    path = os.path.join(workdir, "state.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (ValueError, OSError):
+        return None
+
+
+def _expected_module_filenames(workdir: str) -> set[str] | None:
+    """FIX 4: nomes de arquivo (`<slug>.md`) autorizados por
+    `state.json['stages']['modules']['done']`, usando o mesmo slug de
+    `codescan.export._slug` (é o que `codescan/cli.py:_module_artifact` usa
+    para gravar `modules/<slug>.md` originalmente).
+
+    None = fallback seguro (publica tudo): state.json ausente, sem stage
+    `modules` ou sem lista `done` — nunca bloqueia workdirs de versões antigas
+    ou fora do padrão do codescan.
+    """
+    state = _state_json(workdir)
+    if not state:
+        return None
+    done = ((state.get("stages") or {}).get("modules") or {}).get("done")
+    if not isinstance(done, list):
+        return None
+    from codescan.export import _slug as _codescan_slug
+
+    return {
+        f"{_codescan_slug(item.replace(chr(92), '/'))}.md"
+        for item in done
+        if isinstance(item, str)
+    }
+
+
+def _publish_candidates(workdir: str) -> tuple[list[str], list[str]]:
+    """Arquivos elegíveis: `sdd/**/*.{md,html}` e `modules/*.md` (só os
+    registrados em `state.json['stages']['modules']['done']` — FIX 4), mais
+    confirmed.md/inferred.md na raiz do workdir. Nunca `*.py`, `*.txt`,
+    agent-packs/, agent-outputs/, agent-runs/, state.json ou surface.json.
+
+    Devolve `(candidatos, modulos_orfaos_descartados)` — o segundo item é a
+    lista de nomes de arquivo em `modules/` que NÃO constam em `done` (workaround
+    manual de operador, path bugado etc.); vazio se não houver descarte ou se
+    o fallback seguro (sem state.json/sem lista `done`) publicar tudo.
+    """
     candidates: list[str] = []
 
     sdd_root = os.path.join(workdir, "sdd")
@@ -1922,17 +2541,22 @@ def _publish_candidates(workdir: str) -> list[str]:
             for fn in sorted(filenames):
                 if fn in _PUBLISH_EXCLUDED_FILENAMES:
                     continue
-                if os.path.splitext(fn)[1].lower() != ".md":
+                if os.path.splitext(fn)[1].lower() not in _PUBLISH_SDD_EXTS:
                     continue
                 candidates.append(os.path.join(dirpath, fn))
 
     modules_root = os.path.join(workdir, "modules")
+    modulos_orfaos: list[str] = []
     if os.path.isdir(modules_root):
+        expected = _expected_module_filenames(workdir)
         for fn in sorted(os.listdir(modules_root)):
             full = os.path.join(modules_root, fn)
             if not os.path.isfile(full) or fn in _PUBLISH_EXCLUDED_FILENAMES:
                 continue
             if os.path.splitext(fn)[1].lower() != ".md":
+                continue
+            if expected is not None and fn not in expected:
+                modulos_orfaos.append(fn)
                 continue
             candidates.append(full)
 
@@ -1941,11 +2565,96 @@ def _publish_candidates(workdir: str) -> list[str]:
         if os.path.isfile(full):
             candidates.append(full)
 
-    return candidates
+    return candidates, modulos_orfaos
 
 
 def _publish_source_type(rel: str) -> str:
     return "code-repo" if rel in _PUBLISH_CODE_REPO_REL else "agent-output"
+
+
+# ---------- FIX 3: portão de `verify` (promote/compile/docx não promovem/
+# compilam/exportam conteúdo de um workdir de codescan cujo verify falhou) ----------
+
+
+def _codescan_workdirs_for_topic(store_root: str, topic: str | None) -> list[str]:
+    """Workdirs em `<store>/.codescan/*` cujo `state.json['topic']` bate com
+    `topic` (todos, se `topic` for None/vazio). [] se não houver `.codescan/`
+    no store — store só-manual (transcrições/docs) nunca tem workdir, então
+    nunca é afetado pelo portão de verify."""
+    codescan_root = os.path.join(store_root, ".codescan")
+    if not os.path.isdir(codescan_root):
+        return []
+    out = []
+    for name in sorted(os.listdir(codescan_root)):
+        wd = os.path.join(codescan_root, name)
+        if not os.path.isdir(wd):
+            continue
+        state = _state_json(wd)
+        if not state:
+            continue
+        if topic and state.get("topic") != topic:
+            continue
+        out.append(wd)
+    return out
+
+
+def _failed_verify_workdirs(store_root: str, topic: str | None) -> list[dict]:
+    """Workdirs (escopados por `topic`, se informado) com
+    `stages.verify.status == 'failed'`. Base determinística do bloqueio do
+    FIX 3 — nunca considera workdirs sem stage `verify` registrado (versões
+    antigas do codescan, ou pipeline ainda não chegou lá) como falhos."""
+    failed = []
+    for wd in _codescan_workdirs_for_topic(store_root, topic):
+        state = _state_json(wd) or {}
+        verify = ((state.get("stages") or {}).get("verify")) or {}
+        if verify.get("status") == "failed":
+            failed.append(
+                {
+                    "workdir": os.path.relpath(wd, store_root).replace("\\", "/"),
+                    "topic": state.get("topic"),
+                    "at": verify.get("at"),
+                }
+            )
+    return failed
+
+
+def _verify_gate_scope(
+    store_root: str, topic: str | None, allow_unverified: bool
+) -> tuple[dict | None, list[dict]]:
+    """Portão de `verify` para comandos escopáveis por `topic` (`compile`,
+    `docx`). `topic=None` varre TODOS os workdirs de codescan do store (modo
+    "processa tudo"); informado, escopa só ao(s) workdir(s) daquele topic.
+
+    Devolve `(bloqueio, sobrepostos)`:
+    - `bloqueio` None = liberado; dict = erro acionável (chamador deve
+      imprimir em stderr e abortar com código != 0);
+    - `sobrepostos` = workdirs cujo verify falhou mas foram liberados via
+      `--allow-unverified` (decisão humana explícita) — chamador deve
+      registrar no output e no log.
+    """
+    failed = _failed_verify_workdirs(store_root, topic)
+    if not failed:
+        return None, []
+    if allow_unverified:
+        return None, failed
+    return (
+        {
+            "error": (
+                f"`verify` falhou para {len(failed)} workdir(s) de codescan — "
+                "comando bloqueado (README/INSTALL: conteúdo não verificado "
+                "não deve ser promovido/compilado/exportado)"
+            ),
+            "workdirs_bloqueados": failed,
+            "acao": (
+                "rode `wk code --repo <repo> verify --artifact "
+                "<workdir>/sdd/confirmed.md` e corrija as citações reprovadas "
+                "(ou rebaixe a claim para inferred.md); para prosseguir mesmo "
+                "assim (decisão humana explícita, registrada no log/manifesto), "
+                "repita o comando com --allow-unverified"
+            ),
+        },
+        [],
+    )
 
 
 def _repo_name_from_workdir(workdir: str) -> str:
@@ -1977,7 +2686,7 @@ def cmd_publish(a) -> int:
     store_root = _store_root(a)
     inbox_root = os.path.abspath(os.path.join(store_root, "inbox"))
     repo_name = _repo_name_from_workdir(workdir)
-    candidates = _publish_candidates(workdir)
+    candidates, modulos_orfaos = _publish_candidates(workdir)
 
     published: list[dict] = []
     for path in candidates:
@@ -1997,10 +2706,41 @@ def cmd_publish(a) -> int:
             )
             return 2
 
-        text = _read_md(path)
-        _, body = split(text)  # descarta frontmatter que o artefato já tivesse
         stem_slug = _slug(os.path.splitext(rel)[0].replace("/", "-"))
+        ext = os.path.splitext(path)[1].lower()
+        # FIX 1: `sdd/coupling.html` e `sdd/coupling.md` colidiriam no mesmo
+        # doc_id (ambos derivam de "sdd-coupling" — o stem ignora extensão);
+        # sufixo "-html" desambigua sem tocar no esquema de id dos .md
+        # (mantém compatibilidade com ids já emitidos por publishes antigos).
         doc_id = f"sb-publish-{_slug(repo_name)}-{stem_slug}"
+        if ext == ".html":
+            doc_id += "-html"
+        asset_rel = None
+        if ext == ".html":
+            # FIX 1: asset navegável, não markdown. Preserva os bytes originais
+            # em raw/assets/ (mesmo padrão de `_ingest_asset` p/ docx/xlsx/csv/
+            # pdf) e cria um stub .md — o stub É que passa pelo portão normal
+            # de promote/compile; o asset em si nunca é interpretado como
+            # markdown em lugar nenhum do pipeline (`cmd_docx` nunca o vê:
+            # `docxgen.build_document` só recebe o stub).
+            assets_dir = os.path.join(store_root, "raw", "assets")
+            os.makedirs(assets_dir, exist_ok=True)
+            asset_dest = os.path.join(assets_dir, f"{doc_id}.html")
+            shutil.copyfile(path, asset_dest)
+            asset_rel = os.path.relpath(asset_dest, store_root).replace("\\", "/")
+            body = (
+                f"# Visualização: {os.path.basename(rel)}\n\n"
+                f"Asset navegável: `{asset_rel}`\n\n"
+                "Artefato HTML interativo (mapa de acoplamento), gerado "
+                "deterministicamente por `scripts/codescan/coupling_java_html.py`. "
+                "Não é markdown — abra o arquivo para navegar. `wk compile` copia "
+                "este asset para dentro de `wiki/`, ao lado da página desta fonte, "
+                "e o linka a partir dela e da visão geral do tópico.\n"
+            )
+        else:
+            text = _read_md(path)
+            _, body = split(text)  # descarta frontmatter que o artefato já tivesse
+
         meta = {
             "id": doc_id,
             "source_type": source_type,
@@ -2011,22 +2751,37 @@ def cmd_publish(a) -> int:
         }
         dest = _unique_dest(os.path.join(dest_dir, f"{stem_slug}.md"))
         _write_md(dest, _render_frontmatter(meta, body))
-        published.append(
-            {
-                "id": doc_id,
-                "source_type": source_type,
-                "path": os.path.relpath(dest, store_root).replace("\\", "/"),
-                "origem": rel,
-            }
-        )
+        entry = {
+            "id": doc_id,
+            "source_type": source_type,
+            "path": os.path.relpath(dest, store_root).replace("\\", "/"),
+            "origem": rel,
+        }
+        if asset_rel:
+            entry["asset"] = asset_rel
+        published.append(entry)
 
     _append_log(
         store_root,
         f"## [{_utc_now()}] publish | {len(published)} artefatos | workdir {workdir}",
     )
     out = {"workdir": workdir, "topic": a.topic, "publicados": published}
+    if modulos_orfaos:
+        out["modulos_orfaos_descartados"] = {"n": len(modulos_orfaos), "arquivos": modulos_orfaos}
     if not candidates:
         out["aviso"] = "nenhum artefato elegível em sdd/ ou modules/"
+
+    # FIX 3: publish NÃO bloqueia (é só staging em inbox/; nada aqui vira
+    # canônico sem `promote`, e agent-output nunca auto-promove) — mas avisa,
+    # para o humano decidir com informação em mãos antes de aprovar/promover.
+    verify_status = _failed_verify_workdirs(store_root, a.topic)
+    ours = [v for v in verify_status if os.path.abspath(os.path.join(store_root, v["workdir"])) == workdir]
+    if ours:
+        out["aviso_verify"] = (
+            "`verify` falhou para este workdir — os artefatos foram publicados em "
+            "inbox/ (staging), mas NÃO devem ser promovidos (`wk promote`) até "
+            "corrigir ou usar --allow-unverified conscientemente"
+        )
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
@@ -2165,11 +2920,17 @@ def _build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--source-type", dest="approve_source_type",
                     help="tipo exigido por --approve-all (human-transcript|human-doc|web-clip|agent-output)")
     pr.add_argument("--approved-by", default="humano", help="quem aprovou; vai para promoted_by")
+    pr.add_argument("--allow-unverified", action="store_true",
+                    help="promove mesmo assim fontes de topic cujo `verify` do codescan falhou "
+                         "(decisão humana explícita; fica registrada no log)")
     pr.set_defaults(fn=cmd_promote)
 
     co = sub.add_parser("compile", help="compila wiki/ a partir de raw/ promovido")
     co.add_argument("topic", nargs="?", help="tópico opcional")
     co.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    co.add_argument("--allow-unverified", action="store_true",
+                    help="compila mesmo assim topic(s) cujo `verify` do codescan falhou "
+                         "(decisão humana explícita; fica registrada no log/manifesto)")
     co.set_defaults(fn=cmd_compile)
 
     dx = sub.add_parser("docx", help="gera wiki-docx/ (DOCX) a partir de raw/ promovido")
@@ -2177,6 +2938,9 @@ def _build_parser() -> argparse.ArgumentParser:
     dx.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     dx.add_argument("--out-dir", default="wiki-docx", help="pasta de saída dentro do store")
     dx.add_argument("--no-prune", action="store_true", help="não remove .docx órfão")
+    dx.add_argument("--allow-unverified", action="store_true",
+                    help="exporta mesmo assim topic(s) cujo `verify` do codescan falhou "
+                         "(decisão humana explícita; fica registrada no log)")
     dx.set_defaults(fn=cmd_docx)
 
     li = sub.add_parser("lint", help="audita o índice e escreve wiki/_lint-report.md")
