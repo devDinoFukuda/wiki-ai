@@ -1590,6 +1590,84 @@ def _run_stage_next_action(stage: str, batches: list[dict]) -> str:
     )
 
 
+def _stage_contract_path(wd: str, stage: str) -> str:
+    return os.path.join(wd, "agent-packs", f"{stage}-contract.json")
+
+
+def _write_stage_contract(wd: str, stage: str, st: dict) -> str:
+    """Materializa o contrato do estágio (mesmo payload do sdd-brief) em
+    arquivo ao lado dos agent-packs. O subagente lê pack + contrato como
+    arquivos — nenhum comando precisa ser executado por LLM no fan-out."""
+    path = _stage_contract_path(wd, stage)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(sdd_mod.brief(wd, stage, st), f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return path
+
+
+def _handoff_prompt(stage: str, batches: list[dict], contract_path: str) -> str:
+    """Prompt de despacho pronto para colar na LLM: despachante dispara um
+    subagente por batch; cada subagente lê 2 arquivos e grava 1."""
+    lines = [
+        f"Fan-out do estágio {stage}. Você é despachante: NÃO analise o repositório você mesmo,",
+        "NÃO gere conteúdo você mesmo, NÃO execute comandos, NÃO faça merge.",
+        "",
+        f"Dispare exatamente {len(batches)} subagente(s), um por batch, listas de itens disjuntas:",
+        "",
+    ]
+    for b in batches:
+        items = ", ".join(str(i) for i in (b.get("items") or []))
+        lines += [
+            f"[batch {int(b['batch']):02d} — subagente {b['agent_slot']}]",
+            f"  LEIA:    {b['agent_pack']}",
+            f"  LEIA:    {contract_path}",
+            f"  ESCREVA: {b['output']}",
+            f"  ITENS:   {items}",
+            "",
+        ]
+    lines += [
+        "Instrução para cada subagente:",
+        "  Analise SOMENTE os itens do seu pack.",
+        "  Escreva no caminho ESCREVA só blocos `=== <BLOCO>: <id> ===` … `=== END ===`, conforme o contrato.",
+        "  Item impossível: bloco FAILED conforme o contrato.",
+        "  MARCADORES: 🟢 confirmado (exige arquivo:linha) · 🟡 inferido (justificativa) · 🔴 desconhecido (pergunta objetiva).",
+        '  PROIBIDO no arquivo: código, diff, log, saída de comando, prosa fora de bloco, "Ran command", "Edited", "Wrote".',
+        "  PT-BR técnico, sem preâmbulo, sem resumo, sem conclusão.",
+        "  Devolva só: ARQUIVO: <caminho> / BLOCOS: <n> / BYTES: <n>",
+        "",
+        "AO FINAL, devolva SOMENTE a lista de recibos (ARQUIVO/BLOCOS/BYTES por batch).",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_handoff(a) -> int:
+    """Imprime o prompt de despacho do fan-out — o único texto que o humano
+    entrega à LLM. Exige manifesto de run-stage; regrava o contrato para
+    garantir frescor com o doc_level atual."""
+    wd = _wd(a)
+    st = st_mod.load(wd)
+    manifest_path = os.path.join(_agent_runs_dir(wd), f"{a.stage}-plan.json")
+    if not st or not os.path.isfile(manifest_path):
+        print(json.dumps({
+            "error": f"manifesto ausente para {a.stage}; rode run-stage {a.stage} antes de handoff",
+            "acao": f"{_sdd_brief_hint(a.stage)}; rode run-stage {a.stage} e depois handoff {a.stage}",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    batches = manifest.get("batches") or []
+    if not batches:
+        print(json.dumps({
+            "error": f"manifesto de {a.stage} sem batches",
+            "acao": f"rode run-stage {a.stage} novamente",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+    contract_path = _write_stage_contract(wd, a.stage, st)
+    print(_handoff_prompt(a.stage, batches, contract_path))
+    return 0
+
+
 def _run_stage_permission_probe(wd: str) -> str | None:
     """Prova determinística de permissão antes de emitir o manifesto do run-stage.
 
@@ -1745,11 +1823,13 @@ def cmd_run_stage(a) -> int:
 
     fanout_required = len(batches)
     next_action = _run_stage_next_action(stage, batches)
+    contract_path = _write_stage_contract(wd, stage, st)
 
     manifest = {
         "schema": "wiki-ai.run-stage-plan.v1",
         "stage": stage,
         "workdir": wd,
+        "contract": contract_path,
         "role": role,
         "requires_subagents": True,
         "spawns_agents": False,
@@ -1775,6 +1855,7 @@ def cmd_run_stage(a) -> int:
         "schema": manifest["schema"],
         "stage": stage,
         "manifest": manifest_path,
+        "contract": contract_path,
         "fanout_required": fanout_required,
         "next_action": next_action,
         "batches": [
@@ -2391,6 +2472,10 @@ def main(argv=None) -> int:
     rs.add_argument("--max-files", type=int, default=agentpack_mod.DEFAULT_MAX_FILES_PER_MODULE)
     rs.add_argument("--max-lines", type=int, default=agentpack_mod.DEFAULT_MAX_LINES_PER_FILE)
     rs.set_defaults(fn=cmd_run_stage)
+
+    ho = sub.add_parser("handoff", help="imprime o prompt de despacho do fan-out, pronto para colar na LLM")
+    ho.add_argument("stage", choices=sdd_mod.CRITICAL_STAGES)
+    ho.set_defaults(fn=cmd_handoff)
 
     au = sub.add_parser("audit", help="mede qualidade SDD sem alterar estado")
     au.add_argument("stage_pos", nargs="?", choices=sdd_mod.CRITICAL_STAGES)

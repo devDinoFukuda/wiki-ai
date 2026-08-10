@@ -497,7 +497,10 @@ def _parse_modules(text: str) -> list[tuple[str, str]]:
             continue
         match = MODULE_RE.match(lines[i])
         if not match:
-            raise MergeError("prosa fora de bloco MODULE")
+            raise MergeError(
+                "prosa fora de bloco MODULE; esperado: `=== MODULE: <path> ===` "
+                "… `=== END ===` (todo conteúdo dentro de blocos)"
+            )
         item = _normalize_item(match.group(1))
         i += 1
         body: list[str] = []
@@ -529,7 +532,11 @@ def _parse_spec_body(item: str, body: list[str]) -> dict[str, str]:
             continue
         if current is None:
             if line.strip():
-                raise MergeError(f"prosa fora de arquivo SPEC: {item}")
+                raise MergeError(
+                    f"prosa fora de arquivo SPEC: {item}; esperado: seções "
+                    "`--- requirements.md ---` / `--- design.md ---` / `--- tasks.md ---` "
+                    "(opcionais: contracts.md, edge-cases.md) antes de qualquer conteúdo"
+                )
             continue
         sections[current].append(line)
     required = ("requirements.md", "design.md", "tasks.md")
@@ -562,7 +569,10 @@ def _parse_specs(text: str) -> tuple[list[tuple[str, dict[str, str]]], list[tupl
             continue
         match = SPEC_RE.match(lines[i])
         if not match:
-            raise MergeError("prosa fora de bloco SPEC")
+            raise MergeError(
+                "prosa fora de bloco SPEC; esperado: `=== SPEC: <unit> ===` "
+                "… `=== END ===` (SPEC singular, não SPECS; todo conteúdo dentro de blocos)"
+            )
         item = _normalize_item(match.group(1))
         i += 1
         body: list[str] = []
@@ -605,7 +615,12 @@ def _parse_named_blocks(stage: str, text: str) -> list[tuple[str, str]]:
             continue
         match = header_re.match(lines[i])
         if not match:
-            raise MergeError(f"prosa fora de bloco {label}")
+            accepted = ", ".join(allowed + NAMED_STAGE_PREFIX_HINTS.get(stage, ()))
+            raise MergeError(
+                f"prosa fora de bloco {label}; esperado: `=== {label}: <id> ===` "
+                f"… `=== END ===` com <id> em: {accepted} "
+                f"(o nível de confiança vai nos marcadores 🟢🟡🔴, não no cabeçalho)"
+            )
         name = _normalize_item(match.group(1))
         prefix_res = NAMED_STAGE_PREFIX_RES.get(stage, ())
         if name not in allowed and not any(p.match(name) for p in prefix_res):

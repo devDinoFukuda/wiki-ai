@@ -13,7 +13,7 @@ frase. Contagem de passos nomeados neste doc:
 
 | Tipo | Passos | Quem | Precisa de LLM? |
 |---|---|---|---|
-| **D** | 16 — `surface`, `export`, `plan`, `agent-pack`, `run-stage` (as 5 chamadas, que só preparam manifesto), `merge-agent-output` (as 5 chamadas, mecânico), `evidence`, `verify`, `audit --strict`, `publish`, `state`/`next`/`read`, `cleanup` | 👤 ou 🤖, indiferente | **Não** |
+| **D** | 17 — `surface`, `export`, `plan`, `agent-pack`, `run-stage` (as 5 chamadas, que preparam manifesto + packs + contrato), `handoff` (as 5 chamadas, que só imprimem o prompt de despacho), `merge-agent-output` (as 5 chamadas, mecânico), `evidence`, `verify`, `audit --strict`, `publish`, `state`/`next`/`read`, `cleanup` | **👤 por padrão** — scripts geram as estruturas/artefatos; 🤖 só quando o humano pedir explicitamente | **Não** |
 | **M** | 5 — os 5 pontos de fan-out: subagente escreve `modules`, `rules`, `architecture`, `specs`, `synth` | 🤖 obrigatório | **Sim** — sem modelo o estágio não produz conteúdo, fica pendente para sempre |
 | **H** | 4 — `config --doc-level/--granularity`; `pending specs --items`; fechar `done <stage>` (portão de qualidade, decide se aceita/rebaixa); decidir `--allow-unverified` em `promote`/`compile`/`docx` a jusante | 👤 obrigatório | Não, mas exige julgamento e responsabilidade |
 
@@ -25,7 +25,8 @@ desses 5 estágios (prova de que nada gera conteúdo fora deles:
 `cmd_run_stage`, docstring `"""Prepara execução por subagentes. Não gera
 conteúdo SDD."""`, `scripts/codescan/cli.py` (docstring de `cmd_run_stage`)). Todo o resto —
 `surface`, `export`, `config`, `plan`, `run-stage` (a chamada que só monta o
-manifesto), `merge-agent-output`, `done`, `evidence`, `verify`, `audit`,
+manifesto), `handoff` (só imprime o prompt de despacho), `merge-agent-output`,
+`done`, `evidence`, `verify`, `audit`,
 `publish` — roda sem LLM: são leitura de repositório, regex, SQL/state JSON
 e cópia de arquivo. A prova, comando a comando, está na tabela "Estágio ×
 tipo" logo abaixo e repetida em cada seção de estágio.
@@ -37,7 +38,8 @@ tipo" logo abaixo e repetida em cada seção de estágio.
 | `export` | **D** | motor de acoplamento Java/genérico, cálculo Ce/Ca/I determinístico |
 | `config --doc-level/--granularity` | **H** | valor não é inferido — alguém escolhe (`cmd_config`, `scripts/codescan/cli.py` (função `cmd_config`), grava exatamente o que foi passado) |
 | `plan` | **D** | partição por fórmula fixa `min(8, nº módulos, ceil(LOC/2000))` (`scripts/codescan/cli.py` (dimensionamento de fan-out `_auto_batches`)) — humano NÃO escolhe N |
-| `run-stage <stage>` | **D** | só monta manifesto/packs; nunca gera conteúdo SDD (`scripts/codescan/cli.py` (docstring de `cmd_run_stage`)) |
+| `run-stage <stage>` | **D** | monta manifesto/packs + `agent-packs/<stage>-contract.json` (contrato do estágio em arquivo); nunca gera conteúdo SDD (`scripts/codescan/cli.py` (docstring de `cmd_run_stage`)) |
+| `handoff <stage>` | **D** | imprime o prompt de despacho pronto (batches, caminhos, slots e contrato preenchidos) — 👤 cola esse texto na LLM; não gera conteúdo |
 | **fan-out `modules`/`rules`/`architecture`/`specs`/`synth`** | **M** | só um LLM lê o pack e escreve o bloco de resposta |
 | `pending specs --items` | **H** | humano decide/confirma quais units entram na fila (`cmd_pending`, `scripts/codescan/cli.py` (função `cmd_pending`)) |
 | `agent-pack` | **D** | serialização determinística do pack para o subagente |
@@ -63,13 +65,17 @@ Só 5 pontos deste pipeline exigem que um LLM escreva conteúdo — todo o resto
 | 4 | `run-stage specs` | `agent-packs/specs-batch-NN.json` | `agent-outputs/specs-batch-NN.txt` | `=== SPEC: <unit> ===` **SINGULAR** + trio `--- requirements.md/design.md/tasks.md ---` | `merge-agent-output specs` → `done specs` |
 | 5 | `run-stage synth` | `sdd/*.md` de 1º nível | `agent-outputs/synth-batch-01.txt` | `=== SYNTH: confirmed\|inferred ===` | `merge-agent-output synth` → `done synth` |
 
-`run-stage` NUNCA gera conteúdo — só prepara o manifesto
-(`"generates_sdd_content": false` no próprio retorno). Todo output com
-`fanout_required` ≥ 1 é chamada de modelo obrigatória. `evidence` **não**
-entra nessa lista — roda sem `run-stage`, sem fan-out (ver Estágio 6
-abaixo). Mecanismo de disparo por engine: Claude Code = `Task` · Devin =
-subagentes · Antigravity = `start_subagent` · Copilot = sessões de
-subagente.
+`run-stage` NUNCA gera conteúdo — só prepara o manifesto, os packs e o
+contrato do estágio (`agent-packs/<stage>-contract.json`;
+`"generates_sdd_content": false` no próprio retorno). Todo output com
+`fanout_required` ≥ 1 é chamada de modelo obrigatória. **Fluxo padrão de
+disparo (humano-dirigido):** 👤 roda `{{WK}} code handoff <stage>` e cola o
+prompt impresso na LLM; a LLM só despacha — 1 subagente por batch (Claude
+Code = `Task` · Devin = subagentes · Antigravity = `start_subagent` ·
+Copilot = sessões de subagente); cada subagente lê o pack e o contrato como
+ARQUIVOS (não executa comando) e grava o próprio `output`. `evidence`
+**não** entra nessa lista — roda sem `run-stage`, sem fan-out (ver Estágio
+6 abaixo).
 
 ## Regra do campo `acao`
 
@@ -114,7 +120,9 @@ Ao fim do estágio 7, apague o clone (só remoto; mantém a análise):
   subagente; o pai/orquestrador nunca gera conteúdo SDD diretamente. Use
   `run-stage` para esses estágios: o JSON de retorno traz `next_action` e
   `fanout_required` (nº de batches) por estágio, além de `agent_slot` por
-  batch.
+  batch, e grava `agent-packs/<stage>-contract.json`. Em seguida
+  `handoff <stage>` imprime o prompt de despacho pronto — é o texto que 👤
+  entrega à LLM; a LLM não precisa executar comando nenhum.
 - `merge-agent-output --agent <id>` é obrigatório; valores genéricos (`main`,
   `orquestrador`, `self`, `principal`) são recusados. Input com `mtime`
   anterior ao plano do stage (`run-stage`) é recusado. `done` bloqueia se
@@ -433,18 +441,21 @@ cada módulo do repo aparece em exatamente um batch.
 
 2. Fan-out — 🤖 **M**, obrigatório: um subagente por grupo, listas
 disjuntas. Sem subagente aqui, os `modules/*.md` simplesmente não existem —
-nada mais no pipeline gera esse conteúdo. Spawn: Claude Code = Task ·
-Devin = subagentes · Antigravity = `start_subagent` · Copilot = sessões de subagente.
+nada mais no pipeline gera esse conteúdo. Disparo padrão: 👤 roda
+`{{WK}} code ... handoff modules` e cola o prompt impresso na LLM; a LLM
+despacha (Claude Code = Task · Devin = subagentes · Antigravity =
+`start_subagent` · Copilot = sessões de subagente).
 
 Gerar pacote determinístico por batch — 👤/🤖 **D**:
 ```bash
 {{WK}} code --repo C:/projetos/insurance-quote-service --store <store> agent-pack modules --batch 1
 ```
 
-Fluxo fechado — abertura é 👤/🤖 **D** (só monta manifesto e packs; não
+Fluxo fechado — abertura é 👤 **D** (só monta manifesto, packs e contrato; não
 gera conteúdo SDD, `scripts/codescan/cli.py` (docstring de `cmd_run_stage`)):
 ```bash
 {{WK}} code --repo C:/projetos/insurance-quote-service --store <store> run-stage modules
+{{WK}} code --repo C:/projetos/insurance-quote-service --store <store> handoff modules
 ```
 Saída esperada (trecho): `{"stage": "modules", "fanout_required": 3,
 "generates_sdd_content": false, "batches": [{"batch": 1, "agent_slot":
@@ -472,7 +483,9 @@ mesclado) e roda `audit --strict`. O JSON de `run-stage` traz, por batch,
 > Papel do subagente neste estágio: `Archaeologist`. O pai atua como orquestrador
 > e valida com gate >=90 antes de gravar/fechar item.
 
-Instrução ao subagente:
+Instrução ao subagente — `handoff modules` imprime o prompt de despacho
+pronto com este conteúdo (batches, caminhos e slots preenchidos); o texto
+abaixo é a referência do que ele carrega:
 > Analise SOMENTE os módulos do `agent-pack`. Responda integralmente em PT-BR.
 > GRAVE a resposta em `<output do batch>` (não a devolva na mensagem); não
 > rode `wk.pyz`, não copie arquivos do repo.
@@ -535,9 +548,10 @@ Artefatos (§5): `sdd/domain.md`; se `doc_level` ≥ completo, também
 Subagente entrega um bloco por artefato, nome fixo (`=== RULES: domain ===`,
 `=== RULES: state-machines ===`, `=== RULES: permissions ===` — ver "Brief
 compacto" acima); nome fora dessa lista faz o merge rejeitar o bloco. Depois
-rode (D, D, H nesta ordem):
+rode (D, D, D, H nesta ordem; entre `handoff` e `merge`, 👤 cola o prompt na LLM):
 ```bash
 {{WK}} code --repo <repo> run-stage rules
+{{WK}} code --repo <repo> handoff rules
 {{WK}} code --repo <repo> merge-agent-output rules --input <output-do-batch> --agent <id-do-subagente>
 {{WK}} code --repo <repo> done rules
 ```
@@ -573,9 +587,10 @@ vira **warning** (`score -5`), nunca bypass silencioso. Erro de sintaxe
 Mermaid sempre traz linha + trecho + nome do padrão violado na mensagem;
 corrija o trecho apontado, não redesenhe o diagrama do zero.
 
-D, D, H nesta ordem:
+D, D, D, H nesta ordem (entre `handoff` e `merge`, 👤 cola o prompt na LLM):
 ```bash
 {{WK}} code --repo <repo> run-stage architecture
+{{WK}} code --repo <repo> handoff architecture
 {{WK}} code --repo <repo> merge-agent-output architecture --input <output-do-batch> --agent <id-do-subagente>
 {{WK}} code --repo <repo> done architecture
 ```
@@ -624,9 +639,11 @@ Papel de revisão: `Reviewer`. Revisão final (§5): reclassificar 🟢 frágil,
 `sdd/gaps.md`. Não há `questions.md` no contrato do código — as 🔴 ficam
 registradas dentro de `confidence-report.md`/`gaps.md` e do `sdd/confirmed.md`/
 `sdd/inferred.md` do estágio synth.
-Para fechar (D, depois H):
+Para fechar (D, D, depois H; entre `handoff` e `done`, 👤 cola o prompt na
+LLM e roda o `merge-agent-output` de cada batch):
 ```bash
 {{WK}} code --repo <repo> run-stage specs
+{{WK}} code --repo <repo> handoff specs
 {{WK}} code --repo <repo> done specs
 ```
 `run-stage specs` é obrigatório para geração das units; grava
@@ -676,9 +693,11 @@ O CLI aceita `synth` em `run-stage`/`merge-agent-output`
 (`choices=(modules, rules, architecture, specs, synth)`). Subagente entrega
 um bloco por artefato, nome fixo (`=== SYNTH: confirmed ===`, `=== SYNTH:
 inferred ===` — ver "Brief compacto" acima); nome fora dessa lista faz o
-merge rejeitar o bloco. Fluxo fechado, igual aos demais estágios (D, D, H):
+merge rejeitar o bloco. Fluxo fechado, igual aos demais estágios (D, D, D, H;
+entre `handoff` e `merge`, 👤 cola o prompt na LLM):
 ```bash
 {{WK}} code --repo <repo> run-stage synth
+{{WK}} code --repo <repo> handoff synth
 {{WK}} code --repo <repo> merge-agent-output synth --input <output-do-batch> --agent <id-do-subagente>
 {{WK}} code --repo <repo> done synth
 ```

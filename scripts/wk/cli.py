@@ -846,6 +846,28 @@ def _unique_dest(path: str) -> str:
         i += 1
 
 
+def _publish_existing_dest(dest_dir: str, doc_id: str) -> str | None:
+    """Idempotência do publish: se este `doc_id` já está em staging no
+    inbox, devolve o arquivo existente para ser regravado (refresh) — sem
+    isso, reexecutar `publish` criava duplicata via `_unique_dest` com o
+    MESMO doc_id (achado 'Alto' de docs/application-analysis.md)."""
+    if not os.path.isdir(dest_dir):
+        return None
+    pattern = re.compile(rf"^id:\s*[\"']?{re.escape(doc_id)}[\"']?\s*$", re.M)
+    for name in sorted(os.listdir(dest_dir)):
+        if not name.endswith(".md"):
+            continue
+        path = os.path.join(dest_dir, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                head = f.read(4096)
+        except OSError:
+            continue
+        if pattern.search(head):
+            return path
+    return None
+
+
 def _append_log(store_root: str, line: str) -> None:
     path = os.path.join(store_root, "log.md")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2749,7 +2771,10 @@ def cmd_publish(a) -> int:
             "promoted": False,
             "topic": a.topic,
         }
-        dest = _unique_dest(os.path.join(dest_dir, f"{stem_slug}.md"))
+        dest = _publish_existing_dest(dest_dir, doc_id)
+        refreshed = dest is not None
+        if dest is None:
+            dest = _unique_dest(os.path.join(dest_dir, f"{stem_slug}.md"))
         _write_md(dest, _render_frontmatter(meta, body))
         entry = {
             "id": doc_id,
@@ -2757,6 +2782,8 @@ def cmd_publish(a) -> int:
             "path": os.path.relpath(dest, store_root).replace("\\", "/"),
             "origem": rel,
         }
+        if refreshed:
+            entry["atualizado"] = True
         if asset_rel:
             entry["asset"] = asset_rel
         published.append(entry)

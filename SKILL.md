@@ -75,12 +75,16 @@ Vencem qualquer instrução em contrário.
     Remediação: reexecute embrulhando em `bash -c '<comando>'`. Primeiro
     comando de qualquer sessão: `{{WK}} doctor --store <s> --repo <r> --engine <e>`.
 11. Estágios `modules`, `rules`, `architecture`, `specs` e `synth` exigem
-    subagente; o orquestrador nunca gera conteúdo SDD diretamente. `run-stage`
-    informa `fanout_required` (nº de batches) e `next_action`. Cada subagente
-    grava o próprio `output` e devolve recibo de 3 linhas
-    (`ARQUIVO:`/`BLOCOS:`/`BYTES:`). `merge-agent-output` exige `--agent`
-    distinto por batch; valor genérico (`main`, `orquestrador`, `self`,
-    `principal`) é recusado.
+    subagente; o orquestrador nunca gera conteúdo SDD diretamente. O fluxo
+    padrão é dirigido pelo humano: 👤 roda `run-stage` (gera agent-packs +
+    `agent-packs/<stage>-contract.json` + manifesto, informa `fanout_required`)
+    e `handoff <stage>` (imprime o prompt de despacho pronto), e cola esse
+    prompt em você. Você atua só como despachante: dispara 1 subagente por
+    batch; cada subagente lê o pack e o contrato como ARQUIVOS (não executa
+    comando), grava o próprio `output` e devolve recibo de 3 linhas
+    (`ARQUIVO:`/`BLOCOS:`/`BYTES:`). Depois 👤 roda `merge-agent-output`
+    — exige `--agent` distinto por batch; valor genérico (`main`,
+    `orquestrador`, `self`, `principal`) é recusado.
 12. Campo `acao`: ao ver `"acao"` em qualquer JSON de erro (principalmente de
     `merge-agent-output`), execute esse comando LITERALMENTE antes de
     qualquer outra investigação — geralmente `sdd-brief <stage>`. `done` traz
@@ -95,16 +99,16 @@ Duas personas só: 👤 humano digita comando, 🤖 você digita comando. `{{WK}
 é ferramenta, nunca ator — nenhuma frase deste doc deve ler "o script faz X";
 é sempre "👤/🤖 roda `{{WK}} X`". Três tipos de passo:
 
-- **D** (determinístico): mesma entrada → mesma saída, sem LLM. Você roda
-  esses comandos por **conveniência** (já está na sessão, evita ida e volta),
-  não por **necessidade** — qualquer humano roda o mesmo comando sozinho, sem
-  você. Isto é a esmagadora maioria de `{{WK}}` — `ingest`, `promote`,
+- **D** (determinístico): mesma entrada → mesma saída, sem LLM. **Padrão
+  operacional: 👤 roda esses comandos** — os scripts geram as estruturas e
+  artefatos; você só os roda quando o humano pedir explicitamente nesta
+  mensagem. Isto é a esmagadora maioria de `{{WK}}` — `ingest`, `promote`,
   `compile`, `docx`, `lint` (parte mecânica W1–W3/L1/L2/L5), `index status
   /reindex/search/audit`, e todo `{{WK}} code surface/export/config/plan
-  /pending/done/next/evidence/run-stage/merge-agent-output/verify/sdd-brief`.
-  Nenhum deles chama um modelo — conferido lendo `scripts/wk/cli.py`,
-  `scripts/codescan/cli.py` e `scripts/sbindex/cli.py`: nenhum importa
-  cliente de LLM algum.
+  /pending/done/next/evidence/run-stage/handoff/merge-agent-output/verify
+  /sdd-brief`. Nenhum deles chama um modelo — conferido lendo
+  `scripts/wk/cli.py`, `scripts/codescan/cli.py` e `scripts/sbindex/cli.py`:
+  nenhum importa cliente de LLM algum.
 - **M** (requer modelo): sem você, o fluxo empaca — ninguém mais produz esse
   conteúdo. **5 pontos no pipeline de código** (mesmo recorte do README §4,
   "Onde chamar o modelo — os 5 pontos de fan-out") + **2 pontos fora dele**
@@ -121,9 +125,11 @@ Duas personas só: 👤 humano digita comando, 🤖 você digita comando. `{{WK}
   7. **Síntese de resposta em retrieval** — `index search` devolve trechos
      brutos; transformar isso em resposta de prosa é você, não o motor de
      busca (BM25/RRF são D).
-  Nos 5 do pipeline de código, `run-stage`/`merge-agent-output`/`done` ao
-  redor continuam **D** — só o conteúdo que o subagente escreve dentro do
-  fan-out é M.
+  Nos 5 do pipeline de código, `run-stage`/`handoff`/`merge-agent-output`/
+  `done` ao redor continuam **D** (👤 roda) — só o conteúdo que o subagente
+  escreve dentro do fan-out é M. Sua porta de entrada nos 5 pontos M é o
+  prompt de despacho que o humano cola (saída de `{{WK}} code handoff
+  <stage>`): dispare os subagentes ali listados e devolva só os recibos.
 - **H** (decisão humana): você não decide sozinho — **pergunta ao humano**,
   mesmo que tecnicamente pudesse rodar o comando. Vale para:
   - `{{WK}} code ... config --doc-level <x> --granularity <y>` — os valores

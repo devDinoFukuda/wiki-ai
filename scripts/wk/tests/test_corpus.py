@@ -194,6 +194,36 @@ class PublishTests(StoreTestCase):
         data = json.loads(out)
         self.assertEqual(data["publicados"], [])
 
+    def test_publish_reexecutado_e_idempotente_no_staging(self):
+        # reexecutar publish não pode criar duplicata com o mesmo doc_id
+        # (achado 'Alto' de docs/application-analysis.md): o arquivo em
+        # staging é regravado (refresh), mantendo caminho e id.
+        _write(os.path.join(self.workdir, "sdd", "domain.md"), "Dominio v1.\n")
+
+        code, out, err = _run(
+            ["publish", "--workdir", self.workdir, "--topic", "demo", "--store", self.store]
+        )
+        self.assertEqual(code, 0, err)
+        first = json.loads(out)["publicados"][0]
+
+        _write(os.path.join(self.workdir, "sdd", "domain.md"), "Dominio v2.\n")
+        code, out, err = _run(
+            ["publish", "--workdir", self.workdir, "--topic", "demo", "--store", self.store]
+        )
+        self.assertEqual(code, 0, err)
+        second = json.loads(out)["publicados"][0]
+
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(first["path"], second["path"])
+        self.assertTrue(second.get("atualizado"))
+
+        dest_dir = os.path.dirname(os.path.join(self.store, second["path"]))
+        md_files = [n for n in os.listdir(dest_dir) if n.endswith(".md")]
+        self.assertEqual(len(md_files), 1, md_files)
+        text = open(os.path.join(self.store, second["path"]), encoding="utf-8").read()
+        self.assertIn("Dominio v2.", text)
+        self.assertNotIn("Dominio v1.", text)
+
 
 class IngestTests(StoreTestCase):
     def setUp(self):
