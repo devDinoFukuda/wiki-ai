@@ -3563,6 +3563,306 @@ def cmd_publish(a) -> int:
     return 0
 
 
+# ---------- finish: fechamento composto da fase 3D (README) ----------
+#
+# Substitui os 7 comandos manuais de 3D (verify, audit, publish, promote,
+# compile, index reindex, lint) + o docx opcional por UM comando, sem
+# duplicar nenhum gate: cada passo chama o `cmd_*`/CLI interna que já os
+# implementa (verify/audit via `codescan.cli.main`, exatamente como
+# `_run_code` já faz; index reindex via `sbindex.cli.main`, como `_run_index`
+# já faz; publish/promote/compile/docx/lint via os `cmd_*` deste módulo, com
+# um `argparse.Namespace` equivalente ao que o subparser correspondente
+# produziria). `finish` só orquestra: captura a saída de cada passo, decide
+# se para (gate reprovado ou ponto de decisão humana) e monta o resumo.
+
+
+def _finish_capture(fn, *args, **kwargs) -> tuple[int, str, str]:
+    """Roda `fn(*args, **kwargs)` com stdout/stderr capturados.
+
+    Todo `cmd_*`/`main` interno já imprime seu próprio JSON de resultado (ou
+    erro) direto no stdout/stderr real; `finish` precisa desse payload para
+    montar o PRÓPRIO resumo, sem imprimir o corpo de cada passo solto no meio
+    da saída final (que tem que ser um único JSON)."""
+    out_buf, err_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        code = fn(*args, **kwargs)
+    return code, out_buf.getvalue(), err_buf.getvalue()
+
+
+def _finish_payload(stdout_text: str, stderr_text: str) -> dict | None:
+    """Tenta decodificar o JSON impresso pelo passo (stdout primeiro; alguns
+    erros de entrada saem só em stderr, ex.: `cmd_publish` sem --topic)."""
+    for raw in (stdout_text, stderr_text):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _finish_acao(payload: dict | None, fallback: str) -> str:
+    """Propaga a `acao` (ou equivalente) do JSON original do passo que falhou
+    — nunca inventa um motivo genérico quando o passo já disse o que fazer."""
+    if isinstance(payload, dict):
+        for key in ("acao", "message"):
+            v = payload.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+        # `audit` reporta blockers por stage/artefato, cada um com `action`
+        # (ver README 3B: "o erro traz blockers[].action") — sem `acao`
+        # de topo, agrega os primeiros para não deixar o motivo mudo.
+        acoes: list[str] = []
+        for stage_report in payload.get("stages") or []:
+            for b in stage_report.get("blockers") or []:
+                if isinstance(b, dict) and isinstance(b.get("action"), str):
+                    acoes.append(b["action"])
+            for art in stage_report.get("artifacts") or []:
+                for b in art.get("blockers") or []:
+                    if isinstance(b, dict) and isinstance(b.get("action"), str):
+                        acoes.append(b["action"])
+        if acoes:
+            vistos: list[str] = []
+            for a_ in acoes:
+                if a_ not in vistos:
+                    vistos.append(a_)
+                if len(vistos) >= 3:
+                    break
+            return "; ".join(vistos)
+        err = payload.get("error")
+        if isinstance(err, str) and err.strip():
+            return f"{err} — {fallback}"
+    return fallback
+
+
+def cmd_finish(a) -> int:
+    """Fechamento composto do FLUXO 3 (README 3D): roda, em sequência,
+    `code verify` (confirmed.md + inferred.md se existir) -> `code audit` ->
+    `publish` -> [PONTO DE DECISÃO HUMANA] -> `promote --approve-all` ->
+    `compile` -> `index reindex` -> `lint` -> `docx` (opcional).
+
+    Para no PRIMEIRO passo reprovado, propagando o `acao` original do passo
+    (nunca inventa outro motivo). Sem `--approve`, para ANTES de rodar
+    `promote` — aprovação em massa nunca é implícita (mesma regra F-11 já
+    aplicada por `cmd_promote`; aqui só a decisão de RODAR é antecipada).
+
+    Saída: um único JSON `{"passos": [...], "parado_em"?, "acao"?}` — nenhum
+    passo imprime a própria saída solta no meio.
+    """
+    from codescan.cli import main as codescan_main
+    from sbindex.cli import main as sbindex_main
+    from sbindex.frontmatter import split as _fm_split
+
+    store_root = _store_root(a)
+    repo = a.repo
+    workdir = os.path.abspath(a.workdir)
+    topic = (a.topic or "").strip()
+    approved_by = (a.approved_by or "").strip()
+    allow_unverified = bool(getattr(a, "allow_unverified", False))
+    passos: list[dict] = []
+
+    def emit(code: int, *, parado_em: str | None = None, acao: str | None = None, **extra) -> int:
+        out: dict = {"passos": passos}
+        if parado_em is not None:
+            out["parado_em"] = parado_em
+        out.update(extra)
+        if acao is not None:
+            out["acao"] = acao
+        print(json.dumps(out, ensure_ascii=False, indent=2), file=(sys.stdout if code == 0 else sys.stderr))
+        return code
+
+    if not os.path.isdir(workdir):
+        passos.append({"passo": "workdir", "status": "falhou", "resumo": f"não encontrado: {a.workdir}"})
+        return emit(2, parado_em="workdir", acao=f"confira o caminho de --workdir ({a.workdir!r})")
+
+    # 1) verify — confirmed.md sempre; inferred.md também, se existir (F-02: a
+    # cobertura exige os dois para o stage `verify` virar `done`). ------------
+    confirmed = os.path.join(workdir, "sdd", "confirmed.md")
+    inferred = os.path.join(workdir, "sdd", "inferred.md")
+    verify_artifacts = [confirmed] + ([inferred] if os.path.isfile(inferred) else [])
+    verify_payload: dict | None = None
+    for artifact in verify_artifacts:
+        code, out_text, err_text = _finish_capture(
+            codescan_main,
+            ["--store", store_root, "--repo", repo, "verify", "--artifact", artifact],
+        )
+        verify_payload = _finish_payload(out_text, err_text)
+        rel = os.path.relpath(artifact, workdir).replace("\\", "/")
+        if code != 0:
+            passos.append({"passo": "verify", "status": "falhou", "resumo": f"{rel}: reprovado (exit {code})"})
+            return emit(2, parado_em="verify", acao=_finish_acao(
+                verify_payload,
+                f"corrija as citações de `{rel}` e rode `wk code --repo {repo} --store {store_root} "
+                f"verify --artifact {artifact}` de novo",
+            ))
+    cobertura = (verify_payload or {}).get("cobertura") or {}
+    stage_status = (verify_payload or {}).get("stage_status")
+    if stage_status != "done":
+        passos.append({
+            "passo": "verify", "status": "falhou",
+            "resumo": f"cobertura incompleta: faltam {cobertura.get('faltantes_obrigatorios')}",
+        })
+        return emit(2, parado_em="verify", acao=_finish_acao(
+            verify_payload, "rode o(s) `code verify --artifact` que faltam para fechar a cobertura",
+        ))
+    passos.append({
+        "passo": "verify", "status": "ok",
+        "resumo": f"cobertura completa: {', '.join(cobertura.get('verificados') or [])}",
+    })
+
+    # 2) audit — exige status pass e score >= threshold (hoje 90); o próprio
+    # `sdd.audit_stages` decide o threshold, `finish` não o hardcoda. ---------
+    code, out_text, err_text = _finish_capture(
+        codescan_main, ["--store", store_root, "--repo", repo, "audit"],
+    )
+    audit_payload = _finish_payload(out_text, err_text)
+    if code != 0:
+        passos.append({
+            "passo": "audit", "status": "falhou",
+            "resumo": f"status={(audit_payload or {}).get('status')} score={(audit_payload or {}).get('score')}",
+        })
+        return emit(2, parado_em="audit", acao=_finish_acao(
+            audit_payload, "corrija os blockers de `wk code audit` e rode `wk finish` de novo",
+        ))
+    passos.append({
+        "passo": "audit", "status": "ok",
+        "resumo": f"status={audit_payload.get('status')} score={audit_payload.get('score')}",
+    })
+
+    # 3) publish — leva a árvore SDD do workdir para inbox/. ------------------
+    code, out_text, err_text = _finish_capture(
+        cmd_publish, argparse.Namespace(workdir=workdir, topic=topic, store=store_root),
+    )
+    publish_payload = _finish_payload(out_text, err_text)
+    if code != 0:
+        passos.append({"passo": "publish", "status": "falhou", "resumo": "falha ao publicar em inbox/"})
+        return emit(2, parado_em="publish", acao=_finish_acao(
+            publish_payload, "corrija o erro de `wk publish` e rode `wk finish` de novo",
+        ))
+    n_publicados = len((publish_payload or {}).get("publicados") or [])
+    passos.append({"passo": "publish", "status": "ok", "resumo": f"{n_publicados} artefato(s) publicado(s)"})
+
+    # 4) PONTO DE DECISÃO HUMANA — sem --approve, para AQUI. Nunca aprova
+    # implicitamente. Com --approve: promote --approve-all --source-type
+    # agent-output --topic <t> --approved-by <nome> (regras F-11 vigentes,
+    # aplicadas por `cmd_promote`; nada é reimplementado aqui). -------------
+    if not getattr(a, "approve", False):
+        targets, _err = _resolve_promote_targets(store_root, None)
+        approved_paths, _em_massa, _targets, _err2 = _collect_approved_paths(
+            store_root, list(targets), None, "agent-output", topic,
+        )
+        pendentes = []
+        for path in sorted(approved_paths):
+            meta, _body = _fm_split(_read_md(path))
+            pendentes.append({
+                "id": meta.get("id"),
+                "path": os.path.relpath(path, store_root).replace("\\", "/"),
+            })
+        passos.append({
+            "passo": "promote", "status": "pendente_aprovacao",
+            "resumo": f"{len(pendentes)} item(ns) seriam aprovados (source_type=agent-output, topic={topic})",
+        })
+        return emit(
+            3, parado_em="promote", pendentes=pendentes,
+            acao=f"reexecute com --approve para aprovar como {approved_by}",
+        )
+
+    code, out_text, err_text = _finish_capture(
+        cmd_promote,
+        argparse.Namespace(
+            target=None, store=store_root,
+            approve=None, approve_all=True,
+            approve_source_type="agent-output", approve_topic=topic,
+            approved_by=approved_by, allow_unverified=allow_unverified,
+        ),
+    )
+    promote_payload = _finish_payload(out_text, err_text)
+    if code != 0:
+        passos.append({"passo": "promote", "status": "falhou", "resumo": "falha ao promover para raw/"})
+        return emit(2, parado_em="promote", acao=_finish_acao(
+            promote_payload, "corrija o erro de `wk promote` e rode `wk finish --approve` de novo",
+        ))
+    n_promovidos = len((promote_payload or {}).get("promovidos") or [])
+    passos.append({
+        "passo": "promote", "status": "ok",
+        "resumo": f"{n_promovidos} fonte(s) promovida(s) para raw/ (aprovado por {approved_by})",
+    })
+
+    # 5) compile ---------------------------------------------------------------
+    code, out_text, err_text = _finish_capture(
+        cmd_compile,
+        argparse.Namespace(topic=topic, store=store_root, no_prune=False, allow_unverified=allow_unverified),
+    )
+    compile_payload = _finish_payload(out_text, err_text)
+    if code != 0:
+        passos.append({"passo": "compile", "status": "falhou", "resumo": "falha ao compilar wiki/"})
+        return emit(2, parado_em="compile", acao=_finish_acao(
+            compile_payload, "corrija o erro de `wk compile` e rode `wk finish --approve` de novo",
+        ))
+    n_paginas = len((compile_payload or {}).get("paginas") or [])
+    passos.append({"passo": "compile", "status": "ok", "resumo": f"{n_paginas} página(s) compilada(s)"})
+
+    # 6) index reindex — completo (embeddings inclusos; não --lex-only). -------
+    code, out_text, err_text = _finish_capture(
+        sbindex_main, ["--store", store_root, "reindex"],
+    )
+    reindex_payload = _finish_payload(out_text, err_text)
+    if code != 0:
+        passos.append({"passo": "reindex", "status": "falhou", "resumo": "falha em `index reindex`"})
+        return emit(2, parado_em="reindex", acao=_finish_acao(
+            reindex_payload, "corrija o erro de `wk index reindex` e rode `wk finish --approve` de novo",
+        ))
+    passos.append({
+        "passo": "reindex", "status": "ok",
+        "resumo": (
+            f"documentos={reindex_payload.get('documents')} alterados={reindex_payload.get('changed')} "
+            f"podados={reindex_payload.get('pruned')} embutidos={reindex_payload.get('embedded')}"
+        ) if reindex_payload else "ok",
+    })
+
+    # 7) lint — diagnóstico: achados NÃO abortam o finish. ---------------------
+    code, out_text, err_text = _finish_capture(
+        cmd_lint, argparse.Namespace(path=None, store=store_root),
+    )
+    lint_payload = _finish_payload(out_text, err_text)
+    if isinstance(lint_payload, dict) and "achados" in lint_payload:
+        passos.append({
+            "passo": "lint",
+            "status": "ok" if not lint_payload["achados"] else "aviso",
+            "resumo": f"{lint_payload['achados']} achado(s) | relatório: {lint_payload.get('report')}",
+        })
+    else:
+        passos.append({
+            "passo": "lint", "status": "aviso",
+            "resumo": _finish_acao(lint_payload, f"lint não rodou (exit {code}); rode `wk lint --store {store_root}` manualmente"),
+        })
+
+    # opcional) docx — falha aqui é warning, não derruba o finish. -------------
+    if not getattr(a, "no_docx", False):
+        code, out_text, err_text = _finish_capture(
+            cmd_docx,
+            argparse.Namespace(
+                topic=topic, store=store_root, out_dir="wiki-docx",
+                no_prune=False, allow_unverified=allow_unverified,
+            ),
+        )
+        docx_payload = _finish_payload(out_text, err_text)
+        if code != 0:
+            passos.append({
+                "passo": "docx", "status": "aviso",
+                "resumo": _finish_acao(docx_payload, f"`wk docx {topic}` falhou (exit {code}); gere manualmente se precisar"),
+            })
+        else:
+            n_docs = len((docx_payload or {}).get("documentos") or [])
+            passos.append({"passo": "docx", "status": "ok", "resumo": f"{n_docs} documento(s) .docx gerado(s)"})
+
+    return emit(0)
+
+
 # ---------- despacho para as CLIs existentes ----------
 
 
@@ -3754,6 +4054,31 @@ def _build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--topic", default=None, help="tópico do wiki-ai (OBRIGATÓRIO)")
     pu.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     pu.set_defaults(fn=cmd_publish)
+
+    fi = sub.add_parser(
+        "finish",
+        help=(
+            "fechamento composto da fase 3D (substitui verify+audit+publish+"
+            "promote+compile+index reindex+lint(+docx))"
+        ),
+    )
+    fi.add_argument("--workdir", required=True, help="workdir do codescan (.codescan/<repo>-<hash>)")
+    fi.add_argument("--topic", required=True, help="tópico do wiki-ai")
+    fi.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    fi.add_argument("--repo", required=True, help="mesmo --repo usado em `wk code` para este workdir")
+    fi.add_argument("--approved-by", required=True, help="quem aprova o promote; vai para promoted_by e log.md")
+    fi.add_argument(
+        "--approve", action="store_true",
+        help="aprova o promote (F-11); sem esta flag, finish PARA antes do promote "
+             "(ponto de decisão humana) e não promove nada",
+    )
+    fi.add_argument(
+        "--allow-unverified", action="store_true",
+        help="propaga aos passos promote/compile/docx: segue mesmo com verify falhado "
+             "noutro workdir/topic (decisão humana explícita, registrada no log)",
+    )
+    fi.add_argument("--no-docx", action="store_true", help="pula o passo opcional de geração de wiki-docx/")
+    fi.set_defaults(fn=cmd_finish)
 
     # Grupos repassados às CLIs internas: parsing fica com elas.
     for name, help_ in (

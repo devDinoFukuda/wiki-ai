@@ -14,7 +14,13 @@
   read      lê arquivo do repo com limite de linhas (leitura confinada)
   evidence  gera pacote JSON de evidências por tópico, sem parser nativo
   run-stage prepara manifesto determinístico para subagentes, sem gerar SDD
+  run       composto: run-stage + handoff (prepara o fan-out e entrega o prompt)
+  integrate composto: merge de todos os batches do manifesto + done do estágio
   verify    valida Markdown confirmado contra citações arquivo:linha
+
+`next --run` executa a próxima ação quando ela é determinística; decisão
+humana (config/pending) e passo de LLM continuam pedindo o comando explícito.
+Todo payload de `next`/`state`/`run`/`integrate`/`done` carrega `progresso`.
 
 O legado é READ-ONLY: nada é escrito dentro do repositório analisado.
 """
@@ -320,24 +326,27 @@ def cmd_plan(a) -> int:
     return 0
 
 
-def cmd_next(a) -> int:
+def _next_payload(a) -> dict:
+    """Payload puro do `next` (mesmos campos de sempre, sem imprimir).
+
+    Extraído de `cmd_next` para que os compostos (`next --run`) possam decidir
+    a partir do MESMO cálculo de `acao` que o humano vê — sem uma segunda
+    implementação da máquina de estados que pudesse divergir dos gates.
+    """
     wd = _wd(a)
     st = st_mod.load(wd)
     if not st:
-        print(json.dumps({"proximo": "surface", "motivo": "nada iniciado"}))
-        return 0
+        return {"proximo": "surface", "motivo": "nada iniciado"}
     if _surface_done(st):
         missing = _missing_sdd_config(st)
         if missing:
-            out = {
+            return {
                 "proximo": "config",
                 "status": "pending",
                 "motivo": "config SDD obrigatória antes de plan/run-stage modules",
                 "missing": missing,
                 "acao": SDD_CONFIG_ACTION,
             }
-            print(json.dumps(out, ensure_ascii=False, indent=2))
-            return 0
     stage = None
     for candidate in st_mod.STAGES:
         s_candidate = st.get("stages", {}).get(candidate, {})
@@ -347,8 +356,7 @@ def cmd_next(a) -> int:
     if stage is None:
         stage = st_mod.next_stage(st)
     if stage is None:
-        print(json.dumps({"proximo": None, "motivo": "pipeline completo"}))
-        return 0
+        return {"proximo": None, "motivo": "pipeline completo"}
     s = st["stages"][stage]
     out = {"proximo": stage, "status": s.get("status")}
     if s.get("last_error"):
@@ -366,8 +374,7 @@ def cmd_next(a) -> int:
                 out["item"] = first.get("item")
         else:
             out["acao"] = _action_for_blocker(wd, stage, s.get("last_artifact"), error_text)
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0
+        return out
     for problem in st_mod.ITEM_PROBLEM_STATUSES:
         if s.get(problem):
             out[problem] = s[problem]
@@ -383,7 +390,16 @@ def cmd_next(a) -> int:
         out["concluidos"] = len(s.get("done") or [])
         out["motivo"] = "itens concluídos; falta consolidar artefatos SDD e rodar done do estágio"
         out["acao"] = f"gerar artefatos SDD de {stage} e rodar done {stage}"
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+def cmd_next(a) -> int:
+    wd = _wd(a)
+    payload = _next_payload(a)
+    payload["progresso"] = _progresso(wd, st_mod.load(wd), payload.get("proximo"))
+    if getattr(a, "run", False):
+        return _next_run(a, payload)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1152,7 +1168,11 @@ def cmd_done(a) -> int:
             _err(error)
             return 2
     st = st_mod.clear_stage_error(wd, a.stage)
-    print(json.dumps(st["stages"][a.stage], ensure_ascii=False, indent=2))
+    # `progresso` só no payload IMPRESSO: cópia rasa para não vazar o campo
+    # derivado para dentro de state.json em um save posterior.
+    out = dict(st["stages"][a.stage])
+    out["progresso"] = _progresso(wd, st, a.stage)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1181,7 +1201,9 @@ def cmd_state(a) -> int:
     if not st:
         print(json.dumps({"error": "sem estado; rode `surface`"}), file=sys.stderr)
         return 1
-    print(json.dumps(st, ensure_ascii=False, indent=2))
+    out = dict(st)
+    out["progresso"] = _progresso(wd, st)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1387,6 +1409,50 @@ def _load_json_or_none(path: str) -> dict | None:
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+PROGRESSO_FASES = ("preparacao", "fanout", "fechamento")
+
+
+def _stage_phase(wd: str, stage: str, st: dict) -> str:
+    """Fase do estágio dentro do ciclo `preparar -> fan-out -> fechar`.
+
+    Determinística e derivada só de disco + state.json: `preparacao` enquanto
+    não existe manifesto de fan-out (`agent-runs/<stage>-plan.json`), `fanout`
+    entre o `run-stage` e o fechamento dos itens, `fechamento` quando os itens
+    já estão completos (falta só o `done`) ou o estágio fechou.
+    """
+    s = (st.get("stages") or {}).get(stage) or {}
+    if s.get("status") == "done" or s.get("items_complete"):
+        return "fechamento"
+    if os.path.isfile(_plan_manifest_path(wd, stage)):
+        return "fanout"
+    return "preparacao"
+
+
+def _progresso(wd: str, st: dict | None, stage: str | None = None) -> str:
+    """Campo `progresso`: `"etapa <i> de <total> — fase <...>"`.
+
+    Um único escalar que responde "onde eu estou" sem que o orquestrador
+    precise gastar uma invocação (e o corpo inteiro do `state`) só para
+    descobrir isso — é o campo que aparece em `next`, `state`, `run`,
+    `integrate` e `done`. Escalar de propósito: sobrevive intacto ao
+    `--quiet` (`_quiet_condense` só colapsa listas/dicts).
+
+    `stage` fora de `state.STAGES` (ex.: o pseudo-passo `config` do `next`)
+    cai no estágio real corrente; pipeline completo devolve a última etapa.
+    """
+    total = len(st_mod.STAGES)
+    if not st:
+        return f"etapa 1 de {total} — fase preparacao"
+    if stage not in st_mod.STAGES:
+        stage = st_mod.next_stage(st)
+    if stage is None:
+        return f"etapa {total} de {total} — fase fechamento"
+    return (
+        f"etapa {st_mod.STAGES.index(stage) + 1} de {total} "
+        f"— fase {_stage_phase(wd, stage, st)}"
+    )
 
 
 def _plan_created_at_epoch(wd: str, stage: str) -> float | None:
@@ -1952,6 +2018,391 @@ def cmd_run_stage(a) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Compostos (`run`, `integrate`, `next --run`).
+#
+# FLUXO 3 gastava ~40 invocações porque cada passo determinístico da máquina de
+# estados era um `wk code ...` separado (run-stage, handoff, N merges, done,
+# next entre cada um). Os compostos abaixo NÃO reimplementam nem afrouxam nada:
+# chamam exatamente a mesma `fn` que o argparse chamaria, com o mesmo namespace,
+# e só reempacotam a saída. Todo gate (freshness do input, --agent obrigatório,
+# conflito de re-merge, artefato de outro batch, ruído, blockers do done, ...)
+# continua valendo porque é literalmente o mesmo código executando.
+# ---------------------------------------------------------------------------
+
+
+def _capture(fn, args) -> tuple[int, str, str]:
+    """Roda um subcomando existente capturando stdout/stderr (mesmo mecanismo
+    do `--quiet`; redirects aninham sem problema)."""
+    out_buf, err_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        code = fn(args)
+    return code, out_buf.getvalue(), err_buf.getvalue()
+
+
+def _split_json_prefix(text: str) -> tuple[dict | None, str]:
+    """Separa o payload JSON do resto da saída.
+
+    `run` imprime uma linha JSON seguida do prompt de despacho em texto cru —
+    o composto precisa recuperar o dict sem perder o prompt (que é o produto
+    entregue ao humano). Devolve `(payload_ou_None, cauda_em_texto)`.
+    """
+    raw = text.strip("\n")
+    if not raw.strip():
+        return None, ""
+    try:
+        value = json.loads(raw)
+        return (value if isinstance(value, dict) else None), ""
+    except ValueError:
+        pass
+    lines = raw.split("\n")
+    try:
+        value = json.loads(lines[0])
+    except ValueError:
+        return None, text
+    tail = "\n".join(lines[1:]).strip("\n")
+    return (value if isinstance(value, dict) else None), tail
+
+
+def _derived_args(a, **overrides):
+    """Namespace irmão do atual com os defaults do subcomando alvo aplicados.
+
+    Os compostos não passam pelo argparse do subcomando chamado, então os
+    defaults que aquele subparser aplicaria precisam ser explicitados aqui.
+    """
+    ns = argparse.Namespace(**vars(a))
+    for key, value in overrides.items():
+        setattr(ns, key, value)
+    return ns
+
+
+def cmd_run(a) -> int:
+    """`run <stage>` = `run-stage <stage>` + `handoff <stage>`.
+
+    Um comando prepara o fan-out E entrega o prompt de despacho. Falha do
+    `run-stage` aborta antes do handoff e propaga a saída original intacta
+    (mesmo `error`/`acao`, mesmo exit code).
+
+    STDOUT: uma linha JSON (manifesto/batches/`progresso`/`acao`) e, abaixo
+    dela, o prompt cru pronto para colar.
+    """
+    stage = a.stage
+    args = _derived_args(a, stage=stage)
+    code, out_text, err_text = _capture(cmd_run_stage, args)
+    if code != 0:
+        sys.stdout.write(out_text)
+        sys.stderr.write(err_text)
+        return code
+    payload, _tail = _split_json_prefix(out_text)
+    payload = payload if payload is not None else {"stage": stage}
+    hcode, hout, herr = _capture(cmd_handoff, args)
+    if hcode != 0:
+        sys.stdout.write(out_text)
+        sys.stderr.write(herr)
+        return hcode
+    wd = _wd(a)
+    payload["progresso"] = _progresso(wd, st_mod.load(wd), stage)
+    payload["acao"] = (
+        f"cole na LLM despachante o prompt impresso abaixo desta linha JSON "
+        f"({payload.get('fanout_required', len(payload.get('batches') or []))} subagente(s), "
+        f"cada um grava o próprio output); quando os outputs existirem, rode "
+        f"`integrate {stage}` — um único comando faz todos os merges e o done {stage}"
+    )
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    sys.stdout.write(hout if hout.endswith("\n") else hout + "\n")
+    return 0
+
+
+def _integrate_batch_id(batch: dict, fallback: int) -> int:
+    try:
+        return int(batch.get("batch"))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def cmd_integrate(a) -> int:
+    """`integrate <stage>`: merge de TODOS os batches do manifesto + `done`.
+
+    Lê `agent-runs/<stage>-plan.json` e, na ordem dos batches, roda o fluxo
+    real de `merge-agent-output` com o `--agent <agent_slot>` do próprio
+    manifesto (nada de `--agent main`: o slot vem do plano, então o fan-out
+    continua provável). Todos os gates de merge continuam ativos.
+
+    Nada é mergeado parcialmente por acidente: se faltar QUALQUER
+    `agent-outputs/<stage>-batch-NN.txt`, o comando falha antes do primeiro
+    merge listando os `faltantes[]`. `--partial` é o opt-in explícito para
+    integrar só o que já chegou.
+
+    Primeiro erro para a execução e propaga o payload ORIGINAL do subcomando
+    (com `comandos_redo`, `violacoes`, ...), acrescido do contexto do batch.
+    """
+    wd = _wd(a)
+    stage = a.stage
+    st = st_mod.load(wd)
+    manifest = _load_json_or_none(_plan_manifest_path(wd, stage))
+    if manifest is None:
+        _err(
+            f"manifesto ausente para {stage}; rode `run {stage}` antes de integrate",
+            acao=(
+                f"{_sdd_brief_hint(stage)}; rode `run {stage}`, cole o prompt de handoff "
+                f"e só então `integrate {stage}`"
+            ),
+            progresso=_progresso(wd, st, stage),
+        )
+        return 2
+    batches = manifest.get("batches") or []
+    if not batches:
+        _err(
+            f"manifesto de {stage} sem batches",
+            acao=f"rode `run {stage}` novamente",
+            progresso=_progresso(wd, st, stage),
+        )
+        return 2
+
+    faltantes = [
+        {
+            "batch": _integrate_batch_id(b, i),
+            "agent": b.get("agent_slot"),
+            "output": b.get("output"),
+        }
+        for i, b in enumerate(batches, start=1)
+        if not os.path.isfile(str(b.get("output") or ""))
+    ]
+    if faltantes and not getattr(a, "partial", False):
+        _err(
+            f"output(s) de subagente ausente(s) para {stage}: "
+            + ", ".join(str(f["output"]) for f in faltantes),
+            faltantes=faltantes,
+            acao=(
+                "cada subagente precisa GRAVAR o próprio recibo antes do merge; falta(m) "
+                + ", ".join(f"{f['agent']} -> {f['output']}" for f in faltantes)
+                + f"; rode `handoff {stage}` para reemitir o prompt, ou "
+                f"`integrate {stage} --partial` para integrar só os batches já entregues"
+            ),
+            progresso=_progresso(wd, st, stage),
+        )
+        return 2
+
+    merges: list[dict] = []
+    for i, batch in enumerate(batches, start=1):
+        batch_id = _integrate_batch_id(batch, i)
+        slot = batch.get("agent_slot")
+        output = str(batch.get("output") or "")
+        if not os.path.isfile(output):  # só alcançável com --partial
+            merges.append({"batch": batch_id, "agent": slot, "status": "ausente", "output": output})
+            continue
+        code, out_text, err_text = _capture(
+            cmd_merge_agent_output,
+            _derived_args(a, stage=stage, input=output, agent=slot),
+        )
+        if code != 0:
+            payload, _tail = _split_json_prefix(err_text or out_text)
+            if payload is None:
+                payload = {"error": (err_text or out_text).strip() or f"falha no merge do batch {batch_id}"}
+            payload.setdefault("acao", _sdd_brief_hint(stage))
+            payload.setdefault("stage", stage)
+            payload["batch"] = batch_id
+            payload["agent"] = slot
+            payload["input"] = output
+            payload["merges"] = merges
+            payload["progresso"] = _progresso(wd, st_mod.load(wd), stage)
+            print(json.dumps(payload, ensure_ascii=False, indent=2), file=sys.stderr)
+            return code
+        result, _tail = _split_json_prefix(out_text)
+        entry = {"batch": batch_id, "agent": slot, "status": "ok"}
+        if isinstance(result, dict):
+            entry["items"] = result.get("items")
+            entry["artifacts"] = result.get("artifacts")
+            if result.get("blockers"):
+                entry["blockers"] = result["blockers"]
+            if result.get("warnings"):
+                entry["warnings"] = result["warnings"]
+        merges.append(entry)
+
+    dcode, dout, derr = _capture(
+        cmd_done, _derived_args(a, stage=stage, item=None, artifact=None)
+    )
+    if dcode != 0:
+        payload, _tail = _split_json_prefix(derr or dout)
+        if payload is None:
+            payload = {"error": (derr or dout).strip() or f"falha no done {stage}"}
+        payload.setdefault("acao", f"corrija o blocker e rode `done {stage}`")
+        payload.setdefault("stage", stage)
+        payload["merges"] = merges
+        payload["progresso"] = _progresso(wd, st_mod.load(wd), stage)
+        print(json.dumps(payload, ensure_ascii=False, indent=2), file=sys.stderr)
+        return dcode
+    done_payload, _tail = _split_json_prefix(dout)
+    print(json.dumps(
+        {
+            "stage": stage,
+            "merges": merges,
+            "done": done_payload if done_payload is not None else dout.strip(),
+            "progresso": _progresso(wd, st_mod.load(wd), stage),
+        },
+        ensure_ascii=False,
+        indent=2,
+    ))
+    return 0
+
+
+# Subcomandos que `next --run` pode disparar sozinho: 100% determinísticos,
+# sem decisão humana e sem passo de LLM no meio.
+NEXT_RUNNABLE_CMDS = (
+    "run-stage", "handoff", "run", "integrate", "done", "evidence", "export", "plan",
+)
+
+
+def _next_command(a, name: str, stage: str | None = None):
+    """(nome, fn, namespace) de um subcomando determinístico, já com os
+    defaults que o subparser correspondente aplicaria."""
+    if name == "plan":
+        return name, cmd_plan, _derived_args(
+            a, top=None, batches=None,
+            agent_pack_max_bytes=agentpack_mod.DEFAULT_MAX_BYTES, include_tests=False,
+        )
+    if name == "export":
+        return name, cmd_export, _derived_args(a, topic=None, output=None)
+    if name == "evidence":
+        return name, cmd_evidence, _derived_args(
+            a, topic=None, top=20, context=ev_mod.DEFAULT_CONTEXT,
+            max_lines=ev_mod.DEFAULT_MAX_LINES, output=None,
+        )
+    if name in ("run", "run-stage"):
+        fn = cmd_run if name == "run" else cmd_run_stage
+        return name, fn, _derived_args(
+            a, stage=stage, batches=None,
+            max_bytes=agentpack_mod.DEFAULT_MAX_BYTES,
+            max_files=agentpack_mod.DEFAULT_MAX_FILES_PER_MODULE,
+            max_lines=agentpack_mod.DEFAULT_MAX_LINES_PER_FILE,
+        )
+    if name == "handoff":
+        return name, cmd_handoff, _derived_args(a, stage=stage)
+    if name == "integrate":
+        return name, cmd_integrate, _derived_args(a, stage=stage, partial=False)
+    if name == "done":
+        return name, cmd_done, _derived_args(a, stage=stage, item=None, artifact=None)
+    raise KeyError(name)
+
+
+def _next_dispatch(a, payload: dict):
+    """Resolve o passo do `next` em UM subcomando determinístico, ou explica
+    por que não dá para executá-lo sozinho.
+
+    Devolve `(nome, fn, args)` para executar, ou um dict
+    `{bloqueado_em, acao}` quando o próximo passo é decisão humana (`config`,
+    `pending`, parâmetros de `surface`/`verify`) ou passo de LLM (colar o
+    handoff, gerar os outputs dos subagentes, escrever artefato SDD que falta).
+    Uma ação por chamada — nunca encadeia, nunca recorre.
+    """
+    wd = _wd(a)
+    st = st_mod.load(wd)
+    stage = payload.get("proximo")
+    acao = str(payload.get("acao") or "")
+
+    if stage is None:
+        return {"bloqueado_em": "pipeline_completo", "acao": "nada a executar"}
+    if not st:
+        return {
+            "bloqueado_em": "passo_manual",
+            "acao": "rode `surface --topic <topico>` (parâmetros de varredura não são dedutíveis do estado)",
+        }
+    # `export` é 100% determinístico e obrigatório no estágio 1, mas nunca é o
+    # `proximo` da máquina de estados (não é um stage) — sem este ramo ele
+    # ficaria inalcançável por `next --run`.
+    if _surface_done(st) and not _nonempty(_sdd(wd, "inventory.md")):
+        return _next_command(a, "export")
+    if stage == "config":
+        return {"bloqueado_em": "decisao_humana", "acao": acao or SDD_CONFIG_ACTION}
+    if stage == "surface":
+        return {
+            "bloqueado_em": "passo_manual",
+            "acao": acao or "rode `surface --topic <topico>` (parâmetros de varredura não são dedutíveis do estado)",
+        }
+
+    s = (st.get("stages") or {}).get(stage) or {}
+    if s.get("last_error"):
+        return {
+            "bloqueado_em": "blocker_do_done",
+            "acao": acao or f"corrija o blocker e rode `done {stage}`",
+        }
+    if s.get("status") in st_mod.ITEM_PROBLEM_STATUSES:
+        return {
+            "bloqueado_em": f"estagio_{s.get('status')}",
+            "acao": acao or f"resolva o item {s.get('status')} e rode `done {stage}`",
+        }
+    if stage == "evidence":
+        return _next_command(a, "evidence")
+    if stage == "verify":
+        return {
+            "bloqueado_em": "passo_manual",
+            "acao": "rode `verify --artifact <markdown>` (o artefato a verificar não sai do estado)",
+        }
+
+    # Estágios de fan-out: plan -> run -> (LLM grava outputs) -> integrate.
+    if stage == "modules" and not s.get("pending") and not (s.get("done") or []):
+        return _next_command(a, "plan")
+    if (
+        stage in st_mod.ITEM_STAGES_REQUIRE_FINALIZE
+        and stage != "modules"
+        and not s.get("pending")
+        and not (s.get("done") or [])
+    ):
+        return {
+            "bloqueado_em": "decisao_humana",
+            "acao": f"escolha as unidades do estágio e rode `pending {stage} --items a,b,c`",
+        }
+    if s.get("items_complete") and s.get("status") != "done":
+        return _next_command(a, "done", stage)
+    manifest = _load_json_or_none(_plan_manifest_path(wd, stage))
+    batches = (manifest or {}).get("batches") or []
+    if not batches:
+        return _next_command(a, "run", stage)
+    faltantes = [
+        str(b.get("output")) for b in batches if not os.path.isfile(str(b.get("output") or ""))
+    ]
+    if faltantes:
+        return {
+            "bloqueado_em": "outputs_de_subagente_ausentes",
+            "acao": (
+                f"passo de LLM: cole o prompt de `handoff {stage}` na LLM despachante e faça cada "
+                f"subagente GRAVAR o próprio output; falta(m) " + ", ".join(faltantes)
+                + f"; depois rode `integrate {stage}`"
+            ),
+            "faltantes": faltantes,
+        }
+    return _next_command(a, "integrate", stage)
+
+
+def _next_run(a, payload: dict) -> int:
+    """`next --run`: no máximo UMA ação determinística por invocação."""
+    plan = _next_dispatch(a, payload)
+    if isinstance(plan, dict):
+        out = dict(payload)
+        out.update(plan)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    name, fn, args = plan
+    code, out_text, err_text = _capture(fn, args)
+    result, tail = _split_json_prefix(out_text if code == 0 else (err_text or out_text))
+    wd = _wd(a)
+    envelope: dict = {
+        "proximo": payload.get("proximo"),
+        "executado": name,
+        "exit_code": code,
+        "progresso": _progresso(wd, st_mod.load(wd)),
+    }
+    if result is not None:
+        envelope["resultado"] = result
+    else:
+        envelope["saida"] = (out_text or err_text).strip()
+    stream = sys.stdout if code == 0 else sys.stderr
+    print(json.dumps(envelope, ensure_ascii=False, indent=2), file=stream)
+    if tail:
+        sys.stdout.write(tail if tail.endswith("\n") else tail + "\n")
+    return code
+
+
 _EXPORT_GUARDED_STORE_SUBDIRS = ("raw", "wiki")
 
 
@@ -2344,12 +2795,10 @@ def _quiet_extra_fields(cmd: str, payload: dict) -> dict:
 
 def _quiet_summary(cmd: str, code: int, out_text: str, err_text: str) -> dict:
     raw = out_text.strip() or err_text.strip()
-    payload = None
-    if raw:
-        try:
-            payload = json.loads(raw)
-        except ValueError:
-            payload = None
+    # `_split_json_prefix` (e não `json.loads` direto) porque `run` imprime uma
+    # linha JSON seguida do prompt de despacho: sem isso o resumo de `--quiet`
+    # degradaria para `output_bytes` justamente no composto principal.
+    payload, _tail = _split_json_prefix(raw) if raw else (None, "")
     summary: dict = {"ok": code == 0, "cmd": cmd}
     if isinstance(payload, dict):
         if isinstance(payload.get("error"), str):
@@ -2438,6 +2887,8 @@ def _flag_reorder_hint(argv: list[str], subcommands: set[str]) -> dict | None:
 # sem indicar que o comando certo é `evidence --topic <topico>`.
 _STAGE_CMD_VALUE_FLAGS = {
     "run-stage": ("--batches", "--max-bytes", "--max-files", "--max-lines"),
+    "run": ("--batches", "--max-bytes", "--max-files", "--max-lines"),
+    "integrate": (),
     "merge-agent-output": ("--input", "--agent"),
     "agent-pack": ("--batch", "--batches", "--max-bytes", "--max-files", "--max-lines", "--output"),
     "redo": ("--item",),
@@ -2590,6 +3041,15 @@ def main(argv=None) -> int:
     cf.set_defaults(fn=cmd_config)
 
     n = sub.add_parser("next", help="o que fazer agora")
+    n.add_argument(
+        "--run",
+        action="store_true",
+        help=(
+            "executa a próxima ação quando ela é um subcomando determinístico "
+            f"({'/'.join(NEXT_RUNNABLE_CMDS)}); decisão humana ou passo de LLM "
+            "devolve {bloqueado_em, acao} sem executar nada"
+        ),
+    )
     n.set_defaults(fn=cmd_next)
 
     d = sub.add_parser("done", help="marca concluído")
@@ -2657,6 +3117,26 @@ def main(argv=None) -> int:
     ho = sub.add_parser("handoff", help="imprime o prompt de despacho do fan-out, pronto para colar na LLM")
     ho.add_argument("stage", choices=sdd_mod.CRITICAL_STAGES)
     ho.set_defaults(fn=cmd_handoff)
+
+    rn = sub.add_parser("run", help="composto: run-stage + handoff (prepara o fan-out e entrega o prompt)")
+    rn.add_argument("stage", choices=sdd_mod.CRITICAL_STAGES)
+    rn.add_argument("--batches", type=int, help="override de batches para modules")
+    rn.add_argument("--max-bytes", type=int, default=agentpack_mod.DEFAULT_MAX_BYTES)
+    rn.add_argument("--max-files", type=int, default=agentpack_mod.DEFAULT_MAX_FILES_PER_MODULE)
+    rn.add_argument("--max-lines", type=int, default=agentpack_mod.DEFAULT_MAX_LINES_PER_FILE)
+    rn.set_defaults(fn=cmd_run)
+
+    ig = sub.add_parser(
+        "integrate",
+        help="composto: merge de todos os batches do manifesto (com o agent_slot de cada um) + done do estágio",
+    )
+    ig.add_argument("stage", choices=sdd_mod.CRITICAL_STAGES)
+    ig.add_argument(
+        "--partial",
+        action="store_true",
+        help="opt-in: integra só os batches cujo output já existe (sem isso, output faltando aborta antes do 1º merge)",
+    )
+    ig.set_defaults(fn=cmd_integrate)
 
     au = sub.add_parser("audit", help="mede qualidade SDD sem alterar estado")
     au.add_argument("stage_pos", nargs="?", choices=sdd_mod.CRITICAL_STAGES)
