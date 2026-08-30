@@ -65,3 +65,35 @@ Sem git funcional no repo (`.git` vazio) não há worktree/branch — a garantia
 3. `wk ingest diagrama.drawio.xml` gera markdown estruturado + Mermaid válido.
 4. `wk lint` acusa wikilink quebrado e página órfã em store de teste.
 5. E2E codebase `doc_level=detalhado`: todos os estágios (incl. `synth`) fecham `done` com a árvore completa do contrato §1.
+
+## Backlog pós-remediação 2026-08
+
+Achados da auditoria pós-ondas 1–4 (commits `a3d9ebd`, `85a9c85`, `95c49e4`,
+`b7b24ac`) que ficaram de fora do escopo remediado — cada um confirmado
+lendo o código atual, não hipotético:
+
+- **F-28** — sem dedup por hash no `ingest`: o `doc_id` sai de
+  `sha1(caminho_absoluto + captured_at)`, não de um hash do conteúdo; ingerir
+  o mesmo byte-a-byte duas vezes sempre cria arquivo/id novo. `scripts/wk/cli.py:3258-3261`.
+- **F-33** — `os.path.commonpath` sem normalização de case: comparação
+  literal de segmentos falha em Windows (filesystem case-insensitive) quando
+  os dois caminhos diferem só em maiúsculas/minúsculas. `scripts/wk/cli.py:786` (`_resolve_promote_targets`) e `scripts/wk/cli.py:3596` (checagem `inside_inbox` do publish); contraste com `_confined` (`scripts/wk/cli.py:1610`), que já usa `os.path.realpath` antes de comparar.
+- **F-37** — unicidade de `--agent` não é real: `_validate_agent_id` só
+  rejeita valor ausente ou genérico (`main`/`orquestrador`/`self`/`principal`);
+  nada impede reusar o mesmo slot entre batches/estágios — é convenção, não
+  enforcement. `scripts/codescan/cli.py:1385-1399`.
+- **F-38** — assimetria entre o waiver de script no merge e no audit
+  estrito: `merge-agent-output` rejeita `.py/.ps1/.sh/.bat/.cmd/.js/.ts/.mjs/.cjs`
+  no workdir (`scripts/codescan/agentmerge.py:93`, checado em `_reject_workdir_scripts`, `agentmerge.py:653-669`), mas `_strict_workdir_blockers` (usado por `audit --strict`/`done`) só enxerga `.py` e `.txt` solto na raiz — um `.ps1`/`.sh` sobra sem bloqueio ali. `scripts/codescan/sdd.py:1194-1205`.
+- **F-44** — tabela de preços defasada: item não confirmado nesta varredura
+  — nenhuma tabela de custo (embeddings Azure, tokens de LLM) foi encontrada
+  em `docs/`, `references/`, `README.md`, `operations/*.md` ou
+  `scripts/sbindex/*`. Ou a tabela já foi removida antes desta remediação,
+  ou o achado original apontava para outro artefato; revalidar a origem do
+  F-44 antes de agir.
+- **F-46** — `deny` de permissão é best-effort fora do `claude-code`:
+  `_permission_format_status` só devolve `"verificado"` para
+  `.claude/settings.json`; `.agents/settings.json` (antigravity/devin/copilot)
+  é sempre `"best-effort"` — grava certo, mas nada garante que a engine
+  de fato consome o schema. `scripts/wk/cli.py:200-215`, consumido em
+  `scripts/wk/cli.py:611-621` (`permissao_garantida`).

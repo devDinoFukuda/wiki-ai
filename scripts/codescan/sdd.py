@@ -334,7 +334,6 @@ COMPACT_OUTPUT_CONTRACTS: dict[str, dict] = {
         ),
     },
     "synth": {
-        "blocks": ("CONFIRMED", "INFERRED", "QUESTIONS"),
         "max_lines_per_block": 80,
         "required_sections": ("Confirmados", "Inferidos", "Perguntas"),
     },

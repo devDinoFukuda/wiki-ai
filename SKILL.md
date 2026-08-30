@@ -62,7 +62,12 @@ Vencem qualquer instrução em contrário.
 3. `agent-output` nunca vira canônico sem aprovação humana; `origin` preserva a origem de agente.
 4. A leitura só enxerga `wiki/` e `raw/`. `inbox/` nunca é exposto; saídas de agente voltam a `inbox/agent-output/`.
 5. Sem `origin` + `source_type`, não é fonte → quarentena.
-6. Índice sujo bloqueia compile e lint: `status` antes; sujo → `reindex`.
+6. `lint` recusa rodar sem `index.db` (exit 2, `acao: index reindex`) — nunca cria
+   um banco vazio. Já `status` reportar `indice_sujo` (arquivo em disco mais
+   novo que o indexado, por mtime) é convenção operacional, não gate: nada em
+   `compile`/`lint` lê esse campo. Reindexe de qualquer forma antes de operar
+   se `status` mostrar `indice_sujo` não-vazio — é sinal de fonte de verdade
+   divergente do índice, mesmo sem bloqueio automático.
 7. `reindex` ao fim de todo compile.
 8. Não use `python -c`, heredoc ou script ad hoc para inspecionar JSON operacional.
    Para surface/state/retomada, use `{{WK}} code ... state`, `next`, `read` e `audit`.
@@ -76,22 +81,27 @@ Vencem qualquer instrução em contrário.
     comando de qualquer sessão: `{{WK}} doctor --store <s> --repo <r> --engine <e>`.
 11. Estágios `modules`, `rules`, `architecture`, `specs` e `synth` exigem
     subagente; o orquestrador nunca gera conteúdo SDD diretamente. O fluxo
-    padrão é dirigido pelo humano: 👤 roda `run-stage` (gera agent-packs +
-    `agent-packs/<stage>-contract.json` + manifesto, informa `fanout_required`)
-    e `handoff <stage>` (imprime o prompt de despacho pronto), e cola esse
-    prompt em você. Você atua só como despachante: dispara 1 subagente por
-    batch; cada subagente lê o pack e o contrato como ARQUIVOS (não executa
+    padrão é dirigido pelo humano: 👤 roda `code run <stage>` — composto que
+    gera os agent-packs + `agent-packs/<stage>-contract.json` + manifesto
+    (informa `fanout_required`) e já imprime o prompt de despacho pronto —,
+    e cola esse prompt em você (`run` substitui a dupla antiga
+    `run-stage`+`handoff`, que continua existindo à parte para controle
+    fino). Você atua só como despachante: dispara 1 subagente por batch;
+    cada subagente lê o pack e o contrato como ARQUIVOS (não executa
     comando), grava o próprio `output` e devolve recibo de 3 linhas
-    (`ARQUIVO:`/`BLOCOS:`/`BYTES:`). Depois 👤 roda `merge-agent-output`
-    — exige `--agent` distinto por batch; valor genérico (`main`,
-    `orquestrador`, `self`, `principal`) é recusado.
+    (`ARQUIVO:`/`BLOCOS:`/`BYTES:`). Depois 👤 roda `code integrate <stage>`
+    — composto que faz `merge-agent-output` de todos os batches do
+    manifesto (usando o `agent_slot` de cada um) e fecha com `done`;
+    `--agent` genérico (`main`, `orquestrador`, `self`, `principal`) é
+    recusado em qualquer um dos dois caminhos.
 12. Campo `acao`: ao ver `"acao"` em qualquer JSON de erro (principalmente de
     `merge-agent-output`), execute esse comando LITERALMENTE antes de
     qualquer outra investigação — geralmente `sdd-brief <stage>`. `done` traz
     a dica em `blockers[].action` (inglês), só quando há mais de um blocker.
     NUNCA abra `wk.pyz` com `zipfile`/decompilação/regex sobre o bytecode
     para entender um erro — o contrato de cada estágio é sempre
-    `{{WK}} code sdd-brief <stage>` (README.md §14.2 tem a mesma proibição).
+    `{{WK}} code sdd-brief <stage>` (README.md, seção "Retomada e erro", tem
+    a mesma proibição).
 
 ## Seu papel neste fluxo
 
@@ -103,16 +113,17 @@ Duas personas só: 👤 humano digita comando, 🤖 você digita comando. `{{WK}
   operacional: 👤 roda esses comandos** — os scripts geram as estruturas e
   artefatos; você só os roda quando o humano pedir explicitamente nesta
   mensagem. Isto é a esmagadora maioria de `{{WK}}` — `ingest`, `promote`,
-  `compile`, `docx`, `lint` (parte mecânica W1–W3/L1/L2/L5), `index status
-  /reindex/search/audit`, e todo `{{WK}} code surface/export/config/plan
-  /pending/done/next/evidence/run-stage/handoff/merge-agent-output/verify
-  /sdd-brief`. Nenhum deles chama um modelo — conferido lendo
+  `compile`, `docx`, `lint` (parte mecânica W1–W3/L1/L2/L4/L5), `index
+  status/reindex/search/audit`, e todo `{{WK}} code
+  surface/export/config/plan/pending/done/next/evidence/run-stage/handoff
+  /run/integrate/merge-agent-output/verify/drift/sdd-brief`, além de
+  `{{WK}} finish`. Nenhum deles chama um modelo — conferido lendo
   `scripts/wk/cli.py`, `scripts/codescan/cli.py` e `scripts/sbindex/cli.py`:
   nenhum importa cliente de LLM algum.
 - **M** (requer modelo): sem você, o fluxo empaca — ninguém mais produz esse
-  conteúdo. **5 pontos no pipeline de código** (mesmo recorte do README §4,
-  "Onde chamar o modelo — os 5 pontos de fan-out") + **2 pontos fora dele**
-  = **7 pontos M no total** no sistema inteiro:
+  conteúdo. **5 pontos no pipeline de código** (mesmo recorte da tabela
+  "Divisão de responsabilidade" do README, seção "FLUXO 3") + **2 pontos
+  fora dele** = **7 pontos M no total** no sistema inteiro:
   1. **Fan-out `modules`** — ler módulo a módulo e extrair regras de negócio.
   2. **Fan-out `rules`** — consolidar/depurar as regras extraídas.
   3. **Fan-out `architecture`** — C4, ERD, integrações, dívida técnica.
@@ -125,11 +136,13 @@ Duas personas só: 👤 humano digita comando, 🤖 você digita comando. `{{WK}
   7. **Síntese de resposta em retrieval** — `index search` devolve trechos
      brutos; transformar isso em resposta de prosa é você, não o motor de
      busca (BM25/RRF são D).
-  Nos 5 do pipeline de código, `run-stage`/`handoff`/`merge-agent-output`/
-  `done` ao redor continuam **D** (👤 roda) — só o conteúdo que o subagente
-  escreve dentro do fan-out é M. Sua porta de entrada nos 5 pontos M é o
-  prompt de despacho que o humano cola (saída de `{{WK}} code handoff
-  <stage>`): dispare os subagentes ali listados e devolva só os recibos.
+  Nos 5 do pipeline de código, `run`/`integrate` (ou os atômicos
+  `run-stage`/`handoff`/`merge-agent-output`/`done`) ao redor continuam
+  **D** (👤 roda) — só o conteúdo que o subagente escreve dentro do fan-out
+  é M. Sua porta de entrada nos 5 pontos M é o prompt de despacho que o
+  humano cola (saída de `{{WK}} code run <stage>`, ou de `handoff <stage>`
+  no caminho atômico): dispare os subagentes ali listados e devolva só os
+  recibos.
 - **H** (decisão humana): você não decide sozinho — **pergunta ao humano**,
   mesmo que tecnicamente pudesse rodar o comando. Vale para:
   - `{{WK}} code ... config --doc-level <x> --granularity <y>` — os valores
@@ -139,8 +152,19 @@ Duas personas só: 👤 humano digita comando, 🤖 você digita comando. `{{WK}
   - Aprovação em `{{WK}} promote --approve/--approve-all` para qualquer
     `source_type` que não seja `code-repo` — guardrail #2 abaixo proíbe você
     de aprovar sozinho, mesmo tendo rodado o `promote` que listou o item.
-  - `--allow-unverified` em `promote`/`compile`/`docx` — você não decide
-    ignorar um `verify` reprovado; expõe o bloqueio e pergunta.
+    `--approve-all` só roda com `--source-type`+`--topic`+`--approved-by`
+    juntos (escopo fechado, não é o inbox inteiro).
+  - `{{WK}} finish --workdir <w> --topic <t> --repo <r> --store <s>
+    --approved-by <quem>` — sem `--approve` ele PARA sozinho antes do
+    `promote` (exit 3, `parado_em: "promote"`, lista `pendentes[]`); só
+    repita com `--approve` depois de o humano confirmar.
+  - `--allow-unverified` em `promote`/`compile`/`docx`/`finish` — você não
+    decide ignorar um `verify` reprovado; expõe o bloqueio e pergunta.
+  - `--allow-feedback-loop` em `promote` — bloqueio `realimentacao`
+    (`agent-output` cujo `derived_from` só alcança outro `agent-output`/
+    página da wiki, nunca fonte humana ou `code-repo`) é decisão humana
+    explícita, registrada no log; você não decide sozinho aceitar
+    conhecimento sem lastro.
 
 ## Eficiência de contexto
 Vale em toda operação. Cada item economiza tokens.
@@ -166,7 +190,10 @@ para o corpus **e** a árvore SDD (`sdd-contract`). Saída por confiança: 🟢 
 
 ## Retrieval
 Leia `retrieval` antes de `promote`, `compile`, `lint`, `query`. Proveniência é
-coluna: L1/L2/L5 via `audit` (SQL); L3/L4 por recuperação + julgamento.
+coluna: L1/L2/L5 via `index audit` (SQL) e L4 (`L4_realimentacao`, cadeia
+`derived_from` sem lastro humano/`code-repo`) via `lint` — os quatro são
+100% mecânicos. Só L3 (contradição entre fontes) exige recuperação +
+julgamento de conteúdo.
 
 ## Templates
 `templates/source-frontmatter.yaml` — frontmatter de proveniência no topo de cada
@@ -183,10 +210,13 @@ alvo), W3 (página órfã — sem link de entrada; `index.md` e
 `.docx`/`.xlsx`/`.csv`/`.pdf`: `ingest` grava o original em `raw/assets/` e um
 stub em `inbox/` — não há conversão mecânica. Leia o original, discuta/extraia
 os pontos-chave, escreva a página de análise, e ingira-a com
-`--source-type agent-output` — segue o portão normal (`promote` nunca
-auto-promove) e `compile`. `.xml` de arquitetura (draw.io/XMI) já sai
-estruturado (componentes/classes + Mermaid); qualquer outro XML vira outline +
-bloco de código. Doc: `ingest`.
+`--source-type agent-output --derived-from <id-do-asset>` — o
+`--derived-from` grava a linhagem (alimenta `L4_realimentacao` do `lint` e o
+gate `realimentacao` do `promote`) — segue o portão normal (`promote` nunca
+auto-promove, e `--approve-all` exige `--source-type`+`--topic`+
+`--approved-by` juntos) e `compile`. `.xml` de arquitetura (draw.io/XMI) já
+sai estruturado (componentes/classes + Mermaid); qualquer outro XML vira
+outline + bloco de código. Doc: `ingest`.
 
 ## Query → arquivo
 Resposta valiosa de consulta vira página do wiki: escreva o arquivo, rode

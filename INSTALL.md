@@ -31,11 +31,14 @@ engine.
 | Fluxo | Passos D | Passos M | Passos H | Dá para completar sem modelo? |
 |---|---|---|---|---|
 | Instalação (§1–§3) | doctor, init, store init, check, index status | nenhum | escolher engine/caminho do store e do repo | **Sim, integralmente.** |
-| Fluxo A — Conhecimento (ingest→promote→compile→audit→query) | `wk ingest` (grava), `wk promote` (portão), `wk compile`, `wk index audit`, `wk index search` (busca) | análise de `.docx/.xlsx/.csv/.pdf`; lint semântico L3/L4; síntese da resposta em `query` | classificar `source_type/origin/topic`; aprovar item em `promote` | **Não** para análise de assets, lint semântico e síntese de resposta — o resto sim |
-| Fluxo B — Codebase (surface→export→plan→cavar→evidence→publish) | `surface`, `export`, `config` (grava), `plan`, `pending`/`done` (gravam), `next`, `evidence`, `run-stage`, `merge-agent-output`, `verify`, `publish`, `promote` (código-fonte), `compile`, `docx` | conteúdo dos estágios `modules`/`rules`/`architecture`/`specs`/`synth` (o que o subagente escreve) | valores de `--doc-level`/`--granularity`; escopo de `pending --items`; `--allow-unverified`; aprovação em `promote` de itens não-`code-repo` | **Não** — cavar o repo e sintetizar `confirmed.md`/`inferred.md` exige LLM; o resto do runbook é D/H |
+| Fluxo A — Conhecimento (ingest→promote→compile→audit→query) | `wk ingest` (grava), `wk promote` (portão), `wk compile`, `wk index audit`, `wk lint` (L1/L2/L4/L5 mecânicos), `wk index search` (busca) | análise de `.docx/.xlsx/.csv/.pdf`; lint semântico L3 (contradição); síntese da resposta em `query` | classificar `source_type/origin/topic`; aprovar item em `promote` (`--approve-all` exige `--source-type`+`--topic`+`--approved-by` juntos) | **Não** para análise de assets, lint semântico e síntese de resposta — o resto sim |
+| Fluxo B — Codebase (Preparar→Fan-out→Fechar) | `surface`, `export`, `config` (grava), `plan`, `pending`/`done` (gravam), `next`, `evidence`, `code run`/`run-stage`, `code integrate`/`merge-agent-output`, `verify`, `drift`, `publish` (exige `--topic`), `promote` (código-fonte), `compile`, `docx`, `wk finish` (composto: verify→audit→publish→[decisão]→promote→compile→reindex→lint) | conteúdo dos estágios `modules`/`rules`/`architecture`/`specs`/`synth` (o que o subagente escreve) | valores de `--doc-level`/`--granularity`; escopo de `pending --items`; `--allow-unverified`; `--allow-feedback-loop`; aprovação em `promote`/`finish --approve` de itens não-`code-repo` | **Não** — cavar o repo e sintetizar `confirmed.md`/`inferred.md` exige LLM; o resto do runbook é D/H |
 
-Runbook completo de codebase, com a tabela de responsáveis por cada um dos 32
-subpassos, em [README.md §4](README.md#4-runbook-de-codebase).
+Caminho feliz atual (3 fases, 7 invocações fixas + fan-out ×5 que se repete por
+estágio) e a tabela de responsáveis por cada passo: [README.md, seção "FLUXO
+3 — Ingerir codebase"](README.md). O runbook abaixo (B1–B4) documenta a mesma
+sequência no nível atômico, útil para quem quer entender o D/M/H de cada
+comando por trás dos compostos `code run`/`code integrate`/`wk finish`.
 
 ---
 
@@ -133,7 +136,11 @@ se persistir, confira `python wk.pyz engines` para ver se `SKILL.md` está de
 fato em disco no caminho que a engine lê.
 
 > **Update:** troque o `wk.pyz` e rode `init` de novo (D). `check` mostra o que
-> você editou à mão antes de sobrescrever (`--force` para aplicar).
+> você editou à mão antes de sobrescrever (`--force` para aplicar). Se em vez
+> disso você tem o código-fonte solto (`scripts/`) ao lado de um `.pyz`
+> antigo, `wk doctor` compara os dois sozinho (`wk.pyz.pyz_desatualizado`) e
+> avisa `rode python scripts/build_pyz.py` quando divergem — é diagnóstico,
+> nunca bloqueia.
 
 ## 2. Criar o store — 👤 D
 
@@ -324,8 +331,14 @@ M completo:
 🤖 lê raw/assets/sb-ingest-relatorio-9f8e7d6c.xlsx, extrai os pontos-chave,
    escreve store/agent-analise-relatorio.md, então roda:
 python wk.pyz ingest ./agent-analise-relatorio.md \
-  --source-type agent-output --origin "análise de sb-ingest-relatorio-9f8e7d6c.xlsx" --topic pagamentos
+  --source-type agent-output --origin "análise de sb-ingest-relatorio-9f8e7d6c.xlsx" \
+  --topic pagamentos --derived-from sb-ingest-relatorio-9f8e7d6c
 ```
+
+`--derived-from <id[,id...]>` grava a linhagem de proveniência no
+frontmatter (`derived_from`) — alimenta a regra `L4_realimentacao` do `lint`
+e o gate `realimentacao` do `promote` (ver A2/A4): sem ela, uma cadeia de
+`agent-output` que nunca cita fonte humana/`code-repo` passa despercebida.
 
 Áudio, imagem e demais formatos seguem recusados como fora de escopo.
 
@@ -355,8 +368,10 @@ Substitua `sb-2026-0142` pelo id real listado em "Requer decisão humana", e
 
 ```bash
 python wk.pyz promote --approve sb-2026-0142 --approved-by "Maria" --store "$WK_STORE"
-# ou, para aprovar em lote por tipo:
-python wk.pyz promote --approve-all --source-type human-transcript --approved-by "Maria" --store "$WK_STORE"
+# ou, para aprovar em lote por tipo (--approve-all exige os três juntos —
+# --source-type + --topic + --approved-by — senão recusa com exit 2; o topic
+# fecha o escopo, sem ele a aprovação varreria o inbox inteiro):
+python wk.pyz promote --approve-all --source-type human-transcript --topic pagamentos --approved-by "Maria" --store "$WK_STORE"
 ```
 
 O arquivo migra para `store/raw/`, vira `promoted: true` /
@@ -365,9 +380,18 @@ aprovado vira `confidence: unverified`, nunca `reviewed`, mesmo aprovado).
 
 **Como saber que deu certo:** o item some de "Requer decisão humana" e
 aparece com `promoted_by` preenchido; `store/log.md` ganha a linha de
-aprovação. **Se falhar:** `verify_blocked` no JSON de saída — o `topic` desse
-item tem um `verify` de codescan reprovado (ver B4); corrija ou decida
-`--allow-unverified` (H, registrado no log).
+aprovação. **Se falhar:**
+- `verify_blocked` no JSON de saída — o `topic` desse item tem um `verify` de
+  codescan reprovado (ver B4); corrija ou decida `--allow-unverified` (H,
+  registrado no log).
+- `duplicados: [...]` — o `id` do item já existe em `raw/`; `promote` não
+  sobrescreve (transacional: grava por tmp+replace, revalida, só então
+  remove do inbox) — resolva o conflito de id no frontmatter antes.
+- `bloqueados_realimentacao: [...]`, `motivo: "realimentacao"` — item
+  `agent-output` cujo `derived_from` só alcança outra saída de agente/página
+  da wiki, nunca uma fonte humana ou `code-repo`; ancore a proveniência
+  (`--derived-from` no `ingest` original) ou decida `--allow-feedback-loop`
+  (H, registrado no log).
 
 ## A3. Compilar — 👤/🤖 D
 
@@ -388,18 +412,30 @@ sources: ["sb-001"]
 Isso não é enfeite: é o que torna L1 e L5 verificáveis por SQL. Cruzamento
 entre fontes acontece na leitura (`search`/`query`), não na compilação.
 
+`compile` também **poda** página órfã de `wiki/<topic>/` por padrão — qualquer
+`.md`/`.html` sem fonte promovida correspondente é removido (`--no-prune`
+desliga; sem `--topic`, a poda cobre `wiki/` inteiro). `wiki/index.md` é
+sempre **global** — reconstruído com todas as fontes promovidas de `raw/`,
+não só as do `--topic` passado. id/topic com componente de caminho inválido
+(anti-traversal) não trava a compilação inteira: esse item pula e entra em
+`recusados[]` no JSON de saída (exit ≠ 0 mesmo assim, para nenhuma automação
+tratar como sucesso silencioso); os itens efetivamente removidos pela poda
+entram em `podados[]`.
+
 ```bash
 python wk.pyz compile --store "$WK_STORE"
 ```
 
 **Como saber que deu certo:** o comando encerra com exit `0` e imprime a
-contagem de páginas geradas; `wiki/index.md` lista o novo documento. **Se
-falhar:** índice sujo bloqueia — rode `python wk.pyz index status` e, se
-`indice_sujo` não estiver vazio, `python wk.pyz index reindex --store
-"$WK_STORE"` antes.
-
-O compile roda `reindex` sozinho ao final — não precisa rodar manualmente
-depois.
+contagem de páginas geradas, `podados: []` e `recusados` ausente/vazio;
+`wiki/index.md` lista o novo documento. **Se falhar:** `recusados` não-vazio
+no JSON — cada item traz `campo`/`valor`/`motivo`/`acao`; corrija o `id`/
+`topic` do frontmatter da fonte apontada e rode `compile` de novo. Índice
+desatualizado não bloqueia `compile` — ele mesmo roda `index reindex` ao
+final (campo `reindex_modo`: `"completo"` com `AZURE_OPENAI_*` configuradas,
+senão `"lex-only"`); `python wk.pyz index status` é só diagnóstico
+(`indice_sujo` não vazio → exit 1 do `status`, mas não impede `compile`/
+`lint`).
 
 ## A4. Auditar — 👤/🤖 D (mecânico) + 🤖 M (semântico)
 
@@ -423,18 +459,27 @@ python wk.pyz index audit
 `1` e `report` aponta para `wiki/_lint-report.md` com a lista de linhas; cada
 achado traz `ação sugerida`.
 
-O lint semântico (L3 contradição, L4 realimentação) é **M** — julgar se duas
-fontes se contradizem, ou se uma página resume outra sem citar (realimentação),
-exige ler e comparar prosa; nenhum SQL faz isso. Sem modelo, L3/L4 não rodam —
-não há substituto determinístico. Roda periodicamente (é caro):
+`wk lint` (não `index audit`) roda **antes de tudo** uma checagem própria: se
+`store/index.db` não existir, recusa (`{"error": "índice não encontrado:
+...", "acao": "rode: wk index reindex --store ..."}`, exit `2`) — nunca cria
+um banco vazio por engano. Com o índice presente, `lint` traz mais uma regra
+mecânica — **D**, sem LLM:
+
+| Regra | Pega |
+|---|---|
+| `L4_realimentacao` | `agent-output` cujo `derived_from` (frontmatter, gravado por `ingest --derived-from`) só alcança outra saída de agente/página da wiki, nunca fonte humana ou `code-repo` |
+
+Só o lint semântico (**L3 contradição**) é **M** — julgar se duas fontes se
+contradizem exige ler e comparar prosa; nenhum SQL faz isso. Sem modelo, L3
+não roda — não há substituto determinístico. Roda periodicamente (é caro):
 
 ```
 /wiki-ai lint
 ```
 
-🤖 lê as páginas candidatas, decide se há contradição/realimentação, e escreve
-o achado em `wiki/_lint-report.md` via o mesmo comando `wk lint` (a gravação do
-relatório continua D; o julgamento que preenche L3/L4 é M).
+🤖 lê as páginas candidatas, decide se há contradição, e escreve o achado em
+`wiki/_lint-report.md` via o mesmo comando `wk lint` (a gravação do relatório
+continua D; o julgamento que preenche L3 é M).
 
 ## A5. Consultar — 👤/🤖 D (busca) + 🤖 M (resposta)
 
@@ -502,18 +547,21 @@ ninguém costura eles em resposta.
 
 # Fluxo B — Codebase
 
-> **Esta é a visão RESUMIDA.** O passo a passo completo de CLI — com
-> `--store`, `run-stage`, `merge-agent-output`, `agent-runs` e a tabela de
-> responsáveis (D/M/H, mesma taxonomia deste guia) de cada um dos 32
-> subpassos — está em [README.md §4](README.md#4-runbook-de-codebase). Se for
+> **Esta é a visão RESUMIDA, no nível atômico** (um comando por sub-passo).
+> O caminho feliz atual usa comandos compostos (`code run`, `code
+> integrate`, `wk finish`) que encadeiam vários destes atômicos de uma vez —
+> 3 fases, 7 invocações fixas + fan-out ×5 — documentado em [README.md,
+> seção "FLUXO 3 — Ingerir codebase"](README.md), junto com a tabela de
+> responsáveis (D/M/H, mesma taxonomia deste guia) de cada passo. Se for
 > executar via CLI manual (fora do slash command `/wiki-ai ingest codebase`),
-> comece por lá. Os comandos abaixo omitem `--store`/`$WK_STORE` por
+> qualquer um dos dois caminhos serve — os atômicos abaixo continuam
+> funcionando e são o que os compostos chamam por baixo (útil para retomada
+> e controle fino). Os comandos abaixo omitem `--store`/`$WK_STORE` por
 > brevidade, mas ele é **obrigatório** em todo `wk code`/`wk publish` — sem
 > `--store` e sem `WK_STORE` no ambiente, o comando recusa com `store não
 > informado` (conferido em `scripts/codescan/cli.py`, função `main`,
 > verificação que roda para *todo* subcomando de `wk code`, antes de
-> despachar; README.md
-> §11.2, "Erros comuns").
+> despachar; ver README.md, seção "Erros comuns").
 
 O legado é **READ-ONLY**. Nada é escrito dentro dele. Além das fontes para o
 corpus, o pipeline gera a **árvore SDD** em
@@ -561,10 +609,14 @@ python wk.pyz code --repo /caminho/do/legado --store "$WK_STORE" \
   config --doc-level essencial --granularity module
 ```
 
-`--doc-level` aceita `essencial`/`completo`; `--granularity` aceita
-`module`/`file`. **Como saber que deu certo:** o JSON de saída ecoa os dois
-valores gravados. **Se falhar:** `sem estado; rode surface primeiro` — rode
-`surface` (acima) antes de `config`.
+`--doc-level` aceita `essencial`/`completo`/`detalhado` (níveis mais altos
+exigem mais artefatos obrigatórios por estágio — ex.: `completo` exige
+flowchart em `modules`/ADRs retroativos em `rules`; `detalhado` exige
+sequências em `architecture`). `--granularity` aceita `module`/`endpoint`/
+`use-case`/`hybrid`/`feature`/`custom` (obrigatório, mas hoje só
+`doc-level` muda os artefatos exigidos). **Como saber que deu certo:** o
+JSON de saída ecoa os dois valores gravados. **Se falhar:** `sem estado;
+rode surface primeiro` — rode `surface` (acima) antes de `config`.
 
 ## B2. Planejar — 👤/🤖 D
 
@@ -585,25 +637,23 @@ antes.
 ```
 
 Este é o único passo do runbook onde `sem modelo o fluxo PARA` de verdade.
-Decomposto:
+Decomposto (nível atômico; `code run`/`code integrate` fazem os dois pares
+abaixo num só comando cada — ver README FLUXO 3, Fase 2):
 
 | Sub-passo | Tipo | Quem | Por quê |
 |---|---|---|---|
-| `run-stage <stage>` — prepara manifesto de fan-out | **D** | 👤/🤖 | lê `state.json`/`surface.json`, monta lista de batches; sem LLM |
+| `run-stage <stage>` + `handoff <stage>` — prepara manifesto de fan-out e imprime o prompt (ou `run <stage>` para os dois num comando) | **D** | 👤/🤖 | lê `state.json`/`surface.json`, monta lista de batches; sem LLM |
 | conteúdo dos estágios `modules`, `rules`, `architecture`, `specs` (e `synth`, ver nota abaixo) | **M** | 🤖 obrigatório | é o subagente que lê o código-fonte e **escreve** a análise (regras de negócio, C4, ERD, requirements/design/tasks); nenhum comando gera essa prosa sozinho |
-| `merge-agent-output <stage> --agent <id>` — integra a saída | **D** | 👤/🤖 | parseia/valida o texto que o subagente já escreveu; não gera conteúdo novo |
-| `done <stage>` — marca concluído | **D** | 👤/🤖 | grava status em `state.json` |
+| `merge-agent-output <stage> --agent <id>` por batch + `done <stage>` (ou `integrate <stage>` para tudo isso num comando; `--partial` integra só os batches já entregues) | **D** | 👤/🤖 | parseia/valida o texto que o subagente já escreveu e fecha o estágio; não gera conteúdo novo |
 
 O agente segue `operations/ingest-codebase.md`: lê `surface.json`, cava módulo
 a módulo, extrai regras de negócio, e marca cada afirmação. Por baixo, esse
-único slash command percorre a sequência inteira do README §4 —
-`run-stage <stage>` (D) → subagentes 🤖 escrevem (M) →
-`merge-agent-output <stage> --agent <id>` (D, um por batch) → `done <stage>`
-(D) — para os estágios `modules`, `rules`, `architecture` e `specs`. Rodando
-via CLI manual em vez do slash command, siga o README §4.5–4.18 passo a
-passo; não existe atalho que pule `run-stage`/`merge-agent-output`/`done` por
-estágio — e nenhum desses três comandos substitui o subagente escrevendo a
-análise.
+único slash command percorre a sequência inteira — `run <stage>` (D) →
+subagentes 🤖 escrevem (M) → `integrate <stage>` (D) — para os estágios
+`modules`, `rules`, `architecture`, `specs` e `synth`. Rodando via CLI manual
+em vez do slash command, siga o README, seção "FLUXO 3", Fase 2, passo a
+passo; não existe atalho que pule o fan-out por estágio — e nenhum comando
+substitui o subagente escrevendo a análise.
 
 | Marca | Exige |
 |---|---|
@@ -641,7 +691,7 @@ python wk.pyz code --repo /caminho/do/legado --store "$WK_STORE" next
 ## B3.5. Evidence pack — 👤/🤖 D
 
 Antes da síntese, gere um pacote rastreável de evidências para o tópico — sem
-subagente, sem fan-out (README §4.19):
+subagente, sem fan-out:
 
 ```bash
 python wk.pyz code --repo /caminho/do/legado --store "$WK_STORE" \
@@ -711,6 +761,19 @@ como `code-repo`. `verify` não prova que a análise está semanticamente
 perfeita; ele só bloqueia a classe mais perigosa de erro: afirmação 🟢 sem
 evidência `arquivo:linha`.
 
+`verify` também acumula **cobertura por artefato** em `state.json`
+(`stages.verify.artifacts`): `sdd/confirmed.md` sempre exigido para o
+estágio fechar; `sdd/inferred.md` só se existir no workdir. E checa
+**drift**: se o commit pinado em `surface.json` (`git.head`) mudou desde a
+análise, uma citação `arquivo:linha` cujo arquivo mudou entre esse commit e
+o HEAD atual vira erro `drift_detectado` — a citação não prova mais nada.
+`wk code drift` compara os dois HEADs e lista os artefatos afetados, com o
+comando `redo` exato por item:
+
+```bash
+python wk.pyz code --repo /caminho/do/legado --store "$WK_STORE" drift
+```
+
 **`verify` falho é gate real em `promote`/`compile`/`docx`** (não em
 `publish`, que só anota `aviso_verify` — nada em `inbox/` é canônico
 ainda). O bloqueio é por `topic`: em `promote`, item a item, cobrindo
@@ -725,18 +788,24 @@ isso sozinho; ele expõe o bloqueio e pergunta. Exemplo (substitua o topic):
 python wk.pyz compile pagamentos --store "$WK_STORE" --allow-unverified
 ```
 
-Detalhe completo: README.md §4.24 e §13 ("Gates").
+Detalhe completo: README.md, seção "FLUXO 3" (fase Fechar) e "Erros comuns".
 
-Depois: `publish`, `promote` e `compile` normais (todos **D** na execução;
+Depois: `publish` (agora exige `--topic` — recusa com exit `2` e `acao` se
+vier vazio), `promote` e `compile` normais (todos **D** na execução;
 `promote` de itens não-`code-repo` continua exigindo aprovação **H**, igual
-A2).
+A2). Ou, num só comando: `wk finish --workdir <w> --topic <t> --repo <r>
+--store "$WK_STORE" --approved-by "seu-nome"` encadeia verify→audit→
+publish→[PARA para aprovação — exit 3, sem `--approve`]→promote→compile→
+index reindex→lint(+docx opcional); repita com `--approve` para completar a
+partir do `promote`.
 
-> **Estágio `synth` no pipeline de código:** `run-stage synth` e
-> `merge-agent-output synth` são aceitos normalmente pelo `codescan` atual —
-> os blocos esperados são `=== SYNTH: confirmed ===` / `=== SYNTH: inferred
-> ===`, gravados em `sdd/confirmed.md` / `sdd/inferred.md`. Completar `done
-> synth` exige `agent-runs/synth.json` (mesma prova de proveniência dos
-> demais estágios).
+> **Estágio `synth` no pipeline de código:** é o 5º estágio do fan-out, igual
+> aos demais — `run synth`/`integrate synth` (ou os atômicos `run-stage
+> synth`/`merge-agent-output synth`/`done synth`) funcionam do mesmo jeito.
+> Os blocos esperados são `=== SYNTH: confirmed ===` / `=== SYNTH: inferred
+> ===` (não `=== CONFIRMED: ===`), gravados em `sdd/confirmed.md` /
+> `sdd/inferred.md`. Completar `done synth` exige `agent-runs/synth.json`
+> (mesma prova de proveniência dos demais estágios).
 
 **É aqui que o valor aparece.** A spec diz `MAX_RETRIES = 5` em
 `PaymentProcessor.cs:3` 🟢. A Maria disse "3x" na transferência. Nenhuma das
@@ -757,7 +826,14 @@ Não comece pelo codebase. Valide o portão com o caminho simples primeiro.
 
 # Estado atual: modo léxico
 
-Você optou por não integrar embeddings. Consequências:
+Sem as três variáveis `AZURE_OPENAI_*` no ambiente, o store roda em modo
+léxico. Isto não é mais uma escolha manual em todo comando: `ingest`,
+`promote`, `compile` e `finish` chamam `index reindex` sozinhos ao final e
+**detectam** as três variáveis (`_ENDPOINT`/`_API_KEY`/`_EMBED_DEPLOY`)
+automaticamente — todas presentes → reindex completo (embeddings); qualquer
+uma ausente → `--lex-only` sozinho, sem flag manual. O campo `reindex_modo`
+na saída desses comandos diz qual dos dois rodou. Consequências do modo
+léxico enquanto as variáveis não estiverem configuradas:
 
 - `lex:` funciona. `vec:` e `hyde:` **dão erro explícito, com exit code `2`**
   — de propósito, nunca `results: []` silencioso. Comportamento real,
@@ -803,7 +879,9 @@ que *você* nomeou no Azure, não o nome do modelo.
 | `ModuleNotFoundError: sbindex` | PYTHONPATH (seção 3) |
 | Busca não acha o que existe | modo léxico: a palavra é outra. Use `OR`. |
 | `filtro desconhecido: 'collectio'` | typo — o erro lista os válidos |
-| Busca não acha página que o compile acabou de gerar | índice sujo. `status` → `reindex` (o `compile` já roda sozinho, mas se você editou `raw/`/`wiki/` por fora, rode manualmente). |
+| Busca não acha página que o compile acabou de gerar | índice desatualizado por edição manual fora do `wk` (não é gate — `compile`/`ingest`/`promote` já rodam `reindex` sozinhos ao final). Rode `python wk.pyz index status`; `indice_sujo` não vazio → `index reindex --store "$WK_STORE"`. |
+| `índice não encontrado: ...` (`lint`, exit 2) | store sem `index.db` — `index reindex --store "$WK_STORE"` primeiro; `lint` nunca cria o banco sozinho |
+| `drift_detectado` (`verify`) | commit pinado em `surface.json` mudou desde a análise — `code drift` lista os artefatos afetados e o `redo` exato por item |
 | Resultado fora de escopo | faltou `-c wiki` ou `--filter topic=` |
 | Página some após compile | correto: a wiki é derivada, não edite à mão |
 
@@ -811,11 +889,9 @@ que *você* nomeou no Azure, não o nome do modelo.
 
 # O que não está pronto
 
-- **Estágio `synth` do pipeline de código tem `run-stage`/`merge-agent-output`
-  no CLI atual** (ver nota em B4). Blocos `=== SYNTH: confirmed ===` /
-  `=== SYNTH: inferred ===` gravam `sdd/confirmed.md` / `sdd/inferred.md`.
-  `agent-runs/synth.json` é exigido pelo `audit`/`done synth`, como nos
-  demais estágios.
-- **Azure OpenAI não validado.** Ver acima.
+- **Azure OpenAI não validado.** Ver acima — a detecção automática das três
+  `AZURE_OPENAI_*` funciona, mas o caminho fim-a-fim com embeddings reais
+  nunca foi testado de verdade; o que quebra primeiro costuma ser o nome do
+  deployment.
 - **Estágio 4 do codebase divide por confiança, não por tipo.** Num rescan você
   vê uma reescrita, não um diff. Dói quando o repo for reanalisado.

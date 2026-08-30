@@ -74,6 +74,7 @@ DOCS = {
     "compile": ("operations/compile.md", "operations/compile.md", "Operação: compile"),
     "docx": ("operations/docx.md", "operations/docx.md", "Operação: docx"),
     "lint": ("operations/lint.md", "operations/lint.md", "Operação: lint"),
+    "fluxo3": ("operations/fluxo3.md", "operations/fluxo3.md", "FLUXO 3 — máquina de estados e porquês"),
     "retrieval": (
         "references/retrieval.md",
         "references/retrieval.md",
