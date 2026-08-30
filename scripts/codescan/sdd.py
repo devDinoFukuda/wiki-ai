@@ -46,11 +46,6 @@ FALLBACK_RE = re.compile(
     r"fallback operacional|generic output|shallow output)",
     re.I,
 )
-EN_HEADING_RE = re.compile(
-    r"(?im)^\s{0,3}#{1,6}\s+"
-    r"(overview|responsibility|responsibilities|business rules|requirements|"
-    r"technical design|implementation tasks|dependencies|data structures)\s*$"
-)
 OPERATIONAL_MARKERS = (
     "fluxo",
     "erro",
@@ -1810,6 +1805,32 @@ def _mask_code_fences(text: str) -> str:
     return "".join(out)
 
 
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+# Caminho/arquivo técnico (com ou sem citação `:linha`), a mesma forma que
+# `evidence.citations` reconhece — mascarado aqui para não contar como
+# prosa em inglês (F-30).
+_PATH_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z0-9_.-]+[/\\])+[A-Za-z0-9_.-]+"
+    r"|\b[A-Za-z0-9_-]+\.[A-Za-z0-9_]{1,8}(?::\d+(?:-\d+)?)?\b"
+)
+
+
+def _mask_for_lang_detection(text: str) -> str:
+    """Mascara crases/fences e caminhos antes de contar marcadores EN/PT (F-30).
+
+    O detector de "provável inglês" era manipulável: um artefato honesto em
+    PT-BR mas rico em citações/caminhos técnicos (`RequirementsService.java:42`,
+    trechos de código entre crases) inflava `en_hits` com tokens que não são
+    prosa — não é o agente escrevendo em inglês, é o repositório citado
+    fielmente. Mascarar (zerando o conteúdo, preservando o resto do texto)
+    antes de contar os marcadores tira essa alavanca de falso positivo/forja.
+    """
+    masked = _mask_code_fences(text)
+    masked = _INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), masked)
+    masked = _PATH_TOKEN_RE.sub(lambda m: " " * len(m.group(0)), masked)
+    return masked
+
+
 def _citation_sample(citations: list, text: str, size: int = CITATION_SAMPLE_SIZE) -> list:
     """Amostra determinística de até `size` citações distintas.
 
@@ -1921,12 +1942,27 @@ def _audit_file(
                 "(arquivo:linha) sem conferência contra o repositório: repo indisponível no contexto "
                 f"da auditoria ({repo!r})"
             )
-    pt_hits = sum(1 for marker in PT_MARKERS if _norm(marker) in norm)
-    en_hits = sum(1 for marker in EN_MARKERS if marker in norm)
-    if en_hits > pt_hits or EN_HEADING_RE.search(text):
+    # F-30: mascara crases/fences e caminhos antes de contar — um `norm`
+    # separado só para esta checagem, sem afetar FALLBACK_RE/operational_hits/
+    # _generic_artifact mais abaixo, que continuam sobre o `norm` original.
+    # Ocorrências (não só presença/ausência): com só 6 marcadores EN
+    # cadastrados, contar presença travaria o piso em 6 e `en_hits >= 8`
+    # nunca disparia nem para um artefato 100% em inglês — a calibração do
+    # contrato pressupõe contagem de ocorrência (prosa real repete "overview",
+    # "requirements" etc. várias vezes ao longo do artefato).
+    lang_norm = _norm(_mask_for_lang_detection(text))
+    pt_hits = sum(lang_norm.count(_norm(marker)) for marker in PT_MARKERS)
+    en_hits = sum(lang_norm.count(marker) for marker in EN_MARKERS)
+    # Recalibrado (igual ao contrato/evidence): heading isolada em inglês não
+    # acusa mais sozinha — só um punhado de termos técnicos em EN (comum em
+    # prosa PT-BR real) não é "provável inglês". Só acusa quando o inglês é
+    # dominante E robusto: pelo menos o dobro dos marcadores PT-BR, E pelo
+    # menos 8 marcadores EN no total — um artefato majoritariamente em
+    # inglês, não um artefato PT-BR com jargão técnico.
+    if en_hits >= 2 * pt_hits and en_hits >= 8:
         blockers.append(
             f"provável saída em inglês em {rel}: não demonstra idioma PT-BR técnico suficiente "
-            f"(marcadores pt-br={pt_hits}, en={en_hits}; esperado pt-br > en)"
+            f"(marcadores pt-br={pt_hits}, en={en_hits}; esperado en<8 ou en<2x pt-br)"
         )
         score -= 20
     elif pt_hits >= 2 or rule.min_citations == 0:

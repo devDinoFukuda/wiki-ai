@@ -17,6 +17,7 @@
   run       composto: run-stage + handoff (prepara o fan-out e entrega o prompt)
   integrate composto: merge de todos os batches do manifesto + done do estágio
   verify    valida Markdown confirmado contra citações arquivo:linha
+  drift     compara o commit pinado no surface com o HEAD atual do repo
 
 `next --run` executa a próxima ação quando ela é determinística; decisão
 humana (config/pending) e passo de LLM continuam pedindo o comando explícito.
@@ -50,6 +51,7 @@ from . import sdd as sdd_mod
 from . import agentpack as agentpack_mod
 from . import agentmerge as agentmerge_mod
 from . import noise as noise_mod
+from . import surface as surface_mod
 from .surface import scan, to_dict
 
 
@@ -2705,6 +2707,252 @@ def _verify_next_action(wd: str, cobertura: dict) -> str:
     return f"{motivo}: rode `verify --artifact {caminho}`"
 
 
+# --- F-25: pinagem de commit + detecção de drift --------------------------
+#
+# `surface` grava `git.head` em surface.json e `evidence` copia esse sha para
+# `commit` de cada pack — mas NADA nunca comparava esse valor com o repo. O
+# efeito prático: depois de qualquer `git pull` no legado analisado, todo o
+# SDD (e todas as citações `arquivo:linha` que o `verify` aprova) passava a
+# falar de um commit que não é mais o do disco, sem UM aviso. Uma citação
+# `Foo.java:120` continuava "válida" porque a linha 120 existe — só que agora
+# é outro código. As funções abaixo fecham esse buraco em dois lugares:
+# `verify` (reprova a citação afetada) e o subcomando `drift` (relatório).
+
+
+def _pinned_head(wd: str) -> tuple[str | None, str | None]:
+    """(head_pinado, motivo_indisponível) lido do surface.json do workdir."""
+    st = st_mod.load(wd) or {}
+    art = ((st.get("stages") or {}).get("surface") or {}).get("artifact")
+    if not art or not os.path.isfile(art):
+        return None, "surface.json ausente: rode `surface` para pinar o commit analisado"
+    data = _load_json_or_none(art)
+    if not isinstance(data, dict):
+        return None, f"surface.json ilegível ({art}): commit pinado indisponível"
+    head = (data.get("git") or {}).get("head")
+    if not head:
+        return None, "surface.json sem `git.head`: o repo não tinha git quando foi varrido"
+    return str(head), None
+
+
+def _drift_state(wd: str, repo_path: str) -> dict:
+    """Estado de drift do workdir. NUNCA levanta: indisponível vira warning."""
+    pinned, motivo = _pinned_head(wd)
+    if pinned is None:
+        return {
+            "disponivel": False,
+            "drift": False,
+            "head_pinado": None,
+            "head_atual": surface_mod.current_head(repo_path),
+            "arquivos_alterados": [],
+            "warnings": [motivo],
+        }
+    return surface_mod.drift_report(repo_path, pinned)
+
+
+def _module_item_from_slug(wd: str, slug: str) -> str:
+    """Volta de `modules/<slug>.md` para o item real gravado no state.
+
+    O slug é lossy (`src/app/Pagamentos` -> `src-app-pagamentos`); reconstruir
+    por string daria um `--item` que `redo` não encontra. Aqui o slug é
+    comparado contra os itens que já existem no stage.
+    """
+    stage_state = ((st_mod.load(wd) or {}).get("stages") or {}).get("modules") or {}
+    for key in ITEM_LIST_KEYS:
+        for cand in stage_state.get(key) or []:
+            if ex_mod._slug(str(cand).replace("\\", "/")) == slug:
+                return str(cand)
+    return slug
+
+
+def _artifact_stage_item(wd: str, path: str) -> tuple[str | None, str | None]:
+    """Mapeia um artefato do workdir de volta para (stage, item) de `redo`.
+
+    O layout é o mesmo que `agentmerge` usa para GRAVAR: `modules/<slug>.md`,
+    `sdd/specs/<unit>/*.md` e `sdd/<nome>.md` para os stages nomeados.
+    """
+    try:
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(wd)).replace("\\", "/")
+    except ValueError:
+        return None, None
+    if rel.startswith("../"):
+        return None, None
+    if rel.startswith("modules/") and rel.endswith(".md"):
+        return "modules", _module_item_from_slug(wd, rel[len("modules/"):-len(".md")])
+    if not rel.startswith("sdd/"):
+        return None, None
+    name = rel[len("sdd/"):]
+    name = name[:-len(".md")] if name.endswith(".md") else name
+    if name.startswith("specs/"):
+        parts = name.split("/")
+        return "specs", (parts[1] if len(parts) >= 3 else None)
+    for stage, allowed in agentmerge_mod.NAMED_STAGE_ALLOWED.items():
+        prefixes = agentmerge_mod.NAMED_STAGE_PREFIX_RES.get(stage, ())
+        if name in allowed or any(p.match(name) for p in prefixes):
+            return stage, name
+    if agentmerge_mod._is_specs_doc(name):
+        return "specs", name
+    return None, None
+
+
+_DRIFT_ARTIFACT_ROOTS = ("modules", "sdd")
+MAX_DRIFT_CITATIONS_REPORTED = 20
+
+
+def _artifacts_citing(a, wd: str, changed: set[str]) -> list[dict]:
+    """Artefatos SDD (.md do workdir) que citam algum arquivo alterado.
+
+    Varre as citações `arquivo:linha` de cada .md — a mesma extração que o
+    `verify` usa — e devolve, por artefato, o(s) arquivo(s) afetado(s) e o
+    comando `redo` literal do item correspondente.
+    """
+    afetados: list[dict] = []
+    for root_name in _DRIFT_ARTIFACT_ROOTS:
+        root = os.path.join(wd, root_name)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for fn in sorted(filenames):
+                if not fn.endswith(".md"):
+                    continue
+                full = os.path.join(dirpath, fn)
+                try:
+                    with open(full, encoding="utf-8-sig", errors="replace") as f:
+                        text = f.read()
+                except OSError:
+                    continue
+                hits = [
+                    c for c in ev_mod.citations(text)
+                    if surface_mod.normalize_repo_path(c.path) in changed
+                ]
+                if not hits:
+                    continue
+                stage, item = _artifact_stage_item(wd, full)
+                entry = {
+                    "artefato": os.path.relpath(full, wd).replace("\\", "/"),
+                    "stage": stage,
+                    "item": item,
+                    "arquivos": sorted({surface_mod.normalize_repo_path(c.path) for c in hits}),
+                    "citacoes": [
+                        f"{c.path}:{c.line_start}" for c in hits[:MAX_DRIFT_CITATIONS_REPORTED]
+                    ],
+                    "citacoes_afetadas": len(hits),
+                }
+                if stage in sdd_mod.CRITICAL_STAGES and item:
+                    entry["redo"] = _redo_command(a, stage, item)
+                afetados.append(entry)
+    afetados.sort(key=lambda e: e["artefato"])
+    return afetados
+
+
+def cmd_drift(a) -> int:
+    """Compara o commit pinado no surface.json com o HEAD atual do repo.
+
+    Sem drift: `{"drift": false}` — os artefatos continuam falando do commit
+    que foi analisado. Com drift: lista COMPLETA de arquivos alterados, quais
+    artefatos SDD citam esses arquivos e o `redo` de cada item afetado.
+    """
+    repo_path, code = _ensure_repo(a)
+    if code:
+        return code
+    wd = _wd(a)
+    drift = _drift_state(wd, repo_path)
+
+    payload = {
+        "drift": bool(drift.get("drift")),
+        "disponivel": bool(drift.get("disponivel")),
+        "head_pinado": drift.get("head_pinado"),
+        "head_atual": drift.get("head_atual"),
+        "arquivos_alterados": list(drift.get("arquivos_alterados") or []),
+        "artefatos_afetados": [],
+        "warnings": list(drift.get("warnings") or []),
+    }
+
+    if not payload["drift"]:
+        payload["acao"] = (
+            "sem drift: o repo ainda está no commit pinado; artefatos e citações seguem válidos"
+            if payload["disponivel"]
+            else "drift indeterminado: rode `surface` para (re)pinar o commit deste repo"
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    changed = set(payload["arquivos_alterados"])
+    afetados = _artifacts_citing(a, wd, changed)
+    payload["artefatos_afetados"] = afetados
+
+    redos = []
+    for entry in afetados:
+        cmd = entry.get("redo")
+        if cmd and cmd not in redos:
+            redos.append(cmd)
+    if redos:
+        payload["acao"] = (
+            f"{len(afetados)} artefato(s) citam arquivo alterado entre "
+            f"{payload['head_pinado']} e {payload['head_atual']}: refaça os itens afetados — "
+            + "; ".join(redos[:5])
+            + ("; ..." if len(redos) > 5 else "")
+            + " e rode `surface` de novo para repinar o commit"
+        )
+    elif afetados:
+        payload["acao"] = (
+            "artefatos citam arquivo alterado, mas o item de origem não é remapeável para "
+            "`redo`: revise os artefatos listados e rode `surface` de novo"
+        )
+    else:
+        payload["acao"] = (
+            "drift sem impacto: nenhum artefato SDD cita arquivo alterado; "
+            "rode `surface` de novo para repinar o commit"
+        )
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _apply_drift_to_report(a, wd: str, repo_path: str, md: str, report: dict) -> dict | None:
+    """Aplica o contrato de drift ao relatório do `verify` (mutando-o).
+
+    Devolve o bloco `drift` do payload quando o repo divergiu do commit
+    pinado, ou `None`. Regra: citação para arquivo alterado desde o commit
+    pinado vira ERRO `drift_detectado` (o artefato precisa ser refeito, não
+    "revalidado"); drift que não toca nenhum arquivo citado é só warning.
+    """
+    drift = _drift_state(wd, repo_path)
+    warnings = report.setdefault("warnings", [])
+    for w in drift.get("warnings") or []:
+        if w not in warnings:
+            warnings.append(w)
+    if not drift.get("drift"):
+        return None
+
+    changed = set(drift.get("arquivos_alterados") or [])
+    afetadas = [c for c in ev_mod.citations(md) if surface_mod.normalize_repo_path(c.path) in changed]
+    arquivos_afetados = sorted({surface_mod.normalize_repo_path(c.path) for c in afetadas})
+
+    if afetadas:
+        for c in afetadas:
+            report["errors"].append(
+                {
+                    "citation": f"{c.path}:{c.line_start}",
+                    "rule": "drift_detectado",
+                    "detail": (
+                        f"{c.path} mudou entre o commit pinado {drift.get('head_pinado')} e o "
+                        f"HEAD atual {drift.get('head_atual')}: a citação não prova mais nada"
+                    ),
+                }
+            )
+        report["ok"] = not report["errors"]
+    else:
+        warnings.append(
+            f"drift: {len(changed)} arquivo(s) mudaram entre {drift.get('head_pinado')} e "
+            f"{drift.get('head_atual')}, nenhum deles citado neste artefato"
+        )
+
+    return {
+        "head_pinado": drift.get("head_pinado"),
+        "head_atual": drift.get("head_atual"),
+        "arquivos_alterados": arquivos_afetados,
+    }
+
+
 def cmd_verify(a) -> int:
     """Valida Markdown confirmado.
 
@@ -2724,11 +2972,17 @@ def cmd_verify(a) -> int:
         return code
     md = open(a.artifact, encoding="utf-8-sig", errors="replace").read()
     report = ev_mod.verify_markdown(repo_path, md)
+
+    wd = _wd(a)
+    # F-25: o drift entra ANTES da gravação do relatório e do estado — um
+    # artefato cujas citações apontam para arquivo já alterado não pode ser
+    # gravado como `done` nem sair com exit code 0.
+    drift_bloco = _apply_drift_to_report(a, wd, repo_path, md, report)
+
     out = a.output
     if out:
         ev_mod.write_json(out, report)
 
-    wd = _wd(a)
     key = _verify_artifact_key(wd, a.artifact)
     st = st_mod.load(wd) or {}
     stage = st.setdefault("stages", {}).setdefault("verify", {})
@@ -2746,9 +3000,16 @@ def cmd_verify(a) -> int:
     st_mod.mark(wd, "verify", cobertura["status"], out or a.artifact)
 
     payload = dict(report)
+    if drift_bloco:
+        payload["drift"] = drift_bloco
     payload["cobertura"] = cobertura
     payload["stage_status"] = cobertura["status"]
     payload["acao"] = _verify_next_action(wd, cobertura)
+    if drift_bloco and drift_bloco["arquivos_alterados"]:
+        payload["acao"] = (
+            "drift: o repo saiu do commit pinado e arquivos citados mudaram — rode "
+            "`surface` para repinar e `drift` para ver os itens a refazer, depois revalide"
+        )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 1
 
@@ -3156,6 +3417,12 @@ def main(argv=None) -> int:
     vf.add_argument("--artifact", required=True, help="Markdown a verificar")
     vf.add_argument("--output", help="salva relatório JSON")
     vf.set_defaults(fn=cmd_verify)
+
+    df = sub.add_parser(
+        "drift",
+        help="compara o commit pinado no surface.json com o HEAD atual e lista artefatos SDD afetados",
+    )
+    df.set_defaults(fn=cmd_drift)
 
     # `--quiet`/`--verbose` precisam funcionar em QUALQUER posição (antes ou
     # depois do subcomando) com efeito idêntico. Sem isto, algo como

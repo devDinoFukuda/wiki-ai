@@ -218,8 +218,16 @@ def build_evidence_pack(
     }
 
 
+# F-29: a classe original era `[A-Za-z0-9_.-]`, ASCII puro. Em legado real
+# (o alvo declarado deste pipeline) nome de arquivo com acento é comum —
+# `servico/Usuário.java`, `dominio/Cotação.cs`. A citação simplesmente NÃO era
+# extraída: a claim ficava "sem citação" e o verify reprovava com
+# `claim_sem_evidencia` uma evidência que existia e estava correta.
+# `\w` em padrão `str` do Python 3 já é Unicode-aware, então cobre acento,
+# cedilha e alfabetos não-latinos, mantendo a exclusão de espaço e de ':'
+# (que separa caminho de linha) — ':' e ' ' não pertencem a `\w`.
 _CITATION_RE = re.compile(
-    r"(?P<path>(?:[A-Za-z0-9_.-]+[/\\])*[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+)"
+    r"(?P<path>(?:[\w.-]+[/\\])*[\w.-]+\.\w+)"
     r":(?P<start>\d+)(?:-(?P<end>\d+))?"
 )
 _GREEN = "\U0001F7E2"
@@ -252,6 +260,57 @@ _EN_MARKERS = (
     "dependencies",
     "data structures",
 )
+# F-30: o detector antigo comparava só a PRESENÇA destes marcadores, num texto
+# que incluía código, crases e caminhos de arquivo. Duas consequências:
+#   (1) falso positivo — um artefato em PT-BR que cite `requirements.md`,
+#       `dependencies` de um pom.xml ou um heading técnico "## Overview"
+#       era acusado de estar em inglês;
+#   (2) manipulável por keyword — bastava salpicar duas palavras PT-BR da
+#       lista para desligar a acusação de um documento inteiro em inglês.
+# A recalibração abaixo troca "presença de palavra-chave" por PROPORÇÃO de
+# sinal linguístico sobre a PROSA (código/crase/caminho removidos antes):
+# palavras funcionais são as que um autor não escolhe conscientemente, e por
+# isso não são manipuláveis como um heading é.
+_EN_FUNCTION_WORDS = frozenset(
+    """
+    the this that these those with without from after before and or of for to in on at by
+    is are was were be been being has have had does did will would should must can could
+    may might when which while whose where what who into than then their there they them
+    its it not but also such each other another more most only both between during through
+    over under about above below within across any all every some many few
+    """.split()
+)
+# `as`, `do`, `a`, `e`, `o`, `no`, `os` ficam DE FORA de propósito: são
+# palavras funcionais das DUAS línguas e envenenariam a contagem.
+_PT_FUNCTION_WORDS = frozenset(
+    """
+    de da do das dos para com sem que não nao é são ser está estão como pelo pela pelos
+    pelas quando onde cada este esta esse essa aquele aquela seu sua seus suas ao aos às
+    um uma uns umas na nas nos em por mais menos também entre sobre até após antes depois
+    todo toda todos todas isso aquilo qual quais deve devem faz fazem usa usam existe
+    existem apenas ainda já pode podem foi foram sendo cujo cuja porque então
+    """.split()
+)
+# Sinal PT-BR mais barato e mais difícil de forjar que qualquer lista: o acento.
+_ACCENTED_WORD_RE = re.compile(r"\b\w*[À-ÿ]\w*\b", re.UNICODE)
+_WORD_RE = re.compile(r"[\wÀ-ÿ']+", re.UNICODE)
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.S)
+_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+# Caminho de arquivo/identificador com extensão: `src/quotes/Quote.java:12`,
+# `pom.xml`, `README.md`. Nada disso diz em que idioma a PROSA está escrita.
+_PATH_LIKE_RE = re.compile(
+    r"\S*[/\\]\S*|\b[\w.-]+\.[A-Za-z0-9_]{1,8}\b(?::\d+(?:-\d+)?)?",
+    re.UNICODE,
+)
+# Marcador conta o dobro de uma palavra funcional (é um sinal deliberado e
+# multivocabular), mas o PISO alto (`_EN_MIN_SIGNAL`) garante que headings
+# técnicos em inglês ISOLADOS — "## Overview", "## Dependencies" — não bastem
+# para acusar um documento; e a razão mínima garante que prosa PT-BR de verdade
+# ao redor sempre vence.
+_MARKER_WEIGHT = 2
+_EN_MIN_SIGNAL = 8
+_EN_PT_RATIO = 2
+
 _TECHNICAL_BOILERPLATE_MARKERS = ("TODO", "TBD", "FIXME", "XXX")
 _TECHNICAL_BOILERPLATE_RE_TEMPLATE = r"(?<!\w){marker}(?!\w)"
 _BOILERPLATE_TEXT_MARKERS = (
@@ -358,12 +417,60 @@ def _citation_error(repo: str, c: Citation) -> dict | None:
     return None
 
 
+def _prose_only(text: str) -> str:
+    """Prosa do artefato: sem fences, sem crases, sem caminho de arquivo.
+
+    É o único recorte em que uma pergunta sobre IDIOMA faz sentido — código e
+    caminho são inglês por construção em qualquer repositório.
+    """
+    cleaned = _CODE_FENCE_RE.sub(" ", text or "")
+    cleaned = _INLINE_CODE_RE.sub(" ", cleaned)
+    return _PATH_LIKE_RE.sub(" ", cleaned)
+
+
+def _language_signal(markdown: str) -> tuple[int, int]:
+    """(en_hits, pt_hits) sobre a prosa. Determinístico e simétrico."""
+    prose = _prose_only(markdown)
+    lower = prose.lower()
+    words = _WORD_RE.findall(lower)
+
+    en_hits = _MARKER_WEIGHT * sum(lower.count(marker) for marker in _EN_MARKERS)
+    en_hits += sum(1 for w in words if w in _EN_FUNCTION_WORDS)
+
+    pt_hits = _MARKER_WEIGHT * sum(lower.count(marker) for marker in _PT_BR_MARKERS)
+    pt_hits += sum(1 for w in words if w in _PT_FUNCTION_WORDS)
+    pt_hits += len(_ACCENTED_WORD_RE.findall(lower))
+    return en_hits, pt_hits
+
+
+def provavel_ingles(markdown: str) -> bool:
+    """Verdadeiro só quando o sinal EN é alto EM ABSOLUTO e domina o PT.
+
+    Antes bastavam 2 palavras-chave em inglês em qualquer lugar do arquivo
+    (inclusive dentro de crase) para reprovar o artefato.
+    """
+    en_hits, pt_hits = _language_signal(markdown)
+    return en_hits >= _EN_MIN_SIGNAL and en_hits >= _EN_PT_RATIO * pt_hits
+
+
+def _claim_word_count(block: str) -> tuple[int, str]:
+    """(palavras, prosa) de uma claim.
+
+    F-31: o conteúdo entre crases era APAGADO antes da contagem, então
+    `- O teto de retry é `MAX_RETRIES` em `PaymentService.retry()`. 🟢` perdia
+    justamente os tokens que a tornam precisa e caía no piso de 7 palavras
+    como se fosse genérica. Cada trecho em crase vale 1 palavra — é 1 termo,
+    não 0 e não N.
+    """
+    code_spans = _INLINE_CODE_RE.findall(block)
+    prose = _INLINE_CODE_RE.sub(" ", block)
+    words = re.findall(r"\b[\wÀ-ÿ]{3,}\b", prose, re.UNICODE)
+    return len(words) + len(code_spans), prose
+
+
 def _markdown_quality_errors(markdown: str, claim_blocks: list[tuple[int, str]]) -> list[dict]:
-    lower = markdown.lower()
     errors: list[dict] = []
-    pt_hits = sum(1 for marker in _PT_BR_MARKERS if marker in lower)
-    en_hits = sum(1 for marker in _EN_MARKERS if marker in lower)
-    if en_hits > pt_hits and en_hits >= 2:
+    if provavel_ingles(markdown):
         errors.append(
             {
                 "rule": "provavel_ingles",
@@ -382,9 +489,8 @@ def _markdown_quality_errors(markdown: str, claim_blocks: list[tuple[int, str]])
     for line_no, block in claim_blocks:
         if _GREEN not in block:
             continue
-        claim_text = re.sub(r"`[^`]+`", "", block)
-        words = re.findall(r"\b[\wÀ-ÿ]{3,}\b", claim_text, re.UNICODE)
-        if len(words) < 7 or (_GENERIC_GREEN_RE.search(claim_text) and len(words) < 10):
+        total_words, claim_text = _claim_word_count(block)
+        if total_words < 7 or (_GENERIC_GREEN_RE.search(claim_text) and total_words < 10):
             errors.append(
                 {
                     "line": line_no,

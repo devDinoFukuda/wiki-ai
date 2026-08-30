@@ -19,6 +19,7 @@ import re
 import sqlite3
 import struct
 import time
+import unicodedata
 from dataclasses import dataclass
 
 SCHEMA = """
@@ -306,6 +307,58 @@ _TERM = re.compile(r'"[^"]*"|\S+')
 _FTS5_OPS = {"OR", "AND", "NOT"}
 
 
+_STEM_MIN_LEN = 4  # abaixo disso o wildcard fica curto demais (ex.: "a*") e explode em ruído
+
+# Sufixos de flexão/plural PT-BR, do mais específico para o mais genérico —
+# checados nessa ordem para que "-ões"/"-ns"/"-ão"/"-is" não sejam engolidos
+# pela regra genérica de "-s" antes de terem chance de casar. `cut` é quantos
+# caracteres finais são removidos; `add` é o que entra no lugar (pode ser "").
+# Operam SEM acento: o índice normaliza via `remove_diacritics 2`
+# (unicode61), então tanto a base quanto o wildcard têm que ir sem acento —
+# senão o wildcard nunca casa com o token indexado.
+_PT_SUFFIX_RULES: tuple[tuple[str, int, str], ...] = (
+    ("oes", 3, ""),   # integrações -> integrac* (casa com integração -> integrac*)
+    ("ns", 2, "m"),   # homens -> homem
+    ("ao", 2, ""),    # integracao -> integrac* (casa com integrações -> integrac*)
+    ("is", 2, "l"),   # papeis -> papel
+    ("es", 2, ""),    # professores -> professor
+    ("s", 1, ""),     # servicos -> servico
+)
+
+
+def _strip_diacritics(s: str) -> str:
+    nfd = unicodedata.normalize("NFD", s)
+    return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn")
+
+
+def _pt_stem(word: str) -> str | None:
+    """Stem morfológico leve PT-BR para expansão de recall no FTS5 (F-34).
+
+    FTS5 (unicode61 + remove_diacritics 2, sem stemming) trata "integração" e
+    "integrações" como tokens totalmente diferentes — a frase exata não acha
+    a flexão. Sem mudar o schema (sem migração/reindex), a expansão acontece
+    do lado da query: gera um stem conservador + wildcard de prefixo
+    (`stem*`), casando com qualquer flexão que compartilhe o mesmo radical no
+    índice.
+
+    Sanitiza para alfanumérico sem acento (o wildcard não pode carregar aspas
+    nem os caracteres especiais do FTS5 — a query resultante continua tendo
+    que passar pelo saneamento F-20). Aplica no máximo UMA regra — a primeira
+    que casar, da mais específica à mais genérica — e só devolve stem se o
+    resultado tiver pelo menos `_STEM_MIN_LEN` caracteres e for diferente da
+    palavra original (senão a expansão é redundante com o termo exato).
+    """
+    base = re.sub(r"[^0-9a-z]", "", _strip_diacritics(word.lower()))
+    if len(base) < _STEM_MIN_LEN:
+        return None
+    for suf, cut, add in _PT_SUFFIX_RULES:
+        if base.endswith(suf) and len(base) > len(suf):
+            stem = base[:-cut] + add
+            if len(stem) >= _STEM_MIN_LEN and stem != base:
+                return stem
+    return None
+
+
 def to_fts_query(q: str) -> str:
     """Traduz a mini-sintaxe para FTS5.
 
@@ -320,9 +373,17 @@ def to_fts_query(q: str) -> str:
     sqlite3.OperationalError não tratada (F-20). Em vez de emitir o
     operador pendente, ele é degradado para termo literal: perde-se a
     semântica do operador, mas a query nunca quebra o parser do FTS5.
+
+    F-34: todo termo positivo avulso (não frase entre aspas, não operador,
+    não negado) com >= 4 caracteres ganha uma alternativa morfológica —
+    `("termo" OR stem*)` — para recall de flexões PT-BR (plural, "-ção"/
+    "-ções" etc.) que o FTS5 sem stemming não recupera sozinho. Frase entre
+    aspas e termo negado (`-termo`) NUNCA expandem: frase é busca literal
+    exata por contrato, e negar uma família morfológica inteira em vez do
+    termo exato seria surpreendente (excluiria mais do que o usuário pediu).
     """
     tokens = _TERM.findall(q or "")
-    items: list[tuple] = []  # ("op", "OR"/"AND"/"NOT") | ("term", neg, phrase)
+    items: list[tuple] = []  # ("op", "OR"/"AND"/"NOT") | ("term", neg, phrase, stem)
     for tok in tokens:
         neg = tok.startswith("-") and len(tok) > 1
         if neg:
@@ -331,11 +392,13 @@ def to_fts_query(q: str) -> str:
         if not neg and upper in _FTS5_OPS:
             items.append(("op", upper))
             continue
-        if tok.startswith('"') and tok.endswith('"') and len(tok) >= 2:
+        is_phrase = tok.startswith('"') and tok.endswith('"') and len(tok) >= 2
+        if is_phrase:
             phrase = tok
         else:
             phrase = '"' + tok.replace('"', "") + '"'
-        items.append(("term", neg, phrase))
+        stem = _pt_stem(tok) if (not neg and not is_phrase and len(tok) >= _STEM_MIN_LEN) else None
+        items.append(("term", neg, phrase, stem))
 
     out: list[str] = []
     have_operand = False  # há um operando à esquerda pronto para casar
@@ -354,7 +417,8 @@ def to_fts_query(q: str) -> str:
                 pending_op = word
                 have_operand = False
         else:
-            _, neg, phrase = item
+            _, neg, phrase, stem = item
+            operand = f"({phrase} OR {stem}*)" if stem else phrase
             if neg and not have_operand:
                 # `-termo` isolado / sem operando à esquerda para o NOT:
                 # negação sem alvo não tem como virar FTS5 válido -> termo
@@ -366,7 +430,7 @@ def to_fts_query(q: str) -> str:
                 if pending_op:
                     out.append(pending_op)
                     pending_op = None
-                out.append(phrase)
+                out.append(operand)
             have_operand = True
     return " ".join(out)
 

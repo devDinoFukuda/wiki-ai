@@ -3,7 +3,8 @@
   reindex   varre raw/ e wiki/, chunka, indexa o que mudou, poda o que sumiu
   search    híbrido (BM25 + vetorial) com fusão RRF e filtro de proveniência
   get       recupera documento/trecho por docid ou path
-  audit     regras DETERMINÍSTICAS (L1, L2, L5) em SQL — sem LLM, sem vetor
+  audit     regras DETERMINÍSTICAS (L1, L2, L5 em SQL; L4 por travessia de
+            frontmatter) — sem LLM, sem vetor
   status    saúde do índice e frescor
 """
 
@@ -316,12 +317,168 @@ AUDIT_SQL = {
 }
 
 
+# ---------------- L4: realimentação (anti-contaminação) ----------------
+#
+# F-26. O FLUXO 4 fecha um loop perigoso: a resposta sintetizada a partir da
+# wiki pode voltar como fonte (`agent-output`) e, daí em diante, o corpus cita
+# a si mesmo — conhecimento sem nenhum lastro humano ou de código. O vínculo é
+# declarado no frontmatter da fonte (`derived_from: id1,id2`, gravado por
+# `wk ingest --derived-from`).
+#
+# Por que NÃO é SQL como L1/L2/L5: `derived_from` não é coluna do índice
+# (o schema de `store.py` não muda neste lote), então a regra é uma travessia
+# DETERMINÍSTICA de `raw/` + `wiki/` lendo o frontmatter direto do disco —
+# mesmo padrão das regras W de `wk lint`. Continua sem LLM e sem vetor.
+
+L4_RULE = "L4_realimentacao"
+AUDIT_RULES = sorted(AUDIT_SQL) + [L4_RULE]
+
+
+def derived_from_ids(meta: dict) -> list[str]:
+    """Ids declarados em `derived_from`, normalizados.
+
+    Aceita a forma canônica (string separada por vírgula, que é como
+    `wk ingest --derived-from` grava) e também lista YAML — o frontmatter pode
+    ser escrito à mão. Preserva a ordem, descarta vazios e duplicados.
+    """
+    raw = meta.get("derived_from")
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        bruto = [str(x) for x in raw]
+    else:
+        bruto = str(raw).strip().strip("[]").split(",")
+    out: list[str] = []
+    for item in bruto:
+        v = item.strip().strip("\"'").strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def _read_text(path: str) -> str:
+    # utf-8-sig pelo mesmo motivo do reindex: BOM do Windows não pode virar corpo.
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
+        return f.read()
+
+
+def derivation_graph(store_root: str) -> tuple[dict, set]:
+    """(`fontes de raw/ por id`, `ids de páginas de wiki/`).
+
+    Cada fonte vira `{path, source_type, derived_from}`. O primeiro arquivo a
+    reivindicar um id vence (ordem estável de `_walk`) — id duplicado em raw/ é
+    achado de outra regra (F-16b, no promote), não desta.
+    """
+    fontes: dict[str, dict] = {}
+    raw_root = os.path.join(store_root, "raw")
+    if os.path.isdir(raw_root):
+        for path in _walk(raw_root):
+            meta, _body = split(_read_text(path))
+            doc_id = meta.get("id")
+            if doc_id is None or not str(doc_id).strip():
+                continue
+            fontes.setdefault(
+                str(doc_id).strip(),
+                {
+                    "path": path,
+                    "source_type": meta.get("source_type"),
+                    "derived_from": derived_from_ids(meta),
+                },
+            )
+    paginas: set[str] = set()
+    wiki_root = os.path.join(store_root, "wiki")
+    if os.path.isdir(wiki_root):
+        for path in _walk(wiki_root):
+            if os.path.basename(path) in IGNORED_WIKI_FILES:
+                continue
+            meta, _body = split(_read_text(path))
+            page_id = meta.get("id")
+            if page_id is not None and str(page_id).strip():
+                paginas.add(str(page_id).strip())
+            # o stem também identifica a página (é como os wikilinks a citam)
+            paginas.add(os.path.splitext(os.path.basename(path))[0])
+    return fontes, paginas
+
+
+def derivation_lastro(
+    refs: list[str], fontes: dict, paginas: set, origem: str | None = None
+) -> dict:
+    """Percorre o grafo de derivação a partir de `refs` e classifica o que
+    alcança. `lastro` = fontes de raw/ que NÃO são `agent-output` (transcrição,
+    doc, repositório, web-clip): é o que ancora o conhecimento fora do próprio
+    agente. Página de wiki NUNCA conta como lastro — ela é saída compilada do
+    corpus, e tratá-la como origem é exatamente o loop que a regra fecha.
+
+    A travessia é transitiva: uma fonte de agente que deriva de outra fonte de
+    agente ancorada numa transcrição humana TEM lastro (indireto, mas real).
+    Ids não resolvidos saem em `desconhecidos` — o chamador não deve acusar
+    realimentação sem conseguir resolver a cadeia inteira.
+    """
+    fila = list(refs)
+    visto = {origem} if origem else set()
+    resultado = {"lastro": [], "agent_output": [], "wiki": [], "desconhecidos": []}
+    while fila:
+        ref = fila.pop(0)
+        if ref in visto:
+            continue
+        visto.add(ref)
+        info = fontes.get(ref)
+        if info is None:
+            resultado["wiki" if ref in paginas else "desconhecidos"].append(ref)
+            continue
+        if info["source_type"] != "agent-output":
+            resultado["lastro"].append(ref)
+            continue
+        resultado["agent_output"].append(ref)
+        fila.extend(info["derived_from"])
+    return resultado
+
+
+def is_realimentacao(lastro: dict) -> bool:
+    """Verdadeiro quando a cadeia foi resolvida por inteiro e não alcançou
+    nenhuma fonte humana/de código — só saída de agente e/ou página da wiki."""
+    return not lastro["lastro"] and not lastro["desconhecidos"] and bool(
+        lastro["agent_output"] or lastro["wiki"]
+    )
+
+
+def realimentacao_findings(store_root: str) -> list[dict]:
+    """Achados de L4, no mesmo formato dos itens das regras SQL."""
+    fontes, paginas = derivation_graph(store_root)
+    itens: list[dict] = []
+    for doc_id, info in sorted(fontes.items(), key=lambda kv: kv[1]["path"]):
+        if info["source_type"] != "agent-output" or not info["derived_from"]:
+            continue
+        lastro = derivation_lastro(info["derived_from"], fontes, paginas, origem=doc_id)
+        if not is_realimentacao(lastro):
+            continue
+        origens = []
+        if lastro["agent_output"]:
+            origens.append("agent-output: " + ", ".join(lastro["agent_output"]))
+        if lastro["wiki"]:
+            origens.append("wiki: " + ", ".join(lastro["wiki"]))
+        itens.append(
+            {
+                "docid": "#" + store.make_docid(info["path"]),
+                "path": info["path"],
+                "detalhe": (
+                    "derivada so de saida de agente/pagina da wiki, sem lastro "
+                    "humano ou de codigo (" + "; ".join(origens) + ")"
+                ),
+            }
+        )
+    return itens
+
+
 def cmd_audit(a) -> int:
     """Regras determinísticas. Não gastam LLM nem vetor.
 
-    L3 (contradição) e L4 (realimentação) NÃO estão aqui de propósito: exigem
-    julgamento semântico. Para elas, use `search` para gerar candidatos e leve
-    só esses ao LLM.
+    L1/L2/L5 saem de SQL sobre o índice; L4 (realimentação) sai da travessia de
+    `derived_from` no frontmatter de raw/ — determinística também, só não
+    consultável em SQL porque o campo não é coluna do índice.
+
+    L3 (contradição) NÃO está aqui de propósito: exige julgamento semântico.
+    Para ela, use `search` para gerar candidatos e leve só esses ao LLM.
     """
     conn = store.connect(a.db)
     report: dict[str, list] = {}
@@ -333,6 +490,8 @@ def cmd_audit(a) -> int:
             {"docid": "#" + r["docid"], "path": r["path"], "detalhe": r["detalhe"]}
             for r in rows
         ]
+    if not a.rule or a.rule == L4_RULE:
+        report[L4_RULE] = realimentacao_findings(a.store)
     total = sum(len(v) for v in report.values())
     print(
         json.dumps(
@@ -412,8 +571,8 @@ def main(argv=None) -> int:
     g.add_argument("--count", type=int, default=0)
     g.set_defaults(fn=cmd_get)
 
-    au = sub.add_parser("audit", help="regras determinísticas (L1, L2, L5)")
-    au.add_argument("--rule", choices=sorted(AUDIT_SQL))
+    au = sub.add_parser("audit", help="regras determinísticas (L1, L2, L4, L5)")
+    au.add_argument("--rule", choices=AUDIT_RULES)
     au.set_defaults(fn=cmd_audit)
 
     st = sub.add_parser("status", help="saúde e frescor do índice")

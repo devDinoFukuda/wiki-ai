@@ -1002,16 +1002,51 @@ def _promote_validation_error(dest: str, source_id, body_esperado: str) -> str |
     return None
 
 
-def _run_reindex(store_root: str) -> tuple[bool, str | None]:
+# F-14: as três variáveis que `sbindex.embed.get_embedder` exige para sair do
+# modo léxico. A detecção aqui é SÓ por presença delas no ambiente — nenhuma
+# chamada de rede é feita para "testar" a credencial (um reindex não pode
+# depender de latência/quota de API para decidir o próprio modo). Em CI e nos
+# testes as vars não existem, então o caminho léxico antigo é preservado.
+_EMBED_ENV_VARS = (
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_EMBED_DEPLOY",
+)
+
+
+def _embeddings_configurados() -> bool:
+    return all((os.environ.get(name) or "").strip() for name in _EMBED_ENV_VARS)
+
+
+def _reindex_modo() -> str:
+    return "completo" if _embeddings_configurados() else "lex-only (embeddings não configurados)"
+
+
+def _run_reindex(store_root: str) -> tuple[bool, str | None, str]:
+    """Reindexa o store depois de promote/compile. Devolve (ok, erro, modo).
+
+    F-14: antes passava SEMPRE `--lex-only`, então os reindexes automáticos do
+    pipeline jamais geravam embedding — num ambiente com Azure OpenAI
+    configurado, a metade vetorial da busca ficava permanentemente vazia até
+    alguém lembrar de rodar `wk index reindex` na mão (e `vec:`/`hyde:`
+    falhavam com exit 2 num store que, do ponto de vista da configuração,
+    estava pronto). Agora o modo segue o ambiente: com as três
+    `AZURE_OPENAI_*` presentes, reindex completo; sem elas, lex-only —
+    idêntico ao comportamento anterior. O modo escolhido vai para o JSON do
+    comando chamador, para que nunca seja preciso adivinhar qual rodou.
+    """
     from sbindex.cli import main as sbindex_main
 
+    completo = _embeddings_configurados()
+    modo = _reindex_modo()
+    argv = ["--store", store_root, "reindex"] + ([] if completo else ["--lex-only"])
     stdout = io.StringIO()
     stderr = io.StringIO()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        code = sbindex_main(["--store", store_root, "reindex", "--lex-only"])
+        code = sbindex_main(argv)
     if code:
-        return False, (stderr.getvalue() or stdout.getvalue()).strip()
-    return True, None
+        return False, (stderr.getvalue() or stdout.getvalue()).strip(), modo
+    return True, None, modo
 
 
 def _collect_approved_paths(
@@ -1170,6 +1205,17 @@ def cmd_promote(a) -> int:
     massa_promovidos: list[str] = []
     verify_blocked: list[dict] = []
     verify_overridden: list[dict] = []
+    # F-26(c): anti-contaminação. O grafo de derivação é montado UMA vez, do
+    # estado de raw/ ANTES deste lote — `derived_from` sempre aponta para
+    # fontes já promovidas, e resolver contra um raw/ que muda no meio do laço
+    # deixaria o resultado dependente da ordem de varredura do inbox.
+    from sbindex.cli import derivation_graph, derivation_lastro, derived_from_ids
+    from sbindex.cli import is_realimentacao
+
+    allow_feedback_loop = bool(getattr(a, "allow_feedback_loop", False))
+    grafo_fontes, grafo_paginas = derivation_graph(store_root)
+    realimentacao_blocked: list[dict] = []
+    realimentacao_overridden: list[dict] = []
     # F-16(b): ids já presentes em raw/**. O mapa é atualizado a cada item
     # promovido, então duas fontes do MESMO lote com o mesmo id também colidem.
     raw_ids = _raw_ids(store_root)
@@ -1221,6 +1267,50 @@ def cmd_promote(a) -> int:
                 verify_overridden.append(
                     {"id": source_id, "path": rel, "topic": item_topic, "workdirs": vfailed}
                 )
+
+        # F-26(c): fecha o loop do FLUXO 4. Uma saída de agente que declara
+        # `derived_from` e cuja cadeia — resolvida contra raw/, transitivamente
+        # — não alcança NENHUMA fonte humana ou de código é conhecimento que só
+        # cita a si mesmo: a resposta sintetizada da wiki voltando como se
+        # fosse fonte primária. Promover isso é o que transforma uma alucinação
+        # em fato canônico do corpus. Bloqueio por ITEM (fontes sem
+        # `derived_from` seguem o caminho de sempre); override só por decisão
+        # humana explícita (--allow-feedback-loop), registrada no log.
+        derivados = derived_from_ids(meta)
+        if source_type == "agent-output" and derivados:
+            lastro = derivation_lastro(
+                derivados, grafo_fontes, grafo_paginas, origem=str(source_id) if source_id else None
+            )
+            if is_realimentacao(lastro):
+                item_loop = {
+                    "id": source_id,
+                    "path": rel,
+                    "derived_from": derivados,
+                    "cadeia": {
+                        "agent_output": lastro["agent_output"],
+                        "wiki": lastro["wiki"],
+                    },
+                }
+                if not allow_feedback_loop:
+                    realimentacao_blocked.append(
+                        {
+                            **item_loop,
+                            "motivo": "realimentacao",
+                            "detalhe": (
+                                "derived_from só alcança saída de agente e/ou página da "
+                                "wiki — nenhuma fonte humana (human-transcript, human-doc, "
+                                "web-clip) ou de código (code-repo) na cadeia"
+                            ),
+                            "acao": (
+                                "ancore a fonte: ingira a transcrição/doc/repositório que "
+                                "sustenta o conteúdo e cite o id dela em `--derived-from`; "
+                                "ou, se a decisão humana é aceitar conhecimento sem lastro, "
+                                "repita com --allow-feedback-loop (fica registrado no log)"
+                            ),
+                        }
+                    )
+                    continue
+                realimentacao_overridden.append(item_loop)
 
         is_approved = os.path.abspath(path) in approved_paths
 
@@ -1361,20 +1451,40 @@ def cmd_promote(a) -> int:
                 store_root,
                 f"- override verify: {item.get('id') or '(sem-id)'} | {item['path']} | topic {item['topic']}",
             )
+    # F-26(c): o override do gate de realimentação é a decisão mais cara do
+    # sistema (admite conhecimento sem lastro no corpus canônico) — vai para o
+    # log SEMPRE, com a cadeia que motivou o bloqueio.
+    if realimentacao_overridden:
+        _append_log(
+            store_root,
+            f"## [{_utc_now()}] promote --allow-feedback-loop | "
+            f"{len(realimentacao_overridden)} promovidos sem lastro humano/codigo | {log_actor}",
+        )
+        for item in realimentacao_overridden:
+            _append_log(
+                store_root,
+                f"- override realimentacao: {item.get('id') or '(sem-id)'} | {item['path']} | "
+                f"derived_from: {', '.join(item['derived_from'])}",
+            )
     reindexed = False
     reindex_error = None
+    reindex_modo = _reindex_modo()
     if promoted:
-        reindexed, reindex_error = _run_reindex(store_root)
+        reindexed, reindex_error, reindex_modo = _run_reindex(store_root)
 
     out = {
         "promovidos": promoted,
         "decisao_humana": human,
         "quarentena": quarantine,
         "bloqueados_verify": verify_blocked,
+        "bloqueados_realimentacao": realimentacao_blocked,
         "reindexed": reindexed,
+        "reindex_modo": reindex_modo,
     }
     if verify_overridden:
         out["verify_override"] = verify_overridden
+    if realimentacao_overridden:
+        out["realimentacao_override"] = realimentacao_overridden
     if duplicados:
         out["duplicados"] = duplicados
     if falhas_gravacao:
@@ -2153,7 +2263,7 @@ def cmd_compile(a) -> int:
     _write_md(index_path, index_text)
     pages.insert(0, os.path.relpath(index_path, store_root).replace("\\", "/"))
 
-    reindexed, reindex_error = _run_reindex(store_root)
+    reindexed, reindex_error, reindex_modo = _run_reindex(store_root)
     _append_log(
         store_root,
         f"## [{_utc_now()}] compile | {len(pages)} páginas | {len(sources)} fontes | "
@@ -2170,6 +2280,7 @@ def cmd_compile(a) -> int:
         "fontes": len(sources),
         "podados": podados,
         "reindexed": reindexed,
+        "reindex_modo": reindex_modo,
         "overview": [{"topic": t, "href": h, "lacunas": l} for t, h, l in overview_entries],
     }
     if verify_overridden:
@@ -2453,7 +2564,7 @@ def cmd_docx(a) -> int:
 
 def _audit_index(store_root: str, path_filter: str | None = None) -> dict:
     from sbindex import store
-    from sbindex.cli import AUDIT_SQL
+    from sbindex.cli import AUDIT_SQL, L4_RULE, realimentacao_findings
 
     conn = store.connect(os.path.join(store_root, "index.db"))
     rules = {}
@@ -2468,6 +2579,17 @@ def _audit_index(store_root: str, path_filter: str | None = None) -> dict:
         rules[rule] = {"n": len(rows), "itens": rows}
         total += len(rows)
     conn.close()
+    # F-26(b): L4 não sai de SQL — `derived_from` não é coluna do índice, então
+    # a regra lê o frontmatter de raw/ direto do disco (travessia
+    # determinística, mesmo padrão das regras W). O `wk lint` precisa dela aqui
+    # porque não passa por `sbindex audit`: monta o relatório pelo AUDIT_SQL.
+    l4 = [
+        item
+        for item in realimentacao_findings(store_root)
+        if not path_filter or path_filter in item["path"]
+    ]
+    rules[L4_RULE] = {"n": len(l4), "itens": l4}
+    total += len(l4)
     return {"achados": total, "regras": rules}
 
 
@@ -3055,7 +3177,7 @@ def _docx_gerado_por_wk(path: str) -> bool:
 
 def _ingest_asset(
     file_path: str, ext: str, store_root: str, source_type: str, origin: str,
-    captured_at: str, topic, doc_id: str,
+    captured_at: str, topic, doc_id: str, derived_from: str | None = None,
 ) -> tuple[str, str]:
     """Guarda o original imutável em `raw/assets/` e cria a página de fonte no inbox/.
 
@@ -3078,6 +3200,10 @@ def _ingest_asset(
         "promoted": False,
         "topic": topic,
     }
+    # F-26: a cadeia de derivação viaja no frontmatter como chave extra
+    # (`_render_frontmatter` preserva extras; `frontmatter.split` as devolve).
+    if derived_from:
+        meta["derived_from"] = derived_from
     body = "\n".join([
         f"# Fonte: {filename}",
         "",
@@ -3117,6 +3243,15 @@ def cmd_ingest(a) -> int:
         print(json.dumps({"error": "--origin não pode ser vazio"}, ensure_ascii=False), file=sys.stderr)
         return 2
 
+    # F-26(a): `--derived-from "<id1>,<id2>"` declara de QUE fontes este
+    # documento foi derivado. É o que permite ao lint (L4) e ao promote
+    # detectar o loop do FLUXO 4 — resposta sintetizada da wiki reingerida como
+    # se fosse fonte primária. Normaliza para lista separada por vírgula.
+    from sbindex.cli import derived_from_ids
+
+    derived_ids = derived_from_ids({"derived_from": getattr(a, "derived_from", None)})
+    derived_from = ",".join(derived_ids) if derived_ids else None
+
     store_root = _store_root(a)
     captured_at = a.captured_at or _utc_now()
     stem = os.path.splitext(os.path.basename(a.file))[0]
@@ -3145,7 +3280,8 @@ def cmd_ingest(a) -> int:
     asset_rel = None
     if ext in _INGEST_ASSET_EXTS:
         dest, asset_rel = _ingest_asset(
-            a.file, ext, store_root, a.source_type, origin, captured_at, a.topic, doc_id
+            a.file, ext, store_root, a.source_type, origin, captured_at, a.topic,
+            doc_id, derived_from,
         )
     else:
         body, conv_error = _convert_to_markdown(a.file)
@@ -3160,19 +3296,24 @@ def cmd_ingest(a) -> int:
             "promoted": False,
             "topic": a.topic,
         }
+        if derived_from:
+            meta["derived_from"] = derived_from
         dest_dir = os.path.join(store_root, "inbox", INBOX_DIR_BY_SOURCE_TYPE[a.source_type])
         dest = _unique_dest(os.path.join(dest_dir, f"{doc_id}.md"))
         _write_md(dest, _render_frontmatter(meta, body))
 
     _append_log(
         store_root,
-        f"## [{_utc_now()}] ingest | {doc_id} | {a.source_type} | {a.file}",
+        f"## [{_utc_now()}] ingest | {doc_id} | {a.source_type} | {a.file}"
+        + (f" | derived_from: {derived_from}" if derived_from else ""),
     )
     out = {
         "id": doc_id,
         "path": os.path.relpath(dest, store_root).replace("\\", "/"),
         "source_type": a.source_type,
     }
+    if derived_ids:
+        out["derived_from"] = derived_ids
     if asset_rel:
         out["asset"] = asset_rel
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -4007,6 +4148,10 @@ def _build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--allow-unverified", action="store_true",
                     help="promove mesmo assim fontes de topic cujo `verify` do codescan falhou "
                          "(decisão humana explícita; fica registrada no log)")
+    pr.add_argument("--allow-feedback-loop", action="store_true",
+                    help="promove mesmo assim agent-output cujo `derived_from` só alcança "
+                         "saída de agente/página da wiki (F-26: conhecimento sem lastro "
+                         "humano ou de código; decisão humana explícita, registrada no log)")
     pr.set_defaults(fn=cmd_promote)
 
     co = sub.add_parser("compile", help="compila wiki/ a partir de raw/ promovido")
@@ -4043,6 +4188,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ig.add_argument("--origin", required=True, help="proveniência concreta (pessoa, agente, link)")
     ig.add_argument("--topic", required=True, help="tópico do wiki-ai")
     ig.add_argument("--captured-at", dest="captured_at", help="ISO 8601 (default: agora, UTC)")
+    ig.add_argument("--derived-from", dest="derived_from", default=None,
+                    help="ids das fontes/páginas de que este documento foi derivado, "
+                         "separados por vírgula (F-26: alimenta o L4 do lint e o gate de "
+                         "realimentação do promote)")
     ig.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     ig.set_defaults(fn=cmd_ingest)
 

@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, field
 
 # Extensão -> linguagem. Agnóstico: adicionar linguagem é uma linha.
@@ -312,10 +313,17 @@ MANIFESTS = {
 
 
 def _git(repo: str, *args) -> str | None:
+    # encoding explícito: `text=True` sozinho decodifica com o codepage do SO
+    # (cp1252 no Windows), e git emite UTF-8 — um caminho como
+    # `servico/Usuário.java` voltava como `Usu\xc3\xa1rio.java` (mojibake), o
+    # que quebrava silenciosamente qualquer comparação com as citações dos
+    # artefatos (todas UTF-8). `errors="replace"` mantém o contrato de nunca
+    # levantar exceção por saída inesperada.
     try:
         r = subprocess.run(
             ["git", "-C", repo, *args],
             capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
         )
         return r.stdout.strip() if r.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
@@ -333,6 +341,141 @@ def _git_info(repo: str) -> dict:
         "last_commit": _git(repo, "log", "-1", "--format=%cI"),
         "total_commits": _git(repo, "rev-list", "--count", "HEAD"),
     }
+
+
+# ---------- drift: commit pinado x HEAD atual (F-25) ----------
+#
+# `git.head` sempre foi GRAVADO em surface.json (e copiado para o `commit` de
+# cada evidence pack), mas nunca era COMPARADO com nada. Na prática o pipeline
+# inteiro — evidence, SDD, verify — falava de um repositório que podia já ter
+# mudado, e a citação `arquivo:linha` continuava "válida" apontando para uma
+# linha que hoje é outro código. As funções abaixo são o lado determinístico
+# do fix: dizem se o repo se moveu e QUAIS arquivos mudaram. Quem decide o que
+# fazer com isso (reprovar citação, sugerir `redo`) é o CLI.
+#
+# Contrato de degradação: nenhuma delas levanta exceção nem depende de git
+# existir. Sem git, sem HEAD ou com commit pinado desconhecido (clone raso,
+# histórico reescrito), devolvem `disponivel=False` + warning explicativo —
+# drift indeterminado NUNCA vira "sem drift" silencioso nem crash.
+
+
+def current_head(repo: str) -> str | None:
+    """HEAD curto do repo AGORA. `None` se não há git/HEAD (repo vazio)."""
+    return _git(repo, "rev-parse", "--short", "HEAD")
+
+
+def _resolve_commit(repo: str, ref: str) -> str | None:
+    """Resolve um ref (sha curto pinado, branch, HEAD) para o sha completo.
+
+    É o que permite comparar um `head` curto de 7 chars gravado meses atrás
+    com o HEAD de hoje sem falso positivo por diferença de abreviação.
+    """
+    if not ref:
+        return None
+    return _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+
+
+def normalize_repo_path(path: str) -> str:
+    """Grafia canônica de um caminho relativo ao repo: '/' e Unicode NFC.
+
+    Os dois lados da interseção do drift nascem de fontes diferentes — o
+    `git diff` vem do sistema de arquivos, a citação vem do Markdown escrito
+    pelo agente. Sem canonizar, `Usuário` em NFC (Markdown) e o mesmo nome em
+    NFD (o padrão do filesystem no macOS) são strings diferentes e o drift
+    daria "sem impacto" com o arquivo citado alterado na frente.
+    """
+    return unicodedata.normalize("NFC", (path or "").replace("\\", "/"))
+
+
+def _unquote_git_path(path: str) -> str:
+    """Desfaz a citação C-style do git para caminho não-ASCII.
+
+    Com `core.quotePath` ligado (o DEFAULT do git), `servico/Usuário.java` sai
+    do `diff --name-only` como `"servico/Usu\\303\\241rio.java"` — se esse
+    literal fosse usado como chave, a interseção com as citações do artefato
+    (F-29, caminho acentuado) nunca casaria e o drift viraria silenciosamente
+    "sem impacto". Já forçamos `-c core.quotePath=false` na chamada; isto é a
+    rede de segurança para git antigo/config herdada.
+    """
+    if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+        body = path[1:-1]
+        try:
+            raw = body.encode("latin-1").decode("unicode_escape").encode("latin-1")
+            return raw.decode("utf-8", "replace")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return body
+    return path
+
+
+def changed_files(repo: str, base: str, head: str = "HEAD") -> list[str] | None:
+    """Arquivos alterados entre `base` e `head` (`git diff --name-only`).
+
+    Caminhos normalizados com '/' — a mesma grafia das citações
+    `arquivo:linha` nos artefatos, para que a interseção seja direta.
+    `None` = diff indisponível (git ausente ou ref desconhecido).
+    """
+    out = _git(repo, "-c", "core.quotePath=false", "diff", "--name-only", f"{base}..{head}")
+    if out is None:
+        return None
+    return sorted(
+        {
+            normalize_repo_path(_unquote_git_path(ln.strip()))
+            for ln in out.splitlines()
+            if ln.strip()
+        }
+    )
+
+
+def drift_report(repo: str, pinned_head: str | None) -> dict:
+    """Compara o commit pinado (surface.json `git.head`) com o HEAD atual.
+
+    Devolve sempre o mesmo formato:
+      {disponivel, drift, head_pinado, head_atual, arquivos_alterados, warnings}
+    """
+    report = {
+        "disponivel": False,
+        "drift": False,
+        "head_pinado": pinned_head or None,
+        "head_atual": None,
+        "arquivos_alterados": [],
+        "warnings": [],
+    }
+    head = current_head(repo)
+    report["head_atual"] = head
+    if head is None:
+        report["warnings"].append(
+            "sem git ou HEAD indisponível neste repo: drift não verificável"
+        )
+        return report
+    if not pinned_head:
+        report["warnings"].append(
+            "surface.json sem `git.head` pinado: drift não verificável"
+        )
+        return report
+
+    pinned_full = _resolve_commit(repo, pinned_head)
+    head_full = _resolve_commit(repo, "HEAD") or head
+    if pinned_full is None:
+        report["warnings"].append(
+            f"commit pinado {pinned_head} não existe neste repo "
+            "(clone raso ou histórico reescrito): drift não verificável"
+        )
+        return report
+
+    report["disponivel"] = True
+    if pinned_full == head_full:
+        return report
+
+    report["drift"] = True
+    files = changed_files(repo, pinned_full)
+    if files is None:
+        report["warnings"].append(
+            f"drift detectado ({pinned_head} -> {head}), mas `git diff` falhou: "
+            "lista de arquivos alterados indisponível"
+        )
+        files = []
+    report["arquivos_alterados"] = files
+    return report
 
 
 def _git_module_stats(repo: str, rel: str, since: str | None) -> dict:
