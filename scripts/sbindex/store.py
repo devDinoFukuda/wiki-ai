@@ -161,7 +161,11 @@ def upsert(
     não têm embedding, então o passo de embedding do reindex re-embeda só eles.
 
     Reindex continua incremental: se nada mudou (corpo + provenância iguais),
-    retorna cedo sem tocar o banco. Só os chunks cujo conteúdo mudou re-embedam.
+    não re-insere chunks nem colunas de metadado. Mas `mtime`/`indexed_at` SÃO
+    atualizados mesmo nesse caminho — senão um `touch`/checkout que muda o
+    mtime em disco sem mudar o conteúdo deixa `index status` "sujo" para
+    sempre (o mtime salvo nunca alcança o do disco, porque este early-return
+    nunca escrevia no banco). F-12.
     """
     full_text = "\n".join(c.text for c in chunks)
     chash = content_hash(full_text + "\n@@PROV@@\n" + _provenance_signature(meta, gaps))
@@ -171,6 +175,10 @@ def upsert(
     mtime = os.path.getmtime(path) if os.path.exists(path) else None
 
     if row and row["content_hash"] == chash:
+        conn.execute(
+            "UPDATE documents SET mtime=?, indexed_at=? WHERE id=?",
+            (mtime, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), row["id"]),
+        )
         return row["id"], False
 
     fields = dict(
@@ -305,21 +313,61 @@ def to_fts_query(q: str) -> str:
       "a frase"   -> "a frase"
       termo       -> "termo"    (aspas escapam caractere especial)
       OR / AND    -> operador FTS5 (case-insensitive), sem aspas
+
+    FTS5 é binário: `a OR b`, `a NOT b`. Um operador SEM operando de um dos
+    lados (`python OR` no fim, `-x` sozinho -> `NOT "x"` sem operando à
+    esquerda, `OR foo` no início) não é "OR/NOT vazio" — é
+    sqlite3.OperationalError não tratada (F-20). Em vez de emitir o
+    operador pendente, ele é degradado para termo literal: perde-se a
+    semântica do operador, mas a query nunca quebra o parser do FTS5.
     """
-    out = []
-    for tok in _TERM.findall(q or ""):
+    tokens = _TERM.findall(q or "")
+    items: list[tuple] = []  # ("op", "OR"/"AND"/"NOT") | ("term", neg, phrase)
+    for tok in tokens:
         neg = tok.startswith("-") and len(tok) > 1
         if neg:
             tok = tok[1:]
         upper = tok.upper()
-        if upper in _FTS5_OPS:
-            out.append(upper)
+        if not neg and upper in _FTS5_OPS:
+            items.append(("op", upper))
             continue
         if tok.startswith('"') and tok.endswith('"') and len(tok) >= 2:
             phrase = tok
         else:
             phrase = '"' + tok.replace('"', "") + '"'
-        out.append(("NOT " if neg else "") + phrase)
+        items.append(("term", neg, phrase))
+
+    out: list[str] = []
+    have_operand = False  # há um operando à esquerda pronto para casar
+    pending_op: str | None = None  # OR/AND esperando o operando à direita
+    n = len(items)
+    for i, item in enumerate(items):
+        if item[0] == "op":
+            word = item[1]
+            has_right = i + 1 < n
+            if not have_operand or not has_right:
+                # operador sem operando (início ou fim da query): termo literal
+                out.append('"' + word + '"')
+                have_operand = True
+                pending_op = None
+            else:
+                pending_op = word
+                have_operand = False
+        else:
+            _, neg, phrase = item
+            if neg and not have_operand:
+                # `-termo` isolado / sem operando à esquerda para o NOT:
+                # negação sem alvo não tem como virar FTS5 válido -> termo
+                # literal (positivo), em vez de "NOT" pendurado sem operando.
+                out.append(phrase)
+            elif neg:
+                out.append("NOT " + phrase)
+            else:
+                if pending_op:
+                    out.append(pending_op)
+                    pending_op = None
+                out.append(phrase)
+            have_operand = True
     return " ".join(out)
 
 
@@ -337,7 +385,13 @@ def search_lex(conn, query: str, filters: dict, limit: int) -> list[tuple[int, f
       ORDER BY s
       LIMIT ?
     """
-    rows = conn.execute(sql, (fts_q, *params, limit)).fetchall()
+    try:
+        rows = conn.execute(sql, (fts_q, *params, limit)).fetchall()
+    except sqlite3.OperationalError as e:
+        # Rede de segurança além da sanitização em to_fts_query: qualquer
+        # outra forma de query que o FTS5 rejeite vira erro claro (com a
+        # query ofensiva), não um traceback cru até o operador. F-20.
+        raise ValueError(f"query léxica inválida: {e} (query={fts_q!r})") from e
     return [(r["cid"], -float(r["s"])) for r in rows]  # bm25: menor = melhor
 
 

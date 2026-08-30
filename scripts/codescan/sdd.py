@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -598,8 +599,24 @@ def _no_evidence_message(st: dict, results: list[dict], *, stages_evaluated: int
     return " ".join(parts)
 
 
+def _repo_root(st: dict) -> str | None:
+    """Raiz do repositório auditado, conforme registrada por `state.init`.
+
+    F-04: é a única fonte do caminho do repo no fluxo de auditoria (`audit`
+    recebe `st`, não o repo). Devolve `None` quando o campo não existe ou já
+    não aponta para um diretório — caso legítimo de workdir isolado/movido, em
+    que `_audit_file` degrada para contagem por regex + warning em vez de
+    reprovar citações que não tem como conferir.
+    """
+    repo = st.get("repo") if isinstance(st, dict) else None
+    if isinstance(repo, str) and repo.strip() and os.path.isdir(repo):
+        return repo
+    return None
+
+
 def _audit_stage(wd: str, stage: str, st: dict) -> dict:
     level = doc_level(st)
+    repo = _repo_root(st)
     artifacts = []
     blockers: list[str] = []
     warnings: list[str] = []
@@ -616,7 +633,7 @@ def _audit_stage(wd: str, stage: str, st: dict) -> dict:
             artifacts.append({"rule": rule.rel, "status": "missing"})
             continue
         for path in paths:
-            item = _audit_file(path, rule, wd=wd)
+            item = _audit_file(path, rule, wd=wd, repo=repo)
             artifacts.append(item)
             blockers.extend(item["blockers"])
             warnings.extend(item["warnings"])
@@ -903,6 +920,125 @@ def current_run_items(wd: str, stage: str) -> dict[str, int]:
     return mapping
 
 
+def _write_json_atomic(path: str, data) -> None:
+    """Grava JSON via tmp + os.replace no MESMO diretório do destino.
+
+    BUG F-22 (perda de manifesto): `open(path, "w")` trunca o arquivo ANTES
+    de escrever — uma sessão morta (Ctrl-C, crash, disco cheio) no meio do
+    `json.dump` deixava `agent-runs/<stage>.json` truncado/vazio. O manifesto
+    é a única prova criptográfica do stage: sem ele, `_agent_run_blockers`
+    emite `P0: agent-runs obrigatório ausente/inválido` e o stage inteiro
+    precisa ser refeito. `os.replace` é atômico dentro do mesmo volume: ou o
+    arquivo antigo continua íntegro, ou o novo já está completo — nunca um
+    meio-termo. Mesmo padrão de `state.save`.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+SUPERSEDED_DIR = "superseded"
+
+
+def _superseded_dest(wd: str, run_id: int, full: str) -> str:
+    """Destino de arquivamento de um artefato superado: `agent-runs/superseded/<run-id>/<rel>`.
+
+    `rel` é o caminho relativo ao workdir (preserva a hierarquia original,
+    ex.: `sdd/modules/foo.md`). Se o artefato estiver FORA do workdir (o
+    manifesto aceita caminho absoluto), cai para o basename — nunca deixamos
+    um `..` compor o destino e escapar do diretório de arquivo.
+    """
+    rel = _rel_to_wd(wd, full)
+    if rel.startswith("../") or rel == ".." or os.path.isabs(rel):
+        rel = os.path.basename(full)
+    base = os.path.join(wd, "agent-runs", SUPERSEDED_DIR, str(run_id))
+    return os.path.join(base, *rel.split("/"))
+
+
+def _archive_superseded_artifacts(wd: str, targets: list[tuple[int, str]]) -> list[dict]:
+    """Move (não deleta) os artefatos dos itens reabertos para o arquivo morto.
+
+    BUG F-23 (auditoria de conteúdo obsoleto): `redo` marcava o run como
+    `superseded` e reabria o item, mas o .md antigo continuava no lugar de
+    sempre. Como `_agent_run_blockers` deliberadamente NÃO reconfere o
+    sha256 de run superado (BQ4), o artefato órfão deixava de ter qualquer
+    prova de integridade — e `_audit_file` seguia lendo e PONTUANDO aquele
+    conteúdo obsoleto como se fosse a entrega vigente do item reaberto. Um
+    `redo` seguido de auditoria "passava" com o texto que o redo existe para
+    substituir.
+
+    Mover (em vez de apagar) preserva a trilha exigida pelo BQ4: o conteúdo
+    exato que o run superado registrou continua no disco, endereçado pelo id
+    do run, e o sha256 gravado no manifesto continua conferível manualmente
+    contra o arquivo arquivado.
+    """
+    archived: list[dict] = []
+    seen: set[str] = set()
+    for run_id, full in targets:
+        key = os.path.normcase(os.path.normpath(os.path.abspath(full)))
+        if key in seen:
+            continue
+        seen.add(key)
+        if not os.path.isfile(full):
+            continue
+        dest = _superseded_dest(wd, run_id, full)
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        os.replace(full, dest)
+        archived.append({
+            "run_id": run_id,
+            "de": _rel_to_wd(wd, full),
+            "para": _rel_to_wd(wd, dest),
+        })
+        _prune_empty_dirs(wd, os.path.dirname(full))
+    return archived
+
+
+def _prune_empty_dirs(wd: str, start: str) -> None:
+    """Remove diretórios que ficaram VAZIOS após o arquivamento, subindo até o wd.
+
+    `_strict_workdir_blockers` emite `P0: diretório vazio em modules/specs`. Sem
+    esta poda, arquivar o único .md de `modules/<x>/` deixaria a pasta vazia
+    para trás e o redo criaria, sozinho, um P0 novo no gate. Só apagamos
+    diretório comprovadamente vazio (nenhum dado se perde) e nunca subimos
+    acima do workdir.
+    """
+    wd_abs = os.path.abspath(wd)
+    current = os.path.abspath(start or wd_abs)
+    while current != wd_abs and current.startswith(wd_abs + os.sep):
+        try:
+            if os.listdir(current):
+                return
+            os.rmdir(current)
+        except OSError:
+            return
+        current = os.path.dirname(current)
+
+
+def _run_item_artifacts(wd: str, run: dict, names: set[str]) -> list[str]:
+    """Caminhos absolutos dos artefatos dos itens de `run` cujo nome está em `names`."""
+    out: list[str] = []
+    for entry in run.get("items") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("item") or "").strip().replace("\\", "/").strip("/")
+        if not name or name not in names:
+            continue
+        for artifact in entry.get("artifacts") or []:
+            if isinstance(artifact, dict):
+                raw = artifact.get("path")
+            elif isinstance(artifact, str):
+                raw = artifact
+            else:
+                raw = None
+            full = _resolve_manifest_path(wd, raw)
+            if full:
+                out.append(full)
+    return out
+
+
 def redo_stage(wd: str, stage: str, item: str | None = None) -> dict:
     """Marca `superseded` os runs `current` do stage (ou só os que cobrem
     `item`, se informado) e reabre o(s) item(ns) correspondente(s) em
@@ -935,6 +1071,7 @@ def redo_stage(wd: str, stage: str, item: str | None = None) -> dict:
 
     superseded_ids: list[int] = []
     items_reopened: set[str] = set()
+    archive_targets: list[tuple[int, str]] = []
     for idx, run in enumerate(runs, start=1):
         if not isinstance(run, dict):
             continue
@@ -948,7 +1085,16 @@ def redo_stage(wd: str, stage: str, item: str | None = None) -> dict:
         run["status"] = "superseded"
         run.setdefault("supersedes", None)
         superseded_ids.append(idx)
-        items_reopened.update({target} if target is not None else run_items)
+        reopened_here = {target} if target is not None else run_items
+        items_reopened.update(reopened_here)
+        # F-23: só os artefatos dos itens efetivamente reabertos por ESTA
+        # chamada saem do lugar. Com `--item`, os demais itens do mesmo run
+        # continuam intactos no disco (o run vira superseded por inteiro,
+        # mas só o item pedido foi invalidado).
+        archive_targets.extend(
+            (int(run.get("id") or idx), full)
+            for full in _run_item_artifacts(wd, run, reopened_here)
+        )
 
     # Normaliza id/status/supersedes explícitos em TODOS os runs (inclusive os
     # que já eram current e continuam current): a partir daqui o arquivo
@@ -963,9 +1109,29 @@ def redo_stage(wd: str, stage: str, item: str | None = None) -> dict:
     data["runs"] = runs
     data["stage"] = stage
     data["schema"] = AGENT_RUNS_VERSIONED_SCHEMA
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+
+    # BUG F-22 (escrita fora de trava): manifesto e state.json descrevem a
+    # MESMA transação ("este run não vale mais / este item voltou a pending").
+    # A gravação do manifesto acontecia solta, sem nenhuma trava: um
+    # `merge-agent-output` concorrente (que serializa em `state._lock`, ver
+    # `agentmerge._mark_items_done_transaction`) podia ler o manifesto antes
+    # deste redo e reescrevê-lo depois, apagando o `superseded` recém-gravado
+    # — o item ficava reaberto em state.json com o run antigo ainda `current`.
+    # Segurar a MESMA trava de estado que os demais mutadores usam
+    # (`state._lock`, o mecanismo que state expõe para transação de workdir,
+    # já usado assim por agentmerge.py e cli.py) põe as duas escritas na
+    # mesma fila. O arquivamento F-23 entra na trava pelo mesmo motivo.
+    #
+    # `state.mark_item` fica FORA da trava de propósito: ele adquire
+    # `state._lock` internamente e a trava é por diretório (os.mkdir), não
+    # reentrante — chamá-lo aqui dentro travaria o processo contra si mesmo
+    # até o TimeoutError. Reimplementar a mutação de item aqui para caber na
+    # trava seria duplicar a resolução de grafia de item que `mark_item` já
+    # faz (BUG B3); o `mark_item` público, com a sua própria trava, é a API
+    # correta.
+    with st_mod._lock(wd):
+        archived = _archive_superseded_artifacts(wd, archive_targets)
+        _write_json_atomic(path, data)
 
     # BUG B3 (causa-raiz, TODO-1 resolvido): `name` aqui é SEMPRE a forma
     # canônica '/' (vem de `target`/`_run_item_names`, ambos normalizados
@@ -991,6 +1157,7 @@ def redo_stage(wd: str, stage: str, item: str | None = None) -> dict:
         "item": target,
         "itens_reabertos": sorted(items_reopened),
         "runs_superseded": {"quantidade": len(superseded_ids), "ids": superseded_ids},
+        "arquivados": archived,
         "proximo_passo": f"run-stage {stage}",
     }
 
@@ -1603,7 +1770,70 @@ def _diagram_requirement_issue(text: str, rule: ArtifactRule) -> tuple[str | Non
     ), None
 
 
-def _audit_file(path: str, rule: ArtifactRule, wd: str | None = None) -> dict:
+_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+CITATION_SAMPLE_SIZE = 5
+
+
+def _mask_code_fences(text: str) -> str:
+    """Zera o conteúdo dentro de blocos de código, preservando a contagem de linhas.
+
+    BUG F-21 (falso positivo de placeholder): `evidence.find_boilerplate_markers`
+    procura TODO/FIXME/TBD/XXX em todo o texto. Um artefato que faz exatamente o
+    que o contrato pede — citar o legado com fidelidade — inclui trechos do
+    código-fonte dentro de ```java ... ```; se o legado tem um `// TODO`, o
+    artefato era reprovado por "placeholder pendente" por ter sido FIEL. O
+    marcador dentro da fence é evidência do repositório, não pendência do
+    artefato; fora da fence (prosa do agente) continua sendo pendência.
+
+    A correção fica aqui, no ponto de consumo: `find_boilerplate_markers`
+    continua com a semântica literal "procure nestes bytes" e quem tem contexto
+    de markdown decide quais bytes valem. Fences não fechadas mascaram até o fim
+    do arquivo (é o que um leitor de markdown também faz).
+    """
+    lines = (text or "").splitlines(keepends=True)
+    out: list[str] = []
+    fence: str | None = None
+    for line in lines:
+        match = _FENCE_RE.match(line)
+        marker = match.group(1)[0] * 3 if match else None
+        if fence is None:
+            if marker is not None:
+                fence = marker
+                out.append(line)  # a linha de abertura (```java) não carrega marcador
+                continue
+            out.append(line)
+        else:
+            out.append("\n" if line.endswith("\n") else "")
+            if marker == fence:
+                fence = None
+    return "".join(out)
+
+
+def _citation_sample(citations: list, text: str, size: int = CITATION_SAMPLE_SIZE) -> list:
+    """Amostra determinística de até `size` citações distintas.
+
+    A ordem é dada por um hash estável de (conteúdo do artefato + citação):
+    o mesmo artefato sempre sorteia a MESMA amostra, em qualquer máquina e
+    qualquer execução (nada de `hash()` builtin, que varia com PYTHONHASHSEED),
+    e artefatos diferentes sorteiam amostras diferentes — quem tenta forjar
+    não consegue prever quais das suas citações serão conferidas sem já ter o
+    texto final.
+    """
+    seed = hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
+    unique: dict[str, object] = {}
+    for c in citations:
+        unique.setdefault(f"{c.path}:{c.line_start}-{c.line_end}", c)
+    ordered = sorted(
+        unique.items(),
+        key=lambda kv: hashlib.sha256(f"{seed}|{kv[0]}".encode("utf-8")).hexdigest(),
+    )
+    return [c for _key, c in ordered[:size]]
+
+
+def _audit_file(
+    path: str, rule: ArtifactRule, wd: str | None = None, repo: str | None = None
+) -> dict:
     blockers: list[str] = []
     warnings: list[str] = []
     rel = _rel_to_wd(wd, path) if wd else os.path.basename(path)
@@ -1623,7 +1853,8 @@ def _audit_file(path: str, rule: ArtifactRule, wd: str | None = None) -> dict:
         score -= 15
     else:
         checks["profundidade"] = True
-    found_boilerplate = ev_mod.find_boilerplate_markers(text)
+    # F-21: só a prosa fora de ``` fences conta como placeholder pendente.
+    found_boilerplate = ev_mod.find_boilerplate_markers(_mask_code_fences(text))
     if found_boilerplate:
         blockers.append(
             f"placeholder pendente em {rel}: marcador(es) observado(s) {', '.join(found_boilerplate[:3])} "
@@ -1651,6 +1882,45 @@ def _audit_file(path: str, rule: ArtifactRule, wd: str | None = None) -> dict:
         score -= 20
     else:
         checks["rastreabilidade"] = True
+    # BUG F-04 (CRÍTICO, gate forjável): até aqui a "rastreabilidade" era
+    # contagem de regex — `ev_mod.citations` só reconhece a FORMA
+    # `arquivo.ext:linha`. Um artefato inteiramente inventado passava no gate
+    # escrevendo `Fake.java:1` as vezes que `rule.min_citations` exigisse: zero
+    # relação com o repositório auditado, score cheio em rastreabilidade. O gate
+    # que existe para provar procedência aceitava a prova mais barata possível
+    # de fabricar.
+    #
+    # Agora uma AMOSTRA determinística (até CITATION_SAMPLE_SIZE por artefato) é
+    # conferida contra o disco do repo com a MESMA lógica de
+    # `evidence._citation_error` (arquivo existe, caminho relativo completo,
+    # dentro do repo, linha dentro do arquivo) — a mesma regra já aplicada em
+    # `evidence.verify_markdown`, não uma segunda implementação que possa
+    # divergir. Amostra, e não verificação total, porque um artefato de specs
+    # traz dezenas/centenas de citações e cada uma custa uma leitura de arquivo;
+    # 5 sorteadas por hash do próprio conteúdo já tornam a forja não-confiável
+    # (quem inventa não sabe quais serão conferidas) a custo fixo.
+    if citations:
+        if repo and os.path.isdir(repo):
+            for c in _citation_sample(citations, text):
+                err = ev_mod._citation_error(repo, c)
+                if not err:
+                    continue
+                blockers.append(
+                    f"citação não confere com o repositório em {rel}: "
+                    f"citacao_invalida: {err['citation']} ({err['rule']}: {err['detail']})"
+                )
+                score -= 20
+        else:
+            # Sem repo no contexto (ex.: auditoria de workdir isolado, sem o
+            # código-fonte por perto) não há como conferir nada: mantemos o
+            # comportamento histórico por regex, mas registramos que a
+            # rastreabilidade deste artefato NÃO foi provada — para que
+            # "não verificado" nunca se confunda com "verificado e válido".
+            warnings.append(
+                f"citacoes_nao_verificadas: {len(citations)} citação(ões) em {rel} contadas por forma "
+                "(arquivo:linha) sem conferência contra o repositório: repo indisponível no contexto "
+                f"da auditoria ({repo!r})"
+            )
     pt_hits = sum(1 for marker in PT_MARKERS if _norm(marker) in norm)
     en_hits = sum(1 for marker in EN_MARKERS if marker in norm)
     if en_hits > pt_hits or EN_HEADING_RE.search(text):

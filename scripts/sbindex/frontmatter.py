@@ -49,7 +49,13 @@ def _coerce(v: Any) -> Any:
         return None
     if isinstance(v, (int, float)):
         return v
-    s = str(v).strip().strip("\"'")
+    s = str(v).strip()
+    # Só remove aspas quando formam um PAR delimitador (mesmo caractere nas
+    # duas pontas). `.strip("\"'")` incondicional mutilava valores com aspas
+    # legítimas na ponta, ex.: 'reunião "kickoff"' virava 'reunião "kickoff'
+    # (perdia a aspa de fechamento de "kickoff" junto com a aspa externa). F-43.
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1]
     if s == "":
         return None
     low = s.lower()
@@ -101,7 +107,7 @@ def _parse_minimal(block: str) -> dict:
     return out
 
 
-def _strip_preamble(text: str) -> str:
+def _strip_preamble(text: str) -> tuple[str, bool]:
     """Descasca BOM e pula comentários/blank lines antes do `---` do frontmatter.
 
     YAML frontmatter deve começar com `---` no topo, mas editores no Windows
@@ -112,6 +118,17 @@ def _strip_preamble(text: str) -> str:
     Limite de MAX_PREAMBLE_LINES: se o `---` não aparecer nas primeiras linhas,
     o arquivo é tratado como corpo puro (sem frontmatter) — evita casar com
     separador horizontal `---` no meio de um markdown comum.
+
+    Devolve (texto, gap). `gap=True` só quando as primeiras MAX_PREAMBLE_LINES
+    linhas foram TODAS comentário/blank sem achar o `---` de abertura — nesse
+    caso não dá pra saber se o arquivo simplesmente não tem frontmatter ou se
+    tem um preâmbulo maior que o limite, e o frontmatter real (se existir) é
+    perdido SILENCIOSAMENTE. F-42: o limite continua valendo (evita falso
+    positivo com separador horizontal), mas o chamador registra esse caso
+    como gap explícito (`frontmatter_nao_encontrado_apos_preambulo`) para o L2
+    diagnosticar, em vez de só engolir o arquivo como "sem proveniência".
+    Quando a primeira linha não-comentário/não-blank já não é `---`, é um
+    arquivo comum sem frontmatter — não é gap.
     """
     if text.startswith("\ufeff"):
         text = text[1:]
@@ -119,24 +136,30 @@ def _strip_preamble(text: str) -> str:
     cut = 0
     for i, ln in enumerate(lines[:MAX_PREAMBLE_LINES]):
         stripped = ln.strip()
-        if stripped == "---" or stripped.startswith("--- "):
+        if stripped == "---":
             cut = i
             break
         if stripped and not stripped.startswith("#"):
             # primeira linha não-vazia e não-comentário que não é `---`:
-            # não há frontmatter aqui.
-            return text
+            # não há frontmatter aqui (arquivo comum, não é gap).
+            return text, False
     else:
-        return text  # não achou `---` no preâmbulo: é corpo
-    return "".join(lines[cut:]) if cut else text
+        return text, True  # só comentário/blank no preâmbulo: gap, não corpo confirmado
+    return ("".join(lines[cut:]) if cut else text), False
 
 
 def split(text: str) -> tuple[dict, str]:
     """Devolve (metadados, corpo-sem-frontmatter)."""
-    text = _strip_preamble(text)
+    text, preamble_gap = _strip_preamble(text)
     m = _FM_RE.match(text)
     if not m:
-        return {}, text
+        meta: dict = {}
+        if preamble_gap:
+            # F-42: preâmbulo esgotou MAX_PREAMBLE_LINES sem achar `---` —
+            # pode haver frontmatter perdido silenciosamente. provenance_gaps
+            # promove esta chave a gap explícito para o L2 diagnosticar.
+            meta["_gap_frontmatter"] = "frontmatter_nao_encontrado_apos_preambulo"
+        return meta, text
     block = m.group(1)
     body = text[m.end() :]
     data: dict = {}
@@ -159,12 +182,29 @@ def split(text: str) -> tuple[dict, str]:
         meta["sources"] = [x.strip().strip("\"'") for x in cleaned.split(",") if x.strip()]
     else:
         meta["sources"] = []
+    # Complemento F-17: chaves do frontmatter fora de FIELDS (tags, autor, etc.)
+    # antes morriam aqui no parse — o dict `data` era descartado depois de
+    # popular só as colunas do schema. Isso anulava a preservação que
+    # `wk/cli.py::_render_frontmatter` já implementa (ela renderiza qualquer
+    # chave extra presente em `meta`): sem incluir as extras aqui, não havia
+    # nada para ela preservar, e um round-trip promote apagava metadados que
+    # a fonte original carregava. `k not in meta` garante que nenhuma chave
+    # extra sobrescreva um field canônico (incl. "sources", já setado acima)
+    # nem a `_gap_frontmatter` (que só existe no ramo sem frontmatter, antes
+    # deste ponto — nunca coexiste com `data`). Validação/`provenance_gaps`
+    # continuam olhando só para FIELDS, então extras não afetam gaps de L2.
+    for k, v in data.items():
+        if k not in meta:
+            meta[k] = _coerce(v)
     return meta, body
 
 
 def provenance_gaps(meta: dict) -> list[str]:
     """Violações de L2 detectáveis sem LLM: proveniência ausente ou inválida."""
     gaps = []
+    fm_gap = meta.get("_gap_frontmatter")
+    if fm_gap:
+        gaps.append(fm_gap)
     if not meta.get("origin"):
         gaps.append("origin ausente")
     st = meta.get("source_type")

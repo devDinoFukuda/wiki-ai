@@ -269,7 +269,9 @@ class AgentPackSuffixResolutionTest(unittest.TestCase):
         _write(path, json.dumps({"schema": "wiki-ai.agent-pack.v2", "filler": "x" * chars}))
         return path
 
-    def test_agent_with_suffix_after_batch_resolves_pack(self) -> None:
+    def test_agent_with_suffix_after_batch_does_not_resolve_pack(self) -> None:
+        """F-36: suffix após `-b<NN>` (ex: modules-b01-model-test) NÃO resolve pack.
+        Contrato B4 foi revogado; sufixo extra impede resolução."""
         with tempfile.TemporaryDirectory() as tmp:
             _repo, _store, wd = _new_wd(tmp)
             self._write_pack(wd, "modules-batch-01.json")
@@ -282,10 +284,11 @@ class AgentPackSuffixResolutionTest(unittest.TestCase):
             with open(manifest_path, encoding="utf-8") as f:
                 data = json.load(f)
             tokens = data["runs"][0]["tokens"]
-            self.assertIsNotNone(tokens["input_estimated"])
-            self.assertGreater(tokens["input_estimated"], 0)
-            self.assertIsNotNone(tokens["agent_pack_used"])
-            self.assertNotIn("input_unresolved_reason", tokens)
+            # Suffix após batch impede resolução
+            self.assertIsNone(tokens["input_estimated"])
+            self.assertIsNone(tokens["agent_pack_used"])
+            self.assertIn("input_unresolved_reason", tokens)
+            self.assertIn("modules-b01-model-test", tokens["input_unresolved_reason"])
 
     def test_agent_with_no_batch_pattern_stays_null_with_explicit_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

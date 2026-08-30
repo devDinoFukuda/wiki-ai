@@ -54,9 +54,12 @@ def cmd_reindex(a) -> int:
             text = open(path, encoding="utf-8-sig", errors="replace").read()
             meta, body = split(text)
             gaps = provenance_gaps(meta) if coll == "raw" else []
+            # Documento sem chunks (corpo vazio, ou só frontmatter) ainda é
+            # registrado: upsert() aceita `chunks=[]` (nenhuma linha em
+            # `chunks`, doc normal em `documents`). Pular o upsert aqui fazia
+            # o documento sumir do índice E do audit L2, e prune() o removia
+            # a cada reindex seguinte por nunca entrar em seen_paths. F-13.
             chunks = chunk(body, coll)
-            if not chunks:
-                continue
             _, did_change = store.upsert(conn, path, coll, meta, gaps, chunks)
             seen += 1
             changed += 1 if did_change else 0
@@ -289,12 +292,14 @@ AUDIT_SQL = {
     """,
     "L5_supersedida_ainda_citada": """
         SELECT w.docid, w.path,
-               'cita ' || old.source_id || ' substituida por ' || new.source_id AS detalhe
+               'cita ' || old.source_id || ' substituida por ' ||
+               GROUP_CONCAT(DISTINCT new.source_id) AS detalhe
         FROM documents new
         JOIN documents old ON old.source_id = new.supersedes
         JOIN doc_sources ds ON ds.source_id = old.source_id
         JOIN documents w ON w.id = ds.doc_id
         WHERE new.supersedes IS NOT NULL
+        GROUP BY w.docid, w.path, old.source_id
     """,
     "wiki_sem_fontes_declaradas": """
         SELECT docid, path, 'sem sources: no frontmatter' AS detalhe

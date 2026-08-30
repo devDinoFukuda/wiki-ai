@@ -26,6 +26,7 @@ import pkgutil
 import re
 import shutil
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -819,25 +820,84 @@ def _yaml_scalar(v) -> str:
     return json.dumps(str(v), ensure_ascii=False)
 
 
+# F-17: chave que pode ser escrita "crua" (sem aspas) num mapa YAML. Qualquer
+# outra é emitida entre aspas — chave extra vinda de fonte externa não pode
+# quebrar o documento inteiro na regravação.
+_YAML_PLAIN_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def _yaml_key(key) -> str:
+    key = str(key)
+    return key if _YAML_PLAIN_KEY_RE.match(key) else json.dumps(key, ensure_ascii=False)
+
+
+def _yaml_entry(key, value) -> str:
+    """Uma linha `chave: valor` de frontmatter.
+
+    Lista vira sequência de fluxo (`[...]`) e mapa vira JSON — os dois são YAML
+    válido, então o round-trip por `sbindex.frontmatter.split` devolve a mesma
+    estrutura (JSON é subconjunto de YAML 1.2, e o parser mínimo de fallback
+    trata a linha como escalar, sem corromper nada).
+    """
+    if isinstance(value, (list, tuple, set)):
+        itens = ", ".join(json.dumps(str(x), ensure_ascii=False) for x in value)
+        return f"{_yaml_key(key)}: [{itens}]"
+    if isinstance(value, dict):
+        return f"{_yaml_key(key)}: {json.dumps(value, ensure_ascii=False)}"
+    return f"{_yaml_key(key)}: {_yaml_scalar(value)}"
+
+
 def _render_frontmatter(meta: dict, body: str) -> str:
+    """Renderiza os campos do schema na ordem canônica (`FIELDS`) e, DEPOIS,
+    as chaves extras em ordem alfabética.
+
+    F-17: antes o laço percorria só `FIELDS` e toda chave fora do schema era
+    silenciosamente DESCARTADA. Como `promote` reescreve o arquivo inteiro por
+    aqui (frontmatter + corpo), qualquer metadado adicional que a fonte
+    carregasse — campos de ferramenta, anotações do ingest, extensões futuras
+    do schema — sumia de raw/ no momento da promoção, sem aviso e sem cópia
+    para recuperar. Preservar as extras mantém a regravação um round-trip fiel.
+    """
     from sbindex.frontmatter import FIELDS
 
     lines = ["---"]
     for key in FIELDS:
         value = meta.get(key)
         if key == "sources":
-            values = value or []
-            if values:
-                lines.append(
-                    f"{key}: ["
-                    + ", ".join(json.dumps(str(x), ensure_ascii=False) for x in values)
-                    + "]"
-                )
+            if value:
+                lines.append(_yaml_entry(key, value))
             continue
         if value is not None:
-            lines.append(f"{key}: {_yaml_scalar(value)}")
+            lines.append(_yaml_entry(key, value))
+    for key in sorted((k for k in meta if k not in FIELDS), key=str):
+        value = meta[key]
+        if value is None:
+            continue
+        lines.append(_yaml_entry(key, value))
     lines.append("---")
     return "\n".join(lines) + "\n\n" + body.lstrip("\n")
+
+
+def _write_md_atomic(path: str, text: str) -> None:
+    """Grava `path` por tmp + `os.replace`: ou o arquivo final aparece
+    completo, ou não aparece. Base da promoção transacional (F-16a), onde a
+    escrita em raw/ tem que estar consolidada em disco ANTES de o original
+    sair do inbox."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    if not text.endswith("\n"):
+        text += "\n"
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".wk-tmp-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
 
 
 def _unique_dest(path: str) -> str:
@@ -856,20 +916,29 @@ def _publish_existing_dest(dest_dir: str, doc_id: str) -> str | None:
     """Idempotência do publish: se este `doc_id` já está em staging no
     inbox, devolve o arquivo existente para ser regravado (refresh) — sem
     isso, reexecutar `publish` criava duplicata via `_unique_dest` com o
-    MESMO doc_id (achado 'Alto' de docs/application-analysis.md)."""
+    MESMO doc_id (achado 'Alto' de docs/application-analysis.md).
+
+    F-39: o `id` é lido do BLOCO DE FRONTMATTER (entre o primeiro `---` e o
+    `---` de fechamento), pelo mesmo parser que o índice usa. Antes o regex
+    `^id:` varria os primeiros 4096 bytes do arquivo INTEIRO — um corpo que
+    citasse `id: <algo>` no começo (bloco de código YAML, trecho de log,
+    exemplo de schema; matéria-prima corriqueira do inbox) fazia o publish
+    sobrescrever um documento de OUTRO id, destruindo o staging alheio.
+    """
+    from sbindex.frontmatter import split
+
     if not os.path.isdir(dest_dir):
         return None
-    pattern = re.compile(rf"^id:\s*[\"']?{re.escape(doc_id)}[\"']?\s*$", re.M)
     for name in sorted(os.listdir(dest_dir)):
         if not name.endswith(".md"):
             continue
         path = os.path.join(dest_dir, name)
         try:
-            with open(path, encoding="utf-8") as f:
-                head = f.read(4096)
+            meta, _body = split(_read_md(path))
         except OSError:
             continue
-        if pattern.search(head):
+        existente = meta.get("id")
+        if existente is not None and str(existente) == doc_id:
             return path
     return None
 
@@ -893,6 +962,44 @@ def _append_quarantine(store_root: str, items: list[dict]) -> None:
                 f"- {item.get('id') or '(sem-id)'} | {item.get('path')} | "
                 f"{item.get('motivo')}\n"
             )
+
+
+def _raw_ids(store_root: str) -> dict[str, str]:
+    """Mapa `id do frontmatter -> caminho store-relativo` das fontes já em
+    `raw/**`. F-16(b): base da detecção de id duplicado no promote."""
+    from sbindex.frontmatter import split
+
+    root = os.path.join(store_root, "raw")
+    out: dict[str, str] = {}
+    for path in _walk_md(root) if os.path.isdir(root) else []:
+        meta, _body = split(_read_md(path))
+        doc_id = meta.get("id")
+        if doc_id is None or not str(doc_id).strip():
+            continue
+        out.setdefault(str(doc_id), os.path.relpath(path, store_root).replace("\\", "/"))
+    return out
+
+
+def _promote_validation_error(dest: str, source_id, body_esperado: str) -> str | None:
+    """Relê o destino recém-gravado em raw/ e confere que ele é um documento
+    legível, com o mesmo `id` da fonte, marcado como promovido e com o corpo
+    intacto. Só depois disso o original pode sair do inbox (F-16a)."""
+    from sbindex.frontmatter import split
+
+    try:
+        meta, body = split(_read_md(dest))
+    except OSError as exc:
+        return f"destino ilegível após a gravação: {exc}"
+    if source_id is not None and str(meta.get("id")) != str(source_id):
+        return (
+            f"o frontmatter gravado não preserva o id "
+            f"({meta.get('id')!r} != {source_id!r})"
+        )
+    if meta.get("promoted") != 1:
+        return "o frontmatter gravado não ficou marcado como promovido"
+    if body.strip() != (body_esperado or "").strip():
+        return "o corpo gravado difere do corpo da fonte"
+    return None
 
 
 def _run_reindex(store_root: str) -> tuple[bool, str | None]:
@@ -1063,6 +1170,13 @@ def cmd_promote(a) -> int:
     massa_promovidos: list[str] = []
     verify_blocked: list[dict] = []
     verify_overridden: list[dict] = []
+    # F-16(b): ids já presentes em raw/**. O mapa é atualizado a cada item
+    # promovido, então duas fontes do MESMO lote com o mesmo id também colidem.
+    raw_ids = _raw_ids(store_root)
+    duplicados: list[dict] = []
+    # F-16(a): itens cuja gravação em raw/ falhou ou não validou — continuam
+    # intactos no inbox (nada é removido antes do destino estar consolidado).
+    falhas_gravacao: list[dict] = []
 
     for path in targets:
         text = _read_md(path)
@@ -1126,6 +1240,31 @@ def cmd_promote(a) -> int:
             )
             continue
 
+        # F-16(b): id já existente em raw/** é ERRO por item — nunca uma cópia
+        # silenciosa em `<nome>-2.md` carregando o MESMO id. Dois documentos com
+        # id igual quebram o índice (o `source_id` é a chave de `doc_sources`) e
+        # tornam impossível dizer qual é o canônico: `_unique_dest` resolvia a
+        # colisão de NOME e escondia a colisão de IDENTIDADE.
+        id_key = str(source_id) if source_id is not None and str(source_id).strip() else ""
+        if id_key and id_key in raw_ids:
+            duplicados.append(
+                {
+                    "id": source_id,
+                    "path": rel,
+                    "source_type": source_type,
+                    "existente": raw_ids[id_key],
+                    "motivo": f"id já promovido em raw/: {raw_ids[id_key]}",
+                    "acao": (
+                        "escolha um caminho: (a) se é a MESMA fonte, apague o item do "
+                        "inbox — já está em raw/; (b) se é uma revisão, use "
+                        "`supersedes: <id-antigo>` com um id novo; (c) se são "
+                        "documentos distintos, corrija o `id` do frontmatter no inbox "
+                        "e rode `wk promote` de novo"
+                    ),
+                }
+            )
+            continue
+
         meta.update(
             {
                 "promoted": True,
@@ -1136,12 +1275,42 @@ def cmd_promote(a) -> int:
         )
         dest_dir = os.path.join(store_root, "raw", RAW_DIR_BY_SOURCE_TYPE[source_type])
         dest = _unique_dest(os.path.join(dest_dir, os.path.basename(path)))
-        _write_md(dest, _render_frontmatter(meta, body))
+        # F-16(a): promoção TRANSACIONAL. Antes era `_write_md` seguido de
+        # `os.remove` sem nenhuma checagem entre os dois: qualquer falha no meio
+        # (disco cheio, permissão, processo morto, escrita parcial) apagava a
+        # fonte do inbox deixando em raw/ um arquivo truncado — ou nada. Agora o
+        # destino é gravado por tmp+replace, relido e validado; o original só sai
+        # do inbox depois disso.
+        rel_dest = os.path.relpath(dest, store_root).replace("\\", "/")
+        try:
+            _write_md_atomic(dest, _render_frontmatter(meta, body))
+            erro_gravacao = _promote_validation_error(dest, source_id, body)
+        except OSError as exc:
+            erro_gravacao = f"falha ao gravar {rel_dest}: {exc}"
+        if erro_gravacao:
+            with contextlib.suppress(OSError):
+                os.remove(dest)
+            falhas_gravacao.append(
+                {
+                    "id": source_id,
+                    "path": rel,
+                    "destino": rel_dest,
+                    "motivo": erro_gravacao,
+                    "acao": (
+                        "o item continua intacto em inbox/ (nada foi removido); "
+                        "corrija a causa (espaço em disco, permissão de escrita em "
+                        "raw/) e rode `wk promote` de novo"
+                    ),
+                }
+            )
+            continue
         os.remove(path)
+        if id_key:
+            raw_ids[id_key] = rel_dest
         promoted.append(
             {
                 "id": source_id,
-                "path": os.path.relpath(dest, store_root).replace("\\", "/"),
+                "path": rel_dest,
                 "source_type": source_type,
                 "confidence": confidence,
             }
@@ -1206,6 +1375,10 @@ def cmd_promote(a) -> int:
     }
     if verify_overridden:
         out["verify_override"] = verify_overridden
+    if duplicados:
+        out["duplicados"] = duplicados
+    if falhas_gravacao:
+        out["falhas_gravacao"] = falhas_gravacao
     if a.approve_all:
         out["aprovacao_em_massa"] = {
             "topic": approve_topic,
@@ -1216,7 +1389,10 @@ def cmd_promote(a) -> int:
     if reindex_error:
         out["reindex_error"] = reindex_error
     print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 1 if reindex_error else 0
+    # F-16: id duplicado e falha de gravação são erro — exit != 0 para que
+    # nenhuma automação trate a recusa como sucesso silencioso (mesmo contrato
+    # dos `recusados` do compile).
+    return 1 if (reindex_error or duplicados or falhas_gravacao) else 0
 
 
 def _slug(s: str) -> str:
@@ -1351,6 +1527,34 @@ def _promoted_raw_sources(store_root: str, topic: str | None) -> list[dict]:
                 "path": path,
                 "rel": os.path.relpath(path, store_root).replace("\\", "/"),
                 "body": body.strip(),
+            }
+        )
+    return out
+
+
+def _promoted_raw_summary(store_root: str) -> list[dict]:
+    """Varredura barata de `raw/`: só os metadados de proveniência das fontes
+    promovidas, SEM carregar o corpo dos documentos.
+
+    F-07: o índice global (`wiki/index.md`) precisa de TODOS os tópicos —
+    inclusive os que a execução atual do compile não regerou — mas não precisa
+    de uma linha sequer do conteúdo.
+    """
+    from sbindex.frontmatter import split
+
+    out = []
+    root = os.path.join(store_root, "raw")
+    for path in _walk_md(root) if os.path.isdir(root) else []:
+        meta, _body = split(_read_md(path))
+        if meta.get("promoted") != 1:
+            continue
+        out.append(
+            {
+                "id": meta.get("id") or os.path.splitext(os.path.basename(path))[0],
+                "source_type": meta.get("source_type") or "sem-tipo",
+                "topic": meta.get("topic") or "geral",
+                "captured_at": meta.get("captured_at"),
+                "rel": os.path.relpath(path, store_root).replace("\\", "/"),
             }
         )
     return out
@@ -1628,6 +1832,12 @@ def cmd_compile(a) -> int:
     Granularidade por grupo (topic, source_type) colapsava dezenas de módulos
     e specs numa página só; aqui cada fonte promovida vira sua própria página,
     e `wiki/index.md` agrega todas com link.
+
+    F-06: ao final, páginas órfãs (`.md`/`.html` em wiki/ sem fonte promovida
+    correspondente) são PODADAS — escopo restrito à subárvore do `--topic`,
+    desligável com `--no-prune`, reportadas em `podados[]`.
+    F-07: `wiki/index.md` é sempre GLOBAL — montado a partir de todas as fontes
+    promovidas em raw/, independentemente do filtro `--topic`.
     """
     store_root = _store_root(a)
 
@@ -1656,6 +1866,10 @@ def cmd_compile(a) -> int:
     page_entries: list[tuple[dict, str, str]] = []
     page_abspath_by_id: dict[str, str] = {}
     asset_abspath_by_id: dict[str, str] = {}
+    # F-06: tudo o que ESTA execução escreveu em wiki/ (páginas, assets
+    # copiados, sínteses e o índice). O que sobrar em wiki/ fora deste conjunto
+    # é órfão e será podado no fim.
+    gerado_abs: set[str] = set()
 
     for s in sources:
         # F-01: TODO componente derivado de frontmatter é sanitizado e o
@@ -1698,6 +1912,7 @@ def cmd_compile(a) -> int:
             shutil.copyfile(asset_src, asset_dest)
             asset_href = f"{id_slug}.html"
             asset_abspath_by_id[s["id"]] = asset_dest
+            gerado_abs.add(os.path.abspath(asset_dest))
 
         body = [
             f"# {s['id']}",
@@ -1718,6 +1933,7 @@ def cmd_compile(a) -> int:
         href = os.path.relpath(path, wiki_root).replace("\\", "/")
         pages.append(rel_page)
         page_entries.append((s, rel_page, href))
+        gerado_abs.add(os.path.abspath(path))
         if s.get("id"):
             page_abspath_by_id[s["id"]] = path
 
@@ -1759,39 +1975,189 @@ def cmd_compile(a) -> int:
         overview_text += "\n\n" + overview_body.rstrip() + "\n"
         _write_md(overview_path, overview_text)
         pages.append(os.path.relpath(overview_path, store_root).replace("\\", "/"))
+        gerado_abs.add(os.path.abspath(overview_path))
         overview_href = os.path.relpath(overview_path, wiki_root).replace("\\", "/")
         overview_entries.append((topic, overview_href, lacunas))
 
+    index_path = os.path.join(wiki_root, "index.md")
+    lint_report_path = os.path.join(wiki_root, "_lint-report.md")
+    gerado_abs.add(os.path.abspath(index_path))
+    gerado_abs.add(os.path.abspath(lint_report_path))
+
+    # ---------- F-06: poda de páginas órfãs em wiki/ ----------
+    # `compile` só ESCREVIA; nada removia. Uma fonte despromovida, apagada de
+    # raw/ ou com `id`/`topic` renomeado deixava a página antiga em wiki/ para
+    # sempre: conteúdo sem nenhuma fonte-verdade por trás continuava sendo
+    # servido, reindexado e citado — exatamente a contaminação que o pipeline
+    # existe para impedir. A poda espelha a do `wk docx`: mesma raiz escopada
+    # por `--topic` (`_prune_root`), mesmo `--no-prune`, mesma limpeza de
+    # diretórios vazios. Roda ANTES do índice e do reindex, para que nem o
+    # índice nem o banco enxerguem o que acabou de sair.
+    podados: list[dict] = []
+    if not a.no_prune:
+        try:
+            prune_root = _prune_root(wiki_root, a.topic)
+        except PathComponentError as exc:  # F-01: nunca podar fora de wiki/
+            print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+        wiki_root_abs = os.path.abspath(wiki_root)
+        # `index.md` é reescrito logo abaixo e `_lint-report.md` é regenerado
+        # pelo `wk lint`: nenhum dos dois tem fonte em raw/, então seriam
+        # órfãos por definição. `overview.md` NÃO entra aqui por nome — a
+        # síntese regenerada já está em `gerado_abs`; a de um tópico que perdeu
+        # todas as fontes é órfã de verdade e deve sair.
+        preservados_por_nome = {"index.md", "_lint-report.md"}
+        if os.path.isdir(prune_root):
+            existentes: list[str] = []
+            for dirpath, dirnames, filenames in os.walk(prune_root):
+                dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+                for fn in sorted(filenames):
+                    if fn.endswith((".md", ".html")) and not fn.startswith("."):
+                        existentes.append(os.path.join(dirpath, fn))
+            for orfao in sorted(existentes):
+                if os.path.basename(orfao) in preservados_por_nome:
+                    continue
+                if os.path.abspath(orfao) in gerado_abs:
+                    continue
+                try:
+                    os.remove(orfao)
+                except OSError as exc:
+                    recusados.append(
+                        {
+                            "campo": "poda",
+                            "valor": os.path.relpath(orfao, store_root).replace(os.sep, "/"),
+                            "motivo": f"não foi possível remover a página órfã: {exc}",
+                            "acao": "remova o arquivo à mão (ou libere a permissão) e recompile",
+                        }
+                    )
+                    continue
+                podados.append(
+                    {
+                        "path": os.path.relpath(orfao, store_root).replace(os.sep, "/"),
+                        "motivo": "orfao",
+                    }
+                )
+
+            for dirpath, _dirnames, _filenames in os.walk(prune_root, topdown=False):
+                if os.path.abspath(dirpath) == wiki_root_abs:
+                    continue
+                try:
+                    if not os.listdir(dirpath):
+                        os.rmdir(dirpath)
+                except OSError:
+                    pass
+
+            if a.topic:
+                # topic com "/" gera diretórios-pai intermediários (ex.:
+                # codebases/exemplo -> pai "codebases"); limpa-os também,
+                # parando antes de wiki_root.
+                parent = os.path.dirname(os.path.abspath(prune_root))
+                while parent != wiki_root_abs and parent.startswith(wiki_root_abs + os.sep):
+                    try:
+                        if os.listdir(parent):
+                            break
+                        os.rmdir(parent)
+                    except OSError:
+                        break
+                    parent = os.path.dirname(parent)
+
+    # ---------- F-07: o índice é GLOBAL, nunca o recorte do `--topic` ----------
+    # `wiki/index.md` é a porta de entrada da wiki inteira, e era reescrito com
+    # o resultado do compile filtrado: um `wk compile <topic>` de rotina
+    # APAGAVA do índice todos os outros tópicos já compilados, deixando a wiki
+    # aparentemente vazia (as páginas continuavam em disco, inalcançáveis).
+    # Agora o índice sai de uma varredura barata de TODAS as fontes promovidas
+    # em raw/ (`_promoted_raw_summary`, sem corpo): o compile filtrado gera
+    # páginas só do tópico, o índice segue listando todo mundo. Entrada cuja
+    # página ainda não existe em disco é listada SEM link (marcada "não
+    # compilada") — listar um link quebrado seria trocar um defeito por outro.
+    index_entries: list[dict] = []
+    for s in _promoted_raw_summary(store_root):
+        try:
+            t_slug = _slug_topic(s["topic"])
+            ty_slug = _slug_component(s["source_type"], "source_type")
+            i_slug = _slug_component(s["id"] or "sem-id", "id")
+        except PathComponentError:
+            # Fonte impossível de mapear em caminho: já sai em `recusados`
+            # quando entra no escopo compilado; aqui é apenas omitida.
+            continue
+        href = "/".join([*t_slug.split("/"), ty_slug, f"{i_slug}.md"])
+        index_entries.append(
+            {
+                "topic": s["topic"],
+                "id": s["id"],
+                "source_type": s["source_type"],
+                "captured_at": s.get("captured_at"),
+                "href": href,
+                "compilada": os.path.isfile(os.path.join(wiki_root, *href.split("/"))),
+            }
+        )
+
+    by_topic_index: dict[str, list[dict]] = {}
+    for entry in index_entries:
+        by_topic_index.setdefault(entry["topic"], []).append(entry)
+
+    # Destaque das sínteses: as geradas agora, mais as que já existem em disco
+    # de compiles anteriores (o índice é global, não só desta execução).
+    overview_agora = {t: (h, l) for t, h, l in overview_entries}
+    index_overviews: list[tuple[str, str, list[str] | None]] = []
+    for topic in sorted(by_topic_index):
+        if topic in overview_agora:
+            href_ov, lacunas_ov = overview_agora[topic]
+            index_overviews.append((topic, href_ov, lacunas_ov))
+            continue
+        try:
+            t_slug = _slug_topic(topic)
+        except PathComponentError:
+            continue
+        href_ov = "/".join([*t_slug.split("/"), "overview.md"])
+        if os.path.isfile(os.path.join(wiki_root, *href_ov.split("/"))):
+            index_overviews.append((topic, href_ov, None))
+
     index_body = ["# Wiki Index", ""]
     if a.topic:
-        index_body.extend([f"Tópico compilado: {a.topic}", ""])
-    if overview_entries:
+        index_body.extend(
+            [
+                f"Tópico compilado nesta execução: {a.topic} "
+                "(o índice abaixo lista todos os tópicos promovidos).",
+                "",
+            ]
+        )
+    if index_overviews:
         index_body.append("## Visão geral por tópico")
         index_body.append("")
-        for topic, href, lacunas in overview_entries:
-            aviso = f" — {len(lacunas)} lacuna(s) de síntese" if lacunas else ""
-            index_body.append(f"- **[{topic}]({href})**{aviso}")
+        for topic, href_ov, lacunas_ov in index_overviews:
+            aviso = f" — {len(lacunas_ov)} lacuna(s) de síntese" if lacunas_ov else ""
+            index_body.append(f"- **[{topic}]({href_ov})**{aviso}")
         index_body.append("")
-    index_body.append(f"Total: {len(page_entries)} páginas em {len(by_topic)} tópico(s).")
+    index_body.append(
+        f"Total: {len(index_entries)} páginas em {len(by_topic_index)} tópico(s)."
+    )
     index_body.append("")
-    for topic in sorted(by_topic):
-        entries = by_topic[topic]
-        index_body.append(f"## {topic} ({len(entries)})")
+    for topic in sorted(by_topic_index):
+        entries_idx = sorted(by_topic_index[topic], key=lambda e: str(e["id"]))
+        index_body.append(f"## {topic} ({len(entries_idx)})")
         index_body.append("")
-        for s, href in entries:
-            atualizado = s.get("captured_at") or compile_ts
-            index_body.append(f"- [{s['id']}]({href}) | `{s['source_type']}` | atualizado {atualizado}")
+        for entry in entries_idx:
+            atualizado = entry.get("captured_at") or compile_ts
+            rotulo = (
+                f"[{entry['id']}]({entry['href']})"
+                if entry["compilada"]
+                else f"{entry['id']} (não compilada)"
+            )
+            index_body.append(f"- {rotulo} | `{entry['source_type']}` | atualizado {atualizado}")
         index_body.append("")
-    index_text = _frontmatter_for_wiki("wiki-index", a.topic or "index", source_ids)
+    index_source_ids = [str(e["id"]) for e in index_entries if e.get("id")] or source_ids
+    index_text = _frontmatter_for_wiki("wiki-index", "index", index_source_ids)
     index_text += "\n" + "\n".join(index_body).rstrip() + "\n"
-    index_path = os.path.join(wiki_root, "index.md")
     _write_md(index_path, index_text)
     pages.insert(0, os.path.relpath(index_path, store_root).replace("\\", "/"))
 
     reindexed, reindex_error = _run_reindex(store_root)
     _append_log(
         store_root,
-        f"## [{_utc_now()}] compile | {len(pages)} páginas | {len(sources)} fontes",
+        f"## [{_utc_now()}] compile | {len(pages)} páginas | {len(sources)} fontes | "
+        f"{len(podados)} podados",
     )
     if verify_overridden:
         _append_log(
@@ -1802,6 +2168,7 @@ def cmd_compile(a) -> int:
     out = {
         "paginas": pages,
         "fontes": len(sources),
+        "podados": podados,
         "reindexed": reindexed,
         "overview": [{"topic": t, "href": h, "lacunas": l} for t, h, l in overview_entries],
     }
@@ -1815,12 +2182,15 @@ def cmd_compile(a) -> int:
     return 1 if (reindex_error or recusados) else 0
 
 
-def _docx_prune_root(out_root: str, topic: str | None) -> str:
+def _prune_root(out_root: str, topic: str | None) -> str:
     """Raiz da poda de órfãos: `out_root` inteiro sem filtro de topic; com
     filtro, apenas a subárvore `out_root/<topic>` (topic pode ter `/`, daí
-    o split). Escopar assim evita que a poda apague `.docx` de outros
-    topics quando a execução só gerou um subconjunto (defeito reportado:
+    o split). Escopar assim evita que a poda apague saída de outros topics
+    quando a execução só gerou um subconjunto (defeito reportado:
     `wk docx <topic>` removia órfãos de topics não filtrados).
+
+    Usada pelas DUAS podas — `wiki-docx/` (cmd_docx) e `wiki/` (cmd_compile,
+    F-06): a regra de escopo é a mesma, muda só a árvore de saída.
 
     O slug é obrigatório aqui: `dest_dir` grava em `_slug_topic(s["topic"])`,
     então usar o topic cru erraria a subárvore em qualquer topic que o slug
@@ -1864,7 +2234,7 @@ def cmd_docx(a) -> int:
         return 3
 
     # F-01: o `--topic` da linha de comando vira raiz da poda de órfãos
-    # (`_docx_prune_root`); valida antes de qualquer escrita/remoção.
+    # (`_prune_root`); valida antes de qualquer escrita/remoção.
     if a.topic:
         try:
             _slug_topic(a.topic)
@@ -2008,11 +2378,11 @@ def cmd_docx(a) -> int:
 
     removidos: list[dict] = []
     if not a.no_prune:
-        # Poda escopada ao filtro (ver _docx_prune_root): sem `a.topic` varre
+        # Poda escopada ao filtro (ver _prune_root): sem `a.topic` varre
         # `out_root` inteiro como antes; com `a.topic` varre só a subárvore
         # daquele topic, para não apagar `.docx` órfãos de outros topics.
         try:
-            prune_root = _docx_prune_root(out_root, a.topic)
+            prune_root = _prune_root(out_root, a.topic)
         except PathComponentError as exc:  # F-01: nunca podar fora de out_root
             print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
             return 2
@@ -2207,6 +2577,25 @@ def _write_lint_report(store_root: str, report: dict) -> str:
 
 def cmd_lint(a) -> int:
     store_root = _store_root(a)
+    # F-15: `sqlite3.connect` CRIA o arquivo se ele não existir — sem esta
+    # checagem, `wk lint` num store nunca indexado abria um banco vazio, as
+    # consultas de auditoria falhavam (ou devolviam zero achados) e o comando
+    # ainda deixava um `index.db` fantasma no disco, que fazia o `doctor` e o
+    # próprio lint relatarem "índice ok, 0 documentos". Checar a EXISTÊNCIA do
+    # arquivo antes de conectar é o que impede a criação acidental.
+    db_path = os.path.join(store_root, "index.db")
+    if not os.path.isfile(db_path):
+        print(
+            json.dumps(
+                {
+                    "error": f"índice não encontrado: {db_path}",
+                    "acao": f"rode: wk index reindex --store {store_root}",
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     report = _audit_index(store_root, a.path)
     wiki_report = _audit_wiki_links(store_root, a.path)
     report["regras"].update(wiki_report["regras"])
@@ -3323,6 +3712,10 @@ def _build_parser() -> argparse.ArgumentParser:
     co = sub.add_parser("compile", help="compila wiki/ a partir de raw/ promovido")
     co.add_argument("topic", nargs="?", help="tópico opcional")
     co.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    co.add_argument("--no-prune", action="store_true",
+                    help="não remove página órfã de wiki/ (F-06: por padrão, .md/.html sem "
+                         "fonte promovida correspondente é podado; com --topic a poda fica "
+                         "restrita à subárvore do tópico)")
     co.add_argument("--allow-unverified", action="store_true",
                     help="compila mesmo assim topic(s) cujo `verify` do codescan falhou "
                          "(decisão humana explícita; fica registrada no log/manifesto)")
@@ -3457,8 +3850,39 @@ def main(argv=None) -> int:
         if guard is not None:
             print(json.dumps(guard, ensure_ascii=False), file=sys.stderr)
             return 2
+    # `parse_args` fica FORA do try: o `SystemExit` do argparse (--help,
+    # --version, usage inválido) tem que continuar subindo com o exit code que
+    # ele mesmo escolhe.
     a = _build_parser().parse_args(argv)
-    return a.fn(a)
+    try:
+        return a.fn(a)
+    except SystemExit:
+        # `sys.exit(N)` dentro de um comando é decisão deliberada dele.
+        raise
+    except Exception as exc:  # F-40: nenhum traceback cru na saída do wk
+        # Antes, qualquer exceção não tratada de um comando local (KeyError num
+        # frontmatter torto, OSError de permissão, sqlite3.Error) escapava como
+        # traceback do Python: saída ILEGÍVEL para JSON, exit code 1 sem
+        # nenhuma chave `error`, e um agente consumindo o stdout do wk não tinha
+        # como distinguir falha de resultado vazio. Aqui vira o mesmo contrato
+        # JSON dos erros já tratados — `error` + `tipo` + `acao` em stderr.
+        print(
+            json.dumps(
+                {
+                    "error": str(exc) or exc.__class__.__name__,
+                    "tipo": exc.__class__.__name__,
+                    "comando": getattr(a, "cmd", None),
+                    "acao": (
+                        "falha não tratada do comando; rode `wk doctor --store <store>` "
+                        "para checar o ambiente e o store, e reporte esta saída "
+                        "(error + tipo) se o problema persistir"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":

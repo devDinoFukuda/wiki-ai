@@ -792,11 +792,20 @@ MODEL_PRICES_USD_PER_MILLION_TOKENS: dict[str, tuple[float, float]] = {
     "claude-haiku-4.5": (1.0, 5.0),
 }
 
-# BUG B4 (validação E2E, lote D): ancorado no fim da string (`$`), este regex
-# não casava identificadores como `modules-b01-model-test` (sufixo extra
-# depois do batch). Sem `$`, casa `-b<NN>` em qualquer posição — cobre tanto
-# a convenção pura (`modules-b01`) quanto variações com sufixo.
-AGENT_BATCH_SUFFIX_RE = re.compile(r"-b(\d{1,4})", re.I)
+# F-36: o regex PRECISA ficar ancorado no fim do identificador (`$`).
+#
+# Histórico: o BUG B4 (lote D) removeu a âncora para aceitar sufixos extras
+# depois do batch (`modules-b01-model-test`). O efeito colateral é pior que o
+# bug original: sem `$`, qualquer `-b<dígito>` no MEIO do nome vira "número do
+# batch". `--agent web-b2b-team` casa `-b2` e o run passa a ser contabilizado
+# contra `agent-packs/<stage>-batch-02.json` — custo, tokens e sha atribuídos
+# ao batch errado, silenciosamente.
+#
+# Contrato atual: o número do batch é o SUFIXO do identificador
+# (`<stage>-b<NN>`, exatamente como `cli._run_stage_agent_slot` emite). Nome
+# que não termine em `-b<NN>` não resolve pack — e o motivo vai explícito em
+# `tokens.input_unresolved_reason` (nunca silencioso).
+AGENT_BATCH_SUFFIX_RE = re.compile(r"-b(\d{1,4})$", re.I)
 
 
 def _estimate_tokens(char_count: int | None) -> int | None:
@@ -811,13 +820,15 @@ def _estimate_tokens(char_count: int | None) -> int | None:
 
 def _agent_pack_path_for(wd: str, stage: str, agent: str | None) -> tuple[str | None, str | None]:
     """Localiza o agent-pack correspondente a este run, pelo número de batch
-    embutido no identificador `--agent` (convenção do projeto, ex.:
-    `modules-b01` -> `agent-packs/modules-batch-01.json`; `-b<NN>` pode
-    aparecer em qualquer posição do identificador, ex.:
-    `modules-b01-model-test` — BUG B4).
+    no SUFIXO do identificador `--agent` (convenção do projeto, ex.:
+    `modules-b01` -> `agent-packs/modules-batch-01.json`).
+
+    F-36: o `-b<NN>` precisa ser o FIM do identificador. Aceitar `-b<NN>` no
+    meio do nome (como fazia o BUG B4) faz `--agent web-b2b-team` casar `-b2`
+    e atribuir custo/tokens ao batch 02, que nem é dele.
 
     Devolve `(path, motivo_se_nao_resolvido)`: quando não dá para resolver,
-    `path` é `None` e `motivo` explica por quê (agente ausente, sem padrão
+    `path` é `None` e `motivo` explica por quê (agente ausente, sem sufixo
     `-b<NN>`, ou pack ausente em disco) — nunca inventa um número, mas
     também nunca fica silencioso: o motivo vai para
     `tokens.input_unresolved_reason` em `_estimate_run_tokens`."""
@@ -826,7 +837,10 @@ def _agent_pack_path_for(wd: str, stage: str, agent: str | None) -> tuple[str | 
     agent = agent.strip()
     match = AGENT_BATCH_SUFFIX_RE.search(agent)
     if not match:
-        return None, f"agent-pack não localizado para o agente '{agent}': nome não contém o padrão -b<NN>"
+        return None, (
+            f"agent-pack não localizado para o agente '{agent}': "
+            "nome não termina no padrão -b<NN> (ex.: modules-b01)"
+        )
     batch = int(match.group(1))
     path = os.path.join(wd, "agent-packs", f"{stage}-batch-{batch:02d}.json")
     if not os.path.isfile(path):
@@ -889,6 +903,205 @@ def _estimate_run_tokens(
     return tokens
 
 
+def _agent_runs_path(wd: str, stage: str) -> str:
+    return os.path.join(wd, "agent-runs", f"{stage}.json")
+
+
+def _agent_runs_entries(wd: str, stage: str) -> list[dict]:
+    """Runs já gravados em `agent-runs/<stage>.json` (lista vazia se o
+    manifesto não existe ou está ilegível — ausência de manifesto nunca é
+    tratada como conflito)."""
+    path = _agent_runs_path(wd, stage)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    runs = data.get("runs")
+    if not isinstance(runs, list):
+        return []
+    return [run for run in runs if isinstance(run, dict)]
+
+
+def _run_is_current(run: dict) -> bool:
+    """Mesma semântica de `sdd._run_status`: run sem `status` (schema v2
+    legado, nunca tocado por `redo`) conta como `current`."""
+    status_fn = getattr(sdd_mod, "_run_status", None)
+    if status_fn is not None:
+        try:
+            return status_fn(run) == "current"
+        except Exception:  # pragma: no cover - manifesto corrompido
+            pass
+    return run.get("status") in (None, "current")
+
+
+def _manifest_path_key(wd: str, value) -> str | None:
+    """Chave comparável para um caminho de artefato do manifesto (absoluto ou
+    relativo ao workdir; case-insensitive no Windows)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = value.strip()
+    if not os.path.isabs(path):
+        path = os.path.join(wd, *path.replace("\\", "/").split("/"))
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _scan_current_runs(wd: str, stage: str) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Varre os runs `current` do manifesto e devolve `(por_item, por_artefato)`.
+
+    `por_item`: item normalizado -> `{"run", "agent", "artifacts"}`.
+    `por_artefato`: chave de caminho -> `{"run", "agent", "item", "artefato"}`.
+
+    Run posterior sobrescreve o anterior nos dois mapas: o dono vigente de um
+    artefato é sempre o run `current` mais recente que o gravou.
+    """
+    by_item: dict[str, dict] = {}
+    by_artifact: dict[str, dict] = {}
+    for idx, run in enumerate(_agent_runs_entries(wd, stage), start=1):
+        if not _run_is_current(run):
+            continue
+        agent = run.get("agent")
+        agent = agent.strip() if isinstance(agent, str) and agent.strip() else None
+        for entry in run.get("items") or []:
+            if not isinstance(entry, dict):
+                continue
+            raw_item = str(entry.get("item") or "").strip()
+            if not raw_item:
+                continue
+            item = raw_item.replace("\\", "/").strip("/")
+            paths: list[str] = []
+            for artifact in entry.get("artifacts") or []:
+                value = artifact.get("path") if isinstance(artifact, dict) else artifact
+                key = _manifest_path_key(wd, value)
+                if key is None:
+                    continue
+                paths.append(str(value))
+                by_artifact[key] = {
+                    "run": idx,
+                    "agent": agent,
+                    "item": item,
+                    "artefato": str(value),
+                }
+            by_item[item] = {"run": idx, "agent": agent, "artifacts": paths}
+    return by_item, by_artifact
+
+
+def current_run_owners(wd: str, stage: str) -> dict[str, dict]:
+    """item -> `{"run": <id 1-based>, "agent": <str|None>, "artifacts": [...]}`
+    do run `current` mais recente que cobre o item.
+
+    Complementa `sdd.current_run_items` (que só devolve o id do run): a
+    mensagem de conflito de re-merge (F-08, em `cli._merge_redo_conflict_error`)
+    precisa dizer QUEM é o dono — run E agent — de cada item conflitante."""
+    by_item, _by_artifact = _scan_current_runs(wd, stage)
+    return by_item
+
+
+def _agent_batch_number(agent: str | None) -> int | None:
+    if not agent or not agent.strip():
+        return None
+    match = AGENT_BATCH_SUFFIX_RE.search(agent.strip())
+    return int(match.group(1)) if match else None
+
+
+def _same_agent_identity(left: str | None, right: str | None) -> bool:
+    """Mesmo agent/batch? Compara o identificador literal e, em fallback, o
+    número de batch do sufixo (`-b<NN>`, F-36) — dois nomes diferentes para o
+    MESMO batch não são "outro batch"."""
+    a = (left or "").strip().lower()
+    b = (right or "").strip().lower()
+    if a == b:
+        return True
+    batch_a, batch_b = _agent_batch_number(left), _agent_batch_number(right)
+    return batch_a is not None and batch_a == batch_b
+
+
+MAX_REPORTED_OWNER_CONFLICTS = 10
+
+
+def _reject_foreign_artifact_overwrite(
+    wd: str, stage: str, planned: list[tuple[str, str]], agent: str | None
+) -> None:
+    """F-24: recusa sobrescrever artefato que pertence a OUTRO batch.
+
+    Cenário real: dois batches reivindicam o mesmo bloco (slug colidente, item
+    renomeado, output copiado entre batches). Como `_write_text` gravava
+    incondicionalmente e `_detect_content_duplicates` só AVISA, o segundo merge
+    sobrescrevia o artefato do primeiro sem erro — e o manifesto ficava com dois
+    runs `current` apontando para o mesmo arquivo, com o sha do primeiro já
+    inválido (`P0: artefato alterado após o merge`).
+
+    Rejeita quando as DUAS condições valem para um artefato de destino:
+      1. ele já é artefato de um run `current` de outro agent/batch; e
+      2. o item DONO desse artefato não está no conjunto deste merge.
+
+    Se o item dono está neste merge, o caso é re-merge do próprio item e segue
+    pelo fluxo de F-08 (`cli._merge_redo_conflict_error` -> `redo`); aqui não
+    se duplica esse bloqueio.
+    """
+
+    if not planned:
+        return
+    _by_item, owners = _scan_current_runs(wd, stage)
+    if not owners:
+        return
+    mine = {_normalize_item(item) for _path, item in planned}
+    conflicts: list[dict] = []
+    for path, item in planned:
+        owner = owners.get(_manifest_path_key(wd, path) or "")
+        if owner is None:
+            continue
+        if owner["item"] in mine:
+            continue  # re-merge do próprio item -> F-08 (redo)
+        if _same_agent_identity(owner["agent"], agent):
+            continue  # mesmo batch reescrevendo o próprio artefato
+        conflicts.append({
+            "tipo": "artefato_de_outro_batch",
+            "item": item,
+            "artefato": os.path.relpath(os.path.abspath(path), os.path.abspath(wd)).replace("\\", "/"),
+            "dono_item": owner["item"],
+            "dono_agent": owner["agent"],
+            "dono_run": owner["run"],
+            "agent": (agent or "").strip() or None,
+        })
+    if not conflicts:
+        return
+    total = len(conflicts)
+    shown = conflicts[:MAX_REPORTED_OWNER_CONFLICTS]
+    first_owner = shown[0]["dono_item"]
+    acao = (
+        f"não sobrescreva o artefato de outro batch: rode `redo {stage} --item <item-do-dono>` "
+        f"(ex.: `redo {stage} --item {first_owner}`) para superar o run dono antes de re-mergear, "
+        "OU corrija o output deste batch para não reivindicar esse artefato"
+    )
+    lines = [
+        "artefato já pertence a outro batch: "
+        + ", ".join(conflict["artefato"] for conflict in shown)
+    ]
+    if total > len(shown):
+        lines[0] += f" (+{total - len(shown)} outro(s), total {total})"
+    for conflict in shown:
+        lines.append(
+            f"- {conflict['artefato']}: dono atual = run #{conflict['dono_run']} "
+            f"(agent {conflict['dono_agent'] or 'não informado'}, item `{conflict['dono_item']}`); "
+            f"este merge (agent {conflict['agent'] or 'não informado'}) tentaria gravá-lo "
+            f"como item `{conflict['item']}`"
+        )
+    if total > len(shown):
+        lines.append(f"... {total - len(shown)} conflito(s) omitido(s) (total {total})")
+    lines.append(f"acao: {acao}")
+    raise MergeError(
+        "\n".join(lines),
+        violacoes=shown,
+        violacoes_total=total,
+        acao=acao,
+    )
+
+
 def _record_agent_run(
     wd: str,
     stage: str,
@@ -899,9 +1112,8 @@ def _record_agent_run(
     output_text: str | None = None,
     model: str | None = None,
 ) -> str:
-    root = os.path.join(wd, "agent-runs")
-    os.makedirs(root, exist_ok=True)
-    path = os.path.join(root, f"{stage}.json")
+    path = _agent_runs_path(wd, stage)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     previous: dict = {}
     if os.path.isfile(path):
         try:
@@ -974,6 +1186,9 @@ def merge_agent_output(
         blocks = _parse_modules(text)
         _reject_duplicate_artifacts(wd, [item for item, _content in blocks])
         planned = [(_module_artifact(wd, item), item, content) for item, content in blocks]
+        _reject_foreign_artifact_overwrite(
+            wd, stage, [(path, item) for path, item, _content in planned], agent
+        )
         warnings = _detect_content_duplicates(os.path.join(wd, "modules"), planned)
         overrides = {path: content for path, _item, content in planned}
         for artifact, item, content in planned:
@@ -987,16 +1202,28 @@ def merge_agent_output(
         _mark_items_done_transaction(wd, stage, [item for _artifact, item, _content in planned])
     elif stage == "specs":
         units, named_docs = _parse_specs(text)
-        for item, files in units:
-            root = _spec_dir(wd, item)
+        # F-24: resolve TODOS os destinos antes de gravar qualquer um — o
+        # bloqueio por dono precisa acontecer com o disco ainda intacto.
+        planned_units = [
+            (item, [(os.path.join(_spec_dir(wd, item), filename), content)
+                    for filename, content in files.items()])
+            for item, files in units
+        ]
+        planned_docs = [(name, _specs_doc_artifact(wd, name), content) for name, content in named_docs]
+        _reject_foreign_artifact_overwrite(
+            wd,
+            stage,
+            [(path, item) for item, files in planned_units for path, _content in files]
+            + [(path, name) for name, path, _content in planned_docs],
+            agent,
+        )
+        for item, files in planned_units:
             artifacts = []
-            for filename, content in files.items():
-                artifact = os.path.join(root, filename)
+            for artifact, content in files:
                 _write_text(artifact, content)
                 artifacts.append(artifact)
             merged.append(MergedArtifact(item=item, artifacts=artifacts))
-        for name, content in named_docs:
-            artifact = _specs_doc_artifact(wd, name)
+        for name, artifact, content in planned_docs:
             _write_text(artifact, content)
             merged.append(MergedArtifact(item=name, artifacts=[artifact]))
         manifest = _record_agent_run(
@@ -1008,8 +1235,11 @@ def merge_agent_output(
         _mark_items_done_transaction(wd, stage, [item for item, _files in units])
     elif stage in NAMED_STAGE_HEADER_RE:
         blocks = _parse_named_blocks(stage, text)
-        for name, content in blocks:
-            artifact = _named_artifact(wd, name)
+        planned_named = [(_named_artifact(wd, name), name, content) for name, content in blocks]
+        _reject_foreign_artifact_overwrite(
+            wd, stage, [(path, name) for path, name, _content in planned_named], agent
+        )
+        for artifact, name, content in planned_named:
             _write_text(artifact, content)
             merged.append(MergedArtifact(item=name, artifacts=[artifact]))
         manifest = _record_agent_run(

@@ -1443,11 +1443,38 @@ def _merge_input_items(stage: str, text: str) -> list[str]:
     return []
 
 
-def _merge_redo_conflict_error(wd: str, stage: str, input_path: str) -> str | None:
+def _redo_command(a, stage: str, item: str) -> str:
+    """Comando `redo` LITERAL, com os valores reais deste contexto (F-08).
+
+    A mensagem antiga (`wk code ... redo <stage> --item <item>`) tinha três
+    placeholders: o operador/agente tinha que adivinhar o binário, o `--repo`,
+    o `--store` E o item. Na prática ninguém rodava o `redo` — o merge era
+    refeito por cima, o run antigo continuava `current` com o sha velho e a
+    auditoria travava em `P0: artefato alterado após o merge` para sempre.
+    Aqui o comando sai pronto para colar."""
+    return (
+        f'$WKPY "$WK" code --repo "{a.repo}" --store "{a.store}" '
+        f'redo {stage} --item "{item}"'
+    )
+
+
+MAX_REPORTED_REDO_CONFLICTS = 10
+
+
+def _merge_redo_conflict_error(a, wd: str, stage: str, input_path: str) -> dict | None:
     """Recusa re-merge de item(ns) que já têm um run `current` registrado
     (BQ4 ponto 5): sem isto, reescrever a resposta do subagente e rodar
     `merge-agent-output` de novo invalidava silenciosamente a trilha anterior
-    em vez de passar pelo caminho suportado (`redo`)."""
+    em vez de passar pelo caminho suportado (`redo`).
+
+    F-08: o bloqueio já existia, mas a mensagem não ENSINAVA a saída — o
+    resultado prático era o operador re-mergear por outro caminho e deixar o
+    run antigo `current` apontando para um sha que não existe mais
+    (`P0: artefato alterado após o merge`, permanente). Agora o payload traz,
+    para cada item em conflito, o run id e o agent que o cobrem, e um `acao`
+    com o(s) comando(s) `redo` literais, um por item, prontos para colar.
+
+    Devolve o payload de erro (dict pronto para `json.dumps`) ou `None`."""
     try:
         with open(input_path, encoding="utf-8-sig", errors="replace") as f:
             text = f.read()
@@ -1456,15 +1483,72 @@ def _merge_redo_conflict_error(wd: str, stage: str, input_path: str) -> str | No
     items = _merge_input_items(stage, text)
     if not items:
         return None
-    current = sdd_mod.current_run_items(wd, stage)
-    conflicts = sorted({item for item in items if item in current})
+    owners = agentmerge_mod.current_run_owners(wd, stage)
+    conflicts = sorted({item for item in items if item in owners})
     if not conflicts:
         return None
-    sample = ", ".join(conflicts[:5])
-    return (
-        f"item já mergeado; rode `wk code ... redo {stage} --item <item>` antes de refazer "
-        f"(itens em conflito: {sample})"
+    shown = conflicts[:MAX_REPORTED_REDO_CONFLICTS]
+    detalhes = [
+        {
+            "item": item,
+            "run": owners[item].get("run"),
+            "agent": owners[item].get("agent"),
+        }
+        for item in conflicts
+    ]
+    listagem = "; ".join(
+        f"`{d['item']}` (run #{d['run']}, agent {d['agent'] or 'não informado'})"
+        for d in detalhes[:len(shown)]
     )
+    if len(conflicts) > len(shown):
+        listagem += f"; ... +{len(conflicts) - len(shown)} outro(s) (total {len(conflicts)})"
+    comandos = [_redo_command(a, stage, item) for item in shown]
+    acao = (
+        "rode o(s) redo abaixo (um por item em conflito) e só então refaça o merge: "
+        + " ; ".join(comandos)
+    )
+    if len(conflicts) > len(shown):
+        acao += (
+            f" ; (+{len(conflicts) - len(shown)} item(ns) em conflito não listado(s): "
+            "repita o mesmo comando trocando --item)"
+        )
+    return {
+        "error": (
+            f"item já mergeado: re-merge sem `redo` deixaria o run anterior `current` com "
+            f"sha desatualizado (P0: artefato alterado após o merge). "
+            f"Itens em conflito: {listagem}"
+        ),
+        "acao": acao,
+        "itens_em_conflito": detalhes,
+        "comandos_redo": comandos,
+    }
+
+
+def _merge_error_payload(a, e: Exception) -> dict:
+    """Payload de um `MergeError`. Usa o `acao` estruturado da exceção quando
+    existe (ruído do lote D, F-24) e, no caso F-24, promove a ação genérica
+    (`redo <stage> --item ...`) para o comando literal com --repo/--store
+    reais — mesma cura do F-08, aplicada ao conflito de dono de artefato."""
+    payload: dict = {"error": str(e)}
+    violacoes = list(getattr(e, "violacoes", None) or [])
+    donos: list[str] = []
+    for v in violacoes:
+        dono = v.get("dono_item") if isinstance(v, dict) else None
+        if v.get("tipo") == "artefato_de_outro_batch" and dono and dono not in donos:
+            donos.append(dono)
+    if donos:
+        comandos = [_redo_command(a, a.stage, item) for item in donos]
+        payload["acao"] = (
+            "supere o run dono antes de re-mergear: " + " ; ".join(comandos)
+            + " — OU corrija o output deste batch para não reivindicar o artefato de outro batch"
+        )
+        payload["comandos_redo"] = comandos
+    else:
+        payload["acao"] = getattr(e, "acao", None) or _sdd_brief_hint(a.stage)
+    if violacoes:
+        payload["violacoes"] = violacoes
+        payload["violacoes_total"] = getattr(e, "violacoes_total", len(violacoes))
+    return payload
 
 
 def cmd_merge_agent_output(a) -> int:
@@ -1489,20 +1573,14 @@ def cmd_merge_agent_output(a) -> int:
             "acao": _sdd_brief_hint(a.stage),
         }, ensure_ascii=False), file=sys.stderr)
         return 2
-    redo_conflict = _merge_redo_conflict_error(wd, a.stage, a.input)
+    redo_conflict = _merge_redo_conflict_error(a, wd, a.stage, a.input)
     if redo_conflict:
-        print(json.dumps({
-            "error": redo_conflict,
-            "acao": _sdd_brief_hint(a.stage),
-        }, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps(redo_conflict, ensure_ascii=False), file=sys.stderr)
         return 2
     try:
         result = agentmerge_mod.merge_agent_output(wd, a.stage, a.input, agent=a.agent)
     except agentmerge_mod.MergeError as e:
-        print(json.dumps({
-            "error": str(e),
-            "acao": _sdd_brief_hint(a.stage),
-        }, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps(_merge_error_payload(a, e), ensure_ascii=False), file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

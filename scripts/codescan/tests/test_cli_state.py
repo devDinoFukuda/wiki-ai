@@ -17,8 +17,11 @@ YELLOW = "\U0001F7E1"
 RED = "\U0001F534"
 
 
-def _write(path: str, text: str = "x\n") -> None:
+def _write(path: str, text: str = None) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if text is None:
+        # Default: create a file with 20 lines to accommodate citations up to line 20
+        text = "\n".join(f"# Line {i}" for i in range(1, 21)) + "\n"
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
 
@@ -434,6 +437,8 @@ class CliStateContractTest(unittest.TestCase):
         os.makedirs(self.repo, exist_ok=True)
         self.wd = st_mod.workdir(self.store, self.repo)
         st_mod.init(self.wd, self.repo, topic=None)
+        # Create src/payments.py in repo with sufficient lines for citations
+        _write(os.path.join(self.repo, "src", "payments.py"), None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1092,6 +1097,9 @@ class RunStageContractTest(unittest.TestCase):
         os.makedirs(self.repo, exist_ok=True)
         self.wd = st_mod.workdir(self.store, self.repo)
         st_mod.init(self.wd, self.repo, topic="codebases/test")
+        # Create src/quote files for synth citations
+        _write(os.path.join(self.repo, "src", "quote", "QuoteService.java"), None)
+        _write(os.path.join(self.repo, "src", "quote", "QuoteRepository.java"), None)
 
     def tearDown(self):
         self.tmp.cleanup()

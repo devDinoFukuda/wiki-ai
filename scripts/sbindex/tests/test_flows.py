@@ -158,9 +158,15 @@ class LexicalOr(unittest.TestCase):
         q = to_fts_query("dead-letter")
         self.assertEqual(q, '"dead-letter"')
 
-    def test_negacao_continua_funcionando(self):
+    def test_negacao_isolada_vira_termo_positivo(self):
+        # F-20: negação sem operando à esquerda é inválida em FTS5 -> termo positivo
         q = to_fts_query("-DLQ")
-        self.assertEqual(q, 'NOT "DLQ"')
+        self.assertEqual(q, '"DLQ"')
+
+    def test_negacao_com_operando_preservada(self):
+        # F-20: negação com operando à esquerda funciona normalmente
+        q = to_fts_query("retry -DLQ")
+        self.assertEqual(q, '"retry" NOT "DLQ"')
 
     def test_case_insensitive(self):
         q = to_fts_query("dead-letter or DLQ")

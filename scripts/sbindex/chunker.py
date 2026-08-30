@@ -30,7 +30,7 @@ RAW_TARGET = 512
 RAW_OVERLAP_PCT = 0.15
 WIKI_MAX = 800  # seção maior que isso é sintoma de compile ruim, mas não quebra
 
-_FENCE = re.compile(r"^\s*(```|~~~)")
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
 _H2 = re.compile(r"^##\s+(.+?)\s*$")
 _H1 = re.compile(r"^#\s+(.+?)\s*$")
 _TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
@@ -51,17 +51,33 @@ class Chunk:
 
 
 def _fence_mask(lines: list[str]) -> list[bool]:
-    """True nas linhas que estão dentro de um bloco de código."""
+    """True nas linhas que estão dentro de um bloco de código.
+
+    ``` e ~~~ NÃO são intercambiáveis (F-45): o fechamento tem que casar o
+    MESMO marcador do fence de abertura, com comprimento >= o de abertura
+    (regra do CommonMark). Sem isso, um fence aninhado de tipo diferente
+    (ex.: um exemplo com ```` dentro de um bloco ~~~) fecha o de fora cedo e
+    inverte a máscara pro resto do documento.
+    """
     inside = []
-    open_fence = False
+    open_marker: tuple[str, int] | None = None  # (char, comprimento) do fence aberto
     for ln in lines:
-        is_fence = bool(_FENCE.match(ln))
-        if is_fence:
-            # a própria linha da cerca pertence ao bloco
+        m = _FENCE.match(ln)
+        if m:
+            marker = m.group(1)
+            char, length = marker[0], len(marker)
+            if open_marker is None:
+                open_marker = (char, length)
+                inside.append(True)  # a própria linha da cerca pertence ao bloco
+                continue
+            if char == open_marker[0] and length >= open_marker[1]:
+                inside.append(True)  # linha de fechamento: pertence ao bloco
+                open_marker = None
+                continue
+            # marcador diferente ou mais curto: não fecha, é conteúdo do bloco
             inside.append(True)
-            open_fence = not open_fence
             continue
-        inside.append(open_fence)
+        inside.append(open_marker is not None)
     return inside
 
 

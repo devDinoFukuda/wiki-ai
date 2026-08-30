@@ -30,7 +30,7 @@ def _run(argv: list[str]) -> tuple[int, str, str]:
 
 def _module_output(item: str) -> str:
     bullets = "\n".join(
-        f"- 🟢 Fluxo operacional {i}: entrada validada, regra aplicada, dependência chamada e saída persistida em src/quote/QuoteService.java:{10 + i}."
+        f"- 🟢 Fluxo operacional {i}: entrada validada, regra aplicada, dependência chamada e saída persistida em src/quote/QuoteService.java:{4 + i}."
         for i in range(1, 18)
     )
     return "\n".join(
@@ -39,7 +39,7 @@ def _module_output(item: str) -> str:
             "# Análise do módulo quote",
             "",
             "## Responsabilidade",
-            "- 🟢 Responsabilidade: processar cotação mínima com entrada, validação e resposta rastreada em src/quote/QuoteService.java:10.",
+            "- 🟢 Responsabilidade: processar cotação mínima com entrada, validação e resposta rastreada em src/quote/QuoteService.java:3.",
             "- 🟢 O módulo concentra a regra de aceite e registra decisão operacional em src/quote/QuoteService.java:11.",
             "",
             "## Estruturas de dados",
@@ -50,14 +50,14 @@ def _module_output(item: str) -> str:
             bullets,
             "",
             "## Dependências",
-            "- 🟢 Persistência: QuoteRepository grava a decisão em src/quote/QuoteRepository.java:4.",
+            "- 🟢 Persistência: QuoteRepository grava a decisão em src/quote/QuoteRepository.java:3.",
             "- 🟢 Integração: QuoteService isola chamada de repositório em src/quote/QuoteService.java:14.",
             "",
             "## Rastreabilidade",
             "| Código | Regra | Evidência |",
             "|---|---|---|",
-            "| QuoteService.create | validar entrada | src/quote/QuoteService.java:10 |",
-            "| QuoteRepository.save | persistir decisão | src/quote/QuoteRepository.java:4 |",
+            "| QuoteService.create | validar entrada | src/quote/QuoteService.java:15 |",
+            "| QuoteRepository.save | persistir decisão | src/quote/QuoteRepository.java:3 |",
             "",
             "## Lacunas",
             "- 🔴 Lacuna objetiva: não há teste de rejeição para valor negativo em src/quote/QuoteService.java:12.",
@@ -78,18 +78,35 @@ class DeterministicE2ETest(unittest.TestCase):
                     [
                         "package app.quote;",
                         "class QuoteService {",
+                        "  // Responsabilidade: processar cotação mínima",
+                        "  // Fluxo operacional 1: entrada validada",
+                        "  // Fluxo operacional 2: entrada validada 2",
+                        "  // Fluxo operacional 3: entrada validada 3",
+                        "  // Fluxo operacional 4: entrada validada 4",
+                        "  // Fluxo operacional 5: entrada validada 5",
+                        "  // Fluxo operacional 6: entrada validada 6",
+                        "  // Fluxo operacional 7: entrada validada 7",
+                        "  // Persistência: registra decisão",
+                        "  // Lacuna: não há teste de rejeição para valor negativo",
+                        "  // Fluxo operacional 8: entrada validada 8",
+                        "  // Integração: isola chamada de repositório",
                         "  QuoteResponse create(QuoteRequest request) {",
                         "    if (request == null) throw new IllegalArgumentException();",
                         "    repository.save(request);",
                         "    return new QuoteResponse();",
                         "  }",
+                        "  // Fluxo operacional 9 a 17",
+                        "  private void placeholder1() { }",
+                        "  private void placeholder2() { }",
+                        "  private void placeholder3() { }",
+                        "  private void placeholder4() { }",
                         "}",
                     ]
                 ),
             )
-            _write(os.path.join(repo, "src", "quote", "QuoteRequest.java"), "package app.quote;\nclass QuoteRequest {}\n")
-            _write(os.path.join(repo, "src", "quote", "QuoteResponse.java"), "package app.quote;\nclass QuoteResponse {}\n")
-            _write(os.path.join(repo, "src", "quote", "QuoteRepository.java"), "package app.quote;\nclass QuoteRepository { void save(Object o) {} }\n")
+            _write(os.path.join(repo, "src", "quote", "QuoteRequest.java"), "package app.quote;\nclass QuoteRequest {\n  private String id;\n  // Additional lines to match citations\n}\n")
+            _write(os.path.join(repo, "src", "quote", "QuoteResponse.java"), "package app.quote;\nclass QuoteResponse {\n  private String status;\n  // Additional lines to match citations\n}\n")
+            _write(os.path.join(repo, "src", "quote", "QuoteRepository.java"), "package app.quote;\nclass QuoteRepository {\n  void save(Object o) {}\n  // Additional line\n}\n")
 
             base = ["--repo", repo, "--store", store, "--verbose"]
             run_stage_out = ""
