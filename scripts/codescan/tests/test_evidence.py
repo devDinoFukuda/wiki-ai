@@ -145,14 +145,31 @@ class VerifyMarkdownTest(unittest.TestCase):
         self.assertEqual(report["green_claims"], 1)
         self.assertEqual(report["valid_citations"], 1)
 
-    def test_verify_allows_yellow_and_red_without_citation(self):
+    def test_verify_rejects_claims_without_valid_citations(self):
+        # F-03: documento com ≥1 claim-block e ZERO citações válidas → ok=False, rule="sem_evidencia"
         report = verify_markdown(
             self.repo,
             f"- Retry parece usar política padrão. {YELLOW}\n- Falta confirmar SLA. {RED}",
         )
-        self.assertTrue(report["ok"], report)
+        self.assertFalse(report["ok"])
         self.assertEqual(report["claims"], 2)
         self.assertEqual(report["green_claims"], 0)
+        self.assertTrue(any(e["rule"] == "sem_evidencia" for e in report["errors"]))
+
+    def test_verify_allows_yellow_and_red_without_individual_citation(self):
+        # F-03: claims 🟡/🔴 não exigem citação individual, mas documento com claims
+        # precisa de ao menos uma citação válida para passar.
+        report = verify_markdown(
+            self.repo,
+            f"- Retry parece usar política padrão. {YELLOW}\n"
+            f"- Falta confirmar o limite de SLA. {RED}\n"
+            f"- A responsabilidade confirmada do fluxo de pagamento é aplicar limite de retry "
+            f"antes de retornar sucesso operacional. {GREEN} Evidência: `src/payments.py:1-2`",
+        )
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["claims"], 3)
+        self.assertEqual(report["green_claims"], 1)
+        self.assertEqual(report["valid_citations"], 1)
 
     def test_verify_rejects_basename_citation_when_full_relative_path_is_required(self):
         report = verify_markdown(

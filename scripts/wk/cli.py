@@ -806,10 +806,16 @@ def _resolve_promote_targets(store_root: str, target: str | None) -> tuple[list[
 
 
 def _yaml_scalar(v) -> str:
+    # F-41: em Python `isinstance(True, int)` é verdadeiro, então o teste de
+    # bool vem SEMPRE antes do de int. Só bool REAL vira true/false; inteiro
+    # continua inteiro — 0 e 1 são números, não booleanos disfarçados, e a
+    # conversão antiga corrompia qualquer campo numérico legítimo cujo valor
+    # calhasse de ser 0 ou 1 (inclusive no round-trip ler->regravar, já que
+    # `frontmatter._coerce` devolve int para `promoted`).
     if isinstance(v, bool):
         return "true" if v else "false"
-    if isinstance(v, int) and v in (0, 1):
-        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
     return json.dumps(str(v), ensure_ascii=False)
 
 
@@ -902,24 +908,34 @@ def _run_reindex(store_root: str) -> tuple[bool, str | None]:
 
 
 def _collect_approved_paths(
-    store_root: str, targets: list[str], target_spec: str | None, source_type: str | None
-) -> tuple[set[str], list[str], str | None]:
-    """Resolve `--approve <alvo>` ou `--approve-all --source-type <t>`.
+    store_root: str,
+    targets: list[str],
+    target_spec: str | None,
+    source_type: str | None,
+    topic: str | None = None,
+) -> tuple[set[str], set[str], list[str], str | None]:
+    """Resolve `--approve <alvo>` ou `--approve-all --source-type <t> --topic <x>`.
 
-    Devolve (caminhos_aprovados, targets_atualizado, erro). Itens aprovados que
-    não estavam no escopo original de `targets` (ex.: `--approve-all` sem alvo
-    posicional) são adicionados — aprovação explícita amplia o escopo, nunca
-    reduz o que já seria escaneado.
+    Devolve (caminhos_aprovados, aprovados_em_massa, targets_atualizado, erro).
+    Itens aprovados que não estavam no escopo original de `targets` (ex.:
+    `--approve-all` sem alvo posicional) são adicionados — aprovação explícita
+    amplia o escopo, nunca reduz o que já seria escaneado.
+
+    F-11: a aprovação em massa cruza DOIS filtros — `source_type` E `topic`
+    (ambos lidos do frontmatter do item). Antes bastava o source_type, e um
+    único `--approve-all --source-type agent-output` aprovava todo o inbox,
+    de qualquer tópico, de uma vez.
     """
     from sbindex.frontmatter import split
 
     approved: set[str] = set()
+    em_massa: set[str] = set()
     existing = {os.path.abspath(t) for t in targets}
 
     if target_spec:
         resolved, err = _resolve_promote_targets(store_root, target_spec)
         if err:
-            return set(), targets, err
+            return set(), set(), targets, err
         for p in resolved:
             ap = os.path.abspath(p)
             approved.add(ap)
@@ -932,17 +948,20 @@ def _collect_approved_paths(
             meta, _ = split(_read_md(p))
             if meta.get("source_type") != source_type:
                 continue
+            if topic is not None and meta.get("topic") != topic:
+                continue
             ap = os.path.abspath(p)
             approved.add(ap)
+            em_massa.add(ap)
             if ap not in existing:
                 targets.append(p)
                 existing.add(ap)
 
-    return approved, targets, None
+    return approved, em_massa, targets, None
 
 
 def cmd_promote(a) -> int:
-    from sbindex.frontmatter import provenance_gaps, split
+    from sbindex.frontmatter import VALID_SOURCE_TYPES, provenance_gaps, split
 
     store_root = _store_root(a)
     targets, err = _resolve_promote_targets(store_root, a.target)
@@ -950,26 +969,98 @@ def cmd_promote(a) -> int:
         print(json.dumps({"error": err}, ensure_ascii=False), file=sys.stderr)
         return 2
 
+    # F-11: aprovação em massa é o ponto de maior alavancagem do sistema —
+    # exige escopo fechado (source_type VÁLIDO + topic) e aprovador nomeado.
     if a.approve_all and not a.approve_source_type:
         print(
-            json.dumps({"error": "--approve-all exige --source-type"}, ensure_ascii=False),
+            json.dumps(
+                {
+                    "error": "--approve-all exige --source-type",
+                    "acao": (
+                        "repita com `--approve-all --source-type <tipo> --topic <topic> "
+                        "--approved-by <pessoa>`; sem os dois filtros a aprovação varreria "
+                        "todo o inbox de uma vez"
+                    ),
+                    "validos": sorted(VALID_SOURCE_TYPES),
+                },
+                ensure_ascii=False,
+            ),
             file=sys.stderr,
         )
         return 2
 
-    approved_paths, targets, err2 = _collect_approved_paths(
-        store_root, targets, a.approve, a.approve_source_type if a.approve_all else None
+    if a.approve_all and not (a.approve_topic or "").strip():
+        print(
+            json.dumps(
+                {
+                    "error": "--approve-all exige --topic",
+                    "acao": (
+                        "repita com `--approve-all --source-type <tipo> --topic <topic> "
+                        "--approved-by <pessoa>`; o topic fecha o escopo da aprovação em "
+                        "massa (só itens cujo `topic` do frontmatter bate são aprovados)"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    if a.approve_source_type and a.approve_source_type not in VALID_SOURCE_TYPES:
+        print(
+            json.dumps(
+                {
+                    "error": f"source_type inválido: {a.approve_source_type}",
+                    "acao": "use um dos tipos do schema (sbindex/frontmatter.py:VALID_SOURCE_TYPES)",
+                    "validos": sorted(VALID_SOURCE_TYPES),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    approved_by = (a.approved_by or "").strip()
+    if (a.approve or a.approve_all) and not approved_by:
+        print(
+            json.dumps(
+                {
+                    "error": "--approve/--approve-all exigem --approved-by",
+                    "acao": (
+                        "repita informando quem assume a aprovação: `--approved-by "
+                        "\"<pessoa>\"`. O valor vai para `promoted_by` no frontmatter e "
+                        "para o log.md — não há mais aprovador genérico default"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    approve_topic = (a.approve_topic or "").strip() or None
+    approved_paths, aprovados_em_massa, targets, err2 = _collect_approved_paths(
+        store_root,
+        targets,
+        a.approve,
+        a.approve_source_type if a.approve_all else None,
+        approve_topic if a.approve_all else None,
     )
     if err2:
         print(json.dumps({"error": err2}, ensure_ascii=False), file=sys.stderr)
         return 2
 
-    approved_by = a.approved_by or "humano"
+    # Ator para as linhas de log que não são aprovação humana (o
+    # `--allow-unverified` sem `--approve` continua sendo ação do próprio wk).
+    log_actor = approved_by or "wiki-ai"
 
     promoted: list[dict] = []
     human: list[dict] = []
     quarantine: list[dict] = []
     approval_lines: list[str] = []
+    # F-11(d): itens efetivamente promovidos pela aprovação em massa — a
+    # contagem vai para o log junto com o escopo (topic + source_type).
+    massa_promovidos: list[str] = []
     verify_blocked: list[dict] = []
     verify_overridden: list[dict] = []
 
@@ -1056,10 +1147,14 @@ def cmd_promote(a) -> int:
             }
         )
         if is_approved and source_type != "code-repo":
+            em_massa = os.path.abspath(path) in aprovados_em_massa
             approval_lines.append(
-                f"- aprovado por {promoted_by}: {source_id or '(sem-id)'} "
+                f"- aprovado por {promoted_by}"
+                f"{' (--approve-all)' if em_massa else ''}: {source_id or '(sem-id)'} "
                 f"({source_type}) | {rel}"
             )
+            if em_massa:
+                massa_promovidos.append(rel)
 
     _append_quarantine(store_root, quarantine)
     if promoted:
@@ -1067,6 +1162,18 @@ def cmd_promote(a) -> int:
             store_root,
             f"## [{_utc_now()}] promote | {len(promoted)} promovidos | wiki-ai",
         )
+    # F-11(d): o escopo da aprovação em massa é registrado SEMPRE que
+    # `--approve-all` é usado — inclusive quando nada casou (contagem 0), para
+    # que a tentativa fique auditável no log.md, e não só o resultado.
+    if a.approve_all:
+        _append_log(
+            store_root,
+            f"## [{_utc_now()}] promote --approve-all | escopo: topic={approve_topic} "
+            f"source_type={a.approve_source_type} | {len(massa_promovidos)} aprovados "
+            f"em massa | {approved_by}",
+        )
+        for rel_massa in massa_promovidos:
+            _append_log(store_root, f"- escopo --approve-all: {rel_massa}")
     if approval_lines:
         _append_log(
             store_root,
@@ -1078,7 +1185,7 @@ def cmd_promote(a) -> int:
         _append_log(
             store_root,
             f"## [{_utc_now()}] promote --allow-unverified | "
-            f"{len(verify_overridden)} promovidos com verify falhado | {approved_by}",
+            f"{len(verify_overridden)} promovidos com verify falhado | {log_actor}",
         )
         for item in verify_overridden:
             _append_log(
@@ -1099,6 +1206,13 @@ def cmd_promote(a) -> int:
     }
     if verify_overridden:
         out["verify_override"] = verify_overridden
+    if a.approve_all:
+        out["aprovacao_em_massa"] = {
+            "topic": approve_topic,
+            "source_type": a.approve_source_type,
+            "aprovados": len(massa_promovidos),
+            "approved_by": approved_by,
+        }
     if reindex_error:
         out["reindex_error"] = reindex_error
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1106,10 +1220,113 @@ def cmd_promote(a) -> int:
 
 
 def _slug(s: str) -> str:
+    """Normalização crua — PRESERVA `.` e `/` (o `topic` usa `/` como
+    separador de sub-tópico). NUNCA use o resultado direto num join de
+    caminho: passe por `_slug_component`/`_slug_topic` (F-01)."""
     s = (s or "geral").strip().lower()
     s = re.sub(r"[^a-z0-9._/-]+", "-", s)
     s = re.sub(r"-+", "-", s).strip("-/")
     return s or "geral"
+
+
+# ---------- F-01: componentes de caminho vindos do frontmatter ----------
+
+# `id`, `topic` e `source_type` são CONTEÚDO DE ARQUIVO (frontmatter da fonte),
+# não argumento confiável, e viram componentes de caminho sob `wiki/` e
+# `wiki-docx/` (cmd_compile, cmd_docx) e sob `raw/assets/` (lookup do asset
+# HTML). Como `_slug` preserva `.` e `/`, um `id: ../../../evil` sobrevivia à
+# normalização e escapava da árvore do store no join. Aqui cada componente
+# passa por whitelist [a-z0-9._-], sem sequência `..` e sem iniciar por `.`;
+# o que não passa vira erro explícito — nunca escrita fora da árvore.
+_SAFE_COMPONENT_RE = re.compile(r"^[a-z0-9._-]+$")
+
+_PATH_ACAO = (
+    "corrija o frontmatter da fonte: `id` e `source_type` só aceitam "
+    "[a-z0-9._-] (um único componente de caminho) e `topic` aceita `/` apenas "
+    "como separador de sub-tópico; nenhum componente pode ser `..`, começar "
+    "por `.` ou conter separador `\\`. A fonte foi recusada e nada foi gravado "
+    "fora da árvore do store"
+)
+
+
+class PathComponentError(ValueError):
+    """Componente de caminho recusado pela sanitização (F-01)."""
+
+    def __init__(self, campo: str, valor, motivo: str) -> None:
+        self.campo = campo
+        self.valor = "" if valor is None else str(valor)
+        self.motivo = motivo
+        super().__init__(f"{campo} inseguro para caminho ({motivo}): {self.valor!r}")
+
+    def as_dict(self) -> dict:
+        return {
+            "error": str(self),
+            "campo": self.campo,
+            "valor": self.valor,
+            "motivo": self.motivo,
+            "acao": _PATH_ACAO,
+        }
+
+
+def _check_component(value: str, campo: str) -> str:
+    """Valida UM componente de caminho já normalizado (minúsculo)."""
+    if not value:
+        raise PathComponentError(campo, value, "componente vazio")
+    if value in (".", "..") or ".." in value:
+        raise PathComponentError(campo, value, "contém sequência `..`")
+    if value.startswith("."):
+        raise PathComponentError(campo, value, "componente iniciado por `.`")
+    if not _SAFE_COMPONENT_RE.match(value):
+        raise PathComponentError(campo, value, "fora da whitelist [a-z0-9._-]")
+    return value
+
+
+def _slug_component(value, campo: str) -> str:
+    """`_slug` + validação: devolve um único componente de caminho seguro.
+    Separador (`/` ou `\\`) no valor cru é recusado, não normalizado — em
+    `id`/`source_type` ele nunca é legítimo e é exatamente o vetor do ataque."""
+    raw = "" if value is None else str(value)
+    if "/" in raw or "\\" in raw:
+        raise PathComponentError(campo, raw, "contém separador de caminho")
+    return _check_component(_slug(raw), campo)
+
+
+def _slug_topic(value, campo: str = "topic") -> str:
+    """`topic` legitimamente tem `/` (sub-tópico: `codebases/demo`): valida
+    componente a componente e devolve o slug com `/` preservado."""
+    raw = "" if value is None else str(value)
+    if "\\" in raw:
+        raise PathComponentError(campo, raw, "contém separador `\\`")
+    parts = [p for p in _slug(raw).split("/") if p]
+    if not parts:
+        raise PathComponentError(campo, raw, "vazio depois da normalização")
+    return "/".join(_check_component(p, campo) for p in parts)
+
+
+def _raw_component(value, campo: str) -> str:
+    """Valida um valor CRU usado direto num join, sem passar por `_slug`
+    (ex.: `raw/assets/<id>.html`, que preserva a caixa do `id`). A whitelist é
+    a mesma, aplicada sobre a versão minúscula; o valor volta intacto."""
+    raw = "" if value is None else str(value).strip()
+    if "/" in raw or "\\" in raw:
+        raise PathComponentError(campo, raw, "contém separador de caminho")
+    _check_component(raw.lower(), campo)
+    return raw
+
+
+def _confined(root: str, path: str, campo: str, valor) -> str:
+    """Última barreira: o destino final tem de ficar dentro de `root` mesmo
+    depois de resolver symlink (`realpath`) — cinto e suspensório sobre a
+    whitelist de componentes."""
+    root_real = os.path.realpath(root)
+    path_real = os.path.realpath(path)
+    try:
+        inside = os.path.commonpath([root_real, path_real]) == root_real
+    except ValueError:  # unidades diferentes no Windows
+        inside = False
+    if not inside:
+        raise PathComponentError(campo, valor, f"destino resolvido fora de {root_real}")
+    return path
 
 
 def _promoted_raw_sources(store_root: str, topic: str | None) -> list[dict]:
@@ -1424,8 +1641,14 @@ def cmd_compile(a) -> int:
     sources = _promoted_raw_sources(store_root, a.topic)
     wiki_root = os.path.join(store_root, "wiki")
     os.makedirs(wiki_root, exist_ok=True)
+    assets_root = os.path.join(store_root, "raw", "assets")
 
     pages = []
+    # F-01: fontes cujo id/topic/source_type não passa na sanitização de
+    # componente de caminho. São recusadas UMA A UMA (o resto da wiki continua
+    # compilando) e saem no JSON com `acao`; o comando termina != 0 para que
+    # nenhuma automação trate a recusa como sucesso silencioso.
+    recusados: list[dict] = []
     # (fonte, rel_page, href): rel_page é store-relativo (contrato de saída,
     # em `pages`); href é relativo a `wiki_root` — usado só nos links dentro
     # de `wiki/index.md`, que mora em `wiki/` (BQ1: usar rel_page ali gerava
@@ -1435,24 +1658,46 @@ def cmd_compile(a) -> int:
     asset_abspath_by_id: dict[str, str] = {}
 
     for s in sources:
-        topic_slug = _slug(s["topic"])
-        type_slug = _slug(s["source_type"])
-        id_slug = _slug(str(s["id"] or "sem-id"))
+        # F-01: TODO componente derivado de frontmatter é sanitizado e o
+        # destino final é confinado por realpath/commonpath ANTES de qualquer
+        # escrita ou leitura de asset.
+        try:
+            topic_slug = _slug_topic(s["topic"])
+            type_slug = _slug_component(s["source_type"], "source_type")
+            id_slug = _slug_component(s["id"] or "sem-id", "id")
+            page_dir = _confined(
+                wiki_root,
+                os.path.join(wiki_root, *topic_slug.split("/"), type_slug),
+                "topic",
+                s["topic"],
+            )
+            path = _confined(wiki_root, os.path.join(page_dir, f"{id_slug}.md"), "id", s["id"])
+            asset_src = None
+            if s.get("id"):
+                # O nome do asset preserva a caixa do id (gravado assim pelo
+                # publish), então valida-se o valor cru: sem isso um
+                # `id: ../../../segredo` fazia o compile LER fora da árvore e
+                # copiar o conteúdo para dentro da wiki.
+                asset_src = _confined(
+                    assets_root,
+                    os.path.join(assets_root, f"{_raw_component(s['id'], 'id')}.html"),
+                    "id",
+                    s["id"],
+                )
+        except PathComponentError as exc:
+            recusados.append({**exc.as_dict(), "fonte": s["rel"]})
+            continue
         page_id = f"wiki-{topic_slug}-{type_slug}-{id_slug}"
-        page_dir = os.path.join(wiki_root, topic_slug, type_slug)
-        path = os.path.join(page_dir, f"{id_slug}.md")
 
         # FIX 1: fonte com asset HTML navegável anexado (publish/coupling.html)
         # — copia o asset para dentro de wiki/, ao lado da página, e linka.
         asset_href = None
-        if s.get("id"):
-            asset_src = os.path.join(store_root, "raw", "assets", f"{s['id']}.html")
-            if os.path.isfile(asset_src):
-                os.makedirs(page_dir, exist_ok=True)
-                asset_dest = os.path.join(page_dir, f"{id_slug}.html")
-                shutil.copyfile(asset_src, asset_dest)
-                asset_href = f"{id_slug}.html"
-                asset_abspath_by_id[s["id"]] = asset_dest
+        if asset_src and os.path.isfile(asset_src):
+            os.makedirs(page_dir, exist_ok=True)
+            asset_dest = os.path.join(page_dir, f"{id_slug}.html")
+            shutil.copyfile(asset_src, asset_dest)
+            asset_href = f"{id_slug}.html"
+            asset_abspath_by_id[s["id"]] = asset_dest
 
         body = [
             f"# {s['id']}",
@@ -1493,8 +1738,17 @@ def cmd_compile(a) -> int:
         topic_sources = [s for s, _href in entries]
         if not any(_codescan_artifact_rel(s.get("origin")) for s in topic_sources):
             continue
-        topic_slug = _slug(topic)
-        overview_dir = os.path.join(wiki_root, topic_slug)
+        # F-01: mesmo tratamento do laço das páginas — o topic aqui já passou
+        # pela sanitização (só chega em `by_topic` fonte aceita), mas o join da
+        # síntese é revalidado e confinado por conta própria.
+        try:
+            topic_slug = _slug_topic(topic)
+            overview_dir = _confined(
+                wiki_root, os.path.join(wiki_root, *topic_slug.split("/")), "topic", topic
+            )
+        except PathComponentError as exc:
+            recusados.append({**exc.as_dict(), "fonte": f"(síntese do topic {topic})"})
+            continue
         overview_path = os.path.join(overview_dir, "overview.md")
         overview_body, lacunas = _build_topic_overview(
             topic, topic_sources, overview_dir, page_abspath_by_id, asset_abspath_by_id
@@ -1553,10 +1807,12 @@ def cmd_compile(a) -> int:
     }
     if verify_overridden:
         out["verify_override"] = verify_overridden
+    if recusados:
+        out["recusados"] = recusados
     if reindex_error:
         out["reindex_error"] = reindex_error
     print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 1 if reindex_error else 0
+    return 1 if (reindex_error or recusados) else 0
 
 
 def _docx_prune_root(out_root: str, topic: str | None) -> str:
@@ -1566,12 +1822,20 @@ def _docx_prune_root(out_root: str, topic: str | None) -> str:
     topics quando a execução só gerou um subconjunto (defeito reportado:
     `wk docx <topic>` removia órfãos de topics não filtrados).
 
-    `_slug` é obrigatório aqui: `dest_dir` grava em `_slug(s["topic"])`, então
-    usar o topic cru erraria a subárvore em qualquer topic que o slug altere
-    (maiúscula, espaço, acento). `_slug` preserva `/`, daí o split depois."""
+    O slug é obrigatório aqui: `dest_dir` grava em `_slug_topic(s["topic"])`,
+    então usar o topic cru erraria a subárvore em qualquer topic que o slug
+    altere (maiúscula, espaço, acento). O slug preserva `/`, daí o split.
+
+    F-01: sem sanitização, `wk docx ../..` fazia a poda subir a árvore e
+    APAGAR `.docx` fora de `out_root`. `_slug_topic` recusa o componente e
+    `_confined` garante, por realpath/commonpath, que a raiz da poda fica
+    dentro de `out_root` (levanta `PathComponentError` se não ficar)."""
     if not topic:
         return out_root
-    return os.path.join(out_root, *_slug(topic).split("/"))
+    slug = _slug_topic(topic)
+    return _confined(
+        out_root, os.path.join(out_root, *slug.split("/")), "topic", topic
+    )
 
 
 def cmd_docx(a) -> int:
@@ -1599,12 +1863,25 @@ def cmd_docx(a) -> int:
         print(json.dumps(verify_block, ensure_ascii=False, indent=2), file=sys.stderr)
         return 3
 
+    # F-01: o `--topic` da linha de comando vira raiz da poda de órfãos
+    # (`_docx_prune_root`); valida antes de qualquer escrita/remoção.
+    if a.topic:
+        try:
+            _slug_topic(a.topic)
+        except PathComponentError as exc:
+            print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+
     sources = _promoted_raw_sources(store_root, a.topic)
     out_root = os.path.join(store_root, a.out_dir)
     os.makedirs(out_root, exist_ok=True)
+    assets_root = os.path.join(store_root, "raw", "assets")
 
     gerados: list[dict] = []
     pulados: list[dict] = []
+    # F-01: fontes recusadas pela sanitização de componente de caminho — como
+    # em cmd_compile, saem no JSON com `acao` e forçam exit != 0.
+    recusados: list[dict] = []
     # FIX 1: skips intencionais (asset HTML sem equivalente .docx) — separado
     # de `pulados` (falhas reais) para não inflar o exit code de um resultado
     # esperado e bem-sucedido.
@@ -1614,10 +1891,28 @@ def cmd_docx(a) -> int:
     docx_path_by_id: dict[str, str] = {}
 
     for s in sorted(sources, key=lambda s: s["id"]):
+        # F-01: sanitiza id/topic/source_type antes de qualquer join.
+        try:
+            topic_slug = _slug_topic(s["topic"])
+            type_slug = _slug_component(s["source_type"], "source_type")
+            asset_src = (
+                _confined(
+                    assets_root,
+                    os.path.join(assets_root, f"{_raw_component(s['id'], 'id')}.html"),
+                    "id",
+                    s["id"],
+                )
+                if s.get("id")
+                else None
+            )
+        except PathComponentError as exc:
+            recusados.append({**exc.as_dict(), "fonte": s.get("rel")})
+            continue
+
         # FIX 1: fonte-stub de asset HTML navegável (ex.: coupling.html
         # publicado via `wk publish`) não vira .docx — o conteúdo real não é
         # markdown; `docxgen.build_document` nunca chega a vê-lo.
-        if s.get("id") and os.path.isfile(os.path.join(store_root, "raw", "assets", f"{s['id']}.html")):
+        if asset_src and os.path.isfile(asset_src):
             asset_rel = os.path.join("raw", "assets", f"{s['id']}.html")
             ignorados_asset_html.append(
                 {
@@ -1629,12 +1924,17 @@ def cmd_docx(a) -> int:
         try:
             filename = docx_meta.docx_filename_unique(s, taken)
             taken.add(filename[: -len(".docx")])
-            dest_dir = os.path.join(out_root, _slug(s["topic"]), _slug(s["source_type"]))
+            dest_dir = os.path.join(out_root, *topic_slug.split("/"), type_slug)
             os.makedirs(dest_dir, exist_ok=True)
-            path = os.path.join(dest_dir, filename)
+            # `docx_meta` já neutraliza `/` e `..` no stem; o confinamento aqui
+            # é a barreira final (F-01), válida para qualquer nome futuro.
+            path = _confined(out_root, os.path.join(dest_dir, filename), "id", s["id"])
             data, avisos = docxgen.build_document(s)
             with open(path, "wb") as f:
                 f.write(data)
+        except PathComponentError as exc:
+            recusados.append({**exc.as_dict(), "fonte": s.get("rel")})
+            continue
         except Exception as exc:
             pulados.append({"id": s["id"], "motivo": str(exc)})
             continue
@@ -1666,12 +1966,19 @@ def cmd_docx(a) -> int:
         # de `wk publish`, não há artefato SDD para sintetizar.
         if not any(_codescan_artifact_rel(s.get("origin")) for s in topic_sources):
             continue
-        dest_dir = os.path.join(out_root, _slug(topic))
+        try:
+            agg_topic_slug = _slug_topic(topic)
+            dest_dir = _confined(
+                out_root, os.path.join(out_root, *agg_topic_slug.split("/")), "topic", topic
+            )
+        except PathComponentError as exc:
+            recusados.append({**exc.as_dict(), "fonte": f"(agregador do topic {topic})"})
+            continue
         os.makedirs(dest_dir, exist_ok=True)
         overview_text, lacunas = _build_topic_overview(
             topic, topic_sources, dest_dir, docx_path_by_id, {}
         )
-        agg_id = f"wk-docx-overview-{_slug(topic).replace('/', '-')}"
+        agg_id = f"wk-docx-overview-{agg_topic_slug.replace('/', '-')}"
         agg_source = {
             "id": agg_id,
             "topic": topic,
@@ -1704,7 +2011,11 @@ def cmd_docx(a) -> int:
         # Poda escopada ao filtro (ver _docx_prune_root): sem `a.topic` varre
         # `out_root` inteiro como antes; com `a.topic` varre só a subárvore
         # daquele topic, para não apagar `.docx` órfãos de outros topics.
-        prune_root = _docx_prune_root(out_root, a.topic)
+        try:
+            prune_root = _docx_prune_root(out_root, a.topic)
+        except PathComponentError as exc:  # F-01: nunca podar fora de out_root
+            print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
         out_root_abs = os.path.abspath(out_root)
         if os.path.isdir(prune_root):
             existentes = []
@@ -1764,8 +2075,10 @@ def cmd_docx(a) -> int:
     }
     if verify_overridden:
         out["verify_override"] = verify_overridden
+    if recusados:
+        out["recusados"] = recusados
     print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 1 if pulados else 0
+    return 1 if (pulados or recusados) else 0
 
 
 def _audit_index(store_root: str, path_filter: str | None = None) -> dict:
@@ -2700,6 +3013,38 @@ def _repo_name_from_workdir(workdir: str) -> str:
 def cmd_publish(a) -> int:
     from sbindex.frontmatter import split
 
+    # F-18: `--topic` é OBRIGATÓRIO. Sem ele, toda fonte publicada entrava em
+    # inbox/ sem `topic`, e o portão de verify do `promote` (que só roda
+    # `if item_topic:`) era silenciosamente contornado — artefato de codescan
+    # com `verify` reprovado virava canônico sem ninguém decidir nada. A
+    # obrigatoriedade fica aqui (e não em `required=True` do argparse) para o
+    # erro sair no contrato de saída do comando: JSON com `acao`, exit 2.
+    topic = (getattr(a, "topic", None) or "").strip()
+    if not topic:
+        print(
+            json.dumps(
+                {
+                    "error": "publish exige --topic (não vazio)",
+                    "acao": (
+                        "repita com `wk publish --workdir <workdir> --topic <slug> "
+                        "--store <store>`; o topic é o que liga a fonte ao portão de "
+                        "verify do `promote` e ao caminho da página em wiki/"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    # F-01: o topic vai para o frontmatter e depois vira caminho em wiki/ e
+    # wiki-docx/; recusa aqui, na entrada, em vez de deixar a fonte envenenada
+    # entrar no store.
+    try:
+        _slug_topic(topic)
+    except PathComponentError as exc:
+        print(json.dumps(exc.as_dict(), ensure_ascii=False), file=sys.stderr)
+        return 2
+
     workdir = os.path.abspath(a.workdir)
     if not os.path.isdir(workdir):
         print(json.dumps({"error": f"workdir não encontrado: {a.workdir}"}, ensure_ascii=False), file=sys.stderr)
@@ -2728,13 +3073,22 @@ def cmd_publish(a) -> int:
             )
             return 2
 
-        stem_slug = _slug(os.path.splitext(rel)[0].replace("/", "-"))
+        # F-01: `stem_slug` e `doc_id` viram nome de arquivo em inbox/ e em
+        # raw/assets/; ambos passam pela whitelist de componente.
+        try:
+            stem_slug = _slug_component(
+                os.path.splitext(rel)[0].replace("/", "-"), "arquivo do workdir"
+            )
+            repo_slug = _slug_component(repo_name, "repo")
+        except PathComponentError as exc:
+            print(json.dumps(exc.as_dict(), ensure_ascii=False), file=sys.stderr)
+            return 2
         ext = os.path.splitext(path)[1].lower()
         # FIX 1: `sdd/coupling.html` e `sdd/coupling.md` colidiriam no mesmo
         # doc_id (ambos derivam de "sdd-coupling" — o stem ignora extensão);
         # sufixo "-html" desambigua sem tocar no esquema de id dos .md
         # (mantém compatibilidade com ids já emitidos por publishes antigos).
-        doc_id = f"sb-publish-{_slug(repo_name)}-{stem_slug}"
+        doc_id = f"sb-publish-{repo_slug}-{stem_slug}"
         if ext == ".html":
             doc_id += "-html"
         asset_rel = None
@@ -2747,7 +3101,9 @@ def cmd_publish(a) -> int:
             # `docxgen.build_document` só recebe o stub).
             assets_dir = os.path.join(store_root, "raw", "assets")
             os.makedirs(assets_dir, exist_ok=True)
-            asset_dest = os.path.join(assets_dir, f"{doc_id}.html")
+            asset_dest = _confined(
+                assets_dir, os.path.join(assets_dir, f"{doc_id}.html"), "id", doc_id
+            )
             shutil.copyfile(path, asset_dest)
             asset_rel = os.path.relpath(asset_dest, store_root).replace("\\", "/")
             body = (
@@ -2769,12 +3125,17 @@ def cmd_publish(a) -> int:
             "origin": f"codescan {repo_name} — {rel}",
             "captured_at": _utc_now(),
             "promoted": False,
-            "topic": a.topic,
+            "topic": topic,
         }
         dest = _publish_existing_dest(dest_dir, doc_id)
         refreshed = dest is not None
         if dest is None:
             dest = _unique_dest(os.path.join(dest_dir, f"{stem_slug}.md"))
+        try:
+            dest = _confined(inbox_root, dest, "arquivo do workdir", stem_slug)
+        except PathComponentError as exc:
+            print(json.dumps(exc.as_dict(), ensure_ascii=False), file=sys.stderr)
+            return 2
         _write_md(dest, _render_frontmatter(meta, body))
         entry = {
             "id": doc_id,
@@ -2792,7 +3153,7 @@ def cmd_publish(a) -> int:
         store_root,
         f"## [{_utc_now()}] publish | {len(published)} artefatos | workdir {workdir}",
     )
-    out = {"workdir": workdir, "topic": a.topic, "publicados": published}
+    out = {"workdir": workdir, "topic": topic, "publicados": published}
     if modulos_orfaos:
         out["modulos_orfaos_descartados"] = {"n": len(modulos_orfaos), "arquivos": modulos_orfaos}
     if not candidates:
@@ -2801,7 +3162,7 @@ def cmd_publish(a) -> int:
     # FIX 3: publish NÃO bloqueia (é só staging em inbox/; nada aqui vira
     # canônico sem `promote`, e agent-output nunca auto-promove) — mas avisa,
     # para o humano decidir com informação em mãos antes de aprovar/promover.
-    verify_status = _failed_verify_workdirs(store_root, a.topic)
+    verify_status = _failed_verify_workdirs(store_root, topic)
     ours = [v for v in verify_status if os.path.abspath(os.path.join(store_root, v["workdir"])) == workdir]
     if ours:
         out["aviso_verify"] = (
@@ -2943,10 +3304,17 @@ def _build_parser() -> argparse.ArgumentParser:
     pr.add_argument("target", nargs="?", help="id ou caminho em inbox/; vazio varre inbox/**/*.md")
     pr.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     pr.add_argument("--approve", help="id ou caminho em inbox/ a aprovar explicitamente (humano)")
-    pr.add_argument("--approve-all", action="store_true", help="aprova todos os itens de --source-type")
+    pr.add_argument("--approve-all", action="store_true",
+                    help="aprova em massa os itens de --source-type E --topic (ambos obrigatórios)")
     pr.add_argument("--source-type", dest="approve_source_type",
-                    help="tipo exigido por --approve-all (human-transcript|human-doc|web-clip|agent-output)")
-    pr.add_argument("--approved-by", default="humano", help="quem aprovou; vai para promoted_by")
+                    help="tipo exigido por --approve-all (human-transcript|human-doc|web-clip|"
+                         "agent-output|code-repo); validado contra o schema")
+    pr.add_argument("--topic", dest="approve_topic",
+                    help="tópico exigido por --approve-all; filtra pelo `topic` do frontmatter "
+                         "(F-11: fecha o escopo da aprovação em massa)")
+    pr.add_argument("--approved-by", default=None,
+                    help="quem aprovou; vai para promoted_by e para o log.md "
+                         "(obrigatório com --approve/--approve-all — sem default)")
     pr.add_argument("--allow-unverified", action="store_true",
                     help="promove mesmo assim fontes de topic cujo `verify` do codescan falhou "
                          "(decisão humana explícita; fica registrada no log)")
@@ -2987,7 +3355,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pu = sub.add_parser("publish", help="leva a árvore SDD de um workdir do codescan para inbox/")
     pu.add_argument("--workdir", required=True, help="workdir do codescan (.codescan/<repo>-<hash>)")
-    pu.add_argument("--topic", required=True, help="tópico do wiki-ai")
+    # F-18: obrigatório de fato, mas checado em `cmd_publish` (não aqui) para
+    # que a ausência saia como JSON com `acao`, igual aos demais erros do
+    # comando, em vez do usage cru do argparse. Mesmo exit code (2).
+    pu.add_argument("--topic", default=None, help="tópico do wiki-ai (OBRIGATÓRIO)")
     pu.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     pu.set_defaults(fn=cmd_publish)
 

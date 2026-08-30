@@ -483,8 +483,24 @@ def verify_markdown(repo: str, markdown: str) -> dict:
 
     if not claim_blocks:
         warnings.append("nenhuma claim em bullet encontrada")
-    if green_claims and not valid_citations:
-        errors.append({"rule": "sem_citacoes_validas", "detail": "nenhuma citacao arquivo:linha valida encontrada"})
+    # F-03: a versão legada (`_verify_markdown_legacy`, linhas 437-440) exigia
+    # citação em TODA claim em bullet; a versão atual passou a exigir apenas em
+    # claim 🟢 — e, com isso, um documento inteiro sem uma única claim verde
+    # passava com `ok=True` mesmo sem NENHUMA evidência (o gate de
+    # promote/compile/docx lia isso como aprovado). O piso restaurado é de
+    # DOCUMENTO, não de bullet: prosa auxiliar (bullets 🟡/🔴 ou sem selo)
+    # continua isenta individualmente, mas um artefato com claims e zero
+    # citações válidas não é verificável e reprova.
+    if claim_blocks and not valid_citations:
+        errors.append(
+            {
+                "rule": "sem_evidencia",
+                "detail": (
+                    f"documento tem {len(claim_blocks)} claim(s) em bullet e nenhuma citacao "
+                    "arquivo:linha valida"
+                ),
+            }
+        )
 
     return {
         "claims": len(claim_blocks),

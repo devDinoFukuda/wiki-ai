@@ -107,10 +107,11 @@ class PromoteApproveTests(StoreTestCase):
 
     def test_approve_all_por_source_type_promove_como_reviewed_para_humano(self):
         path = os.path.join(self.store, "inbox", "transcripts", "z.md")
-        _write(path, _fm("sb-z1", "human-doc", "Pessoa Real"))
+        _write(path, _fm("sb-z1", "human-doc", "Pessoa Real", topic="demo"))
 
         code, out, err = _run(
-            ["promote", "--approve-all", "--source-type", "human-doc", "--store", self.store]
+            ["promote", "--approve-all", "--source-type", "human-doc", "--topic", "demo",
+             "--approved-by", "tester", "--store", self.store]
         )
         self.assertEqual(code, 0, err)
         data = json.loads(out)

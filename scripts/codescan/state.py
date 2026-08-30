@@ -10,10 +10,12 @@ escrito lá dentro, nem um arquivo de estado.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
 import re
+import shutil
 import time
 
 _URL_RE = re.compile(r"^(https?|git|ssh)://", re.I)
@@ -50,11 +52,33 @@ def workdir(store: str, repo: str) -> str:
 
     Chave estável: URL usa a própria string; caminho local usa o absoluto.
     Assim o mesmo repo (URL ou path) resolve sempre para o mesmo workdir.
+
+    BUG F-27: no Windows (e em qualquer FS case-insensitive), `c:/x` e
+    `C:/X` são o MESMO diretório no disco, mas `os.path.abspath` preserva a
+    grafia recebida — sem normalizar, o sha1 da chave produzia dois hashes
+    diferentes para o mesmo repo, e portanto dois workdirs (dois
+    state.json) para o mesmo checkpoint, dependendo só de como o usuário
+    digitou `--repo` numa chamada e noutra. `os.path.normcase` resolve isso:
+    em Windows baixa para minúsculas e troca '/' por '\\'; em POSIX é
+    no-op (mantém case-sensitive, correto lá). URLs NÃO passam por
+    normcase — a chave permanece a string crua da URL (URLs são
+    case-sensitive por natureza; normalizar poderia colidir hosts/paths
+    legitimamente distintos).
+
+    NOTA DE MIGRAÇÃO: workdirs já criados ANTES desta correção com uma
+    grafia de case divergente da que será usada daqui pra frente (ex.:
+    repo passado como "C:\\Code\\Repo" numa sessão antiga e "c:\\code\\repo"
+    depois) ficam ÓRFÃOS — o novo hash não bate com o antigo, então o
+    checkpoint antigo não é mais encontrado automaticamente. Não há
+    reaproveitamento automático aqui (fora do escopo desta correção,
+    que é só `state.py`); quem tiver um workdir órfão precisa localizá-lo
+    manualmente em `<store>/.codescan/` (pelo prefixo `<nome>-`) e apagá-lo
+    ou migrar o `state.json` para o novo diretório à mão.
     """
     if is_url(repo):
         key, name = repo, url_name(repo)
     else:
-        key = os.path.abspath(repo)
+        key = os.path.normcase(os.path.abspath(repo))
         name = os.path.basename(key.rstrip("/\\")) or "repo"
     h = hashlib.sha1(key.encode()).hexdigest()[:8]
     return os.path.join(store, ".codescan", f"{name}-{h}")
@@ -62,6 +86,59 @@ def workdir(store: str, repo: str) -> str:
 
 def _path(wd: str) -> str:
     return os.path.join(wd, "state.json")
+
+
+def _pid_alive(pid: int) -> bool:
+    """True se ainda existe um processo vivo com este pid.
+
+    `os.kill(pid, 0)` (o truque POSIX de "sinal 0 só verifica") não é
+    confiável em Windows: `os.kill` lá não implementa sinal 0 de verificação
+    de existência da forma esperada. Em vez disso, tentamos abrir um handle
+    para o processo via `OpenProcess` (API do Windows, por ctypes) com o
+    direito mínimo (`PROCESS_QUERY_LIMITED_INFORMATION`) — se abrir, o
+    processo existe; se falhar (ERROR_INVALID_PARAMETER/ACCESS_DENIED por
+    pid inexistente), tratamos como morto. Em POSIX, `os.kill(pid, 0)`
+    funciona como documentado: ESRCH = não existe, EPERM = existe mas sem
+    permissão (ainda vivo)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _lock_owner_path(lockdir: str) -> str:
+    return os.path.join(lockdir, "owner.json")
+
+
+def _write_lock_owner(lockdir: str) -> None:
+    owner = {"pid": os.getpid(), "created_at": time.time()}
+    with contextlib.suppress(OSError):
+        with open(_lock_owner_path(lockdir), "w", encoding="utf-8") as f:
+            json.dump(owner, f)
+
+
+def _read_lock_owner(lockdir: str) -> dict | None:
+    try:
+        with open(_lock_owner_path(lockdir), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 @contextlib.contextmanager
@@ -72,7 +149,26 @@ def _lock(wd: str, timeout: float = 30.0, poll: float = 0.05):
     trava, dois `load()->save()` concorrentes se sobrescrevem e um `done` some —
     o pior tipo de bug num pipeline com checkpoint. `os.mkdir` é atômico em
     Windows e POSIX; quem cria o diretório detém a trava.
-    """
+
+    BUG F-09 (CRÍTICO, roubo de trava viva): antes desta correção, o
+    critério para quebrar uma trava travada era só "passou `timeout`" — sem
+    checar se quem a detém ainda está vivo. Processo B, depois de 30s,
+    apagava a trava do processo A AINDA EM EXECUÇÃO (ex.: A só estava
+    demorando — repo grande, disco lento — não morto) e criava a sua
+    própria. Pior: quando o `finally` de A eventualmente rodava, ele
+    apagava a trava de B (que A nunca soube que existia) — dois processos
+    escrevendo `state.json` concorrentemente SEM proteção nenhuma, exatamente
+    o cenário que esta trava existe para prevenir.
+
+    Correção: cada dono grava `owner.json` (pid + created_at) DENTRO do
+    diretório da trava. Ao encontrar a trava ocupada e o timeout local
+    esgotado, só quebramos se o pid do dono já não existir mais (via
+    `_pid_alive` — órfã de sessão morta de verdade) — nunca só por idade.
+    Se o dono ainda está vivo, levantamos `TimeoutError` com erro claro em
+    vez de roubar. No `finally`, só removemos a trava se `owner.json` ainda
+    apontar para o NOSSO próprio pid — se por qualquer razão outro processo
+    já a quebrou e recriou entretanto, não mexemos nela (evita o mesmo
+    "apaga a trava do outro" na ponta de saída)."""
     os.makedirs(wd, exist_ok=True)
     lockdir = os.path.join(wd, ".state.lock")
     deadline = time.time() + timeout
@@ -82,28 +178,87 @@ def _lock(wd: str, timeout: float = 30.0, poll: float = 0.05):
             break
         except (FileExistsError, PermissionError):
             if time.time() >= deadline:
-                # Trava órfã de sessão morta: força depois do timeout.
+                # Só lemos/decidimos sobre `owner.json` aqui, ao esgotar o
+                # timeout — NÃO a cada iteração do poll. Ler o arquivo do
+                # dono em todo tick (a cada `poll` segundos, com N processos/
+                # threads concorrentes) é I/O extra que compete com o
+                # detentor real da trava por disco/GIL; sob concorrência alta
+                # (ex.: dezenas de agentes paralelos marcando itens) isso
+                # sozinho já atrasava o detentor o bastante para o timeout
+                # disparar por inanição, não por trava realmente presa.
+                owner = _read_lock_owner(lockdir)
+                owner_pid = owner.get("pid") if owner else None
+                owner_dead = owner_pid is None or not _pid_alive(int(owner_pid))
+                if not owner_dead:
+                    raise TimeoutError(
+                        f"não obtive a trava do estado em {timeout}s "
+                        f"(detida pelo processo vivo pid={owner_pid} — não "
+                        "roubada; se ele de fato travou, encerre-o e apague "
+                        f"{lockdir!r} manualmente)"
+                    )
+                # Trava órfã de sessão morta de verdade (dono não existe
+                # mais, ou owner.json sumiu/corrompeu junto com o crash):
+                # só agora é seguro quebrar.
+                with contextlib.suppress(OSError):
+                    os.remove(_lock_owner_path(lockdir))
                 with contextlib.suppress(OSError):
                     os.rmdir(lockdir)
-                    continue
-                raise TimeoutError(f"não obtive a trava do estado em {timeout}s")
+                continue
             time.sleep(poll)
+    _write_lock_owner(lockdir)
     try:
         yield
     finally:
-        with contextlib.suppress(OSError):
-            os.rmdir(lockdir)
+        owner = _read_lock_owner(lockdir)
+        if owner is not None and owner.get("pid") == os.getpid():
+            with contextlib.suppress(OSError):
+                os.remove(_lock_owner_path(lockdir))
+            with contextlib.suppress(OSError):
+                os.rmdir(lockdir)
+
+
+class StateCorruptError(Exception):
+    """state.json existe mas está ilegível/corrompido (JSON inválido, I/O,
+    encoding, etc.) — ver a mensagem para o caminho e a sugestão de
+    restaurar `state.json.bak` (gravado por `save()` a cada escrita bem-
+    sucedida)."""
 
 
 def load(wd: str) -> dict | None:
+    """Lê o estado do work dir.
+
+    `None` só significa "arquivo não existe" — checkpoint genuinamente
+    ainda não iniciado. Isso é distinto de "arquivo existe mas não dá pra
+    ler": nesse segundo caso levantamos `StateCorruptError` em vez de
+    devolver None.
+
+    BUG F-10 (causa-raiz): antes desta correção, qualquer exceção de
+    leitura/parse era engolida e virava None — indistinguível de "sem
+    estado". Os mutadores deste módulo fazem `load(wd) or {}` para tratar
+    "sem estado" como "começa vazio"; com o engolimento, um state.json
+    CORROMPIDO (mas com progresso real gravado) também virava `{}`, e a
+    escrita seguinte (`save()`) sobrescrevia o arquivo corrompido com esse
+    estado em branco — perda total e silenciosa do checkpoint, sem
+    qualquer erro reportado ao usuário. Levantando aqui, a exceção
+    atravessa o `load(wd) or {}` dos mutadores sem ser mascarada (`or`
+    nunca avalia o lado direito quando o esquerdo levanta) e chega ao
+    chamador — que agora precisa decidir explicitamente (ex.: restaurar o
+    `.bak`) em vez de perder dado sem saber."""
     p = _path(wd)
     if not os.path.exists(p):
         return None
     try:
         with open(p, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        return None
+    except Exception as e:
+        bak = p + ".bak"
+        if os.path.exists(bak):
+            hint = f"backup disponível em {bak!r} — se íntegro, restaure copiando-o por cima de {p!r}"
+        else:
+            hint = f"nenhum backup encontrado em {bak!r}"
+        raise StateCorruptError(
+            f"estado corrompido/ilegível em {p!r}: {e}. {hint}."
+        ) from e
 
 
 def init(wd: str, repo: str, topic: str | None) -> dict:
@@ -124,12 +279,29 @@ def init(wd: str, repo: str, topic: str | None) -> dict:
 
 
 def save(wd: str, st: dict) -> None:
+    """Grava o estado em disco (via tmp + os.replace atômico).
+
+    BUG F-10 (mitigação complementar): antes de sobrescrever, copia o
+    state.json ANTERIOR (se existir) para state.json.bak. Na sequência
+    normal load()->mutação->save() usada por todo mutador deste módulo, o
+    arquivo que está prestes a ser substituído já foi lido com sucesso por
+    `load()` nesta mesma operação (ou nunca existiu) — ou seja, o que vira
+    `.bak` aqui é sempre o último estado ÍNTEGRO conhecido, nunca lixo.
+    Isso dá uma via de recuperação manual (ver `StateCorruptError`) se um
+    `state.json` futuro corromper por qualquer motivo externo (escrita
+    parcial fora deste módulo, disco cheio, etc.) — sem isto, uma
+    corrupção do arquivo principal não deixaria nenhuma cópia boa para
+    trás."""
     os.makedirs(wd, exist_ok=True)
     st["updated_at"] = _now()
-    tmp = _path(wd) + ".tmp"
+    target = _path(wd)
+    if os.path.exists(target):
+        with contextlib.suppress(OSError):
+            shutil.copyfile(target, target + ".bak")
+    tmp = target + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, _path(wd))  # atômico: sessão morta não corrompe o estado
+    os.replace(tmp, target)  # atômico: sessão morta não corrompe o estado
 
 
 def _ensure_status(status: str) -> None:

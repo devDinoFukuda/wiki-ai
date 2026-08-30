@@ -2097,12 +2097,95 @@ def cmd_sdd_scaffold(a) -> int:
     return 0
 
 
+# --- F-02: `verify` passa a ser estado POR COBERTURA, não por execução ------
+#
+# Antes, `verify --artifact <qualquer.md>` chamava
+# `st_mod.mark(wd, "verify", "done")` — um único artefato trivial (até um .md
+# sem nenhuma claim) marcava o STAGE INTEIRO como aprovado, e o portão de
+# promote/compile/docx em `wk/cli.py` (que lê `stages.verify.status`) liberava
+# o workdir todo. Agora cada execução registra o resultado do SEU artefato em
+# `stages.verify.artifacts` (mapa acumulado entre execuções) e o `status` do
+# stage é DERIVADO da cobertura dos artefatos obrigatórios.
+_VERIFY_REQUIRED_ALWAYS = ("sdd/confirmed.md",)
+_VERIFY_REQUIRED_IF_PRESENT = ("sdd/inferred.md",)
+
+
+def _verify_artifact_key(wd: str, artifact: str) -> str:
+    """Chave estável do artefato no mapa de cobertura: caminho relativo ao
+    workdir, com '/'. Artefato fora do workdir (caso de uso avulso) fica com o
+    caminho absoluto normalizado — nunca colide com um obrigatório."""
+    wd_abs = os.path.abspath(wd)
+    art_abs = os.path.abspath(artifact)
+    try:
+        rel = os.path.relpath(art_abs, wd_abs)
+    except ValueError:  # drives distintos no Windows
+        return art_abs.replace("\\", "/")
+    if rel.startswith(os.pardir) or os.path.isabs(rel):
+        return art_abs.replace("\\", "/")
+    return rel.replace("\\", "/")
+
+
+def _verify_required_rels(wd: str) -> list[str]:
+    """Artefatos que precisam estar `done` para o stage virar `done`.
+
+    `sdd/confirmed.md` é sempre exigido (é o artefato que o portão protege);
+    `sdd/inferred.md` só entra se existir no workdir — workdir que nunca
+    produziu inferred não fica travado por um arquivo que não deveria existir.
+    """
+    rels = list(_VERIFY_REQUIRED_ALWAYS)
+    for rel in _VERIFY_REQUIRED_IF_PRESENT:
+        if os.path.isfile(_sdd(wd, rel.split("/", 1)[1])):
+            rels.append(rel)
+    return rels
+
+
+def _verify_coverage(wd: str, artifacts: dict) -> dict:
+    """Deriva status do stage + relatório de cobertura a partir do mapa."""
+    required = _verify_required_rels(wd)
+    verificados = sorted(k for k, v in artifacts.items() if v == "done")
+    reprovados = sorted(k for k, v in artifacts.items() if v == "failed")
+    faltantes = [rel for rel in required if artifacts.get(rel) != "done"]
+    if reprovados:
+        status = "failed"
+    elif not faltantes:
+        status = "done"
+    else:
+        status = "in_progress"
+    return {
+        "status": status,
+        "obrigatorios": required,
+        "verificados": verificados,
+        "reprovados": reprovados,
+        "faltantes_obrigatorios": faltantes,
+    }
+
+
+def _verify_next_action(wd: str, cobertura: dict) -> str:
+    """Próximo `verify` a rodar para fechar o portão — nunca deixa o agente
+    adivinhar por que `status` não virou `done`."""
+    alvo = None
+    if cobertura["reprovados"]:
+        alvo = cobertura["reprovados"][0]
+        motivo = "corrija as citações reprovadas e revalide"
+    elif cobertura["faltantes_obrigatorios"]:
+        alvo = cobertura["faltantes_obrigatorios"][0]
+        motivo = "artefato obrigatório ainda não verificado"
+    if not alvo:
+        return "cobertura completa: stage verify aprovado para promote/compile/docx"
+    caminho = os.path.join(wd, *alvo.split("/")) if not os.path.isabs(alvo) else alvo
+    return f"{motivo}: rode `verify --artifact {caminho}`"
+
+
 def cmd_verify(a) -> int:
     """Valida Markdown confirmado.
 
     O verificador não tenta provar semântica; ele garante o contrato mínimo:
-    claim verde em bullet precisa ter citação `arquivo:linha`, e a citação precisa
-    apontar para arquivo/linha existentes dentro do repo declarado.
+    claim verde em bullet precisa ter citação `arquivo:linha`, a citação precisa
+    apontar para arquivo/linha existentes dentro do repo declarado, e o
+    documento inteiro precisa ter ao menos uma citação válida se tiver claims.
+
+    O resultado é gravado POR ARTEFATO em `stages.verify.artifacts`; o
+    `status` do stage é a cobertura dos obrigatórios (ver `_verify_coverage`).
     """
     if not os.path.isfile(a.artifact):
         print(json.dumps({"error": f"artifact não encontrado: {a.artifact}"}), file=sys.stderr)
@@ -2115,9 +2198,29 @@ def cmd_verify(a) -> int:
     out = a.output
     if out:
         ev_mod.write_json(out, report)
+
     wd = _wd(a)
-    st_mod.mark(wd, "verify", "done" if report["ok"] else "failed", out or a.artifact)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    key = _verify_artifact_key(wd, a.artifact)
+    st = st_mod.load(wd) or {}
+    stage = st.setdefault("stages", {}).setdefault("verify", {})
+    artifacts = stage.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+    artifacts[key] = "done" if report["ok"] else "failed"  # merge com execuções anteriores
+    stage["artifacts"] = artifacts
+    st_mod.save(wd, st)
+
+    cobertura = _verify_coverage(wd, artifacts)
+    cobertura["artefato_atual"] = key
+    # `mark` faz seu próprio load/save sob trava e é a única via pública que
+    # grava status/artifact do stage — chamado DEPOIS do merge do mapa.
+    st_mod.mark(wd, "verify", cobertura["status"], out or a.artifact)
+
+    payload = dict(report)
+    payload["cobertura"] = cobertura
+    payload["stage_status"] = cobertura["status"]
+    payload["acao"] = _verify_next_action(wd, cobertura)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 1
 
 

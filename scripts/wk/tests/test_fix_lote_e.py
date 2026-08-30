@@ -146,8 +146,9 @@ class LoteEBase(unittest.TestCase):
         self.assertEqual(code, 0, err)
         return json.loads(out)
 
-    def _promote_all(self, **extra_flags) -> dict:
-        argv = ["promote", "--store", self.store, "--approve-all", "--source-type", "agent-output"]
+    def _promote_all(self, topic: str = "codebases/demo", **extra_flags) -> dict:
+        argv = ["promote", "--store", self.store, "--approve-all", "--source-type", "agent-output",
+                "--topic", topic, "--approved-by", "tester"]
         argv += extra_flags.get("argv", [])
         code, out, err = _run(argv)
         self.assertEqual(code, 0, err)
@@ -266,7 +267,7 @@ class Fix3VerifyGateTests(LoteEBase):
 
         code, out, err = _run(
             ["promote", "--store", self.store, "--approve-all", "--source-type", "agent-output",
-             "--allow-unverified"]
+             "--topic", "codebases/demo", "--approved-by", "tester", "--allow-unverified"]
         )
         self.assertEqual(code, 0, err)
         data2 = json.loads(out)
@@ -306,7 +307,7 @@ class Fix3VerifyGateTests(LoteEBase):
             "topic: outro-topico-manual\n"
             "---\n\n# manual\nConteúdo manual.\n"
         ))
-        code, out, err = _run(["promote", manual_path, "--approve", manual_path, "--store", self.store])
+        code, out, err = _run(["promote", manual_path, "--approve", manual_path, "--approved-by", "tester", "--store", self.store])
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertEqual(len(data["promovidos"]), 1)
@@ -409,7 +410,7 @@ class Fix2OverviewSynthesisTests(LoteEBase):
         # nome de tópico/repo).
         wd = _build_workdir(self._codescan_root())
         self._publish(wd, topic="qualquer-outro-nome/xyz")
-        self._promote_all()
+        self._promote_all(topic="qualquer-outro-nome/xyz")
         data = self._compile()
         self.assertEqual(len(data["overview"]), 1)
         self.assertEqual(data["overview"][0]["topic"], "qualquer-outro-nome/xyz")
