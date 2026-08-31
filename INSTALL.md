@@ -32,13 +32,14 @@ engine.
 |---|---|---|---|---|
 | Instalação (§1–§3) | doctor, init, store init, check, index status | nenhum | escolher engine/caminho do store e do repo | **Sim, integralmente.** |
 | Fluxo A — Conhecimento (ingest→promote→compile→audit→query) | `wk ingest` (grava), `wk promote` (portão), `wk compile`, `wk index audit`, `wk lint` (L1/L2/L4/L5 mecânicos), `wk index search` (busca) | análise de `.docx/.xlsx/.csv/.pdf`; lint semântico L3 (contradição); síntese da resposta em `query` | classificar `source_type/origin/topic`; aprovar item em `promote` (`--approve-all` exige `--source-type`+`--topic`+`--approved-by` juntos) | **Não** para análise de assets, lint semântico e síntese de resposta — o resto sim |
-| Fluxo B — Codebase (Preparar→Fan-out→Fechar) | `surface`, `export`, `config` (grava), `plan`, `pending`/`done` (gravam), `next`, `evidence`, `code run`/`run-stage`, `code integrate`/`merge-agent-output`, `verify`, `drift`, `publish` (exige `--topic`), `promote` (código-fonte), `compile`, `docx`, `wk finish` (composto: verify→audit→publish→[decisão]→promote→compile→reindex→lint) | conteúdo dos estágios `modules`/`rules`/`architecture`/`specs`/`synth` (o que o subagente escreve) | valores de `--doc-level`/`--granularity`; escopo de `pending --items`; `--allow-unverified`; `--allow-feedback-loop`; aprovação em `promote`/`finish --approve` de itens não-`code-repo` | **Não** — cavar o repo e sintetizar `confirmed.md`/`inferred.md` exige LLM; o resto do runbook é D/H |
+| Fluxo B — Codebase (Preparar→Fan-out→Fechar) | `surface`, `export`, `config` (grava), `plan`, `pending`/`done` (gravam), `next`, `evidence`, `code auto` (composto: encadeia tudo isso sozinho até a próxima parada real), `code run`/`run-stage`, `code integrate`/`merge-agent-output`, `verify`, `drift`, `publish` (exige `--topic`), `promote` (código-fonte), `compile`, `docx`, `wk finish` (composto: evidence→verify→audit→publish→[decisão]→promote→compile→reindex→lint) | conteúdo dos estágios `modules`/`rules`/`architecture`/`specs`/`synth` (o que o subagente escreve) | valores de `--doc-level`/`--granularity`; escopo de `pending --items`/`--specs-items`; `--allow-unverified`; `--allow-feedback-loop`; aprovação em `promote`/`finish --approve` de itens não-`code-repo` | **Não** — cavar o repo e sintetizar `confirmed.md`/`inferred.md` exige LLM; o resto do runbook é D/H |
 
-Caminho feliz atual (3 fases, 7 invocações fixas + fan-out ×5 que se repete por
-estágio) e a tabela de responsáveis por cada passo: [README.md, seção "FLUXO
-3 — Ingerir codebase"](README.md). O runbook abaixo (B1–B4) documenta a mesma
-sequência no nível atômico, útil para quem quer entender o D/M/H de cada
-comando por trás dos compostos `code run`/`code integrate`/`wk finish`.
+Caminho feliz atual (`code auto` — loop até a próxima parada real, fan-out
+×5 que se repete por estágio) e a tabela de responsáveis por cada passo:
+[README.md, seção "FLUXO 3 — Ingerir codebase"](README.md). O runbook
+abaixo (B1–B4) documenta a mesma sequência no nível atômico, útil para
+quem quer entender o D/M/H de cada comando por trás de `code auto`/dos
+compostos `code run`/`code integrate`/`wk finish`.
 
 ---
 
@@ -548,15 +549,16 @@ ninguém costura eles em resposta.
 # Fluxo B — Codebase
 
 > **Esta é a visão RESUMIDA, no nível atômico** (um comando por sub-passo).
-> O caminho feliz atual usa comandos compostos (`code run`, `code
-> integrate`, `wk finish`) que encadeiam vários destes atômicos de uma vez —
-> 3 fases, 7 invocações fixas + fan-out ×5 — documentado em [README.md,
-> seção "FLUXO 3 — Ingerir codebase"](README.md), junto com a tabela de
-> responsáveis (D/M/H, mesma taxonomia deste guia) de cada passo. Se for
-> executar via CLI manual (fora do slash command `/wiki-ai ingest codebase`),
-> qualquer um dos dois caminhos serve — os atômicos abaixo continuam
-> funcionando e são o que os compostos chamam por baixo (útil para retomada
-> e controle fino). Os comandos abaixo omitem `--store`/`$WK_STORE` por
+> O caminho feliz atual é `code auto`: uma invocação encadeia vários destes
+> atômicos de uma vez, sozinha, até a próxima parada real. Os compostos de
+> 1 estágio (`code run`, `code integrate`, `wk finish`) continuam existindo
+> por baixo — documentado em [README.md, seção "FLUXO 3 — Ingerir
+> codebase"](README.md), junto com a tabela de responsáveis (D/M/H, mesma
+> taxonomia deste guia) de cada passo. Se for executar via CLI manual (fora
+> do slash command `/wiki-ai ingest codebase`), qualquer um dos caminhos
+> serve — os atômicos abaixo continuam funcionando e são o que `auto`/os
+> compostos chamam por baixo (útil para retomada e controle fino). Os
+> comandos abaixo omitem `--store`/`$WK_STORE` por
 > brevidade, mas ele é **obrigatório** em todo `wk code`/`wk publish` — sem
 > `--store` e sem `WK_STORE` no ambiente, o comando recusa com `store não
 > informado` (conferido em `scripts/codescan/cli.py`, função `main`,
@@ -637,8 +639,10 @@ antes.
 ```
 
 Este é o único passo do runbook onde `sem modelo o fluxo PARA` de verdade.
-Decomposto (nível atômico; `code run`/`code integrate` fazem os dois pares
-abaixo num só comando cada — ver README FLUXO 3, Fase 2):
+Decomposto (nível atômico; `code auto` encadeia os dois pares abaixo
+sozinho, invocação após invocação, até parar em `fanout:<stage>`; `code
+run`/`code integrate` fazem os dois pares num só comando cada, 1 estágio
+por vez — ver README FLUXO 3, seção "Caminho feliz novo"):
 
 | Sub-passo | Tipo | Quem | Por quê |
 |---|---|---|---|
@@ -651,9 +655,9 @@ a módulo, extrai regras de negócio, e marca cada afirmação. Por baixo, esse
 único slash command percorre a sequência inteira — `run <stage>` (D) →
 subagentes 🤖 escrevem (M) → `integrate <stage>` (D) — para os estágios
 `modules`, `rules`, `architecture`, `specs` e `synth`. Rodando via CLI manual
-em vez do slash command, siga o README, seção "FLUXO 3", Fase 2, passo a
-passo; não existe atalho que pule o fan-out por estágio — e nenhum comando
-substitui o subagente escrevendo a análise.
+em vez do slash command, siga o README, seção "FLUXO 3" ("Caminho feliz
+novo", comando `auto`), passo a passo; não existe atalho que pule o fan-out
+por estágio — e nenhum comando substitui o subagente escrevendo a análise.
 
 | Marca | Exige |
 |---|---|
@@ -698,7 +702,11 @@ python wk.pyz code --repo /caminho/do/legado --store "$WK_STORE" \
   evidence --topic pagamentos
 ```
 
-`evidence` não tem `run-stage`/fan-out — roda direto, sem subagente.
+`evidence` não tem `run-stage`/fan-out — roda direto, sem subagente. `code
+auto` roda este passo + `done evidence` sozinho, logo depois de `synth`
+fechar; `wk finish` também roda os dois quando ainda não estão `done` — não
+precisa deste passo manual em nenhum dos dois caminhos, só no runbook
+atômico puro.
 
 O pacote fica em `store/.codescan/<repo>-<hash>/evidence-pagamentos.json`.
 Ele é agnóstico: não usa parser nativo nem toolchain da linguagem. Serve para
@@ -794,10 +802,11 @@ Depois: `publish` (agora exige `--topic` — recusa com exit `2` e `acao` se
 vier vazio), `promote` e `compile` normais (todos **D** na execução;
 `promote` de itens não-`code-repo` continua exigindo aprovação **H**, igual
 A2). Ou, num só comando: `wk finish --workdir <w> --topic <t> --repo <r>
---store "$WK_STORE" --approved-by "seu-nome"` encadeia verify→audit→
-publish→[PARA para aprovação — exit 3, sem `--approve`]→promote→compile→
-index reindex→lint(+docx opcional); repita com `--approve` para completar a
-partir do `promote`.
+--store "$WK_STORE" --approved-by "seu-nome"` encadeia evidence (se
+`stages.evidence.status` do workdir ainda não é `done` — senão pula direto
+para verify)→verify→audit→publish→[PARA para aprovação — exit 3, sem
+`--approve`]→promote→compile→index reindex→lint(+docx opcional); repita com
+`--approve` para completar a partir do `promote`.
 
 > **Estágio `synth` no pipeline de código:** é o 5º estágio do fan-out, igual
 > aos demais — `run synth`/`integrate synth` (ou os atômicos `run-stage

@@ -81,19 +81,21 @@ Vencem qualquer instrução em contrário.
     comando de qualquer sessão: `{{WK}} doctor --store <s> --repo <r> --engine <e>`.
 11. Estágios `modules`, `rules`, `architecture`, `specs` e `synth` exigem
     subagente; o orquestrador nunca gera conteúdo SDD diretamente. O fluxo
-    padrão é dirigido pelo humano: 👤 roda `code run <stage>` — composto que
-    gera os agent-packs + `agent-packs/<stage>-contract.json` + manifesto
-    (informa `fanout_required`) e já imprime o prompt de despacho pronto —,
-    e cola esse prompt em você (`run` substitui a dupla antiga
-    `run-stage`+`handoff`, que continua existindo à parte para controle
-    fino). Você atua só como despachante: dispara 1 subagente por batch;
+    padrão é dirigido pelo humano com `code auto`: cada invocação encadeia
+    sozinha os passos determinísticos até parar em `fanout:<stage>` e
+    imprimir o prompt de despacho pronto (por baixo, prepara os agent-packs
+    + `agent-packs/<stage>-contract.json` + manifesto, igual a `code run
+    <stage>` — que continua existindo à parte, para controle fino/retomada,
+    junto com a dupla atômica `run-stage`+`handoff`). 👤 cola esse prompt em
+    você. Você atua só como despachante: dispara 1 subagente por batch;
     cada subagente lê o pack e o contrato como ARQUIVOS (não executa
     comando), grava o próprio `output` e devolve recibo de 3 linhas
-    (`ARQUIVO:`/`BLOCOS:`/`BYTES:`). Depois 👤 roda `code integrate <stage>`
-    — composto que faz `merge-agent-output` de todos os batches do
-    manifesto (usando o `agent_slot` de cada um) e fecha com `done`;
-    `--agent` genérico (`main`, `orquestrador`, `self`, `principal`) é
-    recusado em qualquer um dos dois caminhos.
+    (`ARQUIVO:`/`BLOCOS:`/`BYTES:`). Depois 👤 roda `code auto` de novo —
+    que integra os batches (`merge-agent-output` de cada um, usando o
+    `agent_slot`), fecha com `done`, e já prepara o fan-out do PRÓXIMO
+    estágio (ou `code integrate <stage>`, o composto equivalente para
+    controle fino). `--agent` genérico (`main`, `orquestrador`, `self`,
+    `principal`) é recusado em qualquer um dos caminhos.
 12. Campo `acao`: ao ver `"acao"` em qualquer JSON de erro (principalmente de
     `merge-agent-output`), execute esse comando LITERALMENTE antes de
     qualquer outra investigação — geralmente `sdd-brief <stage>`. `done` traz
@@ -115,8 +117,8 @@ Duas personas só: 👤 humano digita comando, 🤖 você digita comando. `{{WK}
   mensagem. Isto é a esmagadora maioria de `{{WK}}` — `ingest`, `promote`,
   `compile`, `docx`, `lint` (parte mecânica W1–W3/L1/L2/L4/L5), `index
   status/reindex/search/audit`, e todo `{{WK}} code
-  surface/export/config/plan/pending/done/next/evidence/run-stage/handoff
-  /run/integrate/merge-agent-output/verify/drift/sdd-brief`, além de
+  surface/export/config/plan/pending/done/next/evidence/auto/run-stage
+  /handoff/run/integrate/merge-agent-output/verify/drift/sdd-brief`, além de
   `{{WK}} finish`. Nenhum deles chama um modelo — conferido lendo
   `scripts/wk/cli.py`, `scripts/codescan/cli.py` e `scripts/sbindex/cli.py`:
   nenhum importa cliente de LLM algum.
@@ -136,13 +138,13 @@ Duas personas só: 👤 humano digita comando, 🤖 você digita comando. `{{WK}
   7. **Síntese de resposta em retrieval** — `index search` devolve trechos
      brutos; transformar isso em resposta de prosa é você, não o motor de
      busca (BM25/RRF são D).
-  Nos 5 do pipeline de código, `run`/`integrate` (ou os atômicos
-  `run-stage`/`handoff`/`merge-agent-output`/`done`) ao redor continuam
-  **D** (👤 roda) — só o conteúdo que o subagente escreve dentro do fan-out
-  é M. Sua porta de entrada nos 5 pontos M é o prompt de despacho que o
-  humano cola (saída de `{{WK}} code run <stage>`, ou de `handoff <stage>`
-  no caminho atômico): dispare os subagentes ali listados e devolva só os
-  recibos.
+  Nos 5 do pipeline de código, `auto` (ou os compostos `run`/`integrate`, ou
+  os atômicos `run-stage`/`handoff`/`merge-agent-output`/`done`) ao redor
+  continuam **D** (👤 roda) — só o conteúdo que o subagente escreve dentro
+  do fan-out é M. Sua porta de entrada nos 5 pontos M é o prompt de
+  despacho que o humano cola (saída de `{{WK}} code auto`, de `code run
+  <stage>`, ou de `handoff <stage>` no caminho atômico): dispare os
+  subagentes ali listados e devolva só os recibos.
 - **H** (decisão humana): você não decide sozinho — **pergunta ao humano**,
   mesmo que tecnicamente pudesse rodar o comando. Vale para:
   - `{{WK}} code ... config --doc-level <x> --granularity <y>` — os valores

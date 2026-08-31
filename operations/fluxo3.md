@@ -29,6 +29,10 @@ flowchart TD
     style verify fill:#c8e6c9
 ```
 
+## Caminho principal: `wk code auto`
+
+`auto` encadeia sozinho todos os passos determinísticos abaixo — `surface`→`export`→`config`→`plan`→`pending`→ prepara fan-out → integra → `evidence`+`done evidence` — invocação após invocação, até bater numa parada real (`decisao_humana`, `fanout:<stage>`, `pipeline_completo`, `erro`/`intervencao`). 1ª invocação leva `--topic`/`--doc-level`/`--granularity` (e, ao chegar em `specs`, `--specs-items`) para não parar em `decisao_humana`; nas demais, só `auto` — cola o prompt impresso na LLM entre uma invocação e outra. Os comandos compostos/atômicos da tabela abaixo continuam existindo — é o que `auto` chama por baixo — para controle fino/retomada.
+
 ## Fases e comandos compostos
 
 | Fase | Quem | Comando composto | Porquê |
@@ -40,9 +44,9 @@ flowchart TD
 | **2 — Fan-out ×5** | 👤 | `run <stage>` | Prepara packs + contrato + manifesto, imprime prompt |
 | | 🤖 | (cola prompt na LLM) | **Único ponto LLM** do fluxo: subagentes escrevem os 5 artefatos |
 | | 👤 | `integrate <stage> [--partial]` | Merge determinístico de todos os batches + gates intactos (fan-out real, score ≥90, sha256, mermaid) |
-| **3 — Fechar** | 👤 | `evidence` | Síntese pré-synth, sem fan-out |
-| | 👤 | `done evidence` | Fecha evidence |
-| | 👤 | `finish --approve [--allow-unverified]` | verify → audit → publish → promote → compile → lint → docx |
+| **3 — Fechar** | 👤 | `finish --approve [--allow-unverified]` | `evidence`+`done evidence` (se ainda não `done`) → verify → audit → publish → promote → compile → lint → docx |
+
+`finish` absorve `evidence`+`done evidence`: se `stages.evidence.status` do workdir já é `done` (rodou via `auto`, ou à mão antes), pula direto para `verify`; senão gera o pack e fecha o estágio sozinho. Não precisa rodar `evidence`/`done evidence` à mão antes de `finish`.
 
 ## Gates determinísticos (apply em `integrate`/`done` e `audit`/`verify`)
 
@@ -77,4 +81,5 @@ Globais: 8 seções/artefato · 8 bullets/seção · 0 linhas de código · Sem 
 - `code redo <stage> --item <item>` — refaz 1 item, arquiva anteriores em `agent-runs/superseded/`
 - `code drift` — compara commit pinado vs. HEAD, lista artefatos afetados + `redo` por item
 - Falhou gate → `blockers[].acao` instrui correção; repita estágio
+- `code auto` parou em `parado_em: "intervencao"` (mesma falha 2x seguidas na mesma etapa) — rode o(s) `comandos_redo` do payload de erro ou corrija o que `erro` aponta, depois `code auto --retry` para zerar o contador de tentativas e retomar o laço
 - `finish --allow-unverified` — propaga decisão humana mesmo com `verify` reprovado (registrado em log)

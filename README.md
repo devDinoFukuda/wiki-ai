@@ -74,52 +74,57 @@ Opcional no passo 2.3: `--derived-from <id-do-asset>` grava a linhagem de proven
 
 | Papel | Quem | Onde |
 |---|---|---|
-| Determinístico — scripts geram as estruturas/artefatos | 👤 | `surface` `export` `config` `plan` `pending` `run-stage` `handoff` `run` `sdd-brief` `merge-agent-output` `integrate` `done` `evidence` `verify` `drift` `audit` `publish` `promote` `compile` `index` `lint` `next` `state` `redo` `finish` |
+| Determinístico — scripts geram as estruturas/artefatos | 👤 | `surface` `export` `config` `plan` `pending` `auto` `run-stage` `handoff` `run` `sdd-brief` `merge-agent-output` `integrate` `done` `evidence` `verify` `drift` `audit` `publish` `promote` `compile` `index` `lint` `next` `state` `redo` `finish` |
 | Análise de conteúdo | 🤖 | SOMENTE o passo de fan-out: subagentes analisam o codebase e escrevem os artefatos dos estágios `modules` `rules` `architecture` `specs` `synth` |
 
 A LLM não executa nenhum comando `wk`. Todo insumo que ela precisa (o que analisar, onde gravar, em que formato) é gerado antes, por script, pelo humano.
 
-Perdeu o fio: `next --quiet` diz o próximo passo (seção "Retomada e erro"); `next --run` chega a **executar** esse próximo passo quando ele é determinístico (ver Fase 1).
+Perdeu o fio: `next --quiet` diz o próximo passo (seção "Retomada e erro"); `next --run` chega a **executar** esse próximo passo quando ele é determinístico (mesmos passos que `auto` roda sozinho, ver abaixo).
 
 Ordem da máquina de estados: `surface → modules → rules → architecture → specs → evidence → synth → verify`.
 
-### Caminho feliz novo — 3 fases, 7 invocações fixas (+ fan-out ×5, que se repete por estágio)
+### Caminho feliz novo — `wk code auto` (loop até a próxima parada real)
 
-Os comandos compostos (`run`, `integrate`, `finish`) substituem a sequência antiga de comandos atômicos (`run-stage`+`handoff`+N×`merge-agent-output`+`done`, e depois `verify`+`audit`+`publish`+`promote`+`compile`+`index reindex`+`lint`) sem afrouxar gate nenhum — eles só encadeiam os mesmos passos internamente. Os atômicos continuam disponíveis para controle fino/retomada (subseção abaixo).
+`wk code auto` é o caminho principal: encadeia sozinho `surface`→`export`→`config`→`plan`→`pending`→ prepara o fan-out (`run <stage>`) → integra (`integrate <stage>`) → `evidence`+`done evidence`, invocação após invocação, até bater numa parada real:
+- `decisao_humana` — falta uma decisão-chave (topic/doc-level/granularity/specs-items); a `acao` traz a flag que resolve.
+- `fanout:<stage>` — o próximo passo é colar o prompt impresso na LLM despachante; único ponto 🤖 do fluxo inteiro.
+- `pipeline_completo` — todos os estágios SDD fechados; a `acao` já traz o `wk finish ...` pronto.
+- `limite_de_acoes` — teto de 30 ações numa invocação (proteção contra laço); rode `auto` de novo.
+- `erro` — uma ação falhou pela 1ª vez; corrija e rode `auto` de novo.
+- `intervencao` — a MESMA falha se repetiu 2x seguidas na MESMA etapa; ver "Loop de erro" abaixo.
 
-#### Fase 1 — Preparar (👤 sozinho)
+Por baixo é a mesma máquina de estados e os mesmos gates de sempre — `auto` só decide sozinho os pontos que antes exigiam `run`/`integrate` em sequência, chamando as MESMAS funções do CLI. Os compostos (`run`, `integrate`, `finish`) e os atômicos (`run-stage`, `handoff`, `merge-agent-output`, `done`) continuam disponíveis para controle fino/retomada (subseção abaixo).
 
-Porquê: monta o inventário determinístico do repo e trava as decisões de escopo (nível de detalhe, granularidade) antes de qualquer fan-out.
+#### 1ª invocação — decisões-chave nas flags
 
 | # | Quem | Comando |
 |---|---|---|
-| 1 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" surface --topic "$WK_TOPIC"` |
-| 2 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" export --topic "$WK_TOPIC"` |
-| 3 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" config --doc-level detalhado --granularity module` |
-| 4 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" plan` |
+| 1 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto --topic "$WK_TOPIC" --doc-level detalhado --granularity module` |
+| 2 | 🤖 | Cole o prompt impresso pela invocação acima na LLM despachante |
+| 3 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto` |
 
-Valores válidos do passo 3: `--doc-level essencial|completo|detalhado` · `--granularity module|endpoint|use-case|hybrid|feature|custom` (obrigatório, mas hoje não altera o plano — só `doc-level` muda artefatos exigidos).
+Sem estado algum, a invocação 1 roda sozinha `surface`→`export`→grava `config` (as duas flags evitam a parada `decisao_humana`)→`plan`→prepara o fan-out de `modules` e já imprime o prompt — tudo isso numa única chamada de `auto`. `--doc-level essencial|completo|detalhado` · `--granularity module|endpoint|use-case|hybrid|feature|custom` (obrigatório, mas hoje só `doc-level` muda artefatos exigidos). As duas flags só importam na invocação em que a decisão ainda está pendente; nas seguintes, `auto` ignora quem for repassada (já gravou) e segue.
 
-Alternativa: depois de `surface`, `$WKPY "$WK" code ... next --run` executa sozinho os passos determinísticos seguintes (`export`, `plan` estão na lista de comandos que `next --run` roda; `config` é decisão humana — `next --run` para ali e devolve `bloqueado_em`/`acao` sem executar nada).
+A invocação 3 integra os batches do estágio, fecha (`done`), prepara o fan-out do PRÓXIMO estágio e imprime o próximo prompt.
 
-#### Fase 2 — Fan-out ×5 — `modules` · `rules` · `architecture` · `specs` · `synth`
+#### Repita 2↔3 — Fan-out ×5 — `modules` · `rules` · `architecture` · `specs` · `synth`
 
 Porquê: é o único trecho do pipeline em que conteúdo novo é escrito — por isso é o único ponto 🤖 do fluxo inteiro.
 
-| # | Quem | Comando |
-|---|---|---|
-| a | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" run <stage>` — composto: `run-stage` (packs + `<stage>-contract.json` + manifesto) + `handoff` (imprime o prompt de despacho) num só comando |
-| b | 🤖 | Humano cola o prompt impresso pelo passo `a` na LLM despachante. Única participação da LLM no fluxo inteiro. |
-| c | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" integrate <stage>` — composto: `merge-agent-output` de **todos** os batches do manifesto (usa o `agent_slot` de cada um) + `done <stage>`; gates intactos. `--partial` é opt-in para integrar só os batches cujo output já existe (sem a flag, output faltando aborta antes do 1º merge) |
+Repita "cole o prompt" → `auto` para os 5 estágios, nesta ordem. Em `specs`, a 1ª invocação de `auto` que chegar lá também precisa de `--specs-items "a,b"` (escopo de negócio, 👤 H) — sem a flag, `auto` para em `decisao_humana` pedindo exatamente ela; em `modules` quem popula o pending é o `plan` da 1ª invocação, sem flag nenhuma.
 
-Repita a→b→c para os 5 estágios, nesta ordem. `specs` precisa de `pending specs --items "<lista>"` (👤 H — escopo de negócio) antes do passo `a`; em `modules` quem popula o pending é o `plan` da Fase 1.
+Depois de `synth` fechado, `auto` roda `evidence`+`done evidence` sozinho (sem parar) e só então para em `pipeline_completo`, com a `acao` = `wk finish ...` pronta para colar.
 
-Regras do ciclo (ainda valem com os compostos):
+#### Loop de erro
 
-- Sem `pending`, `rules`/`architecture`/`synth` viram **1 batch único** (`fanout_required: 1`) — aceitável. Em `specs` isso geraria uma unit genérica `"specs"` — por isso `pending` é obrigatório lá.
-- `run <stage>` só prepara (packs + contrato + manifesto) e imprime o prompt; nunca gera conteúdo. `integrate`/`merge-agent-output` recusam `--agent` genérico (`main`, `self`, `orquestrador`, `principal`) — usam o `agent_slot` do batch (`modules-b01`).
-- O prompt do passo `a` instrui a LLM como despachante: cada subagente lê 2 arquivos (`<stage>-batch-NN.json` = itens+evidência, `<stage>-contract.json` = blocos/seções/limites), grava 1 arquivo e devolve o recibo `ARQUIVO/BLOCOS/BYTES`. A LLM não executa comando, não estuda o pipeline, não faz merge.
-- Não escreva prompt à mão: seções/limites variam por estágio e já estão no `<stage>-contract.json`; `run`/`handoff` montam tudo.
+Falhou 1x → `parado_em: "erro"`; corrija (a `acao` do erro original) e rode `auto` de novo — ele reexecuta sozinho a ação que falhou. A MESMA falha 2x seguidas na MESMA etapa → `parado_em: "intervencao"`: o laço para de insistir e devolve o erro original completo (com `comandos_redo` quando existe). Corrija — pelos `comandos_redo` do payload, ou reescrevendo o que `erro` aponta — e rode `wk code auto --retry` (zera o contador de tentativas) para retomar.
+
+Regras do ciclo (ainda valem, chamadas por baixo de `auto`):
+
+- Sem `pending`, `rules`/`architecture`/`synth` viram **1 batch único** (`fanout_required: 1`) — aceitável. Em `specs` isso geraria uma unit genérica `"specs"` — por isso `pending`/`--specs-items` é obrigatório lá.
+- A preparação do fan-out (por baixo de `auto`, ou `run <stage>` no atômico) só prepara (packs + contrato + manifesto) e imprime o prompt; nunca gera conteúdo. A integração (por baixo de `auto`, ou `integrate`/`merge-agent-output` no atômico) recusa `--agent` genérico (`main`, `self`, `orquestrador`, `principal`) — usa sempre o `agent_slot` do batch (`modules-b01`).
+- O prompt instrui a LLM como despachante: cada subagente lê 2 arquivos (`<stage>-batch-NN.json` = itens+evidência, `<stage>-contract.json` = blocos/seções/limites), grava 1 arquivo e devolve o recibo `ARQUIVO/BLOCOS/BYTES`. A LLM não executa comando, não estuda o pipeline, não faz merge.
+- Não escreva prompt à mão: seções/limites variam por estágio e já estão no `<stage>-contract.json`; `auto`/`run`/`handoff` montam tudo.
 - Saída de subagente longa demais (eco de instrução, repetição) é ruído rejeitado no merge; limite padrão 220 linhas, ajustável via `WK_AGENT_OUTPUT_MAX_LINES` (env var; valor abaixo de 50 é ignorado, cai no padrão).
 
 Referência rápida do **contrato entregue à LLM** (`compact_contract` — fonte de verdade: `sdd-brief <stage>`; são limites informados no prompt, não os gates que decidem sucesso/falha):
@@ -134,28 +139,34 @@ Referência rápida do **contrato entregue à LLM** (`compact_contract` — font
 
 Globais do `compact_contract`: 8 seções por artefato · 8 bullets por seção · 0 linhas de código. Mermaid obrigatório em `architecture` (flowchart/graph), `c4-*` (flowchart/graph/C4Context/C4Container/C4Component) e `erd-complete` (erDiagram); sem diagrama, `<!-- no-diagram: <motivo> -->`.
 
+**Citação (regra do contrato, literal no prompt de despacho):** todo bullet 🟢 confirmado exige citação com caminho relativo COMPLETO a partir da raiz do repo, com `/`, exatamente como em `evidence[].path` do pack, seguido de `:linha`. Válido: `quote-service/src/main/java/br/com/acme/insurance/quote/domain/event/DomainEvent.java:5`. Inválido: `DomainEvent.java:5` (basename — reprovado no gate de `verify`/`audit`, vira erro `caminho_parcial` se o basename casar com exatamente 1 arquivo do repo, `arquivo_inexistente` caso contrário).
+
+**Id de bloco `MODULE`:** `=== MODULE: <id> ===` — o `<id>` tem que ser o path do item do batch (o mesmo que está em `pending`/no `modules-batch-NN.json`). Encurtamento por SUFIXO ÚNICO é mapeado automaticamente (ex.: `domain/event` casa com `quote-service/.../domain/event` se for o único candidato do batch); sufixo ambíguo (casa com mais de um item) ou id que não corresponde a nenhum item do batch vira erro no merge — `id de bloco fora do batch do plano`, com a lista dos ids válidos do batch. `FAILED MODULE` segue a mesma regra.
+
+**Estruturas de dados (bloco `modules`):** nomes de entidade/tipo vão entre crases (ex.: `` `Quote` ``) — não conta como eco de código (a proibição cobre trecho/linha, não identificador entre crases). Alimenta `sdd/data-dictionary.md` — extração automática no merge de `modules`; sem crases, a entidade pode não ser reconhecida.
+
 Os **gates determinísticos** — o que de fato aprova ou reprova, aplicados em `integrate`/`merge-agent-output` (`done`) e em `audit`/`verify` — são outra coisa, e mais ampla que o contrato acima:
 - No merge (`integrate`/`done`): fan-out real (N agentes distintos quando N>1), artefatos obrigatórios do `doc-level`, score ≥ 90, mermaid válido, proveniência sha256.
 - No `audit`: os mesmos, mais amostra de citações `arquivo:linha` validada contra o disco real (não confia no texto sozinho).
 - No `verify`: cobertura por artefato (`stages.verify.artifacts`; `sdd/confirmed.md` sempre exigido, `sdd/inferred.md` exigido só se existir no workdir) e `drift_detectado` — o commit pinado em `surface.json` (`git.head`) mudou desde a análise, então a citação `arquivo:linha` não prova mais nada. `wk code drift` compara o pinado com o HEAD atual e lista os artefatos afetados, com o comando `redo` exato por item.
 
-Falhou algum gate → o erro traz `blockers[].action`/`acao`; corrija (👤 mecânico, ou novo passo `b` se for conteúdo) e repita.
+Falhou algum gate → o erro traz `blockers[].action`/`acao`; corrija (👤 mecânico, ou cole novo prompt na LLM se for conteúdo) e rode `auto` (ou `integrate`) de novo.
 
-#### Fase 3 — Fechar (👤 sozinho)
+#### Fechar (👤 sozinho)
 
 Porquê: fecha a síntese, publica no corpus e decide promover num só comando de decisão.
 
+`auto` já fechou `evidence`+`done evidence` sozinho, logo depois de `synth` (ver acima) — não rode os dois à mão. Só falta:
+
 | # | Quem | Comando |
 |---|---|---|
-| 5 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" evidence --topic "$WK_TOPIC"` |
-| 6 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" done evidence` |
-| 7 | 👤 | `$WKPY "$WK" finish --workdir "$WK_STORE/.codescan/<workdir>" --topic "$WK_TOPIC" --repo "$WK_REPO" --store "$WK_STORE" --approved-by "seu-nome"` |
+| 1 | 👤 | `$WKPY "$WK" finish --workdir "$WK_STORE/.codescan/<workdir>" --topic "$WK_TOPIC" --repo "$WK_REPO" --store "$WK_STORE" --approved-by "seu-nome"` |
 
-`evidence` não aceita `run-stage`/`run` nem fan-out — roda direto, sem subagente, antes de `synth`.
+`wk finish` também roda `evidence`+`done evidence` sozinho — se `stages.evidence.status` do workdir ainda não é `done` (ex.: veio do caminho atômico, sem `auto`), ele gera o evidence-pack e fecha o estágio antes de seguir; se já é `done` (veio de `auto`), pula direto para `verify`. Idempotente entre reexecuções — não precisa rodar `evidence`/`done evidence` à mão antes de `finish`.
 
-`wk finish` substitui verify→audit→publish→promote→compile→index reindex→lint(+docx opcional) por um único comando composto:
+`wk finish` substitui evidence→verify→audit→publish→promote→compile→index reindex→lint(+docx opcional) por um único comando composto:
 
-1. `verify` (`sdd/confirmed.md`, e `sdd/inferred.md` se existir) → `audit` → `publish` — falha em qualquer um para com exit 2 e `parado_em: "<passo>"`.
+1. `evidence`+`done evidence` (só se ainda não `done`) → `verify` (`sdd/confirmed.md`, e `sdd/inferred.md` se existir) → `audit` → `publish` — falha em qualquer um para com exit 2 e `parado_em: "<passo>"` (`"evidence"` inclusive).
 2. **Ponto de decisão humana**: sem `--approve`, `finish` PARA antes do `promote` — exit **3**, `parado_em: "promote"`, lista `pendentes[]` (o que seria aprovado) e `acao: "reexecute com --approve para aprovar como <approved-by>"`. Nada é promovido nesse ponto.
 3. Com `--approve` (repita o mesmo comando): `promote --approve-all` → `compile` → `index reindex` → `lint` → `docx` (opcional; `--no-docx` pula). Falha de `lint`/`docx` não aborta — vira `"status": "aviso"` no passo.
 
@@ -169,10 +180,14 @@ Use estes quando precisar de granularidade que os compostos não dão (retomar 1
 
 | Comando | Substitui, dentro de | Para quê |
 |---|---|---|
+| `code run <stage>` | `auto` (só a preparação de 1 fan-out) | prepara packs + `<stage>-contract.json` + manifesto e imprime o prompt de despacho, sem deixar `auto` decidir sozinho quando repetir — útil para retomar depois de fechar o terminal |
+| `code integrate <stage> [--partial]` | `auto` (só a integração de 1 fan-out) | integra **todos** os batches do manifesto (`merge-agent-output` de cada um, pelo `agent_slot`) + `done <stage>` de UM estágio manualmente, sem deixar `auto` avançar sozinho para o próximo; `--partial` integra só os batches cujo output já existe |
 | `code run-stage <stage>` | `run <stage>` (só a 1ª metade) | gera packs + manifesto + `<stage>-contract.json`, sem imprimir o prompt |
 | `code handoff <stage>` | `run <stage>` (só a 2ª metade) | reimprime o prompt de despacho de um `run-stage` já feito |
 | `code merge-agent-output <stage> --input <arquivo> --agent <slot>` | `integrate <stage>` (1 batch por vez) | integra um batch específico, sem rodar `done` |
 | `code done <stage>` | `integrate <stage>` (só o fechamento) | fecha o estágio depois de já ter mergeado todos os batches à mão |
+| `code evidence --topic <t>` + `code done evidence` | `auto`/`finish` (passo evidence) | gera o evidence-pack e fecha o estágio manualmente, sem esperar `auto` chegar lá nem rodar `finish` |
+| `code auto --retry` | — (dentro do próprio `auto`) | zera o contador de tentativas do loop de erro depois de corrigir uma `intervencao` (ver "Loop de erro" acima) |
 | `code verify --artifact <path>` | `finish` (passo 1) | roda só a verificação, isolada, contra um artefato específico |
 | `code audit` | `finish` (passo 1) | roda só a auditoria P0 do workdir |
 | `code drift` | — (novo, sem equivalente antigo) | compara commit pinado × HEAD atual; lista artefatos afetados + `redo` por item |
@@ -258,6 +273,9 @@ Proibido abrir `wk.pyz` com zipfile/decompilação para entender um erro.
 | `drift_detectado: true` (`verify`) | commit do repo mudou desde o `surface`; rode `code drift` e refaça os itens afetados |
 | `bloqueio: realimentacao` (`promote`) | fonte deriva de saída de agente sem lastro humano; corrija a proveniência ou use `--allow-feedback-loop` (decisão 👤, fica no log) |
 | `duplicados: [...]` (`promote`) | id já existe em `raw/`; promote não sobrescreve — resolva o conflito de id antes |
+| `parado_em: "intervencao"` (`code auto`) | a MESMA falha se repetiu 2x seguidas na mesma etapa; rode o(s) `comandos_redo` do payload ou corrija o que `erro` aponta, depois `code auto --retry` |
+| `caminho_parcial` (`verify`/`evidence`) | use o caminho relativo COMPLETO a partir da raiz do repo (o erro sugere o caminho certo quando o basename é único) |
+| `artefato já pertence a outro batch` (`integrate`/`merge-agent-output`) | outro batch já é dono desse artefato; rode `code redo <stage> --item <item-do-dono>` antes de re-mergear, ou corrija o output deste batch para não reivindicar esse artefato |
 
 ---
 
@@ -273,7 +291,7 @@ Proibido abrir `wk.pyz` com zipfile/decompilação para entender um erro.
 
 **`wk <cmd>`**: `docs` · `init` · `check` · `engines` · `doctor` · `store` · `promote` · `compile` · `docx` · `lint` · `ingest` · `publish` · `code` · `index` · `search` · `get` · `audit` · `finish`
 
-**`wk code <cmd>`**: `cleanup` · `surface` · `export` · `plan` · `pending` · `config` · `next` · `done` · `blocked` · `failed` · `degraded` · `state` · `read` · `evidence` · `agent-pack` · `merge-agent-output` · `redo` · `run-stage` · `handoff` · `run` · `integrate` · `drift` · `audit` · `sdd-brief` · `sdd-scaffold` · `verify`
+**`wk code <cmd>`**: `cleanup` · `surface` · `export` · `plan` · `pending` · `config` · `next` · `done` · `blocked` · `failed` · `degraded` · `state` · `read` · `evidence` · `agent-pack` · `merge-agent-output` · `redo` · `run-stage` · `handoff` · `run` · `integrate` · `auto` · `drift` · `audit` · `sdd-brief` · `sdd-scaffold` · `verify`
 
 **`wk index <cmd>`**: `reindex` · `search` · `get` · `audit` · `status`
 
