@@ -1,6 +1,6 @@
 # Wiki AI — comandos
 
-Legenda: **👤** humano executa (tudo que é determinístico é do humano) · **🤖** LLM — usada SOMENTE onde há análise de conteúdo (fan-out de codebase, análise de asset, síntese de resposta).
+Legenda: **👤** humano executa (tudo que é determinístico é do humano) · **🤖** LLM — usada SOMENTE onde há análise de conteúdo (fan-out de codebase, análise de asset, síntese de resposta); operacionalmente: colar o prompt numa sessão de agente com acesso ao disco (ex.: Claude Code).
 
 Variáveis usadas em todos os comandos (troque pelos seus):
 
@@ -48,7 +48,7 @@ Zero passos de LLM.
 | # | Quem | Comando |
 |---|---|---|
 | 2.1 | 👤 | `$WKPY "$WK" ingest "C:/caminho/planilha.xlsx" --source-type human-doc --origin "planilha de tarifas" --topic pagamentos --store "$WK_STORE"` |
-| 2.2 | 🤖 | Lê `$WK_STORE/raw/assets/<id>.xlsx` e grava `C:/caminho/analise.md` |
+| 2.2 | 🤖 | Lê `$WK_STORE/raw/assets/<id>.xlsx` e grava `C:/caminho/analise.md` — ONDE: numa sessão de agente com acesso ao disco desta máquina (ex.: Claude Code), nunca num chat web sem acesso a arquivos |
 | 2.3 | 👤 | `$WKPY "$WK" ingest "C:/caminho/analise.md" --source-type agent-output --origin "análise de planilha.xlsx" --topic pagamentos --store "$WK_STORE"` |
 | 2.4 | 👤 | `$WKPY "$WK" promote --approve-all --source-type agent-output --topic pagamentos --approved-by "seu-nome" --store "$WK_STORE"` |
 | 2.5 | 👤 | `$WKPY "$WK" compile pagamentos --store "$WK_STORE"` |
@@ -100,16 +100,28 @@ Por baixo é a mesma máquina de estados e os mesmos gates de sempre — `auto` 
 | # | Quem | Comando |
 |---|---|---|
 | 1 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto --topic "$WK_TOPIC" --doc-level detalhado --granularity module` |
-| 2 | 🤖 | Cole o prompt impresso pela invocação acima na LLM despachante |
+| 2 | 🤖 | Cole o prompt impresso pela invocação acima na LLM despachante — ver "O passo 🤖 em detalhe" abaixo |
 | 3 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto` |
 
 Sem estado algum, a invocação 1 roda sozinha `surface`→`export`→grava `config` (as duas flags evitam a parada `decisao_humana`)→`plan`→prepara o fan-out de `modules` e já imprime o prompt — tudo isso numa única chamada de `auto`. `--doc-level essencial|completo|detalhado` · `--granularity module|endpoint|use-case|hybrid|feature|custom` (obrigatório, mas hoje só `doc-level` muda artefatos exigidos). As duas flags só importam na invocação em que a decisão ainda está pendente; nas seguintes, `auto` ignora quem for repassada (já gravou) e segue.
 
 A invocação 3 integra os batches do estágio, fecha (`done`), prepara o fan-out do PRÓXIMO estágio e imprime o próximo prompt.
 
+#### O passo 🤖 em detalhe — quando, onde e como
+
+| Pergunta | Resposta |
+|---|---|
+| QUANDO | Toda vez que `auto` parar com `parado_em: "fanout:<stage>"` — acontece 5 vezes (modules, rules, architecture, specs, synth). O prompt vem impresso ABAIXO da linha JSON da saída |
+| O QUE copiar | TUDO a partir da linha `Fan-out do estágio <stage>. Você é despachante:` até o fim (a linha JSON acima NÃO faz parte) |
+| ONDE colar | Numa sessão de agente COM ACESSO AO DISCO desta máquina — ex.: Claude Code (ou engine equivalente configurada no FLUXO 0) aberta em qualquer pasta. NUNCA num chat web sem acesso a arquivos: os subagentes precisam LER os packs e GRAVAR os outputs em caminhos locais |
+| O QUE a LLM faz | Atua como despachante: dispara N subagentes; cada um lê 2 arquivos (`<stage>-batch-NN.json` + `<stage>-contract.json`), analisa SÓ os itens do seu batch e grava 1 arquivo (`agent-outputs/<stage>-batch-NN.txt`). Ela NÃO executa comandos `wk`, NÃO faz merge |
+| COMO saber que terminou | A LLM devolve N recibos `ARQUIVO / BLOCOS / BYTES`; confira que os N arquivos `.txt` existem em `agent-outputs/` |
+| DEPOIS | Volte ao terminal e rode `wk code auto` de novo — ele integra os batches, fecha o estágio e imprime o próximo prompt |
+| SE DER ERRADO | Output rejeitado no integrate → o erro aponta regra+linha; cole um novo prompt (ou peça correção pontual à LLM) e rode `auto`; 2 falhas idênticas → `intervencao` (seção "Loop de erro") |
+
 #### Repita 2↔3 — Fan-out ×5 — `modules` · `rules` · `architecture` · `specs` · `synth`
 
-Porquê: é o único trecho do pipeline em que conteúdo novo é escrito — por isso é o único ponto 🤖 do fluxo inteiro.
+Porquê: é o único trecho do pipeline em que conteúdo novo é escrito — por isso é o único ponto 🤖 do fluxo inteiro. Mecânica do passo 🤖 (quando/onde/como): ver "O passo 🤖 em detalhe" acima.
 
 Repita "cole o prompt" → `auto` para os 5 estágios, nesta ordem. Em `specs`, a 1ª invocação de `auto` que chegar lá também precisa de `--specs-items "a,b"` (escopo de negócio, 👤 H) — sem a flag, `auto` para em `decisao_humana` pedindo exatamente ela; em `modules` quem popula o pending é o `plan` da 1ª invocação, sem flag nenhuma.
 

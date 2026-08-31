@@ -33,6 +33,16 @@ flowchart TD
 
 `auto` encadeia sozinho todos os passos determinísticos abaixo — `surface`→`export`→`config`→`plan`→`pending`→ prepara fan-out → integra → `evidence`+`done evidence` — invocação após invocação, até bater numa parada real (`decisao_humana`, `fanout:<stage>`, `pipeline_completo`, `erro`/`intervencao`). 1ª invocação leva `--topic`/`--doc-level`/`--granularity` (e, ao chegar em `specs`, `--specs-items`) para não parar em `decisao_humana`; nas demais, só `auto` — cola o prompt impresso na LLM entre uma invocação e outra. Os comandos compostos/atômicos da tabela abaixo continuam existindo — é o que `auto` chama por baixo — para controle fino/retomada.
 
+### O passo 🤖 — quando/onde/como (condensado)
+
+| Pergunta | Resposta |
+|---|---|
+| QUANDO | `parado_em: "fanout:<stage>"` (5x: modules/rules/architecture/specs/synth); prompt vem impresso abaixo da linha JSON |
+| O QUE copiar | Da linha `Fan-out do estágio <stage>. Você é despachante:` até o fim |
+| ONDE colar | Sessão de agente com acesso ao disco (ex.: Claude Code) — nunca chat web sem acesso a arquivos |
+| O QUE a LLM faz | Despacha N subagentes; cada um lê `<stage>-batch-NN.json`+`<stage>-contract.json`, grava 1 `.txt`; sem `wk`, sem merge |
+| DEPOIS | Rode `wk code auto` de novo — integra, fecha o estágio, imprime o próximo prompt |
+
 ## Fases e comandos compostos
 
 | Fase | Quem | Comando composto | Porquê |
