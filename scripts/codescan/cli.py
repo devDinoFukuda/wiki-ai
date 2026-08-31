@@ -1774,6 +1774,21 @@ HANDOFF_CITACAO_REGRA = (
     "— INVÁLIDO: DomainEvent.java:5 (basename é reprovado no gate)."
 )
 
+# Falha real observada em execução: subagentes do fan-out tiveram `write`
+# negado pela engine e devolveram o conteúdo na resposta; o despachante não
+# tinha instrução de fallback e o fluxo morreu com 0 outputs gravados. Este
+# parágrafo é o remédio — aparece uma vez no corpo do prompt do despachante e
+# fecha a cadeia: subagente sem permissão devolve o conteúdo, despachante
+# grava; se o despachante também não tiver permissão, nada é descartado.
+HANDOFF_FALLBACK_ESCRITA = (
+    "FALLBACK DE ESCRITA: Se um subagente não conseguir gravar o arquivo (permissão negada), "
+    "ele deve devolver o conteúdo COMPLETO na resposta; nesse caso VOCÊ (despachante) grava o "
+    "conteúdo, byte a byte, no caminho ESCREVA correspondente. Se você também não tiver "
+    "permissão de escrita: NÃO descarte o conteúdo — grave cada um em "
+    "./wk-agent-outputs/<mesmo-nome>.txt no diretório atual da sessão e informe o operador para "
+    "movê-los (comando `move`/`cp` literal por arquivo, origem→destino)."
+)
+
 
 def _handoff_prompt(stage: str, batches: list[dict], contract_path: str) -> str:
     """Prompt de despacho pronto para colar na LLM: despachante dispara um
@@ -1783,6 +1798,8 @@ def _handoff_prompt(stage: str, batches: list[dict], contract_path: str) -> str:
         "NÃO gere conteúdo você mesmo, NÃO execute comandos, NÃO faça merge.",
         "",
         HANDOFF_CITACAO_REGRA,
+        "",
+        HANDOFF_FALLBACK_ESCRITA,
         "",
         f"Dispare exatamente {len(batches)} subagente(s), um por batch, listas de itens disjuntas:",
         "",
@@ -1804,6 +1821,8 @@ def _handoff_prompt(stage: str, batches: list[dict], contract_path: str) -> str:
         "  Item impossível: bloco FAILED conforme o contrato.",
         "  MARCADORES: 🟢 confirmado · 🟡 inferido (justificativa) · 🔴 desconhecido (pergunta objetiva).",
         f"  {HANDOFF_CITACAO_REGRA}",
+        "  Se a escrita falhar, devolva o conteúdo completo entre os marcadores === ... === no "
+        "corpo da resposta (o despachante grava).",
         '  PROIBIDO no arquivo: código, diff, log, saída de comando, prosa fora de bloco, "Ran command", "Edited", "Wrote".',
         "  PT-BR técnico, sem preâmbulo, sem resumo, sem conclusão.",
         "  Devolva só: ARQUIVO: <caminho> / BLOCOS: <n> / BYTES: <n>",
@@ -2134,7 +2153,9 @@ def cmd_run(a) -> int:
         f"cole na LLM despachante o prompt impresso abaixo desta linha JSON "
         f"({payload.get('fanout_required', len(payload.get('batches') or []))} subagente(s), "
         f"cada um grava o próprio output); quando os outputs existirem, rode "
-        f"`integrate {stage}` — um único comando faz todos os merges e o done {stage}"
+        f"`integrate {stage}` — um único comando faz todos os merges e o done {stage}; "
+        f"se a engine negar escrita no store, rode `wk init` novamente para migrar as "
+        f"permissões (allow em agent-outputs)"
     )
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     sys.stdout.write(hout if hout.endswith("\n") else hout + "\n")
@@ -2548,7 +2569,8 @@ def _auto_finish_action(a, wd: str, st: dict | None) -> str:
 
 AUTO_FANOUT_ACAO = (
     "cole o prompt na LLM; quando os outputs existirem, rode `wk code auto` de novo "
-    "(ele continua do integrate)"
+    "(ele continua do integrate); se a engine negar escrita no store, rode `wk init` "
+    "novamente para migrar as permissões (allow em agent-outputs)"
 )
 
 

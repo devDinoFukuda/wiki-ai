@@ -159,9 +159,97 @@ def _settings_targets(engines: list[str], base: str) -> list[str]:
     return sorted(targets)
 
 
+# Racional do conjunto de permissões do store (ver FLUXO 3 / fan-out):
+#
+#   `raw/`, `wiki/`, `inbox/`, `index.db`, `log.md`, `quarantine.md` e os
+#   manifests do codescan (`state.json`, `surface.json`, `agent-runs/`,
+#   `agent-packs/`, `sdd/`, `modules/`) são INVIOLÁVEIS: quem escreve neles é
+#   o `wk` (promote/compile/publish/ingest/merge), nunca um Write/Edit direto
+#   do agente. Por isso cada um deles é negado NOMINALMENTE.
+#
+#   `.codescan/<workdir>/agent-outputs/` é a ÚNICA escrita legítima de agente
+#   no store: é o buffer de ENTRADA do fan-out — cada subagente grava ali o
+#   seu `.txt` bruto e o merge do `wk` valida tudo depois (ruído, sha,
+#   freshness, id de bloco). A escrita ali é segura por construção: nada do
+#   que é gravado entra no corpus sem passar pela validação do merge.
+#
+#   Em Claude Code, regra `deny` SEMPRE vence `allow`. Um deny amplo
+#   `Write(<store>/**)` portanto NÃO pode existir: ele bloqueia o fan-out
+#   inteiro (no teste real de ponta a ponta os 4 subagentes E o despachante
+#   tiveram write negado, e nenhum allow conseguiria reabrir). O deny amplo
+#   antigo é migrado para este conjunto estreito por `init` (ver
+#   `_legacy_broad_deny` / `permissoes_migradas`).
+
+# Subárvores do store que o agente nunca escreve à mão (Write e Edit negados).
+_STORE_DENY_TREES = ("raw", "wiki", "inbox")
+# Arquivos de topo do store gerenciados exclusivamente pelo `wk`.
+_STORE_DENY_FILES = ("index.db*", "log.md", "quarantine.md")
+# Artefatos protegidos DENTRO de .codescan (Write e Edit negados). Note que
+# `agent-outputs/` está deliberadamente fora desta lista.
+_CODESCAN_DENY_ARTIFACTS = (
+    "state.json",
+    "agent-runs/**",
+    "agent-packs/**",
+    "sdd/**",
+    "modules/**",
+    "surface.json",
+)
+# O buffer de entrada do fan-out: única escrita de agente permitida no store.
+_CODESCAN_AGENT_OUTPUTS = ".codescan/**/agent-outputs/**"
+
+
+def _store_deny_rules(store_abs: str) -> list[str]:
+    """Denies estreitos do store — nunca `Write(<store>/**)`, que mataria o
+    fan-out (agent-outputs) junto com o resto."""
+    rules = []
+    for tree in _STORE_DENY_TREES:
+        rules.append(f"Write({store_abs}/{tree}/**)")
+        rules.append(f"Edit({store_abs}/{tree}/**)")
+    for name in _STORE_DENY_FILES:
+        rules.append(f"Write({store_abs}/{name})")
+    for art in _CODESCAN_DENY_ARTIFACTS:
+        rules.append(f"Write({store_abs}/.codescan/**/{art})")
+    for art in _CODESCAN_DENY_ARTIFACTS:
+        rules.append(f"Edit({store_abs}/.codescan/**/{art})")
+    return rules
+
+
+def _store_allow_rules(store_abs: str) -> list[str]:
+    """A única escrita legítima de agente dentro do store."""
+    return [f"Write({store_abs}/{_CODESCAN_AGENT_OUTPUTS})"]
+
+
+def _legacy_broad_deny(store_abs: str) -> list[str]:
+    """O deny amplo gravado pelas versões antigas do `init`. Precisa ser
+    REMOVIDO (não apenas complementado): deny vence allow."""
+    return [f"Write({store_abs}/**)", f"Edit({store_abs}/**)"]
+
+
+def _norm_rule(rule: str) -> str:
+    return (rule or "").replace("\\", "/").strip()
+
+
+def _has_legacy_broad_deny(deny: list, store_abs: str | None) -> bool:
+    if not store_abs:
+        return False
+    legacy = {_norm_rule(r) for r in _legacy_broad_deny(store_abs)}
+    return any(_norm_rule(d) in legacy for d in deny or [])
+
+
+MIGRACAO_ACAO = (
+    "rode wk init --engine ... para migrar as permissões "
+    "(o deny amplo bloqueia o fan-out)"
+)
+
+
 def _merge_settings_permissions(existing: dict, store_abs: str | None, repo_abs: str | None) -> dict:
     """Mescla `permissions` em cima do settings.json existente sem duplicar
-    entradas e sem tocar em nenhuma outra chave (merge idempotente)."""
+    entradas e sem tocar em nenhuma outra chave (merge idempotente).
+
+    Migração: se o settings existente ainda tiver o deny amplo
+    `Write(<store>/**)`/`Edit(<store>/**)`, ele é SUBSTITUÍDO pelo conjunto
+    estreito — mantê-lo bloquearia `agent-outputs` mesmo com o allow explícito.
+    """
     out = dict(existing)
     perms = dict(out.get("permissions") or {})
 
@@ -176,9 +264,10 @@ def _merge_settings_permissions(existing: dict, store_abs: str | None, repo_abs:
     _add_unique("additionalDirectories", dirs)
     _add_unique("allow", [f"Read({d}/**)" for d in dirs] + (["Bash(wk *)"] if dirs else []))
     if store_abs:
-        # A sessão principal não escreve SDD à mão: quem escreve é `wk` (promote/
-        # compile/publish/ingest), nunca Write/Edit direto do agente no store.
-        _add_unique("deny", [f"Write({store_abs}/**)", f"Edit({store_abs}/**)"])
+        legacy = {_norm_rule(r) for r in _legacy_broad_deny(store_abs)}
+        perms["deny"] = [d for d in (perms.get("deny") or []) if _norm_rule(d) not in legacy]
+        _add_unique("deny", _store_deny_rules(store_abs))
+        _add_unique("allow", _store_allow_rules(store_abs))
 
     out["permissions"] = perms
     return out
@@ -192,9 +281,19 @@ def _write_permission_settings(path: str, store_abs: str | None, repo_abs: str |
                 existing = json.load(f)
         except (ValueError, OSError):
             existing = {}
+    migrada = _has_legacy_broad_deny(
+        ((existing.get("permissions") or {}).get("deny") or []), store_abs
+    )
     merged = _merge_settings_permissions(existing, store_abs, repo_abs)
     _write(path, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
-    return {"path": path, "permissions": merged["permissions"]}
+    report = {"path": path, "permissions": merged["permissions"],
+              "permissoes_migradas": migrada}
+    if migrada:
+        report["migracao"] = (
+            "deny amplo Write/Edit(<store>/**) removido e substituído pelo "
+            "conjunto estreito; agent-outputs do fan-out agora é gravável"
+        )
+    return report
 
 
 def _permission_format_status(path: str) -> tuple[str, str | None]:
@@ -217,18 +316,22 @@ def _permission_format_status(path: str) -> tuple[str, str | None]:
 
 def _check_permission_settings(
     path: str, store_abs: str | None, repo_abs: str | None
-) -> tuple[bool, list[str]]:
+) -> tuple[bool, list[str], str | None]:
+    """(ok, problemas, acao). `acao` só é preenchida quando existe um passo
+    concreto para o humano — hoje, a migração do deny amplo antigo."""
     if not os.path.exists(path):
-        return False, ["settings ausente"]
+        return False, ["settings ausente"], None
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (ValueError, OSError):
-        return False, ["settings ilegível (JSON inválido)"]
+        return False, ["settings ilegível (JSON inválido)"], None
     perms = data.get("permissions") or {}
     add_dirs = perms.get("additionalDirectories") or []
     deny = perms.get("deny") or []
-    problems = []
+    allow = perms.get("allow") or []
+    problems: list[str] = []
+    acao: str | None = None
     if store_abs and store_abs not in add_dirs:
         problems.append("store ausente em additionalDirectories")
     if repo_abs and repo_abs not in add_dirs:
@@ -237,7 +340,32 @@ def _check_permission_settings(
         problems.append("deny ausente")
     elif store_abs and not any(store_abs in d for d in deny):
         problems.append("deny não cobre o store")
-    return (not problems), problems
+
+    if store_abs:
+        # Bloqueio 1: o deny amplo antigo ainda está lá. Deny vence allow, então
+        # o fan-out do FLUXO 3 (subagentes gravando em agent-outputs) está morto.
+        if _has_legacy_broad_deny(deny, store_abs):
+            problems.append(
+                "deny amplo antigo Write/Edit(<store>/**) presente — "
+                "bloqueia a escrita dos subagentes em agent-outputs (fan-out)"
+            )
+            acao = MIGRACAO_ACAO
+        # Bloqueio 2: denies estreitos faltando (invioláveis desprotegidos).
+        deny_norm = {_norm_rule(d) for d in deny}
+        faltando = [r for r in _store_deny_rules(store_abs) if _norm_rule(r) not in deny_norm]
+        if faltando:
+            problems.append(f"deny estreito incompleto ({len(faltando)} regra(s)): {faltando[0]} ...")
+            acao = acao or MIGRACAO_ACAO
+        # Bloqueio 3: sem o allow explícito o fan-out também não escreve.
+        allow_norm = {_norm_rule(x) for x in allow}
+        sem_allow = [r for r in _store_allow_rules(store_abs) if _norm_rule(r) not in allow_norm]
+        if sem_allow:
+            problems.append(
+                "allow de agent-outputs ausente — o fan-out não consegue gravar "
+                f"({sem_allow[0]})"
+            )
+            acao = acao or MIGRACAO_ACAO
+    return (not problems), problems, acao
 
 
 def cmd_init(a) -> int:
@@ -276,6 +404,10 @@ def cmd_init(a) -> int:
                 report["aviso"] = aviso
             permissoes.append(report)
         result["permissoes"] = permissoes
+        # Sinal de topo: houve migração do deny amplo antigo em algum settings.
+        result["permissoes_migradas"] = any(
+            p.get("permissoes_migradas") for p in permissoes
+        )
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -342,11 +474,13 @@ def cmd_check(a) -> int:
         repo_abs = os.path.abspath(a.repo) if a.repo else None
         config_report = []
         for target in _settings_targets(engines, a.base):
-            ok, problems = _check_permission_settings(target, store_abs, repo_abs)
+            ok, problems, acao = _check_permission_settings(target, store_abs, repo_abs)
             if not ok:
                 dirty = True
             formato, aviso = _permission_format_status(target)
             entry = {"path": target, "ok": ok, "problemas": problems, "formato": formato}
+            if acao:
+                entry["acao"] = acao
             if aviso:
                 entry["aviso"] = aviso
             config_report.append(entry)
@@ -596,16 +730,22 @@ def cmd_doctor(a) -> int:
             perm_reports = []
             perm_ok_all = True
             formatos = set()
+            acao_migracao: str | None = None
             for target in _settings_targets(engines_resolved, a.base):
-                ok, problems = _check_permission_settings(target, store_abs, repo_abs)
+                ok, problems, acao = _check_permission_settings(target, store_abs, repo_abs)
                 perm_ok_all = perm_ok_all and ok
                 formato, aviso = _permission_format_status(target)
                 formatos.add(formato)
                 entry = {"path": target, "ok": ok, "problemas": problems, "formato": formato}
+                if acao:
+                    entry["acao"] = acao
+                    acao_migracao = acao
                 if aviso:
                     entry["aviso"] = aviso
                 perm_reports.append(entry)
             engine_info["config_permissoes"] = perm_reports
+            if acao_migracao:
+                engine_info["acao_permissao"] = acao_migracao
             if not perm_ok_all:
                 bloqueios.append("permissao")
             # `permissao_garantida` só é True quando o arquivo está correto
