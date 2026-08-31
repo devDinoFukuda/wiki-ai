@@ -178,7 +178,12 @@ class VerifyMarkdownTest(unittest.TestCase):
             f"pelo caminho completo. {GREEN} Evidência: `Quote.java:1`",
         )
         self.assertFalse(report["ok"])
-        self.assertTrue(any(e["rule"] == "arquivo_inexistente" for e in report["errors"]))
+        # basename único agora vira `caminho_parcial` com sugestão do caminho completo
+        self.assertTrue(any(e["rule"] == "caminho_parcial" for e in report["errors"]))
+        # Validar que o detail contém o caminho sugerido
+        error = next((e for e in report["errors"] if e["rule"] == "caminho_parcial"), None)
+        self.assertIsNotNone(error)
+        self.assertIn("src/quotes/Quote.java", error.get("detail", ""))
 
     def test_verify_rejects_invalid_partial_relative_path(self):
         report = verify_markdown(

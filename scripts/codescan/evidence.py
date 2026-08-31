@@ -226,9 +226,14 @@ def build_evidence_pack(
 # `\w` em padrão `str` do Python 3 já é Unicode-aware, então cobre acento,
 # cedilha e alfabetos não-latinos, mantendo a exclusão de espaço e de ':'
 # (que separa caminho de linha) — ':' e ' ' não pertencem a `\w`.
+#
+# `extra` cobre a forma multi-linha `Path.java:9,15,30`: uma lista de números
+# soltos (sem `-`) colada ao primeiro `:linha`/`:linha-linha`, sem espaço. Cada
+# número extra vira uma citação (path, n, n) independente em `citations()` —
+# antes o `,15` era silenciosamente descartado pelo regex (só `:9` casava).
 _CITATION_RE = re.compile(
     r"(?P<path>(?:[\w.-]+[/\\])*[\w.-]+\.\w+)"
-    r":(?P<start>\d+)(?:-(?P<end>\d+))?"
+    r":(?P<start>\d+)(?:-(?P<end>\d+))?(?P<extra>(?:,\d+)*)"
 )
 _GREEN = "\U0001F7E2"
 _YELLOW = "\U0001F7E1"
@@ -336,9 +341,19 @@ _GENERIC_GREEN_RE = re.compile(
 def citations(text: str) -> list[Citation]:
     out = []
     for m in _CITATION_RE.finditer(text or ""):
+        path = m.group("path").replace("\\", "/")
         start = int(m.group("start"))
         end = int(m.group("end") or start)
-        out.append(Citation(m.group("path").replace("\\", "/"), start, end))
+        out.append(Citation(path, start, end))
+        # `:9,15,30` (sem `-`): cada número extra é uma citação de linha única
+        # própria — (path, 9, 9), (path, 15, 15), (path, 30, 30). `:9-15`
+        # (range) não passa por aqui: `extra` só casa vírgula sem `-`.
+        for tok in (m.group("extra") or "").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            n = int(tok)
+            out.append(Citation(path, n, n))
     return out
 
 
@@ -390,7 +405,37 @@ def _claim_blocks(markdown: str) -> list[tuple[int, str]]:
     return claims
 
 
-def _citation_error(repo: str, c: Citation) -> dict | None:
+def _basename_index(repo: str, cache: dict[str, dict[str, list[str]]] | None) -> dict[str, list[str]]:
+    """Mapa `basename -> [caminho relativo, ...]` de todo o repo.
+
+    Mesmos `SKIP_DIRS` do estágio `surface` (bin/obj/node_modules/.git/etc. —
+    varredura de repositório real sem isso devolve lixo por milhares). Ao
+    contrário de `_iter_code_files`, não filtra por `LANGUAGES`/gerado: uma
+    citação pode nomear qualquer arquivo do repo, não só código-fonte.
+
+    Cacheado por `repo` em `cache` (um dict passado pelo chamador, tipicamente
+    um por chamada de `verify_markdown`) para que N citações sem separador no
+    mesmo documento só varram a árvore do repo uma vez.
+    """
+    if cache is not None and repo in cache:
+        return cache[repo]
+    index: dict[str, list[str]] = {}
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for fn in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, fn), repo).replace("\\", "/")
+            index.setdefault(fn, []).append(rel)
+    if cache is not None:
+        cache[repo] = index
+    return index
+
+
+def _citation_error(
+    repo: str,
+    c: Citation,
+    *,
+    basename_cache: dict[str, dict[str, list[str]]] | None = None,
+) -> dict | None:
     try:
         full = _safe_path(repo, c.path)
     except ValueError as e:
@@ -398,7 +443,27 @@ def _citation_error(repo: str, c: Citation) -> dict | None:
     if c.path != c.path.strip() or os.path.isabs(c.path):
         return {"citation": f"{c.path}:{c.line_start}", "rule": "caminho_invalido", "detail": c.path}
     if not os.path.isfile(full):
-        return {"citation": f"{c.path}:{c.line_start}", "rule": "arquivo_inexistente", "detail": c.path}
+        # citação sem separador (`Quote.java:9`, não `src/Quote.java:9`)
+        # que não existe como caminho literal. Antes disso virava direto
+        # `arquivo_inexistente` com `detail: c.path` — verdade, mas inacionável
+        # quando o arquivo existe em outro lugar do repo e só falta o caminho
+        # completo. Busca o basename: exatamente 1 match no repo inteiro vira
+        # `caminho_parcial` com o caminho relativo pronto para copiar; 0 ou 2+
+        # matches (ambíguo ou de fato inexistente) mantém `arquivo_inexistente`
+        # — ainda é erro, só a mensagem melhora.
+        if "/" not in c.path:
+            matches = _basename_index(repo, basename_cache).get(c.path) or []
+            if len(matches) == 1:
+                return {
+                    "citation": f"{c.path}:{c.line_start}",
+                    "rule": "caminho_parcial",
+                    "detail": f"use o caminho relativo completo: {matches[0]}",
+                }
+        return {
+            "citation": f"{c.path}:{c.line_start}",
+            "rule": "arquivo_inexistente",
+            "detail": f"{c.path} — verifique o caminho completo da raiz do repo",
+        }
     exact_rel = os.path.relpath(full, repo).replace("\\", "/")
     if c.path.replace("\\", "/") != exact_rel:
         return {
@@ -520,25 +585,16 @@ def _verify_markdown_legacy(repo: str, markdown: str) -> dict:
                 }
             )
 
+    # Mesma `_citation_error` usada por `verify_markdown` — antes este ramo
+    # legado duplicava a lógica de checagem de citação à mão (isfile, linha
+    # dentro do arquivo) sem o tratamento de basename-único/caminho-parcial,
+    # e as duas versões podiam divergir silenciosamente a cada mudança de uma
+    # sem a outra.
+    basename_cache: dict[str, dict[str, list[str]]] = {}
     for c in all_citations:
-        try:
-            full = _safe_path(repo, c.path)
-        except ValueError as e:
-            errors.append({"citation": f"{c.path}:{c.line_start}", "rule": "fora_do_repo", "detail": str(e)})
-            continue
-        if not os.path.isfile(full):
-            errors.append({"citation": f"{c.path}:{c.line_start}", "rule": "arquivo_inexistente", "detail": c.path})
-            continue
-        with open(full, encoding="utf-8-sig", errors="replace") as f:
-            total = len(f.read().splitlines())
-        if c.line_start < 1 or c.line_end < c.line_start or c.line_end > total:
-            errors.append(
-                {
-                    "citation": f"{c.path}:{c.line_start}-{c.line_end}",
-                    "rule": "linha_invalida",
-                    "detail": f"arquivo tem {total} linhas",
-                }
-            )
+        err = _citation_error(repo, c, basename_cache=basename_cache)
+        if err:
+            errors.append(err)
 
     if not claim_blocks:
         warnings.append("nenhuma claim em bullet encontrada")
@@ -562,8 +618,12 @@ def verify_markdown(repo: str, markdown: str) -> dict:
     all_citations = citations(markdown)
     valid_citations: set[tuple[str, int, int]] = set()
 
+    # Cache por chamada: N citações sem separador (`Quote.java:1`) no mesmo
+    # documento reusam o mesmo índice de basenames em vez de varrer o repo
+    # inteiro de novo a cada uma.
+    basename_cache: dict[str, dict[str, list[str]]] = {}
     for c in all_citations:
-        err = _citation_error(repo, c)
+        err = _citation_error(repo, c, basename_cache=basename_cache)
         if err:
             errors.append(err)
         else:

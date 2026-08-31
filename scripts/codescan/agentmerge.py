@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from . import evidence as ev_mod
@@ -49,6 +50,12 @@ class MergedArtifact:
 
 
 MODULE_RE = re.compile(r"^=== MODULE:\s*(.+?)\s*===\s*$")
+# F-41: o contrato do estágio manda o subagente devolver `=== FAILED MODULE: <id> ===`
+# quando o item é impossível (`cli._handoff_prompt`). O parser de merge não aceita
+# esse bloco (ele cai em "prosa fora de bloco MODULE"), mas o <id> dele PRECISA ser
+# validado contra o batch do plano igual ao do bloco MODULE — senão o operador
+# recebe "prosa fora de bloco" para um id inventado e não descobre a causa real.
+FAILED_MODULE_RE = re.compile(r"^=== FAILED MODULE:\s*(.+?)\s*===\s*$")
 SPEC_RE = re.compile(r"^=== SPEC:\s*(.+?)\s*===\s*$")
 RULES_RE = re.compile(r"^=== RULES:\s*(.+?)\s*===\s*$")
 ARCHITECTURE_RE = re.compile(r"^=== ARCHITECTURE:\s*(.+?)\s*===\s*$")
@@ -95,6 +102,94 @@ IDENTIFIER_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_.$<>?, ]*)`")
 RECORD_RE = re.compile(r"\brecord\s+([A-Z][A-Za-z0-9_]*)\s*\(([^)]*)\)")
 FIELD_WORD_RE = re.compile(r"\b([a-z][A-Za-z0-9_]{2,})\b")
 TYPE_WORD_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]{2,})\b")
+
+# F-42: `IDENTIFIER_RE` só reconhecia identificador ENTRE CRASES, mas o contrato
+# de saída do subagente PROÍBE eco de código — os dois se contradizem e o efeito
+# prático é `sdd/data-dictionary.md` nunca ser gerado (numa execução real: 21
+# módulos, 312 citações arquivo:linha, 0 entidades reconhecidas). A extração
+# passa a aceitar também tipo capitalizado FORA de crase, mas só dentro da seção
+# "Estruturas de dados" e só com forma conservadora de identificador — ver
+# `_looks_like_type_word`.
+DICT_CAMEL_WORD_RE = re.compile(r"\b[A-Z][A-Za-z0-9]{3,}\b")
+DICT_CAMEL_INNER_RE = re.compile(r"[a-z][A-Z]")
+# Sufixos que, sozinhos, já provam que a palavra é nome de tipo (mesmo vocabulário
+# usado por `_entity_kind` para classificar a entidade).
+DICT_TYPE_SUFFIXES = (
+    "dto", "request", "response", "entity", "model", "event", "repository",
+    "gateway", "client", "rule", "rules", "exception", "error", "properties",
+    "configuration", "config", "service", "controller", "handler", "policy",
+    "command", "query", "factory", "mapper", "adapter", "aggregate", "payload",
+)
+# Palavras PT comuns que aparecem capitalizadas por início de frase/rótulo e não
+# são nome de tipo. Comparadas sem acento e em casefold (`_fold`).
+DICT_PT_STOPWORDS = frozenset("""
+    estrutura estruturas dados campo campos tipo tipos classe classes registro
+    registros objeto objetos entidade entidades valor valores lista listas mapa
+    mapas conjunto conjuntos nenhum nenhuma nada apenas somente todos todas cada
+    este esta esse essa aquele aquela quando onde como porque para pela pelo
+    pelos pelas sobre entre depois antes durante contudo porem ainda talvez
+    possivelmente inferido inferida inferidos inferidas observado observada
+    confirmado confirmada presente ausente ausencia contrato contratos fluxo
+    fluxos responsabilidade responsabilidades dependencia dependencias
+    rastreabilidade lacuna lacunas evidencia evidencias citacao citacoes arquivo
+    arquivos linha linhas modulo modulos pacote pacotes servico servicos metodo
+    metodos funcao funcoes interface interfaces enum record records validacao
+    validacoes regra regras persistencia configuracao implementacao requisicao
+    resposta retorno entrada saida erro erros excecao excecoes sistema aplicacao
+    dominio infraestrutura camada camadas banco tabela tabelas coluna colunas
+    chave chaves indice consulta consultas cliente clientes usuario usuarios nome
+    nomes data datas hora numero texto booleano inteiro decimal total tamanho
+    limite limites estado estados nivel ordem grupo grupos item itens parte
+    partes nota notas observacao observacoes detalhe detalhes exemplo exemplos
+    caso casos ponto pontos etapa etapas passo passos acao acoes evento eventos
+    atributo atributos propriedade propriedades opcional obrigatorio obrigatoria
+    padrao versao versoes suporte tambem assim entao segundo terceiro primeiro
+    primeira segunda outro outra outros outras mesmo mesma muito pouco maior
+    menor melhor pior novo nova antigo atual atuais proprio propria varios varias
+    alguns algumas qualquer quaisquer sempre nunca
+    constante constantes falha falhas justificativa justificativas mensagem
+    mensagens sobrecarga sobrecargas resultado resultados motivo motivos decisao
+    decisoes chamada chamadas leitura escrita criacao atualizacao remocao
+    publicacao assinatura assinaturas colecao colecoes sequencia tentativa
+    tentativas politica politicas depende dependem contem existe existem
+    retorna recebe envia grava usa usam deve devem pode podem dois tres quatro
+    cinco
+""".split())
+# Seção do artefato de módulo onde o contrato manda declarar entidades/tipos.
+DICT_DATA_SECTIONS = frozenset({
+    "estruturas de dados",
+    "estrutura de dados",
+    "estruturas de dados/entidades",
+    "estruturas de dados / entidades",
+    "entidades e estruturas de dados",
+    "data structures",
+    "data structures/entities",
+})
+# Demais seções canônicas do artefato de módulo (`sdd.COMPACT_OUTPUT_CONTRACTS`)
+# — servem só para saber ONDE a seção de dados termina.
+DICT_SECTION_TITLES = DICT_DATA_SECTIONS | frozenset({
+    "responsabilidade", "responsabilidades", "fluxo", "fluxos", "fluxo principal",
+    "dependencia", "dependencias", "rastreabilidade", "lacuna", "lacunas",
+    "risco", "riscos", "riscos e lacunas", "evidencia", "evidencias", "escopo",
+    "arquivos", "citacoes", "observacoes", "resumo", "visao geral", "regras",
+    "contratos", "seguranca", "testes", "metricas",
+})
+DICT_HEADING_STRIP_RE = re.compile(r"^\s*#{1,6}\s*")
+# `- 🟢 CatalogUpdatedEvent (record): eventId, eventVersion, occurredAt. Foo.java:9`
+DICT_STRUCT_LEAD_RE = re.compile(r"^[^A-Za-z0-9]*")
+DICT_STRUCT_DECL_RE = re.compile(r"^([A-Z][A-Za-z0-9]{3,})\s*(?:\([^)]*\))?\s*:\s*(.+)$")
+DICT_FIELD_TOKEN_RE = re.compile(r"^\s*([a-z][A-Za-z0-9_]{2,})\b")
+FIELD_RESERVED = frozenset({
+    "public", "private", "return", "record", "class", "final", "static",
+    "string", "integer", "boolean", "optional", "list", "map", "bigdecimal",
+    "instant", "duration", "uuid", "null", "true", "false",
+})
+
+
+def _fold(value: str) -> str:
+    """casefold sem acento — comparação determinística de rótulo PT-BR."""
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
 
 
 def _normalize_item(value: str) -> str:
@@ -227,18 +322,111 @@ def _entity_kind(name: str) -> str:
 
 
 def _field_candidates(text: str) -> list[str]:
-    reserved = {
-        "public", "private", "return", "record", "class", "final", "static",
-        "string", "integer", "boolean", "optional", "list", "map", "bigdecimal",
-        "instant", "duration", "uuid", "null", "true", "false",
-    }
     fields: list[str] = []
     for word in FIELD_WORD_RE.findall(text):
-        if word.lower() in reserved:
+        if word.lower() in FIELD_RESERVED:
             continue
         if word not in fields:
             fields.append(word)
     return fields[:6]
+
+
+def _heading_label(line: str) -> str | None:
+    """Rótulo de seção da linha (sem `#`, sem `**`, sem `:`), já normalizado por
+    `_fold`; `None` quando a linha é conteúdo (bullet, tabela, citação, prosa
+    longa) em vez de cabeçalho."""
+    raw = line.strip()
+    if not raw:
+        return None
+    if raw[0] in "-*+|>" and not raw.startswith("**"):
+        return None
+    label = DICT_HEADING_STRIP_RE.sub("", raw).strip().strip("*_").strip().rstrip(":").strip()
+    if not label or len(label) > 64:
+        return None
+    return _fold(label)
+
+
+def _data_section_lines(content: str) -> set[int]:
+    """Índices (0-based) das linhas dentro da seção "Estruturas de dados".
+
+    Só essa seção libera o reconhecimento de tipo fora de crase (F-42): o resto
+    do artefato é prosa PT-BR e produziria entidade inventada.
+    """
+    inside = False
+    lines: set[int] = set()
+    for idx, line in enumerate(content.splitlines()):
+        label = _heading_label(line)
+        if label is not None and label in DICT_SECTION_TITLES:
+            inside = label in DICT_DATA_SECTIONS
+            continue
+        if label is not None and line.strip().startswith("#"):
+            inside = False  # qualquer outro cabeçalho markdown encerra a seção
+            continue
+        if inside:
+            lines.add(idx)
+    return lines
+
+
+def _looks_like_type_word(word: str, *, line_has_citation: bool) -> bool:
+    """Palavra CamelCase >= 4 chars que é, conservadoramente, nome de tipo.
+
+    Exige pelo menos uma minúscula (descarta siglas `JSON`/`HTTP`), rejeita
+    palavra PT comum capitalizada por início de frase e, além disso, exige UMA
+    das provas: transição camelCase interna (`QuoteReceivedEvent`), sufixo
+    típico de tipo (`...Rule`, `...Dto`, `...Gateway`) ou uma citação
+    `arquivo:linha` na MESMA linha (a linha já está ancorada em evidência).
+    """
+    if len(word) < 4 or not any(ch.islower() for ch in word):
+        return False
+    folded = _fold(word)
+    if folded in DICT_PT_STOPWORDS:
+        return False
+    if DICT_CAMEL_INNER_RE.search(word):
+        return True
+    if folded.endswith(DICT_TYPE_SUFFIXES):
+        return True
+    return line_has_citation
+
+
+def _section_type_candidates(line: str) -> list[str]:
+    line_has_citation = bool(ev_mod.citations(line))
+    out: list[str] = []
+    for word in DICT_CAMEL_WORD_RE.findall(line):
+        if word in out:
+            continue
+        if _looks_like_type_word(word, line_has_citation=line_has_citation):
+            out.append(word)
+    return out
+
+
+def _struct_declaration(line: str) -> tuple[str, list[str]] | None:
+    """`Entidade (record): campoA, campoB(...)` -> `("Entidade", ["campoA", ...])`.
+
+    Deliberadamente estreito: só dispara quando o nome do tipo abre a linha e é
+    seguido de `:`. Sem isso, varrer a linha inteira atrás de campos transformaria
+    prosa PT-BR ("inferido", "como", "delega") em atributo do dicionário.
+    """
+    body = DICT_STRUCT_LEAD_RE.sub("", line)
+    match = DICT_STRUCT_DECL_RE.match(body)
+    if not match:
+        return None
+    entity = match.group(1)
+    if not _looks_like_type_word(entity, line_has_citation=bool(ev_mod.citations(line))):
+        return None
+    fields: list[str] = []
+    for chunk in match.group(2).split(","):
+        token = DICT_FIELD_TOKEN_RE.match(chunk)
+        if not token:
+            continue
+        field = token.group(1)
+        if field.lower() in FIELD_RESERVED or _fold(field) in DICT_PT_STOPWORDS:
+            continue
+        if field in fields:
+            continue
+        fields.append(field)
+    if not fields:
+        return None
+    return entity, fields[:12]
 
 
 def _extract_dictionary(docs: list[tuple[str, str, str]]) -> tuple[list[dict], list[dict], list[str]]:
@@ -253,12 +441,34 @@ def _extract_dictionary(docs: list[tuple[str, str, str]]) -> tuple[list[dict], l
         if not citations:
             continue
         module_citation = citations[0]
+        lines = content.splitlines()
+        data_lines = _data_section_lines(content)
         candidates: list[str] = []
         for raw in IDENTIFIER_RE.findall(content):
             for part in re.split(r"[, ]+", raw):
                 name = _clean_identifier(part)
                 if TYPE_WORD_RE.fullmatch(name) and len(name) >= 3:
                     candidates.append(name)
+        # F-42: tipos capitalizados FORA de crase, restritos à seção
+        # "Estruturas de dados" — é assim que o subagente declara entidade sem
+        # violar a proibição de eco de código.
+        for idx in sorted(data_lines):
+            candidates.extend(_section_type_candidates(lines[idx]))
+        for idx in sorted(data_lines):
+            declaration = _struct_declaration(lines[idx])
+            if declaration is None:
+                continue
+            entity, declared_fields = declaration
+            line_citations = [_citation_text(c) for c in ev_mod.citations(lines[idx])]
+            line_citation = line_citations[0] if line_citations else module_citation
+            for field in declared_fields:
+                fields.append({
+                    "entity": entity,
+                    "field": field,
+                    "type": "campo declarado em Estruturas de dados",
+                    "module": module,
+                    "citation": line_citation,
+                })
         for match in RECORD_RE.finditer(content):
             candidates.append(match.group(1))
             for raw_field in match.group(2).split(","):
@@ -310,8 +520,20 @@ def _extract_dictionary(docs: list[tuple[str, str, str]]) -> tuple[list[dict], l
 
 def _write_data_dictionary(wd: str, docs: list[tuple[str, str, str]]) -> tuple[str | None, str | None]:
     entities, fields, citations = _extract_dictionary(docs)
-    if not entities or len(citations) < 2:
-        return None, "dados insuficientes para data-dictionary.md: exige entidades/tipos e ao menos 2 citações nos módulos"
+    # F-42: o blocker antigo ("exige entidades/tipos e ao menos 2 citações")
+    # não dizia QUAL das duas metades reprovou — com 312 citações e 0 entidades
+    # o operador lia "faltam citações" e reescrevia o artefato inteiro à toa.
+    reprovou: list[str] = []
+    if not entities:
+        reprovou.append("entidades/tipos (nenhuma reconhecida na seção `Estruturas de dados`)")
+    if len(citations) < 2:
+        reprovou.append(f"citações arquivo:linha (mínimo 2, obtidas {len(citations)})")
+    if reprovou:
+        return None, (
+            "dados insuficientes para data-dictionary.md: "
+            f"entidades={len(entities)}, citacoes={len(citations)}; "
+            "reprovou: " + " e ".join(reprovou)
+        )
     path = os.path.join(wd, "sdd", "data-dictionary.md")
     chunks = [
         "# Dicionário de dados",
@@ -1020,6 +1242,210 @@ def _same_agent_identity(left: str | None, right: str | None) -> bool:
     return batch_a is not None and batch_a == batch_b
 
 
+MAX_REPORTED_PLAN_ID_ERRORS = 10
+MAX_LISTED_PLAN_ITEMS = 40
+PLAN_ID_ACTION = "use exatamente o path do campo ITENS/items do seu batch"
+
+
+def _plan_manifest(wd: str, stage: str) -> dict | None:
+    """`agent-runs/<stage>-plan.json` (o manifesto de fan-out escrito por
+    `cli.cmd_run_stage`). Ausente/ilegível devolve `None` — a validação de id
+    então NÃO acontece: merge fora do fluxo de fan-out (testes, uso manual,
+    workdir legado) continua valendo."""
+    path = os.path.join(wd, "agent-runs", f"{stage}-plan.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _plan_batch_items(wd: str, stage: str, agent: str | None) -> tuple[list[str] | None, str | None]:
+    """Itens canônicos do batch deste `--agent`, ou `(None, motivo)`.
+
+    O batch é identificado pelo `agent_slot` do plano (match literal) e, em
+    fallback, pelo número de batch do sufixo `-b<NN>` (`AGENT_BATCH_SUFFIX_RE`,
+    F-36) — dois nomes para o mesmo batch resolvem o mesmo item set.
+    """
+    plan = _plan_manifest(wd, stage)
+    if plan is None:
+        return None, f"agent-runs/{stage}-plan.json ausente ou ilegível"
+    batches = plan.get("batches")
+    if not isinstance(batches, list) or not batches:
+        return None, f"agent-runs/{stage}-plan.json sem batches"
+    wanted = (agent or "").strip()
+    wanted_key = wanted.casefold()
+    number = _agent_batch_number(wanted)
+    chosen: dict | None = None
+    if wanted_key:
+        for batch in batches:
+            if isinstance(batch, dict) and str(batch.get("agent_slot") or "").strip().casefold() == wanted_key:
+                chosen = batch
+                break
+    if chosen is None and number is not None:
+        for batch in batches:
+            if not isinstance(batch, dict):
+                continue
+            slot_number = _agent_batch_number(str(batch.get("agent_slot") or ""))
+            batch_number = batch.get("batch") if isinstance(batch.get("batch"), int) else None
+            if number in (slot_number, batch_number):
+                chosen = batch
+                break
+    if chosen is None:
+        return None, (
+            f"--agent {wanted or '(vazio)'} não corresponde a nenhum batch de "
+            f"agent-runs/{stage}-plan.json"
+        )
+    items = [str(value).strip() for value in (chosen.get("items") or []) if str(value).strip()]
+    if not items:
+        return None, f"batch de agent-runs/{stage}-plan.json sem items"
+    return items, None
+
+
+def _plan_item_key(value: str) -> str:
+    """Chave comparável de um ITEM do plano: só `\\`->`/` (mesma normalização de
+    `_normalize_item`), casefold. Ponto NÃO vira barra aqui — path de item pode
+    conter ponto legítimo e o item do plano é a verdade, não o palpite."""
+    return re.sub(r"/+", "/", value.strip().replace("\\", "/")).strip("/").casefold()
+
+
+def _block_id_forms(value: str) -> list[str]:
+    """Formas comparáveis do `<id>` que veio no cabeçalho do bloco: a
+    normalizada (`\\`->`/`) e, adicionalmente, a com pontos virados barra
+    (`domain.event` -> `domain/event`) — foi exatamente assim que a LLM
+    encurtou o path do item numa execução real."""
+    base = re.sub(r"/+", "/", value.strip().replace("\\", "/")).strip("/")
+    forms: list[str] = []
+    for candidate in (base, base.replace(".", "/")):
+        normalized = re.sub(r"/+", "/", candidate).strip("/").casefold()
+        if normalized and normalized not in forms:
+            forms.append(normalized)
+    return forms
+
+
+def _match_plan_item(block_id: str, items: list[str]) -> tuple[list[str], str]:
+    """`(itens_do_batch_que_casam, modo)` com `modo` em `exato`/`sufixo`.
+
+    Sufixo casa só em fronteira de segmento (`.../domain/event` casa
+    `domain/event` e `domain.event`, mas nunca `event` colado em `subevent`).
+    """
+    forms = _block_id_forms(block_id)
+    if not forms:
+        return [], "exato"
+    keys = [(item, _plan_item_key(item)) for item in items]
+    exact = sorted({item for item, key in keys if key in forms})
+    if exact:
+        return exact, "exato"
+    suffix = sorted({
+        item for item, key in keys
+        if any(key.endswith("/" + form) for form in forms)
+    })
+    return suffix, "sufixo"
+
+
+def _module_header_ids(text: str) -> list[tuple[str, str]]:
+    """`(id_bruto, rótulo_do_bloco)` de cada cabeçalho MODULE/FAILED MODULE."""
+    found: list[tuple[str, str]] = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        match = MODULE_RE.match(line)
+        if match:
+            found.append((match.group(1).strip(), "MODULE"))
+            continue
+        match = FAILED_MODULE_RE.match(line)
+        if match:
+            found.append((match.group(1).strip(), "FAILED MODULE"))
+    return found
+
+
+def _validate_module_block_ids(
+    wd: str, stage: str, text: str, agent: str | None
+) -> tuple[dict[str, str], list[dict]]:
+    """F-41: o `<id>` de cada bloco tem que ser um item DO BATCH deste `--agent`.
+
+    Falha real: a LLM escreveu `=== MODULE: domain.event ===` (nome inventado, o
+    item era `quote-service\\src\\...\\domain\\event`). O merge aceitava qualquer
+    string, gravava `modules/domain-event.md` e marcava `domain.event` como
+    `done` — item fantasma. O item REAL nunca saía de `pending`, então
+    `items_complete` nunca virava `True` e o estágio ficava travado no blocker
+    "módulos não resolvidos", sem nada apontando a causa.
+
+    Devolve `(mapeamento_id_normalizado -> item_canônico, mapeados)`. O
+    mapeamento tolerante é determinístico e só cobre sufixo ÚNICO: id que não
+    casa com item nenhum, ou casa com mais de um, vira `MergeError` com a lista
+    dos itens válidos do batch. `FAILED MODULE` segue a mesma regra.
+
+    Sem plano de fan-out resolvível (arquivo ausente, batch não identificado
+    pelo `--agent`) a validação é no-op — merge manual/legado não regride.
+    """
+    items, _reason = _plan_batch_items(wd, stage, agent)
+    if items is None:
+        return {}, []
+    headers = _module_header_ids(text)
+    if not headers:
+        return {}, []
+    mapping: dict[str, str] = {}
+    mapeados: list[dict] = []
+    violacoes: list[dict] = []
+    for raw, kind in headers:
+        matches, mode = _match_plan_item(raw, items)
+        if len(matches) == 1:
+            canonical = matches[0]
+            if mode == "sufixo":
+                mapping[_normalize_item(raw)] = _normalize_item(canonical)
+                mapeados.append({
+                    "bloco": kind,
+                    "informado": raw,
+                    "item": canonical,
+                    "modo": "sufixo",
+                    "agent": (agent or "").strip() or None,
+                })
+            continue
+        violacoes.append({
+            "tipo": "id_de_bloco_ambiguo" if matches else "id_de_bloco_fora_do_batch",
+            "bloco": kind,
+            "informado": raw,
+            "candidatos": matches,
+            "agent": (agent or "").strip() or None,
+        })
+    if not violacoes:
+        return mapping, mapeados
+    total = len(violacoes)
+    shown = violacoes[:MAX_REPORTED_PLAN_ID_ERRORS]
+    lines = [
+        "id de bloco fora do batch do plano: "
+        + ", ".join(violacao["informado"] for violacao in shown)
+    ]
+    if total > len(shown):
+        lines[0] += f" (+{total - len(shown)} outro(s), total {total})"
+    for violacao in shown:
+        if violacao["candidatos"]:
+            lines.append(
+                f"- `{violacao['informado']}` ({violacao['bloco']}) casa com mais de um item "
+                "do batch: " + ", ".join(f"`{item}`" for item in violacao["candidatos"])
+            )
+        else:
+            lines.append(
+                f"- `{violacao['informado']}` ({violacao['bloco']}) não corresponde a nenhum "
+                "item do batch"
+            )
+    if total > len(shown):
+        lines.append(f"... {total - len(shown)} id(s) omitido(s) (total {total})")
+    lines.append(f"itens válidos do batch (--agent {(agent or '').strip() or 'não informado'}):")
+    lines.extend(f"  - {item}" for item in items[:MAX_LISTED_PLAN_ITEMS])
+    if len(items) > MAX_LISTED_PLAN_ITEMS:
+        lines.append(f"  ... {len(items) - MAX_LISTED_PLAN_ITEMS} item(ns) omitido(s)")
+    lines.append(f"acao: {PLAN_ID_ACTION}")
+    raise MergeError(
+        "\n".join(lines),
+        violacoes=shown,
+        violacoes_total=total,
+        acao=PLAN_ID_ACTION,
+    )
+
+
 MAX_REPORTED_OWNER_CONFLICTS = 10
 
 
@@ -1182,8 +1608,14 @@ def merge_agent_output(
     generated: list[str] = []
     blockers: list[str] = []
     warnings: list[dict] = []
+    mapeados: list[dict] = []
     if stage == "modules":
+        # F-41: valida os ids ANTES de parsear/gravar qualquer coisa — id
+        # inventado nunca chega a virar artefato nem item `done` fantasma.
+        id_mapping, mapeados = _validate_module_block_ids(wd, stage, text, agent)
         blocks = _parse_modules(text)
+        if id_mapping:
+            blocks = [(id_mapping.get(item, item), content) for item, content in blocks]
         _reject_duplicate_artifacts(wd, [item for item, _content in blocks])
         planned = [(_module_artifact(wd, item), item, content) for item, content in blocks]
         _reject_foreign_artifact_overwrite(
@@ -1255,5 +1687,6 @@ def merge_agent_output(
         "generated": generated,
         "blockers": blockers,
         "warnings": warnings,
+        "mapeados": mapeados,
         "manifest": manifest,
     }

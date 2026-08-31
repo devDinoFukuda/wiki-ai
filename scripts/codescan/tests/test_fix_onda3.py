@@ -243,6 +243,9 @@ class Onda3AIntegrationTest(unittest.TestCase):
         """Test (c): `integrate` com `--partial` → merge parcial ocorre."""
         _write(os.path.join(self.repo, "src", "payments", "PaymentService.java"), "class PaymentService {}\n")
         _write(os.path.join(self.repo, "src", "payments", "PaymentPolicy.java"), "class PaymentPolicy {}\n")
+        # Create a second module so we can have 2 batches with one module each
+        _write(os.path.join(self.repo, "src", "orders", "OrderService.java"), "class OrderService {}\n")
+        _write(os.path.join(self.repo, "src", "orders", "OrderPolicy.java"), "class OrderPolicy {}\n")
 
         code, _out, err = _run(self._argv("surface", "--module-min-files", "1"))
         self.assertEqual(code, 0, err)
@@ -258,9 +261,12 @@ class Onda3AIntegrationTest(unittest.TestCase):
         batches = payload.get("batches") or []
         self.assertGreaterEqual(len(batches), 2)
 
-        # Create output only for first batch
+        # Create output only for first batch - use the module id from the batch
         output_path_1 = batches[0].get("output")
-        agent_output = f"=== MODULE: src/payments ===\n{_module_doc()}\n=== END ===\n"
+        # Get the module id(s) for this batch from the manifest
+        batch_items_1 = batches[0].get("items") or []
+        first_module = batch_items_1[0] if batch_items_1 else "src"
+        agent_output = f"=== MODULE: {first_module} ===\n{_module_doc()}\n=== END ===\n"
         _write(output_path_1, agent_output)
 
         # Integrate with --partial should process the available batches

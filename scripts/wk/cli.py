@@ -3820,6 +3820,53 @@ def cmd_finish(a) -> int:
         passos.append({"passo": "workdir", "status": "falhou", "resumo": f"não encontrado: {a.workdir}"})
         return emit(2, parado_em="workdir", acao=f"confira o caminho de --workdir ({a.workdir!r})")
 
+    # 0) evidence — `verify` exige o evidence-pack já materializado; `finish`
+    # absorve o passo em vez de exigir que ele já tenha sido rodado à mão.
+    # Só roda quando `stages.evidence.status` do state.json do workdir ainda
+    # não é "done" (idempotente entre reexecuções de `finish`). Os dois
+    # subcomandos (gerar o pack + marcar o estágio concluído) são registrados
+    # como dois passos em `passos[]`, exatamente como os dois comandos que
+    # substituem (`wk code evidence --topic <t>` + `wk code done evidence`);
+    # falha em qualquer um dos dois para com `parado_em: "evidence"`. --------
+    evidence_state = (_state_json(workdir) or {}).get("stages", {}).get("evidence", {}) or {}
+    if evidence_state.get("status") == "done":
+        passos.append({
+            "passo": "evidence", "status": "ok (já feito)",
+            "resumo": "stages.evidence.status já é 'done' no workdir",
+        })
+    else:
+        code, out_text, err_text = _finish_capture(
+            codescan_main,
+            ["--store", store_root, "--repo", repo, "evidence", "--topic", topic],
+        )
+        evidence_payload = _finish_payload(out_text, err_text)
+        if code != 0:
+            passos.append({"passo": "evidence", "status": "falhou", "resumo": "falha ao gerar o evidence-pack"})
+            return emit(2, parado_em="evidence", acao=_finish_acao(
+                evidence_payload,
+                f"corrija o erro de `wk code --repo {repo} --store {store_root} evidence "
+                f"--topic {topic}` e rode `wk finish` de novo",
+            ))
+        passos.append({
+            "passo": "evidence", "status": "ok",
+            "resumo": (
+                f"{evidence_payload.get('items')} item(ns) | {len(evidence_payload.get('warnings') or [])} aviso(s)"
+            ) if evidence_payload else "evidence-pack gerado",
+        })
+
+        code, out_text, err_text = _finish_capture(
+            codescan_main, ["--store", store_root, "--repo", repo, "done", "evidence"],
+        )
+        evidence_done_payload = _finish_payload(out_text, err_text)
+        if code != 0:
+            passos.append({"passo": "evidence", "status": "falhou", "resumo": "falha ao marcar `done evidence`"})
+            return emit(2, parado_em="evidence", acao=_finish_acao(
+                evidence_done_payload,
+                f"corrija o erro de `wk code --repo {repo} --store {store_root} done evidence` "
+                "e rode `wk finish` de novo",
+            ))
+        passos.append({"passo": "evidence", "status": "ok", "resumo": "stage evidence marcado como done"})
+
     # 1) verify — confirmed.md sempre; inferred.md também, se existir (F-02: a
     # cobertura exige os dois para o stage `verify` virar `done`). ------------
     confirmed = os.path.join(workdir, "sdd", "confirmed.md")

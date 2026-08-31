@@ -108,8 +108,32 @@ class F42FinishVerifyFailsTests(unittest.TestCase):
         code, _out, err = _run(["store", "init", self.store])
         self.assertEqual(code, 0, err)
 
+    def _create_state_json_with_evidence_done(self):
+        """Cria state.json no workdir com evidence.status = 'done' (Onda 6D).
+
+        Onda 6D adicionou um passo 'evidence' antes de 'verify'. Este fixture
+        assegura que evidence já foi feito, para que o primeiro mock capture
+        seja realmente para verify (como os testes esperavam antes).
+        """
+        state_data = {
+            "stages": {
+                "evidence": {
+                    "status": "done",
+                    "done": [],
+                    "pending": [],
+                    "artifact": None
+                }
+            }
+        }
+        state_path = os.path.join(self.workdir, "state.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state_data, f)
+
     def test_finish_verify_fails_returns_exit_2(self):
         """finish com verify falhando → exit 2."""
+        # Criar state.json com evidence.status = "done" (Onda 6D)
+        self._create_state_json_with_evidence_done()
+
         # Criar workdir com confirmed.md vazio/inválido (sem claims válidas)
         sdd_dir = os.path.join(self.workdir, "sdd")
         os.makedirs(sdd_dir, exist_ok=True)
@@ -122,6 +146,7 @@ class F42FinishVerifyFailsTests(unittest.TestCase):
         # verify vai falhar porque confirmed.md não é válido
         with mock.patch("wk.cli._finish_capture") as mock_capture:
             # Fazer verify retornar erro (exit != 0)
+            # Com evidence já done, o primeiro call será verify
             mock_capture.return_value = (1, "", json.dumps({
                 "error": "confirme os claims com citações válidas"
             }))
@@ -144,10 +169,12 @@ class F42FinishVerifyFailsTests(unittest.TestCase):
             self.assertEqual(data["parado_em"], "verify")
             self.assertIn("acao", data)
             self.assertTrue(len(data["acao"]) > 0)
-            # Primeiro passo é verify falhado
+            # Primeiro passo deve ser evidence (já feito), depois verify (falhando)
             self.assertGreater(len(data["passos"]), 0)
-            self.assertEqual(data["passos"][0]["passo"], "verify")
-            self.assertEqual(data["passos"][0]["status"], "falhou")
+            # Procurar pelo passo verify que deve estar como "falhou"
+            verify_steps = [p for p in data["passos"] if p.get("passo") == "verify"]
+            self.assertGreater(len(verify_steps), 0)
+            self.assertEqual(verify_steps[0]["status"], "falhou")
         except json.JSONDecodeError:
             self.fail(f"Resposta não é JSON válido: out={out}, err={err}")
 
@@ -167,8 +194,27 @@ class F42FinishDecisionPointTests(unittest.TestCase):
         code, _out, err = _run(["store", "init", self.store])
         self.assertEqual(code, 0, err)
 
+    def _create_state_json_with_evidence_done(self):
+        """Cria state.json no workdir com evidence.status = 'done' (Onda 6D)."""
+        state_data = {
+            "stages": {
+                "evidence": {
+                    "status": "done",
+                    "done": [],
+                    "pending": [],
+                    "artifact": None
+                }
+            }
+        }
+        state_path = os.path.join(self.workdir, "state.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state_data, f)
+
     def test_finish_without_approve_stops_at_promote_exit_3(self):
         """finish SEM --approve → exit 3, parado_em='promote', pendentes[] preenchido."""
+        # Criar state.json com evidence.status = "done" (Onda 6D)
+        self._create_state_json_with_evidence_done()
+
         sdd_dir = os.path.join(self.workdir, "sdd")
         os.makedirs(sdd_dir, exist_ok=True)
         _write(
@@ -238,6 +284,9 @@ class F42FinishDecisionPointTests(unittest.TestCase):
 
     def test_finish_with_approve_calls_promote_with_approved_by(self):
         """finish COM --approve → promove com approved_by correto."""
+        # Criar state.json com evidence.status = "done" (Onda 6D)
+        self._create_state_json_with_evidence_done()
+
         sdd_dir = os.path.join(self.workdir, "sdd")
         os.makedirs(sdd_dir, exist_ok=True)
         _write(
@@ -327,8 +376,27 @@ class F42FinishDocxFailureTests(unittest.TestCase):
         code, _out, err = _run(["store", "init", self.store])
         self.assertEqual(code, 0, err)
 
+    def _create_state_json_with_evidence_done(self):
+        """Cria state.json no workdir com evidence.status = 'done' (Onda 6D)."""
+        state_data = {
+            "stages": {
+                "evidence": {
+                    "status": "done",
+                    "done": [],
+                    "pending": [],
+                    "artifact": None
+                }
+            }
+        }
+        state_path = os.path.join(self.workdir, "state.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state_data, f)
+
     def test_finish_docx_failure_does_not_change_exit_0(self):
         """finish com docx falhando → exit 0, status aviso para docx."""
+        # Criar state.json com evidence.status = "done" (Onda 6D)
+        self._create_state_json_with_evidence_done()
+
         sdd_dir = os.path.join(self.workdir, "sdd")
         os.makedirs(sdd_dir, exist_ok=True)
         _write(
@@ -415,8 +483,27 @@ class F42FinishLintNotAbortsTests(unittest.TestCase):
         code, _out, err = _run(["store", "init", self.store])
         self.assertEqual(code, 0, err)
 
+    def _create_state_json_with_evidence_done(self):
+        """Cria state.json no workdir com evidence.status = 'done' (Onda 6D)."""
+        state_data = {
+            "stages": {
+                "evidence": {
+                    "status": "done",
+                    "done": [],
+                    "pending": [],
+                    "artifact": None
+                }
+            }
+        }
+        state_path = os.path.join(self.workdir, "state.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state_data, f)
+
     def test_finish_lint_with_findings_does_not_abort(self):
         """finish com lint encontrando issues → exit 0, status aviso."""
+        # Criar state.json com evidence.status = "done" (Onda 6D)
+        self._create_state_json_with_evidence_done()
+
         sdd_dir = os.path.join(self.workdir, "sdd")
         os.makedirs(sdd_dir, exist_ok=True)
         _write(

@@ -16,11 +16,18 @@
   run-stage prepara manifesto determinístico para subagentes, sem gerar SDD
   run       composto: run-stage + handoff (prepara o fan-out e entrega o prompt)
   integrate composto: merge de todos os batches do manifesto + done do estágio
+  auto      laço: encadeia as ações determinísticas até a próxima parada real
   verify    valida Markdown confirmado contra citações arquivo:linha
   drift     compara o commit pinado no surface com o HEAD atual do repo
 
 `next --run` executa a próxima ação quando ela é determinística; decisão
 humana (config/pending) e passo de LLM continuam pedindo o comando explícito.
+
+`auto` vai além: encadeia TODAS as ações determinísticas (surface, export,
+config/pending quando as decisões vêm nas flags, plan, run, integrate,
+evidence, done) e só devolve o controle ao humano em três situações —
+decisão-chave (`decisao_humana`), colar o prompt na LLM (`fanout:<stage>`) e
+loop de erro (`intervencao`, mesma falha 2x seguidas na mesma etapa).
 Todo payload de `next`/`state`/`run`/`integrate`/`done` carrega `progresso`.
 
 O legado é READ-ONLY: nada é escrito dentro do repositório analisado.
@@ -1752,12 +1759,30 @@ def _write_stage_contract(wd: str, stage: str, st: dict) -> str:
     return path
 
 
+# Exigência de citação, LITERAL e com exemplo dos dois lados (válido/inválido).
+# O texto antigo ("🟢 confirmado (exige arquivo:linha)") era ambíguo: o
+# subagente lia "arquivo" como o nome do arquivo e escrevia `DomainEvent.java:5`
+# — basename que o gate de `verify`/`audit` reprova, porque não resolve para um
+# caminho real do repo. A regra canônica já está em
+# `sdd.COMPACT_AGENT_RULES`/`sdd` (`verde_exige_caminho_relativo_completo_da_raiz`);
+# aqui ela aparece na MESMA forma, no único texto que a LLM despachante lê.
+HANDOFF_CITACAO_REGRA = (
+    "CITAÇÃO: 🟢 confirmado exige citação com caminho relativo COMPLETO a partir da raiz do "
+    "repo, com /, exatamente como em evidence[].path do pack, seguido de :linha. "
+    "Exemplo VÁLIDO: "
+    "quote-service/src/main/java/br/com/acme/insurance/quote/domain/event/DomainEvent.java:5 "
+    "— INVÁLIDO: DomainEvent.java:5 (basename é reprovado no gate)."
+)
+
+
 def _handoff_prompt(stage: str, batches: list[dict], contract_path: str) -> str:
     """Prompt de despacho pronto para colar na LLM: despachante dispara um
     subagente por batch; cada subagente lê 2 arquivos e grava 1."""
     lines = [
         f"Fan-out do estágio {stage}. Você é despachante: NÃO analise o repositório você mesmo,",
         "NÃO gere conteúdo você mesmo, NÃO execute comandos, NÃO faça merge.",
+        "",
+        HANDOFF_CITACAO_REGRA,
         "",
         f"Dispare exatamente {len(batches)} subagente(s), um por batch, listas de itens disjuntas:",
         "",
@@ -1777,7 +1802,8 @@ def _handoff_prompt(stage: str, batches: list[dict], contract_path: str) -> str:
         "  Analise SOMENTE os itens do seu pack.",
         "  Escreva no caminho ESCREVA só blocos `=== <BLOCO>: <id> ===` … `=== END ===`, conforme o contrato.",
         "  Item impossível: bloco FAILED conforme o contrato.",
-        "  MARCADORES: 🟢 confirmado (exige arquivo:linha) · 🟡 inferido (justificativa) · 🔴 desconhecido (pergunta objetiva).",
+        "  MARCADORES: 🟢 confirmado · 🟡 inferido (justificativa) · 🔴 desconhecido (pergunta objetiva).",
+        f"  {HANDOFF_CITACAO_REGRA}",
         '  PROIBIDO no arquivo: código, diff, log, saída de comando, prosa fora de bloco, "Ran command", "Edited", "Wrote".',
         "  PT-BR técnico, sem preâmbulo, sem resumo, sem conclusão.",
         "  Devolva só: ARQUIVO: <caminho> / BLOCOS: <n> / BYTES: <n>",
@@ -2403,6 +2429,413 @@ def _next_run(a, payload: dict) -> int:
     if tail:
         sys.stdout.write(tail if tail.endswith("\n") else tail + "\n")
     return code
+
+
+# ---------------------------------------------------------------------------
+# `auto`: o laço determinístico do pipeline.
+#
+# `next --run` executa NO MÁXIMO uma ação por invocação — o humano volta ao
+# teclado depois de cada `export`, `plan`, `done`... `auto` encadeia todas as
+# ações determinísticas seguidas e só devolve o controle nas três situações em
+# que o humano é REALMENTE necessário:
+#
+#   1. decisão-chave (`decisao_humana`): doc_level/granularity, unidades de
+#      `specs`. Quando essas decisões vêm nas flags (`--doc-level`,
+#      `--granularity`, `--specs-items`), `auto` grava a config/pendência ele
+#      mesmo e NÃO para — cada flag elimina uma parada;
+#   2. colar o prompt na LLM (`fanout:<stage>`): o único passo que o CLI não
+#      pode executar. `auto` imprime o prompt e para; na reinvocação, se os
+#      outputs do manifesto já existem, ele retoma do `integrate`;
+#   3. loop de erro (`intervencao`): a MESMA falha duas vezes seguidas na mesma
+#      etapa. Aí insistir é desperdício — devolve o payload de erro original
+#      completo (com `comandos_redo` quando existe) e para.
+#
+# Nada aqui reimplementa a máquina de estados: o próximo passo sai de
+# `_next_payload`/`_next_dispatch`, e cada ação é a MESMA `fn` que o argparse
+# chamaria, com o mesmo namespace — todo gate continua valendo porque é
+# literalmente o mesmo código executando.
+# ---------------------------------------------------------------------------
+
+# Teto duro de ações por invocação: nenhuma recursão, nenhum laço infinito.
+# Alto o suficiente para um pipeline inteiro entre dois fan-outs, baixo o
+# suficiente para que um ciclo patológico morra em segundos.
+AUTO_MAX_ACOES = 30
+
+# Quantas vezes a MESMA assinatura de erro pode aparecer na mesma etapa antes
+# de o laço parar e chamar o humano. 2 = "errou, tentou de novo, errou igual".
+AUTO_MAX_TENTATIVAS = 2
+
+# Quantas execuções BEM-SUCEDIDAS e idênticas seguidas contam como laço parado
+# (a ação sai 0 mas o pipeline não anda). Ver o guarda em `cmd_auto`.
+AUTO_MAX_REPETICOES = 3
+
+
+def _auto_error_signature(stage: str | None, error: str) -> str:
+    """Assinatura estável de um erro: hash de (etapa + mensagem).
+
+    É o que distingue "erro novo" (o pipeline andou, achou outro problema) de
+    "mesmo erro de novo" (o laço está batendo na mesma parede). Só a mensagem
+    entra no hash — nunca timestamps ou caminhos de tmp, que mudariam a
+    assinatura a cada execução e neutralizariam a guarda.
+    """
+    base = f"{stage or '-'}\n{(error or '').strip()}"
+    return hashlib.sha1(base.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _auto_reset_tentativas(wd: str) -> None:
+    """`--retry`: zera o contador de tentativas (o humano interveio)."""
+    with st_mod._lock(wd):
+        st = st_mod.load(wd)
+        if not st:
+            return
+        st["auto"] = {"erros": {}, "reset_em": st_mod._now()}
+        st_mod.save(wd, st)
+
+
+def _auto_clear_error(wd: str, stage: str | None) -> None:
+    """Ação da etapa passou: a assinatura anterior não conta mais como
+    'seguida'. Sem isto, um erro resolvido continuaria armado e a próxima
+    falha diferente já cairia direto em `intervencao`."""
+    if not stage:
+        return
+    with st_mod._lock(wd):
+        st = st_mod.load(wd)
+        if not st:
+            return
+        erros = ((st.get("auto") or {}).get("erros") or {})
+        if stage in erros:
+            erros.pop(stage)
+            st.setdefault("auto", {})["erros"] = erros
+            st_mod.save(wd, st)
+
+
+def _auto_record_error(wd: str, stage: str | None, error: str) -> dict:
+    """Registra a falha em `state.json` (`auto.erros[<stage>]`) e devolve
+    `{assinatura, tentativas}`. Persistir é o ponto: a 2ª tentativa quase
+    sempre acontece em OUTRA invocação do CLI (o humano roda `auto` de novo),
+    então um contador em memória nunca veria a repetição."""
+    key = stage or "-"
+    assinatura = _auto_error_signature(stage, error)
+    tentativas = 1
+    with st_mod._lock(wd):
+        st = st_mod.load(wd)
+        if not st:
+            return {"assinatura": assinatura, "tentativas": tentativas}
+        auto = st.setdefault("auto", {})
+        erros = auto.setdefault("erros", {})
+        anterior = erros.get(key) or {}
+        if anterior.get("assinatura") == assinatura:
+            tentativas = int(anterior.get("tentativas") or 0) + 1
+        erros[key] = {
+            "assinatura": assinatura,
+            "tentativas": tentativas,
+            "mensagem": (error or "")[:500],
+            "em": st_mod._now(),
+        }
+        st_mod.save(wd, st)
+    return {"assinatura": assinatura, "tentativas": tentativas}
+
+
+def _auto_finish_action(a, wd: str, st: dict | None) -> str:
+    topic = (st or {}).get("topic") or getattr(a, "topic", None) or "<topic>"
+    return (
+        "pipeline do `wk code` completo (synth fechado): rode "
+        f'`wk finish --workdir "{wd}" --topic "{topic}" --repo "{a.repo}" '
+        f'--store "{a.store}" --approved-by <voce> --approve` '
+        "para verify+audit+publish+promote+compile+index"
+    )
+
+
+AUTO_FANOUT_ACAO = (
+    "cole o prompt na LLM; quando os outputs existirem, rode `wk code auto` de novo "
+    "(ele continua do integrate)"
+)
+
+
+def _auto_stage_state(st: dict | None, stage: str | None) -> dict:
+    return ((st or {}).get("stages") or {}).get(stage or "") or {}
+
+
+def _auto_plan(a, payload: dict, st: dict | None, wd: str):
+    """Próxima ação do laço: `(rotulo, fn, args, stage)` para executar, ou um
+    dict de PARADA (`parado_em`/`motivo`/`acao`).
+
+    A ordem espelha `_next_dispatch` (mesma máquina de estados); as únicas
+    diferenças são os pontos onde `auto` pode agir sozinho: roda `surface`
+    (o tópico vem de `--topic`), grava `config`/`pending` quando as flags
+    trazem a decisão, e reexecuta o `done` de um estágio com erro registrado
+    em vez de só reportá-lo.
+    """
+    stage = payload.get("proximo")
+
+    # 1) Estágio 1: sem estado ou surface ainda aberto.
+    if not st or not _surface_done(st):
+        if not (getattr(a, "topic", None) or (st or {}).get("topic")):
+            return {
+                "parado_em": "decisao_humana",
+                "motivo": "o tópico do wiki-ai não é dedutível do repositório",
+                "acao": "rode `wk code auto --topic <slug>` (o auto varre o repo e segue sozinho)",
+            }
+        return ("surface", cmd_surface, _derived_args(
+            a, topic=getattr(a, "topic", None), module_min_files=3, since=None,
+        ), "surface")
+
+    # 2) Fim do pipeline do `wk code`: `synth` fechado. `verify` fica de fora
+    #    de propósito — ele roda dentro do `wk finish`, com o artefato certo.
+    if stage is None or _auto_stage_state(st, "synth").get("status") == "done":
+        return {
+            "parado_em": "pipeline_completo",
+            "motivo": "todos os estágios SDD fechados",
+            "acao": _auto_finish_action(a, wd, st),
+        }
+
+    # 3) `export` é determinístico e obrigatório no estágio 1, mas nunca é o
+    #    `proximo` da máquina de estados (não é stage) — mesmo ramo do
+    #    `_next_dispatch`, replicado aqui para vir ANTES do gate de config.
+    if not _nonempty(_sdd(wd, "inventory.md")):
+        name, fn, args = _next_command(a, "export")
+        args.topic = getattr(a, "topic", None)
+        return (name, fn, args, None)
+
+    # 4) Decisão-chave nº 1: doc_level/granularity. Com as flags, o auto grava.
+    if stage == "config":
+        missing = _missing_sdd_config(st)
+        supplied = set()
+        if getattr(a, "doc_level", None):
+            supplied.add("sdd.doc_level")
+        if getattr(a, "granularity", None):
+            supplied.add("sdd.granularity")
+        if set(missing) <= supplied:
+            return ("config", cmd_config, _derived_args(
+                a, doc_level=a.doc_level, granularity=a.granularity,
+            ), "config")
+        return {
+            "parado_em": "decisao_humana",
+            "motivo": "config SDD é decisão-chave: nível de documentação e granularidade",
+            "missing": missing,
+            "acao": (
+                "rode `wk code auto --doc-level <essencial|completo|detalhado> "
+                "--granularity <module|endpoint|use-case|hybrid|feature>` — "
+                "o auto grava a config e segue sem parar de novo aqui"
+            ),
+        }
+
+    s = _auto_stage_state(st, stage)
+
+    # 5) Erro já registrado no estado: REEXECUTA o `done` do estágio. Só
+    #    reportar o blocker travaria o laço para sempre depois que o humano
+    #    corrigisse o artefato; reexecutando, o gate decide de novo, e se
+    #    falhar igual a guarda de erro conta a repetição.
+    if s.get("last_error") and stage in sdd_mod.CRITICAL_STAGES:
+        return ("done " + stage, cmd_done, _derived_args(
+            a, stage=stage, item=None, artifact=None,
+        ), stage)
+
+    # 6) Decisão-chave nº 2: as unidades de `specs`. Com --specs-items, grava.
+    if (
+        stage in st_mod.ITEM_STAGES_REQUIRE_FINALIZE
+        and stage != "modules"
+        and not s.get("pending")
+        and not (s.get("done") or [])
+    ):
+        items = (getattr(a, "specs_items", None) or "").strip()
+        if items:
+            return ("pending " + stage, cmd_pending, _derived_args(
+                a, stage=stage, items=items,
+            ), stage)
+        return {
+            "parado_em": "decisao_humana",
+            "motivo": f"as unidades do estágio {stage} são decisão-chave do humano",
+            "acao": (
+                f'rode `wk code auto --specs-items "a,b"` (o auto registra as pendências '
+                f"de {stage} e segue) — ou `pending {stage} --items a,b`"
+            ),
+        }
+
+    # 7) `evidence`: gera o pacote e fecha o estágio.
+    if stage == "evidence" and s.get("status") != "done":
+        artifact = str(s.get("artifact") or "")
+        if artifact and _nonempty(artifact):
+            return ("done evidence", cmd_done, _derived_args(
+                a, stage="evidence", item=None, artifact=None,
+            ), "evidence")
+        name, fn, args = _next_command(a, "evidence")
+        args.topic = getattr(a, "topic", None)
+        return (name, fn, args, "evidence")
+
+    # 8) Resto (plan / run / integrate / done): a máquina de estados canônica.
+    plan = _next_dispatch(a, payload)
+    if isinstance(plan, dict):
+        bloqueado = plan.get("bloqueado_em")
+        if bloqueado == "pipeline_completo":
+            return {
+                "parado_em": "pipeline_completo",
+                "motivo": "todos os estágios SDD fechados",
+                "acao": _auto_finish_action(a, wd, st),
+            }
+        if bloqueado == "outputs_de_subagente_ausentes":
+            # Fan-out já preparado numa invocação anterior e ainda sem outputs:
+            # mesma parada do `run`, com o prompt reimpresso.
+            return {
+                "parado_em": f"fanout:{stage}",
+                "motivo": f"os outputs dos subagentes de {stage} ainda não existem",
+                "acao": AUTO_FANOUT_ACAO,
+                "faltantes": plan.get("faltantes") or [],
+                "_handoff": stage,
+            }
+        return {
+            "parado_em": "decisao_humana",
+            "motivo": plan.get("bloqueado_em") or "passo não determinístico",
+            "acao": plan.get("acao") or "",
+        }
+    name, fn, args = plan
+    rotulo = f"{name} {stage}" if name in ("run", "integrate", "done") else name
+    return (rotulo, fn, args, stage)
+
+
+def _auto_envelope(wd: str, base: dict, executados: list[str], stage: str | None) -> dict:
+    """Toda saída do `auto` carrega `executados[]` (o que ESTA invocação rodou)
+    e `progresso` — os dois campos que respondem "o que aconteceu" e "onde eu
+    estou" sem uma segunda invocação para descobrir."""
+    out = {k: v for k, v in base.items() if not k.startswith("_")}
+    out["executados"] = list(executados)
+    out["progresso"] = _progresso(wd, st_mod.load(wd), stage)
+    return out
+
+
+def _auto_print(payload: dict, prompt: str = "", stream=None) -> None:
+    """Uma linha JSON compacta e, abaixo dela, o prompt cru quando existe
+    (mesmo contrato de saída do `run`: `head -1` sempre parseia)."""
+    stream = stream or sys.stdout
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), file=stream)
+    if prompt:
+        sys.stdout.write(prompt if prompt.endswith("\n") else prompt + "\n")
+
+
+def _auto_handoff_prompt(a, stage: str) -> str:
+    """Reimprime o prompt de despacho de um fan-out já preparado."""
+    code, out_text, _err = _capture(cmd_handoff, _derived_args(a, stage=stage))
+    return out_text if code == 0 else ""
+
+
+def _auto_error_stop(a, wd: str, stage: str | None, rotulo: str,
+                     code: int, out_text: str, err_text: str,
+                     executados: list[str]) -> int:
+    """Falha de uma ação: conta a repetição e decide entre 'tenta de novo na
+    próxima invocação' e 'chama o humano'."""
+    original, _tail = _split_json_prefix(err_text or out_text)
+    if original is None:
+        original = {"error": (err_text or out_text).strip() or f"falha em `{rotulo}`"}
+    mensagem = str(original.get("error") or "")
+    guarda = _auto_record_error(wd, stage or rotulo, mensagem)
+    tentativas = guarda["tentativas"]
+    comandos_redo = original.get("comandos_redo") or []
+
+    if tentativas >= AUTO_MAX_TENTATIVAS:
+        acao = (
+            f"INTERVENÇÃO HUMANA: o mesmo erro se repetiu {tentativas}x na etapa "
+            f"{stage or rotulo} — o laço parou em vez de insistir. "
+        )
+        if comandos_redo:
+            acao += "Rode o(s) redo e refaça o passo: " + " ; ".join(comandos_redo) + ". "
+        acao += (
+            f"Ou corrija o que `erro` aponta (ex.: reescrever o output do subagente) "
+            f"e rode `wk code auto --retry` para zerar o contador. "
+            f"Ação original do passo: {original.get('acao') or 'ver `erro`'}"
+        )
+        payload = {
+            "parado_em": "intervencao",
+            "motivo": f"mesmo erro {tentativas}x seguidas em `{rotulo}`",
+            "erro": original,
+            "tentativas": tentativas,
+            "assinatura": guarda["assinatura"],
+            "acao": acao,
+        }
+    else:
+        payload = {
+            "parado_em": "erro",
+            "motivo": f"`{rotulo}` falhou (1ª vez com esta assinatura)",
+            "erro": original,
+            "tentativas": tentativas,
+            "assinatura": guarda["assinatura"],
+            "acao": (
+                (original.get("acao") or "corrija o erro e rode `wk code auto` de novo")
+                + " — na próxima repetição idêntica o auto para em `intervencao`"
+            ),
+        }
+    _auto_print(_auto_envelope(wd, payload, executados, stage), stream=sys.stderr)
+    return code or 2
+
+
+def cmd_auto(a) -> int:
+    """Encadeia as ações determinísticas até bater numa parada real.
+
+    Exit 0 nas paradas previstas (`decisao_humana`, `fanout:<stage>`,
+    `pipeline_completo`, `limite_de_acoes`); exit 2 quando uma ação falhou
+    (`erro`), quando a falha se repetiu e exige humano (`intervencao`) ou
+    quando o laço deixou de andar (`sem_progresso`).
+    """
+    wd = _wd(a)
+    if getattr(a, "retry", False):
+        _auto_reset_tentativas(wd)
+    executados: list[str] = []
+
+    for _ in range(AUTO_MAX_ACOES):
+        st = st_mod.load(wd)
+        payload = _next_payload(a)
+        plano = _auto_plan(a, payload, st, wd)
+
+        if isinstance(plano, dict):
+            stage_hint = plano.get("_handoff") or payload.get("proximo")
+            prompt = _auto_handoff_prompt(a, plano["_handoff"]) if plano.get("_handoff") else ""
+            _auto_print(_auto_envelope(wd, plano, executados, stage_hint), prompt)
+            return 0
+
+        rotulo, fn, args, stage = plano
+        code, out_text, err_text = _capture(fn, args)
+        if code != 0:
+            return _auto_error_stop(a, wd, stage, rotulo, code, out_text, err_text, executados)
+
+        executados.append(rotulo)
+        _auto_clear_error(wd, stage)
+
+        # Ação que "passa" mas não move a máquina de estados (ex.: um `export`
+        # que sai 0 sem produzir `inventory.md`) repetiria para sempre até o
+        # teto — e cada repetição custa uma varredura do repo. Três iguais
+        # seguidas já provam que o laço não está andando.
+        if len(executados) >= AUTO_MAX_REPETICOES and len(set(executados[-AUTO_MAX_REPETICOES:])) == 1:
+            parada = {
+                "parado_em": "sem_progresso",
+                "motivo": (
+                    f"`{rotulo}` rodou {AUTO_MAX_REPETICOES}x seguidas com exit 0 sem "
+                    "mudar o próximo passo do pipeline"
+                ),
+                "acao": (
+                    f"rode `state` e `next` para ver por que `{rotulo}` não avança "
+                    "(artefato esperado não foi escrito?); corrija e rode `wk code auto` de novo"
+                ),
+            }
+            _auto_print(_auto_envelope(wd, parada, executados, stage), stream=sys.stderr)
+            return 2
+
+        # `run <stage>` preparou o fan-out: aqui o CLI acaba e a LLM começa.
+        if rotulo.startswith("run "):
+            _prep, prompt = _split_json_prefix(out_text)
+            parada = {
+                "parado_em": f"fanout:{stage}",
+                "motivo": f"fan-out de {stage} preparado; o passo seguinte é de LLM",
+                "acao": AUTO_FANOUT_ACAO,
+            }
+            _auto_print(_auto_envelope(wd, parada, executados, stage), prompt)
+            return 0
+
+    parada = {
+        "parado_em": "limite_de_acoes",
+        "motivo": f"teto de {AUTO_MAX_ACOES} ações por invocação atingido (proteção contra laço)",
+        "acao": "rode `wk code auto` de novo; se o teto voltar a bater sem progresso, rode `state` e investigue",
+    }
+    _auto_print(_auto_envelope(wd, parada, executados, None))
+    return 0
 
 
 _EXPORT_GUARDED_STORE_SUBDIRS = ("raw", "wiki")
@@ -3398,6 +3831,35 @@ def main(argv=None) -> int:
         help="opt-in: integra só os batches cujo output já existe (sem isso, output faltando aborta antes do 1º merge)",
     )
     ig.set_defaults(fn=cmd_integrate)
+
+    au_to = sub.add_parser(
+        "auto",
+        help=(
+            "laço: encadeia as ações determinísticas até a próxima parada real "
+            "(decisão-chave, colar o prompt na LLM, ou loop de erro)"
+        ),
+    )
+    au_to.add_argument(
+        "--topic", help="tópico do wiki-ai; permite ao auto rodar o `surface` sozinho",
+    )
+    au_to.add_argument(
+        "--doc-level", choices=("essencial", "completo", "detalhado"),
+        help="decisão de config antecipada: com ela (e --granularity) o auto grava a config e não para",
+    )
+    au_to.add_argument(
+        "--granularity",
+        choices=("module", "endpoint", "use-case", "hybrid", "feature", "custom"),
+        help="decisão de config antecipada: com ela (e --doc-level) o auto grava a config e não para",
+    )
+    au_to.add_argument(
+        "--specs-items",
+        help='unidades do estágio specs ("a,b"): com elas o auto registra as pendências e não para',
+    )
+    au_to.add_argument(
+        "--retry", action="store_true",
+        help="zera o contador de tentativas da guarda de loop de erro (o humano interveio)",
+    )
+    au_to.set_defaults(fn=cmd_auto)
 
     au = sub.add_parser("audit", help="mede qualidade SDD sem alterar estado")
     au.add_argument("stage_pos", nargs="?", choices=sdd_mod.CRITICAL_STAGES)

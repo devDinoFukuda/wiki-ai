@@ -347,9 +347,14 @@ COMPACT_AGENT_RULES = (
     "nao_repetir_contexto",
     "tabelas_densas_quando_comparar",
     "bullets_rastreaveis_com_marcador_confiana",
-    "verde_exige_arquivo_linha",
+    "verde_exige_caminho_relativo_completo_da_raiz (ex. válido: `src/quote/DomainEvent.java:5`; "
+    "ex. inválido: `DomainEvent.java:5` — basename sozinho não confere, use o mesmo formato de "
+    "`evidence[].path` do pack)",
     "amarelo_exige_justificativa",
     "vermelho_exige_pergunta_objetiva",
+    "entidades_tipos_entre_crases_em_estruturas_de_dados (ex.: `Quote`) — não é eco de código; "
+    "a proibição de eco cobre trecho/linha de código, não identificador entre crases; "
+    "alimenta sdd/data-dictionary.md",
 )
 
 
@@ -474,7 +479,9 @@ def brief(wd: str, stage: str, st: dict) -> dict:
     base = [
         "PT-BR técnico, denso e sem prosa decorativa.",
         "Use tabelas/listas curtas para reduzir tokens sem perder informação.",
-        "Toda afirmação confirmada exige arquivo:linha.",
+        "Toda afirmação confirmada exige caminho relativo COMPLETO da raiz do repo, com '/', "
+        "+ linha (mesmo formato de `evidence[].path` do pack) — ex. válido: "
+        "`src/quote/DomainEvent.java:5`; ex. inválido: `DomainEvent.java:5` (basename não confere).",
         "Não substitua a árvore SDD por confirmed.md/inferred.md.",
         "Subagentes devem receber agent-pack; nunca copie o repo para store/.codescan.",
         "Se não cumprir score >=90, declare blocked/failed/degraded.",

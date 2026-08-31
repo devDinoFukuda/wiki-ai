@@ -250,7 +250,12 @@ def build_agent_pack(
         "rules": [
             "PT-BR tecnico; sem prosa metodologica; sem eco de comando/log/diff/codigo.",
             "Nao copie o repo para store/.codescan; use somente evidencias deste pack.",
-            "Confirmacao exige citacao path:linha presente em signals.",
+            "Confirmacao exige citacao com caminho relativo COMPLETO da raiz do repo, com '/', "
+            "+ linha, igual ao formato de evidence[].path deste pack (nao use basename); "
+            "ex. valido: src/quote/DomainEvent.java:5; ex. invalido: DomainEvent.java:5.",
+            "Nomes de entidade/tipo na secao 'Estruturas de dados' vao entre crases (ex.: `Quote`); "
+            "isso nao e eco de codigo (eco proibido e trecho/linha de codigo, nao identificador "
+            "entre crases); alimenta sdd/data-dictionary.md.",
             "Evidencia insuficiente deve virar FAILED MODULE com leitura adicional pontual.",
         ],
         "modules": packed_modules,
@@ -398,7 +403,12 @@ def build_stage_pack(
         "rules": [
             "PT-BR tecnico; sem prosa metodologica; sem eco de comando/log/diff/codigo.",
             "Nao copie o repo para store/.codescan; use somente evidencias deste pack.",
-            "Confirmacao exige citacao path:linha presente nas sources deste pack.",
+            "Confirmacao exige citacao com caminho relativo COMPLETO da raiz do repo, com '/', "
+            "+ linha, igual ao formato de sources[].path deste pack (nao use basename); "
+            "ex. valido: src/quote/DomainEvent.java:5; ex. invalido: DomainEvent.java:5.",
+            "Nomes de entidade/tipo na secao 'Estruturas de dados' vao entre crases (ex.: `Quote`); "
+            "isso nao e eco de codigo (eco proibido e trecho/linha de codigo, nao identificador "
+            "entre crases); alimenta sdd/data-dictionary.md.",
             "Evidencia insuficiente deve virar FAILED <TIPO> com leitura adicional pontual.",
         ],
         "sources": packed_sources,
