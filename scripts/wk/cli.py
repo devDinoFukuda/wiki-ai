@@ -368,6 +368,112 @@ def _check_permission_settings(
     return (not problems), problems, acao
 
 
+# ---------- init: slash command /wk-flow (claude-code) ----------
+#
+# `codescan.pilot` já sabe montar o prompt-mestre e envelopá-lo como slash
+# command (`render_wk_flow_command`/`WK_FLOW_COMMAND_FILENAME`); aqui só
+# decidimos ONDE gravar (mesma raiz `.claude/` de `.claude/settings.json`,
+# ver `_settings_targets`) e mantemos a escrita idempotente/atômica. Import
+# tardio de `codescan.pilot` pelo mesmo motivo dos outros imports de
+# `codescan` neste arquivo (ver `cmd_finish`/`cmd_verify`): os dois pacotes
+# convivem no mesmo `.pyz`, mas importar no topo criaria uma dependência
+# rígida entre os dois CLIs.
+
+WK_FLOW_ACAO = (
+    "rode wk init --engine claude-code --store <store> --repo <repo> "
+    "para gravar/atualizar o slash command /wk-flow"
+)
+
+
+def _wk_flow_target(base: str) -> str:
+    """Caminho de `.claude/commands/wk-flow.md` — mesma raiz `.claude/` onde
+    `init` grava/ajusta `settings.json` para a engine claude-code."""
+    from codescan.pilot import WK_FLOW_COMMAND_FILENAME
+
+    return os.path.abspath(os.path.join(base, ".claude", "commands", WK_FLOW_COMMAND_FILENAME))
+
+
+def _resolve_wk_flow_pyz() -> str:
+    """Caminho do `wk.pyz`/entrypoint equivalente para o slash command.
+    Reaproveita `codescan.pilot._resolve_pyz` (mesma resolução usada por
+    `wk code pilot --command-file`) quando importável; fallback literal
+    mantém o texto legível mesmo sem o módulo disponível."""
+    try:
+        from codescan.pilot import _resolve_pyz as _codescan_resolve_pyz
+    except ImportError:
+        return "wk.pyz"
+    return _codescan_resolve_pyz()
+
+
+def _render_wk_flow(store_abs: str | None, repo_abs: str | None) -> str:
+    """Slash command `/wk-flow` com os caminhos resolvidos. `store`/`repo`
+    ausentes viram placeholders legíveis (`<store>`/`<repo>`) — o arquivo
+    ainda é útil sem eles e `check`/`doctor` cobram a atualização assim que
+    houver contexto real."""
+    from codescan.pilot import render_wk_flow_command
+
+    return render_wk_flow_command(
+        python=sys.executable or "python",
+        pyz=_resolve_wk_flow_pyz(),
+        store=store_abs or "<store>",
+        repo=repo_abs or "<repo>",
+    )
+
+
+def _write_atomic(path: str, text: str) -> None:
+    """Escreve `path` atomicamente (tmp no mesmo diretório + `os.replace`) —
+    nunca deixa um arquivo pela metade se o processo for interrompido no
+    meio da escrita."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".wk-flow-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
+def _write_wk_flow_command(base: str, store_abs: str | None, repo_abs: str | None) -> dict:
+    """Grava (idempotente, atômico) o slash command `/wk-flow`. `status`:
+    `criado` | `atualizado` | `ok` (já idêntico — não regrava)."""
+    target = _wk_flow_target(base)
+    expected = _render_wk_flow(store_abs, repo_abs)
+    existed = os.path.exists(target)
+    if existed:
+        try:
+            with open(target, encoding="utf-8") as f:
+                current = f.read()
+        except OSError:
+            current = None
+        if current == expected:
+            return {"status": "ok", "caminho": target}
+    _write_atomic(target, expected)
+    return {"status": "atualizado" if existed else "criado", "caminho": target}
+
+
+def _check_wk_flow_command(
+    base: str, store_abs: str | None, repo_abs: str | None
+) -> tuple[bool, list[str], str | None]:
+    """(ok, problemas, acao) do slash command `/wk-flow` — mesmo formato de
+    `_check_permission_settings`."""
+    target = _wk_flow_target(base)
+    if not os.path.exists(target):
+        return False, ["wk-flow ausente"], WK_FLOW_ACAO
+    try:
+        with open(target, encoding="utf-8") as f:
+            current = f.read()
+    except OSError:
+        return False, ["wk-flow ilegível"], WK_FLOW_ACAO
+    expected = _render_wk_flow(store_abs, repo_abs)
+    if current != expected:
+        return False, ["wk-flow desatualizado (conteúdo difere do render atual)"], WK_FLOW_ACAO
+    return True, [], None
+
+
 def cmd_init(a) -> int:
     manifest = _docs_manifest()
     if "skill" not in manifest:
@@ -392,9 +498,13 @@ def cmd_init(a) -> int:
             return 1  # conflito já reportado em stderr
         result["alvos"].append(report)
 
+    store_abs = os.path.abspath(a.store) if a.store else None
+    repo_abs = os.path.abspath(a.repo) if a.repo else None
+
+    if "claude-code" in engines:
+        result["comando_wk_flow"] = _write_wk_flow_command(a.base, store_abs, repo_abs)
+
     if a.store or a.repo:
-        store_abs = os.path.abspath(a.store) if a.store else None
-        repo_abs = os.path.abspath(a.repo) if a.repo else None
         permissoes = []
         for target in _settings_targets(engines, a.base):
             report = _write_permission_settings(target, store_abs, repo_abs)
@@ -485,6 +595,17 @@ def cmd_check(a) -> int:
                 entry["aviso"] = aviso
             config_report.append(entry)
         out["config_permissoes"] = config_report
+
+        if "claude-code" in engines:
+            # Diagnóstico, não portão: assim como a checagem de frescor do
+            # `.pyz` (ver `_check_pyz_freshness`), o wk-flow nunca entra em
+            # `dirty`/afeta o exit code de `check` — ausência/desatualização
+            # vira aviso com `acao`, e `doctor` espelha a mesma regra.
+            ok, problems, acao = _check_wk_flow_command(a.base, store_abs, repo_abs)
+            wk_flow_entry = {"path": _wk_flow_target(a.base), "ok": ok, "problemas": problems}
+            if acao:
+                wk_flow_entry["acao"] = acao
+            out["comando_wk_flow"] = wk_flow_entry
     else:
         # Sem --store/--repo não há o que validar; a chave continua presente
         # (silêncio aqui é o que fazia gente achar que a permissão tinha sido
@@ -496,6 +617,14 @@ def cmd_check(a) -> int:
                 f"wk check --engine {a.engine} --store <store> --repo <repo>"
             ),
         }
+        if "claude-code" in engines:
+            out["comando_wk_flow"] = {
+                "estado": "nao_verificado",
+                "aviso": (
+                    f"informe --store/--repo para validar: "
+                    f"wk check --engine {a.engine} --store <store> --repo <repo>"
+                ),
+            }
 
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 1 if dirty else 0
@@ -759,9 +888,28 @@ def cmd_doctor(a) -> int:
                     "é comprovadamente consumido por ela; best-effort, não "
                     "garantia"
                 )
+            if "claude-code" in engines_resolved:
+                # Diagnóstico, não portão (mesmo racional de `_check_pyz_freshness`
+                # em FIX 5): não entra em `bloqueios`/exit code — só aviso com
+                # `acao`, espelhando `cmd_check`.
+                wk_flow_ok, wk_flow_problems, wk_flow_acao = _check_wk_flow_command(
+                    a.base, store_abs, repo_abs
+                )
+                wk_flow_entry = {
+                    "path": _wk_flow_target(a.base),
+                    "ok": wk_flow_ok,
+                    "problemas": wk_flow_problems,
+                }
+                if wk_flow_acao:
+                    wk_flow_entry["acao"] = wk_flow_acao
+                engine_info["comando_wk_flow"] = wk_flow_entry
         else:
             engine_info["config_permissoes"] = "nao_verificado (informe --store/--repo p/ validar)"
             engine_info["permissao_garantida"] = False
+            if "claude-code" in engines_resolved:
+                engine_info["comando_wk_flow"] = (
+                    "nao_verificado (informe --store/--repo p/ validar)"
+                )
 
     skill_map = engine_info.get("skill_instalada")
     skill_completa = isinstance(skill_map, dict) and bool(skill_map) and all(skill_map.values())

@@ -11,9 +11,9 @@ Seis fluxos operacionais. Cada um é uma tabela sequencial: você executa a linh
 | Símbolo | Quem | O que significa |
 |---|---|---|
 | 👤 | humano | executa o comando no terminal. Tudo que é determinístico é do humano |
-| 🤖 | LLM | **colar o prompt impresso pelo `wk` numa sessão de agente COM ACESSO AO DISCO desta máquina** (ex.: Claude Code, ou a engine configurada no FLUXO 0), aberta em qualquer pasta. Nunca um chat web sem acesso a arquivos — os subagentes precisam LER packs e GRAVAR outputs em caminhos locais. Usada SOMENTE onde há análise de conteúdo: fan-out de codebase, análise de asset binário, síntese de resposta |
+| 🤖 | LLM | **colar o prompt impresso pelo `wk` numa sessão de agente COM ACESSO AO DISCO desta máquina** (ex.: Claude Code, ou a engine configurada no FLUXO 0), aberta em qualquer pasta. Nunca um chat web sem acesso a arquivos — os subagentes precisam LER packs e GRAVAR outputs em caminhos locais. Usada SOMENTE onde há análise de conteúdo: análise de asset binário, síntese de resposta, e o modo manual (avançado) do FLUXO 3 |
 
-A LLM não executa nenhum comando `wk`. Todo insumo que ela precisa (o que analisar, onde gravar, em que formato) é gerado antes, por script, pelo humano.
+A LLM não executa nenhum comando `wk`, exceto no modo piloto do FLUXO 3, onde a própria LLM despachante roda `wk code auto`/`integrate` dentro do laço (§4.1) — em todo o resto, todo insumo que a LLM precisa (o que analisar, onde gravar, em que formato) é gerado antes, por script, pelo humano.
 
 ### Variáveis usadas em todos os comandos
 
@@ -32,9 +32,9 @@ WK_TOPIC="codebases/nome-do-repo"
 | P# | Quem | O que fazer | O que acontece | Deu certo quando |
 |---|---|---|---|---|
 | P1 | 👤 | `$WKPY "$WK" doctor --store "$WK_STORE" --repo "$WK_REPO" --engine claude-code` | diagnostica shell, python, `wk`, store, repo, engine | lista de `bloqueios` (pode vir cheia — é o retrato inicial) |
-| P2 | 👤 | `$WKPY "$WK" init --engine claude-code --store "$WK_STORE" --repo "$WK_REPO"` | materializa a skill em disco e grava as permissões da engine | `.claude/settings.json` escrito com `permissions` |
+| P2 | 👤 | `$WKPY "$WK" init --engine claude-code --store "$WK_STORE" --repo "$WK_REPO"` | materializa a skill em disco, grava as permissões da engine **e** o slash command `/wk-flow` (`.claude/commands/wk-flow.md`, para `--engine claude-code`) — a entrada do FLUXO 3 | `.claude/settings.json` escrito com `permissions`; JSON de saída traz a chave `comando_wk_flow` confirmando o slash command escrito |
 | P3 | 👤 | `$WKPY "$WK" store init "$WK_STORE"` | cria `inbox/`, `raw/`, `wiki/` | estrutura do store criada |
-| P4 | 👤 | `$WKPY "$WK" doctor --store "$WK_STORE" --repo "$WK_REPO" --engine claude-code` | rediagnostica | **`bloqueios: []`** |
+| P4 | 👤 | `$WKPY "$WK" doctor --store "$WK_STORE" --repo "$WK_REPO" --engine claude-code` | rediagnostica; acusa `/wk-flow` ausente/desatualizado (com `acao`) na mesma chave `comando_wk_flow` | **`bloqueios: []`** |
 
 Engines aceitas em `--engine`: `claude-code` · `antigravity` · `devin` · `copilot` · `all` (vírgula para vários). Detalhes do que o `init` escreve: §7.5.
 
@@ -85,108 +85,97 @@ Devolva só: ARQUIVO: <caminho> / BYTES: <n>
 
 ### 4.1 Como funciona
 
-`wk code auto` é o caminho principal. Ele encadeia sozinho TODAS as ações determinísticas — `surface` → `export` → `config` → `plan`/`pending` → prepara o fan-out (`run <stage>`) → integra (`integrate <stage>`) → `evidence` + `done evidence` — e só devolve o controle numa parada real. A única coisa que ele não pode fazer é escrever conteúdo: cinco vezes (`modules`, `rules`, `architecture`, `specs`, `synth`) ele imprime um prompt de despacho e para; você cola esse prompt numa sessão de agente com acesso ao disco, os subagentes gravam os `.txt`, e você roda `auto` de novo. As decisões humanas (tópico, nível de documentação, granularidade, unidades de `specs`, aprovar o `promote`) entram por flag ou por um comando explícito.
+O caminho principal é o **modo piloto**: uma LLM despachante (Claude Code, via slash command) roda o pipeline inteiro sozinha, do primeiro `surface` ao `pipeline_completo`, e só devolve o controle ao humano em decisão-chave ou falha. O humano não copia nem cola prompt nenhum — digita `/wk-flow` uma vez e volta a aparecer só quando é chamado.
+
+Por baixo, nada mudou: é a mesma máquina de estados de 8 etapas (`surface → modules → rules → architecture → specs → evidence → synth → verify`) e os mesmos gates de sempre (§7.3). `wk code auto` continua sendo o motor — ele encadeia sozinho as ações determinísticas e para em `fanout:<stage>` porque o próximo passo é conteúdo escrito por LLM, não um comando. O que o modo piloto faz é mover para dentro da LLM despachante a ponte que antes era manual: ler a parada, disparar os subagentes do fan-out (em paralelo), validar os recibos, rodar `integrate`, rodar `auto` de novo — em laço, até bater numa parada que exige o humano.
 
 ```mermaid
 flowchart TD
-    subgraph F1["FASE 1 — Preparar (👤, tudo dentro de auto)"]
-        S["surface<br/>etapa 1/8"] --> E["export"] --> C["config<br/>DECISÃO: doc-level + granularity"] --> P["plan<br/>batches de modules"]
-    end
-    subgraph F2["FASE 2 — Fan-out ×5 (👤 prepara/integra · 🤖 escreve)"]
-        M["modules 2/8"] --> R["rules 3/8"] --> A["architecture 4/8"] --> SP["specs 5/8<br/>DECISÃO: --specs-items"] --> EV["evidence 6/8<br/>sem fan-out"] --> SY["synth 7/8"]
-    end
-    subgraph F3["FASE 3 — Fechar (👤)"]
-        FIN["finish sem --approve<br/>DECISÃO: revisar pendentes[]"] --> FA["finish --approve<br/>promote+compile+index+lint"]
-    end
-    P --> M
-    SY --> STOP(["auto para em pipeline_completo"]) --> FIN
-    LLM{{"🤖 colar prompt<br/>5x: modules · rules · architecture · specs · synth"}}
-    M -.-> LLM
-    R -.-> LLM
-    A -.-> LLM
-    SP -.-> LLM
-    SY -.-> LLM
+    H1["👤 wk init --engine claude-code ...<br/>uma vez por store (grava /wk-flow)"] --> H2["👤 abre Claude Code, digita /wk-flow"]
+    H2 --> AUTO["piloto roda AUTO"]
+    AUTO --> CHECK{"parado_em?"}
+    CHECK -->|"fanout:&lt;stage&gt;"| FAN["🤖 dispara N subagentes<br/>em paralelo, 1 por batch"]
+    FAN --> VAL["valida recibos<br/>ARQUIVO / BLOCOS / BYTES"]
+    VAL --> INT["integrate &lt;stage&gt;"]
+    INT --> AUTO
+    CHECK -->|"decisao_humana"| DEC["👤 responde no chat<br/>(P3 — §4.3)"]
+    DEC --> AUTO
+    CHECK -->|"erro / intervencao /<br/>sem_progresso / teto"| STOPH["👤 corrige e manda retomar<br/>(§4.3 · §4.4)"]
+    STOPH --> AUTO
+    CHECK -->|"pipeline_completo"| FIN["👤 wk finish ... --approve<br/>(P4 — piloto NUNCA roda finish)"]
 
-    style C fill:#ffe0b2
-    style SP fill:#ffe0b2
+    style FAN fill:#fff3e0
+    style DEC fill:#ffe0b2
+    style STOPH fill:#ffe0b2
     style FIN fill:#ffe0b2
-    style LLM fill:#fff3e0
-    style EV fill:#f3e5f5
 ```
 
-Ordem da máquina de estados (8 etapas): `surface → modules → rules → architecture → specs → evidence → synth → verify`. `evidence` roda **entre `specs` e `synth`**, sozinho, sem fan-out. `verify` não roda dentro de `auto` — roda dentro de `wk finish`, com o artefato certo.
+Quem não usa Claude Code (outra engine, ou quer colar o prompt manualmente): `wk code pilot --store "$WK_STORE" --repo "$WK_REPO"` imprime o mesmo protocolo como prompt-mestre pronto para colar em qualquer sessão de agente com acesso ao disco; `wk code pilot --command-file --store "$WK_STORE" --repo "$WK_REPO"` imprime o conteúdo exato do slash command (o que `wk init` já grava em `.claude/commands/wk-flow.md`).
 
-Paradas possíveis de `auto` (campo `parado_em` da linha JSON):
+### 4.2 Passo a passo
+
+Prefixo comum dos comandos 👤: `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE"`.
+
+| P# | Quem | O que fazer | O que acontece | Deu certo quando |
+|---|---|---|---|---|
+| P1 | 👤 | `$WKPY "$WK" init --engine claude-code --store "$WK_STORE" --repo "$WK_REPO"` — uma vez por store | grava as permissões da engine e o slash command `/wk-flow` (`.claude/commands/wk-flow.md`) | JSON de saída traz `permissoes[]` preenchido e a chave `comando_wk_flow` confirmando o slash command escrito |
+| P2 | 👤 | abrir uma sessão Claude Code no diretório de trabalho e digitar `/wk-flow` | o piloto roda `code auto` em laço: dispara os subagentes de cada fan-out em paralelo, valida os recibos, roda `integrate`, revalida com `auto` — passa sozinho por `surface → modules → rules → architecture → specs → evidence → synth → verify`, sem intervenção | a sessão mostra o progresso avançando estágio a estágio até parar numa das linhas da tabela §4.3 |
+| P3 | 👤 | quando o piloto parar em `decisao_humana`: responder no chat (tópico / `doc_level` / `granularity` / unidades de `specs`) — o piloto mostra uma tabela-resumo e as opções válidas antes de perguntar | o piloto embute a resposta no próximo `auto` e retoma o laço | novo `parado_em` diferente de `decisao_humana` |
+| P4 | 👤 | quando o piloto parar em `pipeline_completo`: rodar o `wk finish --workdir <workdir> --topic "$WK_TOPIC" --repo "$WK_REPO" --store "$WK_STORE" --approved-by "seu-nome" --approve` que o piloto entrega pronto no campo `acao` (o piloto NUNCA roda `finish` sozinho) | `evidence` (se preciso) → `verify` → `audit` → `publish` → `promote --approve-all` → `compile` → `index reindex` → `lint` (+`docx`) | exit **0**, `passos[]` completo com todos `status: "ok"` (`lint`/`docx` podem sair `"aviso"` sem abortar) |
+
+### 4.3 Quando o piloto devolve o controle
+
+| Parada | Quando acontece | O que o humano faz |
+|---|---|---|
+| `decisao_humana` | falta uma decisão-chave: tópico, `doc_level`+`granularity`, ou unidades de `specs` | responde no chat, dentro da mesma sessão — P3 acima |
+| `erro` | uma ação falhou pela 1ª vez; o piloto tenta **1 correção automática** antes de parar | se o piloto não resolveu sozinho, corrige o que o payload de erro aponta e pede para retomar (o piloto usa `code auto --retry`) |
+| `intervencao` | a MESMA falha se repetiu 2x seguidas na MESMA etapa — o `auto` já parou de insistir | corrige pelos `comandos_redo` do payload (ou pelo que `erro` aponta) e pede para retomar (`auto --retry`, que zera o contador de tentativas) |
+| `sem_progresso` | a mesma ação saiu 0 sem mover a máquina de estados | pede ao piloto para rodar `code state`/`code next` e investigar antes de retomar |
+| teto de 40 ações do piloto | proteção contra laço da LLM despachante (independente do teto de 30 ações de uma invocação do `auto` — esse o piloto absorve sozinho) | revisa o `progresso` reportado; retoma digitando `/wk-flow` de novo (§4.4) ou investiga primeiro |
+| `pipeline_completo` | todos os estágios SDD fechados | roda o `wk finish ... --approve` que o piloto entrega — P4 acima |
+
+### 4.4 Retomada e falhas
+
+`code auto` é *stateful* — o checkpoint vive em `state.json`, dentro do workdir (`$WK_STORE/.codescan/<repo>-<hash>`). Isso vale tanto rodando pelo piloto quanto pelo modo manual.
+
+| Situação | O que fazer |
+|---|---|
+| Sessão caiu no meio do laço | digite `/wk-flow` de novo — o piloto reencontra o ponto exato pelo `state.json` e continua; não há passo a "desfazer" nem flag de retomada |
+| Depois de responder uma `decisao_humana` | nada extra: o piloto já embutiu a resposta e voltou ao laço sozinho |
+| Depois de corrigir um `erro`/`intervencao` | o piloto usa `code auto --retry`, que zera o contador de tentativas do loop de erro |
+| Quer só inspecionar sem alterar nada | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" state` (ou peça ao piloto para rodar) |
+| Commit do repo mudou desde o `surface` | `verify` acusa `drift_detectado: true`; `code drift` compara o commit pinado em `surface.json` com o HEAD atual, lista `arquivos_alterados`/`artefatos_afetados` e o `redo` exato por item |
+| Refazer 1 item específico | `code redo <stage> --item <item>` — arquiva os artefatos anteriores em `agent-runs/superseded/<run-id>/` antes de sobrescrever |
+| Item impossível de completar | `code blocked <stage> --item <item>` (ou `failed`, `degraded`) |
+
+**Proibido abrir `wk.pyz` com zipfile/decompilação para entender um erro.**
+
+### 4.5 Modo manual (avançado)
+
+Existe para engines sem slash command, ou para quem quer controle fino passo a passo. É o mesmo motor do modo piloto (`auto` + os compostos/atômicos de §7.4) sem a LLM despachante fazendo a ponte: você lê cada parada e age.
+
+| Situação | Comando |
+|---|---|
+| Rodar o `auto` manualmente (a 1ª vez leva as decisões conhecidas) | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto --topic "$WK_TOPIC" --doc-level detalhado --granularity module` |
+| `auto` parou em `fanout:<stage>` | copie TUDO a partir da linha `Fan-out do estágio <stage>. Você é despachante:` (impressa abaixo da linha JSON) e cole numa sessão de agente com acesso ao disco — nunca um chat web sem acesso a arquivos |
+| Depois do fan-out | rode `auto` de novo — ele integra os batches, fecha o estágio e imprime o próximo prompt (ou vá direto ao ponto: veja §7.4 para `run <stage>` / `handoff <stage>` / `integrate <stage>` isolados) |
+| `specs` exige a flag na invocação que fecha `architecture` | `auto --specs-items "a,b"` |
+| Pipeline fechou | `parado_em: "pipeline_completo"` traz o `wk finish ... --approve` pronto — mesmo P4 de §4.2 |
+| Imprimir o mesmo protocolo do piloto como texto (para colar você mesmo, sem slash command) | `wk code pilot --store "$WK_STORE" --repo "$WK_REPO"` (ou `--command-file` para o conteúdo do slash command) |
+
+Contrato bruto de `auto` (campo `parado_em`, o que o modo manual precisa interpretar sozinho — o piloto já faz essa leitura por você):
 
 | `parado_em` | Exit | Significa |
 |---|---|---|
 | `decisao_humana` | 0 | falta uma decisão-chave (topic / doc-level+granularity / specs-items); a `acao` traz a flag que resolve |
-| `fanout:<stage>` | 0 | o próximo passo é colar o prompt impresso na LLM despachante — único ponto 🤖 |
+| `fanout:<stage>` | 0 | o próximo passo é colar o prompt impresso na LLM despachante |
 | `pipeline_completo` | 0 | todos os estágios SDD fechados; a `acao` já traz o `wk finish ... --approve` pronto |
 | `limite_de_acoes` | 0 | teto de 30 ações numa invocação (proteção contra laço); rode `auto` de novo |
 | `erro` | 2 | uma ação falhou pela 1ª vez com esta assinatura; corrija e rode `auto` de novo |
-| `intervencao` | 2 | a MESMA falha se repetiu 2x seguidas na MESMA etapa — §4.4 |
-| `sem_progresso` | 2 | a mesma ação saiu 0 três vezes seguidas sem mover a máquina de estados; rode `state`/`next` e investigue |
+| `intervencao` | 2 | a MESMA falha se repetiu 2x seguidas na MESMA etapa — corrija e rode `auto --retry` |
+| `sem_progresso` | 2 | a mesma ação saiu 0 sem mover a máquina de estados; rode `state`/`next` e investigue |
 
-Toda saída de `auto` carrega também `executados[]` (o que ESTA invocação rodou) e `progresso` (`"etapa <i> de 8 — fase <...>"`).
-
-Por baixo é a mesma máquina de estados e os mesmos gates de sempre: `auto` chama as MESMAS funções do CLI que `run`/`integrate`/`done` chamariam. Os compostos e os atômicos continuam disponíveis para controle fino/retomada (§7.4).
-
-### 4.2 Passo a passo completo
-
-Substitua `<workdir>` pelo caminho que `auto` devolve na `acao` do `pipeline_completo` (`$WK_STORE/.codescan/<repo>-<hash>`). Prefixo comum de todos os passos 👤 de `code`: `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE"`.
-
-| P# | Quem | O que fazer (comando exato ou ação) | O que acontece | Deu certo quando |
-|---|---|---|---|---|
-| P1 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto --topic "$WK_TOPIC" --doc-level detalhado --granularity module` | roda `surface` → `export` → grava `config` → `plan` → prepara o fan-out de `modules` e imprime o prompt | `parado_em: "fanout:modules"`, `progresso: "etapa 2 de 8 ..."`, prompt impresso abaixo da linha JSON |
-| P2 | 🤖 | cole o prompt de `modules` (§4.3) | N subagentes gravam `agent-outputs/modules-batch-NN.txt` | N recibos `ARQUIVO / BLOCOS / BYTES` e os N `.txt` existem |
-| P3 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto` | integra os batches de `modules`, fecha o estágio, prepara `rules` | `executados: ["integrate modules","run rules"]`, `parado_em: "fanout:rules"` |
-| P4 | 🤖 | cole o prompt de `rules` | subagentes gravam `agent-outputs/rules-batch-NN.txt` | N recibos `ARQUIVO / BLOCOS / BYTES` |
-| P5 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto` | integra `rules`, fecha, prepara `architecture` | `parado_em: "fanout:architecture"`, `progresso: "etapa 4 de 8 ..."` |
-| P6 | 🤖 | cole o prompt de `architecture` | subagentes gravam `agent-outputs/architecture-batch-NN.txt` | N recibos `ARQUIVO / BLOCOS / BYTES` |
-| P7 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto --specs-items "a,b"` | integra `architecture`, fecha, **registra as pendências de `specs`** (a flag é exigida AQUI) e prepara o fan-out de `specs` | `executados` contém `pending specs`; `parado_em: "fanout:specs"` |
-| P8 | 🤖 | cole o prompt de `specs` | subagentes gravam `agent-outputs/specs-batch-NN.txt` | N recibos `ARQUIVO / BLOCOS / BYTES` |
-| P9 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto` | integra `specs`, fecha, roda `evidence` + `done evidence` sozinho e prepara `synth` | `executados: ["integrate specs","evidence","done evidence","run synth"]`, `parado_em: "fanout:synth"` |
-| P10 | 🤖 | cole o prompt de `synth` | subagentes gravam `agent-outputs/synth-batch-NN.txt` | N recibos `ARQUIVO / BLOCOS / BYTES` |
-| P11 | 👤 | `$WKPY "$WK" code --repo "$WK_REPO" --store "$WK_STORE" auto` | integra `synth` e fecha o pipeline do `wk code` | `parado_em: "pipeline_completo"`, exit 0, `acao` = o `wk finish ... --approve` pronto |
-| P12 | 👤 | `$WKPY "$WK" finish --workdir "$WK_STORE/.codescan/<workdir>" --topic "$WK_TOPIC" --repo "$WK_REPO" --store "$WK_STORE" --approved-by "seu-nome"` | `evidence` (se preciso) → `verify` → `audit` → `publish` e **PARA antes do `promote`** — nada é promovido | exit **3**, `parado_em: "promote"`, `pendentes[]` listando o que seria aprovado, `acao: "reexecute com --approve ..."` |
-| P13 | 👤 | o MESMO comando do P12 **+ `--approve`** | `promote --approve-all` → `compile` → `index reindex` → `lint` → `docx` | exit **0**, `passos[]` completo com todos `status: "ok"` (`lint`/`docx` podem sair `"aviso"` sem abortar) |
-
-**Totais: você digita ~8 comandos, cola 5 prompts, decide 3 vezes** (doc-level+granularity no P1 · unidades de specs no P7 · aprovar o promote no P12→P13).
-
-### 4.3 O passo 🤖 — checklist de colagem
-
-| Pergunta | Resposta |
-|---|---|
-| QUANDO | Toda vez que `auto` parar com `parado_em: "fanout:<stage>"` — acontece 5 vezes (`modules`, `rules`, `architecture`, `specs`, `synth`). O prompt vem impresso ABAIXO da linha JSON da saída |
-| O QUE copiar | TUDO a partir da linha `Fan-out do estágio <stage>. Você é despachante:` até o fim (a linha JSON acima NÃO faz parte) |
-| ONDE colar | Numa sessão de agente COM ACESSO AO DISCO desta máquina — ex.: Claude Code (ou a engine configurada no FLUXO 0), aberta em qualquer pasta. NUNCA num chat web sem acesso a arquivos: os subagentes precisam LER os packs e GRAVAR os outputs em caminhos locais |
-| O QUE a LLM faz | Atua como despachante: dispara N subagentes, um por batch, com listas de itens disjuntas; cada um lê 2 arquivos (`<stage>-batch-NN.json` = itens+evidência, `<stage>-contract.json` = blocos/seções/limites), analisa SÓ os itens do seu batch e grava 1 arquivo (`agent-outputs/<stage>-batch-NN.txt`). Ela NÃO executa comandos `wk`, NÃO faz merge |
-| COMO saber que terminou | A LLM devolve N recibos `ARQUIVO / BLOCOS / BYTES`; confira que os N arquivos `.txt` existem em `agent-outputs/` |
-| DEPOIS | Volte ao terminal e rode `wk code auto` de novo — ele integra os batches, fecha o estágio e imprime o próximo prompt |
-| SE DER ERRADO | Output rejeitado no integrate → o erro aponta regra+linha; cole um novo prompt (ou peça correção pontual à LLM) e rode `auto`; 2 falhas idênticas → `intervencao` (§4.4) |
-
-Não escreva o prompt à mão: seções e limites variam por estágio e já estão no `<stage>-contract.json`; `auto`/`run`/`handoff` montam tudo.
-
-### 4.4 Se algo falhar
-
-| Situação | Sinal | O que fazer |
-|---|---|---|
-| Falha na 1ª vez | `parado_em: "erro"`, exit 2, `tentativas: 1` | corrija o que a `acao` do erro original manda e rode `auto` de novo — ele reexecuta sozinho a ação que falhou |
-| Mesma falha 2x seguidas na mesma etapa | `parado_em: "intervencao"`, exit 2, `erro` original completo + `comandos_redo` quando existe | o laço parou de insistir. Corrija pelos `comandos_redo` do payload, ou reescrevendo o que `erro` aponta; depois rode `auto --retry` (zera o contador de tentativas e retoma) |
-| Laço rodando sem andar | `parado_em: "sem_progresso"`, exit 2 | rode `state --quiet` e `next --quiet` para ver por que a ação não avança (artefato esperado não foi escrito?); corrija e rode `auto` de novo |
-| Teto de ações batido | `parado_em: "limite_de_acoes"`, exit 0 | rode `auto` de novo; se o teto voltar a bater sem progresso, investigue com `state` |
-| Perdi o fio / onde parei | — | `code state --quiet` · `code next --quiet` (o próximo passo) · `code next --run` (executa esse passo, se for determinístico: `run-stage`/`handoff`/`run`/`integrate`/`done`/`evidence`/`export`/`plan`) |
-| Commit do repo mudou desde o `surface` | `drift_detectado: true` no `verify` | `code drift` compara o commit pinado em `surface.json` com o HEAD atual, lista `arquivos_alterados`, `artefatos_afetados` e o `redo` exato por item; refaça os afetados e rode `surface` de novo para repinar |
-| Refazer 1 item | — | `code redo <stage> --item <item>` — arquiva os artefatos anteriores em `agent-runs/superseded/<run-id>/` antes de sobrescrever |
-| Item impossível | — | `code blocked <stage> --item <item>` (ou `failed`, `degraded`) |
-| Ver arquivo do repo | — | `code read <arquivo> --from 1 --count 80` |
-| Não sei o contrato do estágio | — | `code sdd-brief <stage>` (fonte de verdade do contrato) |
-| Ler doc embutido | — | `wk docs --list` · `wk docs <slug>` |
-| Erro traz campo `acao` | — | execute o comando de `acao` literalmente |
-| Erro de `done` | — | dica em `blockers[].action` (só quando há mais de um blocker) |
-
-**Proibido abrir `wk.pyz` com zipfile/decompilação para entender um erro.**
+Toda saída de `auto` carrega também `executados[]` (o que ESTA invocação rodou) e `progresso` (`"etapa <i> de 8 — fase <...>"`). Detalhes de contrato/citação/gates: §7.1–§7.3. Comandos atômicos de controle fino (retomar 1 batch, inspecionar antes de integrar, repetir 1 item): §7.4.
 
 ---
 
@@ -284,6 +273,7 @@ Use quando precisar de granularidade que os compostos não dão (retomar 1 batch
 | `code done <stage>` | `integrate <stage>` (só o fechamento) | fecha o estágio depois de já ter mergeado todos os batches à mão |
 | `code evidence --topic <t>` + `code done evidence` | `auto`/`finish` (passo evidence) | gera o evidence-pack e fecha o estágio manualmente |
 | `code auto --retry` | — (dentro do próprio `auto`) | zera o contador de tentativas do loop de erro depois de corrigir uma `intervencao` |
+| `code pilot [--command-file]` | modo piloto (`/wk-flow`) | só GERA TEXTO, não executa nada: sem `--command-file`, imprime o prompt-mestre do protocolo piloto pronto para colar; com `--command-file`, imprime o conteúdo exato de `.claude/commands/wk-flow.md` |
 | `code verify --artifact <path>` | `finish` (passo verify) | roda só a verificação, isolada, contra um artefato específico |
 | `code audit` | `finish` (passo audit) | roda só a auditoria P0 do workdir |
 | `code drift` | — | compara commit pinado × HEAD atual; lista artefatos afetados + `redo` por item |
@@ -307,6 +297,7 @@ Use quando precisar de granularidade que os compostos não dão (retomar 1 batch
 ### 7.5 Omissões — guardrails que não têm passo próprio
 
 - **Permissão da engine é escrita, não só documentada.** `wk init --engine <e> --store <s> --repo <r>` grava, no `settings.json` da engine (`.claude/settings.json` para `claude-code`; `.agents/settings.json` para as demais), um merge idempotente em `permissions`: `additionalDirectories` com store e repo, `allow: ["Read(<store>/**)", "Read(<repo>/**)", "Bash(wk *)"]` + **`Write(<store>/.codescan/**/agent-outputs/**)`** (único ponto de escrita de agente no store — buffer do fan-out) e `deny` NOMINAIS por árvore (`raw/`, `wiki/`, `inbox/`) + arquivos (`index.db*`, `log.md`, `quarantine.md`) + artefatos SDD em `.codescan/` (`state.json`, `agent-runs/`, `agent-packs/`, `sdd/`, `modules/`, `surface.json`). Settings antigos com deny amplo (`Write(<store>/**)`, `Edit(<store>/**)`) são **migrados automaticamente** ao rodar `wk init` de novo (`permissoes_migradas: true`); `check`/`doctor` acusam o formato antigo com `acao: "rode wk init ..."`. O enforcement real desses `deny` só é **verificado** para `claude-code`; para `antigravity`/`devin`/`copilot` é **best-effort** (`wk check`/`doctor` reportam `"formato": "best-effort"`).
+- **`wk init` também grava o slash command do modo piloto.** `wk init --engine claude-code --store <s> --repo <r>` grava `.claude/commands/wk-flow.md` (o mesmo protocolo de `code pilot --command-file`, com os caminhos já resolvidos). O JSON de saída de `init`/`check`/`doctor` traz a chave `comando_wk_flow`; quando o slash command está ausente ou desatualizado em relação ao que o `.pyz` embute, ela vem acompanhada de `acao` (rode `wk init` de novo).
 - **`wk doctor` audita o próprio `.pyz`.** Compara o hash do código-fonte embutido no `.pyz` (`_build_manifest.json`) com um hash recalculado do diretório `scripts/` ao lado do arquivo, quando existe; se divergir, reporta `pyz_desatualizado: true` e `acao: "rode python scripts/build_pyz.py"`. É diagnóstico — nunca vira `bloqueio` nem afeta o exit code.
 - **`publish` é idempotente por `doc_id`.** O id é determinístico (`sb-publish-<repo>-<artefato>`, não hash de conteúdo); reexecutar `publish` no mesmo workdir localiza o arquivo já em `inbox/` com esse `doc_id` e regrava (`atualizado: true`) em vez de duplicar. Vale só para o estágio `inbox/`; duplicidade em `raw/` (pós-`promote`) é outro mecanismo (`duplicados[]`, §8).
 - **`export --output` não escreve em `<store>/raw` nem `<store>/wiki`.** Esses diretórios só mudam via `wk publish`/`promote`/`compile`; grave em `inbox/`.
@@ -360,7 +351,7 @@ Use quando precisar de granularidade que os compostos não dão (retomar 1 batch
 
 **`wk <cmd>`** (18): `docs` · `init` · `check` · `engines` · `doctor` · `store` · `promote` · `compile` · `docx` · `lint` · `ingest` · `publish` · `finish` · `code` · `index` · `search` · `get` · `audit`
 
-**`wk code <cmd>`** (27): `cleanup` · `surface` · `export` · `plan` · `pending` · `config` · `next` · `done` · `blocked` · `failed` · `degraded` · `state` · `read` · `evidence` · `agent-pack` · `merge-agent-output` · `redo` · `run-stage` · `handoff` · `run` · `integrate` · `auto` · `audit` · `sdd-brief` · `sdd-scaffold` · `verify` · `drift`
+**`wk code <cmd>`** (28): `cleanup` · `surface` · `export` · `plan` · `pending` · `config` · `next` · `done` · `blocked` · `failed` · `degraded` · `state` · `read` · `evidence` · `agent-pack` · `merge-agent-output` · `redo` · `run-stage` · `handoff` · `run` · `integrate` · `auto` · `pilot` · `audit` · `sdd-brief` · `sdd-scaffold` · `verify` · `drift`
 
 **`wk index <cmd>`** (5): `reindex` · `search` · `get` · `audit` · `status`
 

@@ -17,6 +17,7 @@
   run       composto: run-stage + handoff (prepara o fan-out e entrega o prompt)
   integrate composto: merge de todos os batches do manifesto + done do estágio
   auto      laço: encadeia as ações determinísticas até a próxima parada real
+  pilot     imprime o prompt-mestre do modo piloto (a LLM roda o laço sozinha)
   verify    valida Markdown confirmado contra citações arquivo:linha
   drift     compara o commit pinado no surface com o HEAD atual do repo
 
@@ -29,6 +30,11 @@ evidence, done) e só devolve o controle ao humano em três situações —
 decisão-chave (`decisao_humana`), colar o prompt na LLM (`fanout:<stage>`) e
 loop de erro (`intervencao`, mesma falha 2x seguidas na mesma etapa).
 Todo payload de `next`/`state`/`run`/`integrate`/`done` carrega `progresso`.
+
+`pilot` fecha a última lacuna: emite o prompt-mestre que faz a própria LLM
+rodar o laço do `auto`, despachar os subagentes de cada `fanout:<stage>`,
+integrar e reexecutar — de modo que o humano só reapareça em `decisao_humana`
+ou em falha. É só texto: nada é executado nem escrito por `pilot`.
 
 O legado é READ-ONLY: nada é escrito dentro do repositório analisado.
 """
@@ -2860,6 +2866,46 @@ def cmd_auto(a) -> int:
     return 0
 
 
+def cmd_pilot(a) -> int:
+    """Imprime o prompt-mestre do modo piloto (ou o slash command resolvido).
+
+    O `auto` já para sozinho em `fanout:<stage>` e o humano faz a ponte à mão:
+    copiar o prompt, colar numa sessão de LLM, esperar os recibos, rodar
+    `integrate`, rodar `auto` de novo — a cada estágio. `pilot` emite o texto
+    que transfere essa ponte para a própria LLM: ela roda o laço, despacha os
+    subagentes, integra e só devolve o controle em decisão-chave ou falha.
+
+    Não executa nada e não escreve nada: só resolve caminhos (python, wk.pyz,
+    --store, --repo, workdir) e imprime texto. Todo o trabalho continua nos
+    subcomandos existentes, com os mesmos gates.
+
+    O import de `pilot` é local de propósito: `pilot` importa deste módulo as
+    constantes de contrato (`HANDOFF_CITACAO_REGRA`, `HANDOFF_FALLBACK_ESCRITA`,
+    `AUTO_MAX_ACOES`) para não duplicar regra divergente — importá-lo no topo
+    daqui fecharia o ciclo.
+    """
+    from . import pilot as pilot_mod
+
+    if getattr(a, "command_file", False):
+        sys.stdout.write(pilot_mod.render_wk_flow_command(
+            python=sys.executable or "python",
+            pyz=pilot_mod._resolve_pyz(),
+            store=a.store,
+            repo=a.repo,
+        ))
+        return 0
+
+    print(pilot_mod.pilot_prompt(
+        store=a.store,
+        repo=a.repo,
+        topic=getattr(a, "topic", None),
+        doc_level=getattr(a, "doc_level", None),
+        granularity=getattr(a, "granularity", None),
+        specs_items=getattr(a, "specs_items", None),
+    ))
+    return 0
+
+
 _EXPORT_GUARDED_STORE_SUBDIRS = ("raw", "wiki")
 
 
@@ -3536,6 +3582,13 @@ def _run_quiet(a) -> int:
     `{"error": ...}` em JSON, esse erro já está condensado no resumo de uma
     linha (`ok`, `error`, `acao`, ...) — reemitir o STDERR bruto duplicaria a
     mesma mensagem de erro em dois formatos diferentes."""
+    # `pilot` é o único comando cujo PRODUTO é texto cru (o prompt-mestre) e
+    # não um payload JSON: condensá-lo devolveria `{"output_bytes": N}` e
+    # descartaria exatamente aquilo que foi pedido. `--quiet` aqui não tem
+    # resumo possível, então é no-op em vez de armadilha silenciosa.
+    if getattr(a, "cmd", None) == "pilot":
+        return a.fn(a)
+
     out_buf, err_buf = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
         code = a.fn(a)
@@ -3882,6 +3935,37 @@ def main(argv=None) -> int:
         help="zera o contador de tentativas da guarda de loop de erro (o humano interveio)",
     )
     au_to.set_defaults(fn=cmd_auto)
+
+    pt = sub.add_parser(
+        "pilot",
+        help=(
+            "imprime o prompt-mestre do modo piloto: a LLM roda o `auto` em laço, "
+            "despacha os subagentes do fan-out, integra e só para em decisão humana ou falha"
+        ),
+    )
+    pt.add_argument(
+        "--command-file",
+        action="store_true",
+        help=(
+            "imprime o conteúdo do slash command (.claude/commands/wk-flow.md) "
+            "com os caminhos já resolvidos, em vez do prompt cru"
+        ),
+    )
+    pt.add_argument("--topic", help="tópico do wiki-ai; embutido no comando AUTO do prompt")
+    pt.add_argument(
+        "--doc-level", choices=("essencial", "completo", "detalhado"),
+        help="decisão de config antecipada: embutida no comando AUTO (o piloto não para nela)",
+    )
+    pt.add_argument(
+        "--granularity",
+        choices=("module", "endpoint", "use-case", "hybrid", "feature", "custom"),
+        help="decisão de config antecipada: embutida no comando AUTO (o piloto não para nela)",
+    )
+    pt.add_argument(
+        "--specs-items",
+        help='unidades do estágio specs ("a,b"): embutidas no comando AUTO do prompt',
+    )
+    pt.set_defaults(fn=cmd_pilot)
 
     au = sub.add_parser("audit", help="mede qualidade SDD sem alterar estado")
     au.add_argument("stage_pos", nargs="?", choices=sdd_mod.CRITICAL_STAGES)
