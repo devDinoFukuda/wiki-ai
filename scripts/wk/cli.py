@@ -531,7 +531,9 @@ def _write_skill_dir(target, manifest, slugs, invocation, force) -> dict | None:
         text = (_doc_text(slug) or "").replace(WK_PLACEHOLDER, invocation)
         dest = os.path.join(target, meta["file"])
         if os.path.exists(dest) and not force:
-            if open(dest, encoding="utf-8").read() == text:
+            with open(dest, encoding="utf-8") as f:
+                disk_text = f.read()
+            if disk_text == text:
                 skipped.append(meta["file"])
                 continue
             print(
@@ -568,7 +570,8 @@ def cmd_check(a) -> int:
             if not os.path.exists(dest):
                 missing.append(meta["file"])
                 continue
-            disk = open(dest, encoding="utf-8").read()
+            with open(dest, encoding="utf-8") as f:
+                disk = f.read()
             same = hashlib.sha256(disk.encode()).hexdigest() == hashlib.sha256(
                 expected.encode()
             ).hexdigest()
@@ -1310,6 +1313,42 @@ def _reindex_modo() -> str:
     return "completo" if _embeddings_configurados() else "lex-only (embeddings não configurados)"
 
 
+@contextlib.contextmanager
+def _closing_sbindex_connections():
+    """`sbindex.cli.cmd_reindex` faz `conn = store.connect(...)` e nunca
+    fecha — bug de fora deste arquivo (sbindex/ é de outro dono, não mexemos
+    lá). Sem isto, cada `promote`/`compile` que aciona `_run_reindex` deixa
+    um `sqlite3.Connection` pendurado; o coletor cíclico do GC eventualmente
+    o fecha em ponto IMPREVISÍVEL do processo, inclusive durante o
+    `redirect_stderr` de um teste sem relação nenhuma com reindex — onde o
+    `ResourceWarning: unclosed database` (impresso via `warnings.warn`, que
+    escreve no `sys.stderr` corrente) se mistura ao JSON que esse outro
+    teste esperava capturar puro e quebra o `json.loads`. Interceptamos
+    `store.connect` só durante a chamada a `sbindex_main` e fechamos tudo
+    que sobrar no `finally`: o fechamento fica determinístico e síncrono com
+    quem abriu, em vez de terceirizado para uma coleta futura qualquer."""
+    from sbindex import store
+
+    opened: list = []
+    original_connect = store.connect
+
+    def _tracked_connect(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    store.connect = _tracked_connect
+    try:
+        yield
+    finally:
+        store.connect = original_connect
+        for conn in opened:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _run_reindex(store_root: str) -> tuple[bool, str | None, str]:
     """Reindexa o store depois de promote/compile. Devolve (ok, erro, modo).
 
@@ -1330,7 +1369,8 @@ def _run_reindex(store_root: str) -> tuple[bool, str | None, str]:
     argv = ["--store", store_root, "reindex"] + ([] if completo else ["--lex-only"])
     stdout = io.StringIO()
     stderr = io.StringIO()
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+            _closing_sbindex_connections():
         code = sbindex_main(argv)
     if code:
         return False, (stderr.getvalue() or stdout.getvalue()).strip(), modo
@@ -3053,16 +3093,18 @@ def _audit_index(store_root: str, path_filter: str | None = None) -> dict:
     conn = store.connect(os.path.join(store_root, "index.db"))
     rules = {}
     total = 0
-    for rule, sql in AUDIT_SQL.items():
-        rows = []
-        for r in conn.execute(sql).fetchall():
-            item = {"docid": "#" + r["docid"], "path": r["path"], "detalhe": r["detalhe"]}
-            if path_filter and path_filter not in item["path"]:
-                continue
-            rows.append(item)
-        rules[rule] = {"n": len(rows), "itens": rows}
-        total += len(rows)
-    conn.close()
+    try:
+        for rule, sql in AUDIT_SQL.items():
+            rows = []
+            for r in conn.execute(sql).fetchall():
+                item = {"docid": "#" + r["docid"], "path": r["path"], "detalhe": r["detalhe"]}
+                if path_filter and path_filter not in item["path"]:
+                    continue
+                rows.append(item)
+            rules[rule] = {"n": len(rows), "itens": rows}
+            total += len(rows)
+    finally:
+        conn.close()
     # F-26(b): L4 não sai de SQL — `derived_from` não é coluna do índice, então
     # a regra lê o frontmatter de raw/ direto do disco (travessia
     # determinística, mesmo padrão das regras W). O `wk lint` precisa dela aqui
@@ -4265,9 +4307,13 @@ def _finish_capture(fn, *args, **kwargs) -> tuple[int, str, str]:
     Todo `cmd_*`/`main` interno já imprime seu próprio JSON de resultado (ou
     erro) direto no stdout/stderr real; `finish` precisa desse payload para
     montar o PRÓPRIO resumo, sem imprimir o corpo de cada passo solto no meio
-    da saída final (que tem que ser um único JSON)."""
+    da saída final (que tem que ser um único JSON).
+
+    `_closing_sbindex_connections` cobre o caso de `fn` ser `sbindex.cli.main`
+    (passo "reindex" do finish) — ver docstring lá para o porquê."""
     out_buf, err_buf = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf), \
+            _closing_sbindex_connections():
         code = fn(*args, **kwargs)
     return code, out_buf.getvalue(), err_buf.getvalue()
 
@@ -4660,7 +4706,8 @@ def _run_index(argv: list[str]) -> int:
     # `--store` com a query posicional.
     if rest and rest[0] == "search":
         rest = ["search"] + _default_search_query(rest[1:])
-    return sbindex_main(["--store", _store(g), *rest])
+    with _closing_sbindex_connections():
+        return sbindex_main(["--store", _store(g), *rest])
 
 
 # ---------- entrada ----------

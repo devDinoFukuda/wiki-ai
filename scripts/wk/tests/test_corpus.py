@@ -40,6 +40,21 @@ def _write(path: str, content: str) -> None:
         f.write(content)
 
 
+def _read(path: str) -> str:
+    """Lê um arquivo texto fechando o handle explicitamente.
+
+    `open(path).read()` sem `with`/`.close()` deixa o TextIOWrapper para o
+    coletor de ciclos do GC. Se a coleta acontecer durante o
+    `redirect_stderr` de OUTRO teste (ex.: `_run` em test_fix_onda1.py), o
+    `ResourceWarning: unclosed file` some no stderr redirecionado e quebra o
+    `json.loads(err)` desse teste — flake dependente de timing do GC, visível
+    só com `unittest discover` (que reativa o filtro default de warnings) e
+    só na suíte completa (mais alocações acumuladas até cruzar o limiar do
+    coletor)."""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 def _fm(doc_id: str, source_type: str, origin: str, *, promoted: str = "false",
         topic: str | None = None, confidence: str | None = None) -> str:
     lines = [
@@ -97,11 +112,11 @@ class PromoteApproveTests(StoreTestCase):
 
         dest = os.path.join(self.store, prom["path"])
         self.assertTrue(os.path.isfile(dest))
-        text = open(dest, encoding="utf-8").read()
+        text = _read(dest)
         self.assertIn('promoted_by: "maria"', text)
         self.assertIn("promoted: true", text)
 
-        log = open(os.path.join(self.store, "log.md"), encoding="utf-8").read()
+        log = _read(os.path.join(self.store, "log.md"))
         self.assertIn("aprovado por maria", log)
         self.assertIn("sb-y1", log)
 
@@ -181,7 +196,7 @@ class PublishTests(StoreTestCase):
         self.assertNotIn("state.json", dump)
         self.assertNotIn("surface.json", dump)
 
-        inv_text = open(os.path.join(self.store, by_origem["sdd/inventory.md"]["path"]), encoding="utf-8").read()
+        inv_text = _read(os.path.join(self.store, by_origem["sdd/inventory.md"]["path"]))
         self.assertNotIn("id: old", inv_text)
         self.assertIn('source_type: "code-repo"', inv_text)
         self.assertIn("Inventario.", inv_text)
@@ -221,7 +236,7 @@ class PublishTests(StoreTestCase):
         dest_dir = os.path.dirname(os.path.join(self.store, second["path"]))
         md_files = [n for n in os.listdir(dest_dir) if n.endswith(".md")]
         self.assertEqual(len(md_files), 1, md_files)
-        text = open(os.path.join(self.store, second["path"]), encoding="utf-8").read()
+        text = _read(os.path.join(self.store, second["path"]))
         self.assertIn("Dominio v2.", text)
         self.assertNotIn("Dominio v1.", text)
 
@@ -243,7 +258,7 @@ class IngestTests(StoreTestCase):
         _write(vtt, "WEBVTT\n\n1\n00:00:01.000 --> 00:00:04.000\nOla mundo\n")
         code, out, err = self._ingest(vtt)
         self.assertEqual(code, 0, err)
-        text = open(os.path.join(self.store, json.loads(out)["path"]), encoding="utf-8").read()
+        text = _read(os.path.join(self.store, json.loads(out)["path"]))
         self.assertIn("00:00:01.000 --> 00:00:04.000", text)
         self.assertIn("Ola mundo", text)
 
@@ -252,7 +267,7 @@ class IngestTests(StoreTestCase):
         _write(srt, "1\n00:00:01,000 --> 00:00:02,000\nLinha um\n\n2\n00:00:03,000 --> 00:00:04,000\nLinha dois\n")
         code, out, err = self._ingest(srt)
         self.assertEqual(code, 0, err)
-        text = open(os.path.join(self.store, json.loads(out)["path"]), encoding="utf-8").read()
+        text = _read(os.path.join(self.store, json.loads(out)["path"]))
         self.assertIn("00:00:01,000 --> 00:00:02,000", text)
         self.assertIn("Linha um", text)
         self.assertIn("Linha dois", text)
@@ -262,7 +277,7 @@ class IngestTests(StoreTestCase):
         _write(htmlf, "<html><body><h1>Titulo</h1><p>Paragrafo <b>com tag</b>.</p></body></html>")
         code, out, err = self._ingest(htmlf, source_type="web-clip", origin="https://exemplo.com")
         self.assertEqual(code, 0, err)
-        text = open(os.path.join(self.store, json.loads(out)["path"]), encoding="utf-8").read()
+        text = _read(os.path.join(self.store, json.loads(out)["path"]))
         self.assertIn("# Titulo", text)
         self.assertIn("Paragrafo", text)
         self.assertNotIn("<h1>", text)
@@ -273,7 +288,7 @@ class IngestTests(StoreTestCase):
         _write(xmlf, "<root><item>1</item></root>")
         code, out, err = self._ingest(xmlf, source_type="agent-output", origin="export tool")
         self.assertEqual(code, 0, err)
-        text = open(os.path.join(self.store, json.loads(out)["path"]), encoding="utf-8").read()
+        text = _read(os.path.join(self.store, json.loads(out)["path"]))
         self.assertIn("```xml", text)
         self.assertIn("<root>", text)
 
@@ -282,7 +297,7 @@ class IngestTests(StoreTestCase):
         _write(jsonf, '{"a": 1}')
         code, out, err = self._ingest(jsonf, source_type="agent-output", origin="export tool")
         self.assertEqual(code, 0, err)
-        text = open(os.path.join(self.store, json.loads(out)["path"]), encoding="utf-8").read()
+        text = _read(os.path.join(self.store, json.loads(out)["path"]))
         self.assertIn("```json", text)
         self.assertIn('"a": 1', text)
 
@@ -295,8 +310,8 @@ class IngestTests(StoreTestCase):
         result = json.loads(out)
         asset = os.path.join(self.store, *result["asset"].split("/"))
         self.assertTrue(os.path.isfile(asset), "original imutável deveria estar em raw/assets/")
-        self.assertEqual(open(asset, encoding="utf-8").read(), "%PDF-1.4 conteudo falso")
-        stub = open(os.path.join(self.store, *result["path"].split("/")), encoding="utf-8").read()
+        self.assertEqual(_read(asset), "%PDF-1.4 conteudo falso")
+        stub = _read(os.path.join(self.store, *result["path"].split("/")))
         self.assertIn("raw/assets/", stub)
         self.assertIn("Análise pendente", stub)
 
@@ -332,10 +347,10 @@ class CompileGranularityTests(StoreTestCase):
         for i in range(3):
             expected = os.path.join(self.store, "wiki", "demo", "code-repo", f"sb-mod-{i}.md")
             self.assertTrue(os.path.isfile(expected), expected)
-            text = open(expected, encoding="utf-8").read()
+            text = _read(expected)
             self.assertIn(f"sb-mod-{i}", text)
 
-        index_text = open(os.path.join(self.store, "wiki", "index.md"), encoding="utf-8").read()
+        index_text = _read(os.path.join(self.store, "wiki", "index.md"))
         for i in range(3):
             self.assertIn(f"sb-mod-{i}", index_text)
 
@@ -371,7 +386,7 @@ class InitCheckPermissionsTests(unittest.TestCase):
 
         settings_path = os.path.join(self.base, ".claude", "settings.json")
         self.assertTrue(os.path.isfile(settings_path))
-        data = json.load(open(settings_path, encoding="utf-8"))
+        data = json.loads(_read(settings_path))
         perms = data["permissions"]
         store_abs = os.path.abspath(self.store)
         repo_abs = os.path.abspath(self.repo)

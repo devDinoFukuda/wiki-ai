@@ -38,6 +38,13 @@ def _walk(root: str):
 
 def cmd_reindex(a) -> int:
     conn = store.connect(a.db)
+    try:
+        return _cmd_reindex_body(a, conn)
+    finally:
+        conn.close()
+
+
+def _cmd_reindex_body(a, conn) -> int:
     emb = embed_mod.get_embedder()
     changed = seen = 0
     seen_paths: set[str] = set()
@@ -52,7 +59,8 @@ def cmd_reindex(a) -> int:
             # utf-8-sig descasca BOM (comum no Windows: PowerShell 5.1, Notepad).
             # Sem isto, o BOM vai pro corpo, vira chunk, polui a busca e quebra
             # a saída da CLI (charmap codec can't encode \ufeff).
-            text = open(path, encoding="utf-8-sig", errors="replace").read()
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
+                text = f.read()
             meta, body = split(text)
             gaps = provenance_gaps(meta) if coll == "raw" else []
             # Documento sem chunks (corpo vazio, ou só frontmatter) ainda é
@@ -164,6 +172,13 @@ def cmd_search(a) -> int:
         filters["collection"] = a.collection
 
     conn = store.connect(a.db)
+    try:
+        return _cmd_search_body(a, conn, intent, subs, filters)
+    finally:
+        conn.close()
+
+
+def _cmd_search_body(a, conn, intent, subs, filters) -> int:
     emb = embed_mod.get_embedder()
     pool = max(a.n * 5, 30)
 
@@ -242,6 +257,13 @@ def cmd_search(a) -> int:
 
 def cmd_get(a) -> int:
     conn = store.connect(a.db)
+    try:
+        return _cmd_get_body(a, conn)
+    finally:
+        conn.close()
+
+
+def _cmd_get_body(a, conn) -> int:
     ref = a.ref.lstrip("#")
     row = conn.execute(
         "SELECT path FROM documents WHERE docid=? OR path=?", (ref, a.ref)
@@ -262,7 +284,8 @@ def cmd_get(a) -> int:
             file=sys.stderr,
         )
         return 1
-    lines = open(row["path"], encoding="utf-8-sig", errors="replace").read().splitlines()
+    with open(row["path"], encoding="utf-8-sig", errors="replace") as f:
+        lines = f.read().splitlines()
     start = max(0, a.line_from - 1) if a.line_from else 0
     end = start + a.count if a.count else len(lines)
     width = len(str(min(end, len(lines))))
@@ -481,6 +504,13 @@ def cmd_audit(a) -> int:
     Para ela, use `search` para gerar candidatos e leve só esses ao LLM.
     """
     conn = store.connect(a.db)
+    try:
+        return _cmd_audit_body(a, conn)
+    finally:
+        conn.close()
+
+
+def _cmd_audit_body(a, conn) -> int:
     report: dict[str, list] = {}
     for rule, sql in AUDIT_SQL.items():
         if a.rule and a.rule != rule:
@@ -508,6 +538,13 @@ def cmd_audit(a) -> int:
 
 def cmd_status(a) -> int:
     conn = store.connect(a.db)
+    try:
+        return _cmd_status_body(a, conn)
+    finally:
+        conn.close()
+
+
+def _cmd_status_body(a, conn) -> int:
     q = lambda s, *p: conn.execute(s, p).fetchone()[0]
     stale = []
     for r in conn.execute("SELECT path, mtime FROM documents").fetchall():
