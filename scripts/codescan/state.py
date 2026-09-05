@@ -46,6 +46,16 @@ STATUSES = ("pending", "in_progress", "done", "blocked", "failed", "degraded")
 ITEM_PROBLEM_STATUSES = ("blocked", "failed", "degraded")
 ITEM_STAGES_REQUIRE_FINALIZE = ("modules", "specs")
 
+# F01 (W0): `evidence`/`verify` não têm itens (done/pending) nem gate de
+# auditoria (sdd.CRITICAL_STAGES) — antes desta correção, `done <stage>`
+# genérico (cli.cmd_done) não tinha NENHUM blocker próprio para os dois, e
+# `st.mark(wd, stage, "done", <qualquer coisa>)` fechava o estágio inteiro
+# sem que nenhuma execução real (`evidence`/`verify --artifact`) tivesse
+# rodado. Estágios aqui só podem ser fechados por `done` quando existe um
+# registro de verificação (`record_verification`) cujo hash ainda bate com o
+# conteúdo atual do artefato em disco (`verification_ok`) — ver cli.cmd_done.
+VERIFIED_STAGES = ("evidence", "verify")
+
 
 def workdir(store: str, repo: str) -> str:
     """Work dir derivado do repo: <store>/.codescan/<nome>-<hash>.
@@ -656,3 +666,136 @@ def sha256_file(path: str) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _safe_sha256(path: str | None) -> str | None:
+    """`sha256_file` sem levantar: `None` se `path` é vazio, sumiu, ou não dá
+    pra ler. Usado nas checagens de integridade abaixo, onde "não dá pra
+    confirmar o hash" e "hash não bate" têm o mesmo efeito prático (artefato
+    verificado não pode mais ser considerado válido)."""
+    if not path:
+        return None
+    try:
+        return sha256_file(path)
+    except OSError:
+        return None
+
+
+# --- F01 (W0): vínculo de verificação para `evidence`/`verify` -------------
+#
+# `record_verification` é chamada SÓ pela execução real (`cli.cmd_evidence`/
+# `cli.cmd_verify`, logo depois de gerar/validar o artefato) — nunca por
+# `done`/`problem-status`. `verification_ok` é o gate que `cli.cmd_done`
+# consulta antes de fechar `evidence`; `revalidate_verified_stages` é a
+# auto-cura: reaberta a cada invocação do CLI (ver `cli.main`), ela derruba
+# de volta para `failed` qualquer estágio cujo artefato verificado mudou de
+# conteúdo (ou sumiu) desde o último `done` — sem isso, editar
+# `sdd/confirmed.md` depois do `verify` deixaria `stages.verify.status`
+# congelado em "done" para sempre, mentindo sobre o que foi de fato checado.
+def record_verification(
+    wd: str, stage: str, key: str, path: str, scope: dict | None = None
+) -> dict:
+    """Grava, sob trava, o hash sha256 + escopo do artefato que embasou uma
+    execução real de `stage` (`evidence` ou `verify`). `key` identifica o
+    artefato dentro do estágio (a mesma chave usada em
+    `stages.verify.artifacts` para `verify`; fixa para `evidence`, que tem um
+    único artefato por vez). Levanta `OSError` se `path` não existir/não der
+    pra ler — quem chama já deve ter confirmado que o artefato foi escrito."""
+    digest = sha256_file(path)
+    with _lock(wd):
+        st = load(wd) or {}
+        s = st.setdefault("stages", {}).setdefault(stage, {})
+        verified = s.setdefault("verified", {})
+        verified[key] = {
+            "path": os.path.abspath(path),
+            "sha256": digest,
+            "scope": scope,
+            "at": _now(),
+        }
+        s.pop("invalidated", None)
+        save(wd, st)
+        return st
+
+
+def verification_ok(wd: str, stage: str) -> tuple[bool, str | None]:
+    """`(True, None)` só se `stage` tem ao menos um artefato verificado
+    (`record_verification`) e todo hash gravado ainda bate com o conteúdo
+    ATUAL em disco. Base do gate de `done <stage>` para `VERIFIED_STAGES`:
+    sem isto, `done evidence` bastava para fechar o estágio sem que
+    `evidence` tivesse rodado de verdade."""
+    st = load(wd) or {}
+    s = (st.get("stages") or {}).get(stage) or {}
+    verified = s.get("verified")
+    if not isinstance(verified, dict) or not verified:
+        return False, f"nenhuma verificação registrada para '{stage}': execute o comando real antes de done"
+    stale = sorted(
+        key
+        for key, entry in verified.items()
+        if not isinstance(entry, dict)
+        or _safe_sha256(entry.get("path")) != entry.get("sha256")
+    )
+    if stale:
+        return False, "artefato(s) alterado(s)/ausente(s) desde a verificação: " + ", ".join(stale)
+    return True, None
+
+
+def revalidate_verified_stages(wd: str) -> dict | None:
+    """Auto-cura: derruba `status` de `evidence`/`verify` de "done" para
+    "failed" quando o artefato que embasou aquele `done` mudou de conteúdo
+    (ou sumiu) desde então. Chamada no início de toda invocação do
+    CLI (ver `cli.main`), ANTES de qualquer subcomando rodar — assim a
+    invalidação por edição de artefato aparece na primeira chamada seguinte
+    ao codescan, sem exigir um comando dedicado. Retorno best-effort: `None`
+    se não há state.json ou nada a revalidar; nunca levanta (chamador não
+    deve deixar uma falha aqui derrubar o comando real que o usuário pediu)."""
+    if not os.path.isfile(_path(wd)):
+        return None
+    try:
+        with _lock(wd):
+            st = load(wd)
+            if not st:
+                return None
+            changed = False
+            for stage in VERIFIED_STAGES:
+                s = (st.get("stages") or {}).get(stage)
+                if not s or s.get("status") != "done":
+                    continue
+                verified = s.get("verified")
+                if not isinstance(verified, dict) or not verified:
+                    continue
+                stale = sorted(
+                    key
+                    for key, entry in verified.items()
+                    if not isinstance(entry, dict)
+                    or _safe_sha256(entry.get("path")) != entry.get("sha256")
+                )
+                if not stale:
+                    continue
+                # "failed", não "in_progress": `wk/cli.py` (fora do meu
+                # escopo de edição) só bloqueia promote/compile/docx quando
+                # `stages.verify.status == "failed"` (ver
+                # `_failed_verify_workdirs` lá) — "in_progress" passaria
+                # batido por aquele portão, como se o estágio nunca tivesse
+                # sido tocado. "failed" é também semanticamente correto: o
+                # resultado que tinha passado não vale mais para o conteúdo
+                # atual do artefato.
+                s["status"] = "failed"
+                s["invalidated"] = {
+                    "artefatos": stale,
+                    "motivo": "conteúdo alterado ou artefato ausente desde a verificação anterior",
+                    "at": _now(),
+                }
+                artifacts = s.get("artifacts")
+                if isinstance(artifacts, dict):
+                    for key in stale:
+                        if artifacts.get(key) == "done":
+                            artifacts[key] = "stale"
+                changed = True
+            if changed:
+                save(wd, st)
+            return st
+    except (OSError, StateCorruptError):
+        # best-effort: um state.json corrompido/ilocável não deve impedir o
+        # comando real de rodar — quem de fato precisa do estado (cmd_state,
+        # cmd_done, ...) vai chamar `load()` de novo e reportar o erro certo.
+        return None

@@ -1538,17 +1538,42 @@ def _record_agent_run(
     output_text: str | None = None,
     model: str | None = None,
 ) -> str:
+    """Acrescenta um run a `agent-runs/<stage>.json`.
+
+    F04 (onda W0, plano de evolução): a leitura + modificação + escrita do
+    manifesto agora acontece INTEIRA dentro de `st_mod._lock(wd)` — a MESMA
+    trava entre processos que `_mark_items_done_transaction` (acima) usa
+    para `state.json` e que `sdd.redo_stage` (BUG F-22) já usa para este
+    MESMO arquivo `agent-runs/<stage>.json`. Antes desta correção, esta era
+    a única das três escritas desse manifesto sem trava: dois
+    `merge-agent-output` concorrentes (ex.: dois batches do mesmo fan-out
+    terminando quase juntos) podiam ler `previous` no mesmo instante e o
+    segundo `write` apagava do disco o run que o primeiro acabara de gravar
+    (perda de atualização/last-write-wins).
+
+    A escrita passa a usar `sdd_mod._write_json_atomic` (tmp no MESMO
+    diretório do destino + `os.replace`), a mesma função que `sdd.redo_stage`
+    já usa para este manifesto, em vez do `open(path, "w")` truncante
+    anterior — uma sessão morta no meio do `json.dump` não deixa mais
+    `agent-runs/<stage>.json` truncado/vazio.
+
+    Resultado (`items_payload`, artefatos+sha256+bytes) e proveniência
+    (`input_sha256`, `agent`, `model`, `tokens`, `estimated_cost_usd`)
+    continuam sendo campos do MESMO dict `new_run`, gravados numa única
+    chamada de escrita — nunca em dois passos separados.
+
+    Unicidade de execução: se, sob a MESMA trava, já existir no manifesto um
+    run `current` com o mesmo `agent` (identidade literal) e o mesmo
+    `input_sha256` do run sendo gravado agora, isso é reexecução/corrida da
+    MESMA tarefa. O manifesto é append-only (nunca sobrescrevemos/removemos
+    um run existente aqui), então as duas execuções já ficam preservadas por
+    construção; o run novo também ganha o campo aditivo `conflito` apontando
+    para o run anterior, para a duplicidade não passar em silêncio pela
+    auditoria (`sdd._agent_run_blockers` / operador lendo o manifesto)."""
     path = _agent_runs_path(wd, stage)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    previous: dict = {}
-    if os.path.isfile(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                previous = json.load(f)
-        except Exception:
-            previous = {}
-    runs = previous.get("runs") if isinstance(previous.get("runs"), list) else []
     input_abs = os.path.abspath(input_path)
+    input_sha256 = st_mod.sha256_file(input_abs)
+    input_bytes = os.path.getsize(input_abs)
     items_payload = []
     for artifact in artifacts:
         artifact_payload = [
@@ -1562,28 +1587,56 @@ def _record_agent_run(
         items_payload.append({"item": artifact.item, "artifacts": artifact_payload})
     resolved_model = _resolve_agent_model(model)
     tokens = _estimate_run_tokens(wd, stage, agent, output_text)
-    runs.append(
-        {
-            "stage": stage,
-            "input": input_abs,
-            "input_sha256": st_mod.sha256_file(input_abs),
-            "input_bytes": os.path.getsize(input_abs),
-            "agent": agent,
-            "model": resolved_model,
-            "tokens": tokens,
-            "estimated_cost_usd": _estimate_cost_usd(
-                tokens["input_estimated"], tokens["output_estimated"], resolved_model
-            ),
-            "items": items_payload,
-            "items_count": len(artifacts),
-            "artifacts_count": sum(len(artifact.artifacts) for artifact in artifacts),
-            "created_at": st_mod._now(),
-        }
-    )
-    out = {"schema": "wiki-ai.agent-runs.v2", "stage": stage, "runs": runs}
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    new_run = {
+        "stage": stage,
+        "input": input_abs,
+        "input_sha256": input_sha256,
+        "input_bytes": input_bytes,
+        "agent": agent,
+        "model": resolved_model,
+        "tokens": tokens,
+        "estimated_cost_usd": _estimate_cost_usd(
+            tokens["input_estimated"], tokens["output_estimated"], resolved_model
+        ),
+        "items": items_payload,
+        "items_count": len(artifacts),
+        "artifacts_count": sum(len(artifact.artifacts) for artifact in artifacts),
+        "created_at": st_mod._now(),
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with st_mod._lock(wd):
+        previous: dict = {}
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8-sig") as f:
+                    previous = json.load(f)
+            except Exception:
+                previous = {}
+        runs = previous.get("runs") if isinstance(previous.get("runs"), list) else []
+        conflict_run_id: int | None = None
+        for idx, existing in enumerate(runs, start=1):
+            if not isinstance(existing, dict):
+                continue
+            if (
+                _run_is_current(existing)
+                and existing.get("agent") == agent
+                and existing.get("input_sha256") == input_sha256
+            ):
+                conflict_run_id = idx
+        if conflict_run_id is not None:
+            new_run["conflito"] = {
+                "tipo": "execucao_duplicada",
+                "run_anterior_id": conflict_run_id,
+                "motivo": (
+                    "agent e input_sha256 idênticos a um run current já "
+                    f"registrado neste manifesto (run #{conflict_run_id}) — "
+                    "possível reexecução ou corrida da mesma tarefa; nenhum "
+                    "run existente foi sobrescrito ou removido"
+                ),
+            }
+        runs.append(new_run)
+        out = {"schema": "wiki-ai.agent-runs.v2", "stage": stage, "runs": runs}
+        sdd_mod._write_json_atomic(path, out)
     return path
 
 

@@ -165,7 +165,12 @@ class TraversalAttackTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
 
     def test_compile_recusa_id_com_traversal_em_recusados(self):
-        """compile deve rejeitar id: ../evil sem compilar nada fora de wiki/"""
+        """F09 (W0): compile rejeita id: ../evil e bloqueia toda a compilação.
+
+        F09 mudou a semântica: qualquer recusado bloqueia a promoção inteira
+        (exit 1, "bloqueado" no JSON, nada é promovido). Antes, o teste esperava
+        que a página boa fosse compilada mesmo com um recusado, mas agora uma
+        fonte recusada aborta tudo."""
         # Criar documento com id malicioso
         bad_path = os.path.join(self.store, "raw", "code-notes", "malicious.md")
         _write(bad_path, (
@@ -174,7 +179,7 @@ class TraversalAttackTests(unittest.TestCase):
             "confidence: reviewed\ntopic: demo\n---\n\nMalicious content.\n"
         ))
 
-        # Criar um documento legítimo também
+        # Criar um documento legítimo também (não será compilado por causa do bloqueio)
         good_path = os.path.join(self.store, "raw", "code-notes", "good.md")
         _write(good_path, (
             "---\nid: sb-good-1\nsource_type: code-repo\norigin: test\n"
@@ -183,31 +188,37 @@ class TraversalAttackTests(unittest.TestCase):
         ))
 
         code, out, err = _run(["compile", "--store", self.store])
-        # Pode retornar 0 ou 1 dependendo de como CLI trata isso
+
+        # F09: exit 1 (bloqueado)
+        self.assertEqual(code, 1, f"F09: compile bloqueado deve retornar 1, foi {code}")
         data = json.loads(out)
 
-        # O malicioso deve estar em recusados (com caminho, não necessariamente 'id')
+        # O malicioso deve estar em recusados
         self.assertIn("recusados", data)
         self.assertGreater(len(data["recusados"]), 0)
         # Verificar que o mal-intencionado está na lista de recusados
         recusados_strs = str(data["recusados"])
         self.assertIn("evil", recusados_strs)
 
-        # O bom deve ter sido compilado
-        self.assertGreater(len(data["paginas"]), 0)
+        # F09: paginas vazio (promoção bloqueada)
+        self.assertEqual(len(data["paginas"]), 0,
+                        "F09: com recusado, paginas deve ser vazio (promoção bloqueada)")
 
-        # Verificar que nada foi criado fora de wiki/ (arquivos novo criados)
-        # O arquivo malicioso original em raw/ não foi criado pelo compile,
-        # apenas rejeitado, então isso não é problema
+        # F09: "bloqueado" presente no JSON
+        self.assertIn("bloqueado", data)
+
+        # Verificar que nada foi criado fora de wiki/
         wiki_root = os.path.join(self.store, "wiki")
+        # Só index.md será criado (vazio), nada do conteúdo foi promovido
         for filename in os.listdir(wiki_root):
-            if filename != "index.md":  # index.md é sempre criado
+            if filename != "index.md":
                 filepath = os.path.join(wiki_root, filename)
                 if os.path.isfile(filepath):
                     with open(filepath, encoding="utf-8") as fp:
                         content = fp.read()
-                        # Nenhum arquivo compilado deve conter "evil"
+                        # Nenhum arquivo deve conter "evil" ou "good"
                         self.assertNotIn("evil", content.lower())
+                        self.assertNotIn("good", content.lower())
 
     def test_publish_recusa_topic_com_componente_iniciado_por_ponto(self):
         """publish --topic com componente iniciado por . é recusado"""

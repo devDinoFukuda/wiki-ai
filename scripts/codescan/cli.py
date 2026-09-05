@@ -1139,8 +1139,59 @@ def _validate_artifact_was_merged(wd: str, stage: str, artifact: str) -> str | N
     )
 
 
+def _cmd_done_verified_stage(wd: str, a) -> int:
+    """`done` para `verify`/`evidence` (F01, W0): os dois só têm `status`
+    fechado por um vínculo de verificação real (`state.record_verification`,
+    gravado por `cmd_evidence`/`cmd_verify`), nunca por mutação direta de
+    `done`. Isola este caminho de `cmd_done` porque nenhum dos dois usa
+    `--item`, `merge-agent-output` ou o gate genérico de blockers — a
+    validação é 100% o hash de `state.verification_ok`.
+    """
+    if a.item:
+        _err(f"done {a.stage} não aceita --item: {a.stage} não tem itens")
+        return 2
+    if a.stage == "verify":
+        # `verify` nunca fecha por `done`: o status é DERIVADO da cobertura
+        # dos artefatos obrigatórios (`_verify_coverage`, computado só por
+        # `cmd_verify`) — permitir `done verify` aqui destrancaria o estágio
+        # inteiro com uma única citação válida, exatamente o bug que F-02 já
+        # fechou para `verify --artifact`. Sem exceção: mesmo com um
+        # `--artifact` já verificado com sucesso, a cobertura pode faltar
+        # outro artefato obrigatório (ex.: inferred.md) — só `cmd_verify`
+        # sabe recalcular isso.
+        error = (
+            "done verify não é permitido: o status de verify é derivado da "
+            "cobertura de artefatos obrigatórios, não de um done manual"
+        )
+        st_mod.record_stage_error(wd, "verify", error, a.artifact, [])
+        _err(error, acao="rode `verify --artifact <sdd/confirmed.md>` (e inferred.md, se existir) até a cobertura fechar sozinha")
+        return 2
+    # stage == "evidence": único artefato; `done` só reafirma um resultado já
+    # produzido por `cmd_evidence` E ainda íntegro (hash bate com o disco).
+    ok, reason = st_mod.verification_ok(wd, "evidence")
+    if not ok:
+        error = f"done evidence recusado: {reason}"
+        st_mod.record_stage_error(wd, "evidence", error, a.artifact, [])
+        _err(error, acao="rode `evidence --topic <topico>` — ela mesma fecha o estágio ao terminar, sem precisar de done depois")
+        return 2
+    st = st_mod.mark(wd, "evidence", "done", a.artifact or None)
+    st = st_mod.clear_stage_error(wd, "evidence")
+    out = dict(st["stages"]["evidence"])
+    out["progresso"] = _progresso(wd, st, "evidence")
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_done(a) -> int:
     wd = _wd(a)
+    # F01 (W0): `evidence`/`verify` não têm itens nem gate de auditoria
+    # (sdd.CRITICAL_STAGES) — sem este bloco, `done <stage>` genérico abaixo
+    # não tinha NENHUM blocker próprio para os dois, e um `--artifact`
+    # qualquer (ou nenhum) fechava o estágio sem que a execução real
+    # (`evidence`/`verify --artifact`) tivesse rodado. Tratado ANTES de
+    # qualquer outra coisa (inclusive `--item`, que estes estágios não usam).
+    if a.stage in st_mod.VERIFIED_STAGES:
+        return _cmd_done_verified_stage(wd, a)
     # BUG B3: migra/deduplica grafias '\\'/'/' já gravadas para este stage
     # antes de validar/mutar, e resolve --item (aceita as duas formas) para
     # a grafia já existente em state.json — sem isso, `done --item` com
@@ -1300,6 +1351,14 @@ def cmd_evidence(a) -> int:
         print(json.dumps({"error": str(e)}, ensure_ascii=False), file=sys.stderr)
         return 2
     ev_mod.write_json(artifact, pack)
+    # F01 (W0): grava o hash do pacote recém-escrito ANTES de marcar `done` —
+    # é este registro que `done evidence` (cmd_done) passa a exigir para
+    # aceitar reafirmar o estágio, e que fica inválido sozinho (ver
+    # `state.revalidate_verified_stages`) se o artefato for editado depois.
+    st_mod.record_verification(
+        wd, "evidence", "evidence", artifact,
+        scope={"topic": topic, "commit": pack.get("commit")},
+    )
     st_mod.mark(wd, "evidence", "done", artifact)
     print(
         json.dumps(
@@ -3496,6 +3555,21 @@ def cmd_verify(a) -> int:
 
     cobertura = _verify_coverage(wd, artifacts)
     cobertura["artefato_atual"] = key
+    # F01 (W0): vincula ESTA aprovação ao hash do artefato + escopo checado
+    # (commit pinado + arquivos citados) — sem isto, `done evidence`/`done
+    # verify` (cmd_done) não tinha como distinguir "artefato de fato passou
+    # por `verify`" de "alguém setou o campo à mão". Só quando o relatório
+    # aprova: um artefato reprovado não deve virar um registro "verificado"
+    # que `cmd_done` (se algum dia relaxar o bloqueio de `verify`) aceitaria.
+    if report["ok"]:
+        pinned_head, _motivo = _pinned_head(wd)
+        st_mod.record_verification(
+            wd, "verify", key, a.artifact,
+            scope={
+                "repo_head": pinned_head,
+                "citations": sorted({c.path for c in ev_mod.citations(md)}),
+            },
+        )
     # `mark` faz seu próprio load/save sob trava e é a única via pública que
     # grava status/artifact do stage — chamado DEPOIS do merge do mapa.
     st_mod.mark(wd, "verify", cobertura["status"], out or a.artifact)
@@ -4070,6 +4144,16 @@ def main(argv=None) -> int:
     # rejuntado como se fosse relativo a outra base. Não alteramos `a.repo`
     # aqui para não arriscar mudar o rótulo exibido em saídas legíveis.
     a.store = os.path.abspath(store_value)
+
+    # F01 (W0): auto-cura ANTES de qualquer subcomando rodar — se o artefato
+    # que embasou um `done` de `evidence`/`verify` mudou de conteúdo (ou
+    # sumiu) desde então, `status` volta pra `failed` aqui, nesta própria
+    # invocação. Sem isto, editar `sdd/confirmed.md` depois do `verify`
+    # deixaria `stages.verify.status` mentindo "done" indefinidamente —
+    # nenhum comando reconferia o hash. Best-effort (nunca levanta: ver
+    # `state.revalidate_verified_stages`) e silencioso quando não há nada a
+    # revalidar, então roda em toda invocação sem custo perceptível.
+    st_mod.revalidate_verified_stages(st_mod.workdir(a.store, a.repo))
 
     # Corpo completo é o padrão do `wk code` (--verbose é aceito só como
     # no-op de compatibilidade). `--quiet` é opt-in explícito para o resumo

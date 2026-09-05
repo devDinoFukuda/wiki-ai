@@ -1511,6 +1511,10 @@ def cmd_promote(a) -> int:
     # F-16(a): itens cuja gravação em raw/ falhou ou não validou — continuam
     # intactos no inbox (nada é removido antes do destino estar consolidado).
     falhas_gravacao: list[dict] = []
+    # FIX (fechamento W0): avisos de revalidação (`_revalidate_codescan_verify_state`)
+    # coletados ao longo do laço — um por workdir onde não pôde rodar (ex.:
+    # módulo `codescan` ausente). Deduplicados na ordem de primeira ocorrência.
+    revalidacao_avisos: list[str] = []
 
     for path in targets:
         text = _read_md(path)
@@ -1532,7 +1536,10 @@ def cmd_promote(a) -> int:
         # docs, ou sem topic) nunca passam por aqui.
         item_topic = meta.get("topic")
         if item_topic:
-            vfailed = _failed_verify_workdirs(store_root, item_topic)
+            vfailed, vwarnings = _failed_verify_workdirs(store_root, item_topic)
+            for w in vwarnings:
+                if w not in revalidacao_avisos:
+                    revalidacao_avisos.append(w)
             if vfailed:
                 if not a.allow_unverified:
                     verify_blocked.append(
@@ -1786,6 +1793,8 @@ def cmd_promote(a) -> int:
         }
     if reindex_error:
         out["reindex_error"] = reindex_error
+    if revalidacao_avisos:
+        out["revalidacao_avisos"] = revalidacao_avisos
     print(json.dumps(out, ensure_ascii=False, indent=2))
     # F-16: id duplicado e falha de gravação são erro — exit != 0 para que
     # nenhuma automação trate a recusa como sucesso silencioso (mesmo contrato
@@ -2241,7 +2250,7 @@ def cmd_compile(a) -> int:
 
     # FIX 3: bloqueia compile de um topic (ou de todos, sem filtro) cujo
     # workdir de codescan teve `verify` reprovado — salvo --allow-unverified.
-    verify_block, verify_overridden = _verify_gate_scope(store_root, a.topic, a.allow_unverified)
+    verify_block, verify_overridden, verify_warnings = _verify_gate_scope(store_root, a.topic, a.allow_unverified)
     if verify_block:
         print(json.dumps(verify_block, ensure_ascii=False, indent=2), file=sys.stderr)
         return 3
@@ -2250,6 +2259,12 @@ def cmd_compile(a) -> int:
     wiki_root = os.path.join(store_root, "wiki")
     os.makedirs(wiki_root, exist_ok=True)
     assets_root = os.path.join(store_root, "raw", "assets")
+    # F09: o conjunto novo (páginas + sínteses) é gerado inteiro aqui, num
+    # staging irmão de wiki/; só é promovido (movido) para `wiki_root` depois
+    # de gerado por inteiro sem recusa (bloco de promoção logo após as
+    # sínteses, abaixo). `wiki_root` — a publicação anterior — não é tocado
+    # até lá.
+    write_root = _staging_dir_for(wiki_root)
 
     pages = []
     # F-01: fontes cujo id/topic/source_type não passa na sanitização de
@@ -2278,12 +2293,12 @@ def cmd_compile(a) -> int:
             type_slug = _slug_component(s["source_type"], "source_type")
             id_slug = _slug_component(s["id"] or "sem-id", "id")
             page_dir = _confined(
-                wiki_root,
-                os.path.join(wiki_root, *topic_slug.split("/"), type_slug),
+                write_root,
+                os.path.join(write_root, *topic_slug.split("/"), type_slug),
                 "topic",
                 s["topic"],
             )
-            path = _confined(wiki_root, os.path.join(page_dir, f"{id_slug}.md"), "id", s["id"])
+            path = _confined(write_root, os.path.join(page_dir, f"{id_slug}.md"), "id", s["id"])
             asset_src = None
             if s.get("id"):
                 # O nome do asset preserva a caixa do id (gravado assim pelo
@@ -2310,7 +2325,10 @@ def cmd_compile(a) -> int:
             shutil.copyfile(asset_src, asset_dest)
             asset_href = f"{id_slug}.html"
             asset_abspath_by_id[s["id"]] = asset_dest
-            gerado_abs.add(os.path.abspath(asset_dest))
+            # F09: `gerado_abs` guarda coordenadas FINAIS (dentro de
+            # `wiki_root`), não as de staging — é contra `wiki_root`, já
+            # promovido, que a poda de órfãos compara mais abaixo.
+            gerado_abs.add(os.path.abspath(_staged_to_final(asset_dest, write_root, wiki_root)))
 
         body = [
             f"# {s['id']}",
@@ -2327,11 +2345,16 @@ def cmd_compile(a) -> int:
         text = _frontmatter_for_wiki(page_id, s["topic"], [str(s["id"])] if s.get("id") else [])
         text += "\n" + "\n".join(body).rstrip() + "\n"
         _write_md(path, text)
-        rel_page = os.path.relpath(path, store_root).replace("\\", "/")
-        href = os.path.relpath(path, wiki_root).replace("\\", "/")
+        # F09: `path` fica em coordenadas de staging (usado abaixo só para
+        # relpaths internos, ex. em `_build_topic_overview`); `final_path` é
+        # onde o arquivo vai parar depois da promoção — é o que entra no
+        # contrato de saída (`pages`) e em `gerado_abs`.
+        final_path = _staged_to_final(path, write_root, wiki_root)
+        rel_page = os.path.relpath(final_path, store_root).replace("\\", "/")
+        href = os.path.relpath(path, write_root).replace("\\", "/")
         pages.append(rel_page)
         page_entries.append((s, rel_page, href))
-        gerado_abs.add(os.path.abspath(path))
+        gerado_abs.add(os.path.abspath(final_path))
         if s.get("id"):
             page_abspath_by_id[s["id"]] = path
 
@@ -2358,7 +2381,7 @@ def cmd_compile(a) -> int:
         try:
             topic_slug = _slug_topic(topic)
             overview_dir = _confined(
-                wiki_root, os.path.join(wiki_root, *topic_slug.split("/")), "topic", topic
+                write_root, os.path.join(write_root, *topic_slug.split("/")), "topic", topic
             )
         except PathComponentError as exc:
             recusados.append({**exc.as_dict(), "fonte": f"(síntese do topic {topic})"})
@@ -2372,10 +2395,55 @@ def cmd_compile(a) -> int:
         overview_text = _frontmatter_for_wiki(overview_page_id, topic, overview_source_ids)
         overview_text += "\n\n" + overview_body.rstrip() + "\n"
         _write_md(overview_path, overview_text)
-        pages.append(os.path.relpath(overview_path, store_root).replace("\\", "/"))
-        gerado_abs.add(os.path.abspath(overview_path))
-        overview_href = os.path.relpath(overview_path, wiki_root).replace("\\", "/")
+        final_overview_path = _staged_to_final(overview_path, write_root, wiki_root)
+        pages.append(os.path.relpath(final_overview_path, store_root).replace("\\", "/"))
+        gerado_abs.add(os.path.abspath(final_overview_path))
+        overview_href = os.path.relpath(overview_path, write_root).replace("\\", "/")
         overview_entries.append((topic, overview_href, lacunas))
+
+    # ---------- F09: promoção do conjunto novo (proteção de publicação) ----------
+    # Até aqui só `write_root` (staging) foi tocado; `wiki_root` — a
+    # publicação anterior — segue 100% intacto. `recusados` é o conjunto novo
+    # incompleto (F-01 recusou pelo menos uma fonte): promovê-lo mesmo assim
+    # faria a poda logo abaixo enxergar a página antiga daquele id como órfã
+    # e apagá-la, destruindo conteúdo válido por causa de uma falha parcial
+    # (achado do plano de evolução, seção W0/F09). Por isso QUALQUER recusado
+    # aborta a promoção inteira — nada é movido, wiki/ sai exatamente como
+    # entrou nesta execução, só o staging é descartado. Reexecutar depois de
+    # corrigir a fonte recusada refaz a geração do zero (staging é sempre um
+    # diretório novo de `tempfile.mkdtemp`; nunca reaproveitado, então não há
+    # como duplicar nem herdar lixo de uma tentativa anterior).
+    bloqueado_geracao = bool(recusados)
+    try:
+        if not bloqueado_geracao:
+            _promote_staged_tree(write_root, wiki_root, a.topic)
+    except PathComponentError as exc:  # F-01: nunca promover fora de wiki_root
+        print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
+    finally:
+        shutil.rmtree(write_root, ignore_errors=True)
+
+    if bloqueado_geracao:
+        _append_log(
+            store_root,
+            f"## [{_utc_now()}] compile ABORTADO (F09) | {len(recusados)} fonte(s) "
+            "recusada(s) | wiki/ preservado sem alteração desta execução",
+        )
+        out = {
+            "paginas": [],
+            "fontes": len(sources),
+            "podados": [],
+            "reindexed": False,
+            "reindex_modo": None,
+            "overview": [],
+            "recusados": recusados,
+            "bloqueado": (
+                "conjunto novo incompleto (fonte recusada na geração) — nada foi "
+                "promovido; wiki/ segue exatamente como estava antes desta execução"
+            ),
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 1
 
     index_path = os.path.join(wiki_root, "index.md")
     lint_report_path = os.path.join(wiki_root, "_lint-report.md")
@@ -2573,12 +2641,67 @@ def cmd_compile(a) -> int:
     }
     if verify_overridden:
         out["verify_override"] = verify_overridden
+    if verify_warnings:
+        out["revalidacao_avisos"] = verify_warnings
     if recusados:
         out["recusados"] = recusados
     if reindex_error:
         out["reindex_error"] = reindex_error
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 1 if (reindex_error or recusados) else 0
+
+
+def _staging_dir_for(real_root: str) -> str:
+    """Diretório de staging IRMÃO de `real_root` (mesmo pai, logo mesmo
+    volume — a promoção usa `os.replace`, que exige isso). Nome garantido
+    único por `tempfile.mkdtemp`; começa com `.`, então nenhum topic_slug
+    real pode colidir com ele nem a poda (que só varre `.md`/`.html`/`.docx`
+    dentro da árvore de saída, nunca o pai) enxerga esse diretório.
+
+    F09 (proteção de publicação, plano W0): `cmd_compile`/`cmd_docx` geram o
+    conjunto novo inteiro aqui, fora de `real_root`; só depois de validado
+    por inteiro ele é promovido (`_promote_staged_tree`). Qualquer falha
+    antes da promoção deixa `real_root` (a publicação anterior) 100% intacto
+    — quem limpa o staging é sempre um `try/finally` no chamador."""
+    parent = os.path.dirname(os.path.abspath(real_root)) or "."
+    os.makedirs(parent, exist_ok=True)
+    base = os.path.basename(os.path.abspath(real_root)) or "staging"
+    return tempfile.mkdtemp(dir=parent, prefix=f".{base}.staging-")
+
+
+def _staged_to_final(staged_path: str, staging_root: str, real_root: str) -> str:
+    """`staged_path` (dentro de `staging_root`) traduzido para o caminho
+    equivalente dentro de `real_root`. A árvore de staging espelha 1:1 a
+    árvore final (mesmo `topic_slug`/`type_slug`/nome de arquivo), então a
+    tradução é só trocar a raiz — usado para reportar no JSON e para montar
+    `gerado_abs` já no sistema de coordenadas que a poda de órfãos (que roda
+    sobre `real_root`) espera."""
+    return os.path.join(real_root, os.path.relpath(staged_path, staging_root))
+
+
+def _promote_staged_tree(staging_root: str, real_root: str, topic: str | None) -> None:
+    """F09: move para dentro de `real_root` (sobrescrevendo o caminho
+    determinístico equivalente) todo arquivo gerado em `staging_root`,
+    escopado pelo mesmo `topic` de `_prune_root` (mesma raiz que a poda vai
+    varrer logo em seguida — nunca promove nem poda fora do escopo do
+    `--topic`).
+
+    Chamada só depois que TODO o conjunto novo (páginas/documentos +
+    sínteses) foi gerado sem falha: não há aqui nenhuma lógica de "o que
+    promover", é tudo que sobreviveu no staging escopado. `os.replace` por
+    arquivo garante que cada um aparece completo no destino final ou não
+    aparece — nunca um `.md`/`.docx` truncado a meio caminho."""
+    staged_scope = _prune_root(staging_root, topic)
+    if not os.path.isdir(staged_scope):
+        return
+    for dirpath, _dirnames, filenames in os.walk(staged_scope):
+        if not filenames:
+            continue
+        rel_dir = os.path.relpath(dirpath, staging_root)
+        dest_dir = real_root if rel_dir == "." else os.path.join(real_root, rel_dir)
+        os.makedirs(dest_dir, exist_ok=True)
+        for fn in filenames:
+            os.replace(os.path.join(dirpath, fn), os.path.join(dest_dir, fn))
 
 
 def _prune_root(out_root: str, topic: str | None) -> str:
@@ -2627,7 +2750,7 @@ def cmd_docx(a) -> int:
 
     # FIX 3: bloqueia docx de um topic (ou de todos, sem filtro) cujo workdir
     # de codescan teve `verify` reprovado — salvo --allow-unverified.
-    verify_block, verify_overridden = _verify_gate_scope(store_root, a.topic, a.allow_unverified)
+    verify_block, verify_overridden, verify_warnings = _verify_gate_scope(store_root, a.topic, a.allow_unverified)
     if verify_block:
         print(json.dumps(verify_block, ensure_ascii=False, indent=2), file=sys.stderr)
         return 3
@@ -2645,6 +2768,12 @@ def cmd_docx(a) -> int:
     out_root = os.path.join(store_root, a.out_dir)
     os.makedirs(out_root, exist_ok=True)
     assets_root = os.path.join(store_root, "raw", "assets")
+    # F09: o conjunto novo (.docx + agregadores) é gerado inteiro aqui, num
+    # staging irmão de `out_root`; só é promovido (movido) para `out_root`
+    # depois de gerado por inteiro sem falha (bloco de promoção logo após os
+    # agregadores, abaixo). `out_root` — a publicação anterior — não é
+    # tocado até lá.
+    write_root = _staging_dir_for(out_root)
 
     gerados: list[dict] = []
     pulados: list[dict] = []
@@ -2693,26 +2822,39 @@ def cmd_docx(a) -> int:
         try:
             filename = docx_meta.docx_filename_unique(s, taken)
             taken.add(filename[: -len(".docx")])
-            dest_dir = os.path.join(out_root, *topic_slug.split("/"), type_slug)
+            # F09: escreve no staging (write_root), nunca direto em out_root
+            # — o conjunto só chega lá na promoção, depois de validado por
+            # inteiro (ver bloco após os agregadores).
+            dest_dir = os.path.join(write_root, *topic_slug.split("/"), type_slug)
             os.makedirs(dest_dir, exist_ok=True)
             # `docx_meta` já neutraliza `/` e `..` no stem; o confinamento aqui
             # é a barreira final (F-01), válida para qualquer nome futuro.
-            path = _confined(out_root, os.path.join(dest_dir, filename), "id", s["id"])
+            path = _confined(write_root, os.path.join(dest_dir, filename), "id", s["id"])
             data, avisos = docxgen.build_document(s)
             with open(path, "wb") as f:
                 f.write(data)
+            # F09: validação mínima do conjunto — um .docx é um .zip; se o
+            # arquivo gravado não abre como zip, trata como falha de geração
+            # (vira `pulados`, bloqueia a promoção) em vez de publicar um
+            # documento corrompido.
+            if not zipfile.is_zipfile(path):
+                raise ValueError("arquivo gerado não é um .docx (zip) válido")
         except PathComponentError as exc:
             recusados.append({**exc.as_dict(), "fonte": s.get("rel")})
             continue
         except Exception as exc:
             pulados.append({"id": s["id"], "motivo": str(exc)})
             continue
-        gerado_abs.add(os.path.abspath(path))
+        # F09: `gerado_abs`/`gerados[].path` usam coordenadas FINAIS (dentro
+        # de out_root) — é contra out_root, já promovido, que a poda de
+        # órfãos compara mais abaixo, e é o caminho real reportado no JSON.
+        final_path = _staged_to_final(path, write_root, out_root)
+        gerado_abs.add(os.path.abspath(final_path))
         if s.get("id"):
             docx_path_by_id[s["id"]] = path
         gerados.append(
             {
-                "path": os.path.relpath(path, store_root).replace(os.sep, "/"),
+                "path": os.path.relpath(final_path, store_root).replace(os.sep, "/"),
                 "id": s["id"],
                 "source_type": s["source_type"],
                 "avisos": avisos,
@@ -2738,7 +2880,7 @@ def cmd_docx(a) -> int:
         try:
             agg_topic_slug = _slug_topic(topic)
             dest_dir = _confined(
-                out_root, os.path.join(out_root, *agg_topic_slug.split("/")), "topic", topic
+                write_root, os.path.join(write_root, *agg_topic_slug.split("/")), "topic", topic
             )
         except PathComponentError as exc:
             recusados.append({**exc.as_dict(), "fonte": f"(agregador do topic {topic})"})
@@ -2763,17 +2905,69 @@ def cmd_docx(a) -> int:
             data, avisos = docxgen.build_document(agg_source)
             with open(path, "wb") as f:
                 f.write(data)
+            if not zipfile.is_zipfile(path):
+                raise ValueError("agregador gerado não é um .docx (zip) válido")
         except Exception as exc:
             pulados.append({"id": agg_id, "motivo": f"agregador: {exc}"})
             continue
-        gerado_abs.add(os.path.abspath(path))
+        final_path = _staged_to_final(path, write_root, out_root)
+        gerado_abs.add(os.path.abspath(final_path))
         agregados.append(
             {
-                "path": os.path.relpath(path, store_root).replace(os.sep, "/"),
+                "path": os.path.relpath(final_path, store_root).replace(os.sep, "/"),
                 "topic": topic,
                 "lacunas": lacunas,
             }
         )
+
+    # ---------- F09: promoção do conjunto novo (proteção de publicação) ----------
+    # Até aqui só `write_root` (staging) foi tocado; `out_root` — a
+    # publicação .docx anterior — segue 100% intacto. `pulados`/`recusados`
+    # juntos já são o mesmo critério que fecha o exit code do comando (linha
+    # final da função); aqui eles decidem se o conjunto novo é promovido.
+    # Promover um conjunto incompleto faria a poda logo abaixo enxergar o
+    # .docx antigo de um id que falhou nesta execução como órfão e apagá-lo —
+    # destruindo o último .docx válido daquele documento por causa de uma
+    # falha parcial (achado do plano de evolução, seção W0/F09). Por isso
+    # QUALQUER pulado/recusado aborta a promoção inteira: nada é movido,
+    # wiki-docx/ sai exatamente como entrou nesta execução, só o staging é
+    # descartado. Reexecutar depois de corrigir a fonte/erro refaz a geração
+    # do zero (staging é sempre um diretório novo de `tempfile.mkdtemp`;
+    # nunca reaproveitado, então não há como duplicar nem herdar lixo de uma
+    # tentativa anterior).
+    bloqueado_geracao = bool(pulados or recusados)
+    try:
+        if not bloqueado_geracao:
+            _promote_staged_tree(write_root, out_root, a.topic)
+    except PathComponentError as exc:  # F-01: nunca promover fora de out_root
+        print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
+    finally:
+        shutil.rmtree(write_root, ignore_errors=True)
+
+    if bloqueado_geracao:
+        _append_log(
+            store_root,
+            f"## [{_utc_now()}] docx ABORTADO (F09) | {len(pulados)} pulado(s), "
+            f"{len(recusados)} recusado(s) | wiki-docx/ preservado sem alteração desta execução",
+        )
+        out = {
+            "documentos": [],
+            "agregadores": [],
+            "fontes": len(sources),
+            "removidos": [],
+            "pulados": pulados,
+            "ignorados_asset_html": ignorados_asset_html,
+            "bloqueado": (
+                "conjunto novo incompleto (falha de geração) — nada foi "
+                "promovido; wiki-docx/ segue exatamente como estava antes "
+                "desta execução"
+            ),
+        }
+        if recusados:
+            out["recusados"] = recusados
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 1
 
     removidos: list[dict] = []
     if not a.no_prune:
@@ -2844,6 +3038,8 @@ def cmd_docx(a) -> int:
     }
     if verify_overridden:
         out["verify_override"] = verify_overridden
+    if verify_warnings:
+        out["revalidacao_avisos"] = verify_warnings
     if recusados:
         out["recusados"] = recusados
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -3646,6 +3842,43 @@ def _state_json(workdir: str) -> dict | None:
         return None
 
 
+def _revalidate_codescan_verify_state(wd: str) -> str | None:
+    """Corrige `<wd>/state.json` EM DISCO, chamando
+    `codescan.state.revalidate_verified_stages(wd)`, ANTES de qualquer gate
+    deste módulo ler o status de `evidence`/`verify` daquele workdir.
+
+    Lacuna que isto fecha: os gates de `promote`/`compile`/`docx` aqui
+    (`_failed_verify_workdirs`, via `_state_json`) leem `state.json` BRUTO
+    (`json.load`), sem checar se o hash do artefato verificado ainda bate com
+    o conteúdo em disco. Se alguém edita o artefato (`confirmed.md`, o
+    evidence-pack) e chama `promote`/`compile`/`docx` DIRETO — sem nenhuma
+    invocação de `codescan` no meio —, nada jamais roda
+    `revalidate_verified_stages`, e o gate vê o status "done" congelado da
+    última verificação válida. `revalidate_verified_stages` já é a auto-cura
+    (derruba "done" -> "failed" quando o sha256 não bate); só faltava alguém
+    chamá-la aqui, no ponto em que o wk decide o gate.
+
+    Import DEFENSIVO: builds empacotados sem o pacote `codescan` (ex.: um
+    `.pyz` só com `wk`) não têm este módulo. Nesse caso NUNCA falha
+    silenciosamente — devolve uma mensagem de aviso explícita e preserva o
+    comportamento ANTERIOR (gate decide só pelo status bruto do state.json,
+    como antes desta mudança). `revalidate_verified_stages` em si já é
+    best-effort e nunca levanta (ver `codescan/state.py`); aqui só cobrimos a
+    ausência do módulo, não erros dela.
+    """
+    try:
+        from codescan.state import revalidate_verified_stages
+    except ImportError as exc:
+        return (
+            "revalidação de verify/evidence indisponível (módulo `codescan` "
+            f"não encontrado: {exc}) — gate usou o status BRUTO de "
+            f"{os.path.relpath(wd)!r} sem checar se o artefato verificado foi "
+            "editado desde a última verificação"
+        )
+    revalidate_verified_stages(wd)
+    return None
+
+
 def _expected_module_filenames(workdir: str) -> set[str] | None:
     """FIX 4: nomes de arquivo (`<slug>.md`) autorizados por
     `state.json['stages']['modules']['done']`, usando o mesmo slug de
@@ -3729,35 +3962,51 @@ def _publish_source_type(rel: str) -> str:
 # compilam/exportam conteúdo de um workdir de codescan cujo verify falhou) ----------
 
 
-def _codescan_workdirs_for_topic(store_root: str, topic: str | None) -> list[str]:
+def _codescan_workdirs_for_topic(store_root: str, topic: str | None) -> tuple[list[str], list[str]]:
     """Workdirs em `<store>/.codescan/*` cujo `state.json['topic']` bate com
-    `topic` (todos, se `topic` for None/vazio). [] se não houver `.codescan/`
-    no store — store só-manual (transcrições/docs) nunca tem workdir, então
-    nunca é afetado pelo portão de verify."""
+    `topic` (todos, se `topic` for None/vazio). ([], []) se não houver
+    `.codescan/` no store — store só-manual (transcrições/docs) nunca tem
+    workdir, então nunca é afetado pelo portão de verify.
+
+    Antes de LER cada `state.json`, chama `_revalidate_codescan_verify_state`
+    (auto-cura via `codescan.state.revalidate_verified_stages`) — assim um
+    artefato verificado editado por fora aparece como "failed" mesmo que
+    nenhum comando de `codescan` tenha rodado no meio. Devolve também a lista
+    de avisos (um por workdir onde a revalidação não pôde rodar, ex.: módulo
+    `codescan` ausente) para o chamador nunca engolir isso em silêncio."""
     codescan_root = os.path.join(store_root, ".codescan")
     if not os.path.isdir(codescan_root):
-        return []
+        return [], []
     out = []
+    warnings: list[str] = []
     for name in sorted(os.listdir(codescan_root)):
         wd = os.path.join(codescan_root, name)
         if not os.path.isdir(wd):
             continue
+        warn = _revalidate_codescan_verify_state(wd)
+        if warn:
+            warnings.append(warn)
         state = _state_json(wd)
         if not state:
             continue
         if topic and state.get("topic") != topic:
             continue
         out.append(wd)
-    return out
+    return out, warnings
 
 
-def _failed_verify_workdirs(store_root: str, topic: str | None) -> list[dict]:
+def _failed_verify_workdirs(store_root: str, topic: str | None) -> tuple[list[dict], list[str]]:
     """Workdirs (escopados por `topic`, se informado) com
     `stages.verify.status == 'failed'`. Base determinística do bloqueio do
     FIX 3 — nunca considera workdirs sem stage `verify` registrado (versões
-    antigas do codescan, ou pipeline ainda não chegou lá) como falhos."""
+    antigas do codescan, ou pipeline ainda não chegou lá) como falhos.
+
+    Devolve `(falhos, avisos)` — `avisos` vem de
+    `_codescan_workdirs_for_topic` (revalidação que não pôde rodar); todo
+    chamador deve propagar isso no JSON de saída, nunca descartar."""
     failed = []
-    for wd in _codescan_workdirs_for_topic(store_root, topic):
+    workdirs, warnings = _codescan_workdirs_for_topic(store_root, topic)
+    for wd in workdirs:
         state = _state_json(wd) or {}
         verify = ((state.get("stages") or {}).get("verify")) or {}
         if verify.get("status") == "failed":
@@ -3768,46 +4017,49 @@ def _failed_verify_workdirs(store_root: str, topic: str | None) -> list[dict]:
                     "at": verify.get("at"),
                 }
             )
-    return failed
+    return failed, warnings
 
 
 def _verify_gate_scope(
     store_root: str, topic: str | None, allow_unverified: bool
-) -> tuple[dict | None, list[dict]]:
+) -> tuple[dict | None, list[dict], list[str]]:
     """Portão de `verify` para comandos escopáveis por `topic` (`compile`,
     `docx`). `topic=None` varre TODOS os workdirs de codescan do store (modo
     "processa tudo"); informado, escopa só ao(s) workdir(s) daquele topic.
 
-    Devolve `(bloqueio, sobrepostos)`:
+    Devolve `(bloqueio, sobrepostos, avisos)`:
     - `bloqueio` None = liberado; dict = erro acionável (chamador deve
       imprimir em stderr e abortar com código != 0);
     - `sobrepostos` = workdirs cujo verify falhou mas foram liberados via
       `--allow-unverified` (decisão humana explícita) — chamador deve
-      registrar no output e no log.
+      registrar no output e no log;
+    - `avisos` = revalidação (`_revalidate_codescan_verify_state`) que não
+      pôde rodar para algum workdir (ex.: módulo `codescan` ausente); nunca
+      silencioso — chamador deve incluir isto na saída mesmo quando libera.
     """
-    failed = _failed_verify_workdirs(store_root, topic)
+    failed, warnings = _failed_verify_workdirs(store_root, topic)
     if not failed:
-        return None, []
+        return None, [], warnings
     if allow_unverified:
-        return None, failed
-    return (
-        {
-            "error": (
-                f"`verify` falhou para {len(failed)} workdir(s) de codescan — "
-                "comando bloqueado (README/INSTALL: conteúdo não verificado "
-                "não deve ser promovido/compilado/exportado)"
-            ),
-            "workdirs_bloqueados": failed,
-            "acao": (
-                "rode `wk code --repo <repo> verify --artifact "
-                "<workdir>/sdd/confirmed.md` e corrija as citações reprovadas "
-                "(ou rebaixe a claim para inferred.md); para prosseguir mesmo "
-                "assim (decisão humana explícita, registrada no log/manifesto), "
-                "repita o comando com --allow-unverified"
-            ),
-        },
-        [],
-    )
+        return None, failed, warnings
+    bloqueio = {
+        "error": (
+            f"`verify` falhou para {len(failed)} workdir(s) de codescan — "
+            "comando bloqueado (README/INSTALL: conteúdo não verificado "
+            "não deve ser promovido/compilado/exportado)"
+        ),
+        "workdirs_bloqueados": failed,
+        "acao": (
+            "rode `wk code --repo <repo> verify --artifact "
+            "<workdir>/sdd/confirmed.md` e corrija as citações reprovadas "
+            "(ou rebaixe a claim para inferred.md); para prosseguir mesmo "
+            "assim (decisão humana explícita, registrada no log/manifesto), "
+            "repita o comando com --allow-unverified"
+        ),
+    }
+    if warnings:
+        bloqueio["revalidacao_avisos"] = warnings
+    return bloqueio, [], warnings
 
 
 def _repo_name_from_workdir(workdir: str) -> str:
@@ -3980,7 +4232,7 @@ def cmd_publish(a) -> int:
     # FIX 3: publish NÃO bloqueia (é só staging em inbox/; nada aqui vira
     # canônico sem `promote`, e agent-output nunca auto-promove) — mas avisa,
     # para o humano decidir com informação em mãos antes de aprovar/promover.
-    verify_status = _failed_verify_workdirs(store_root, topic)
+    verify_status, publish_verify_warnings = _failed_verify_workdirs(store_root, topic)
     ours = [v for v in verify_status if os.path.abspath(os.path.join(store_root, v["workdir"])) == workdir]
     if ours:
         out["aviso_verify"] = (
@@ -3988,6 +4240,8 @@ def cmd_publish(a) -> int:
             "inbox/ (staging), mas NÃO devem ser promovidos (`wk promote`) até "
             "corrigir ou usar --allow-unverified conscientemente"
         )
+    if publish_verify_warnings:
+        out["revalidacao_avisos"] = publish_verify_warnings
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 

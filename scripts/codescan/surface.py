@@ -426,11 +426,108 @@ def changed_files(repo: str, base: str, head: str = "HEAD") -> list[str] | None:
     )
 
 
-def drift_report(repo: str, pinned_head: str | None) -> dict:
-    """Compara o commit pinado (surface.json `git.head`) com o HEAD atual.
+def _git_raw(repo: str, *args) -> str | None:
+    """Como `_git`, mas SEM `.strip()` no stdout inteiro.
 
-    Devolve sempre o mesmo formato:
-      {disponivel, drift, head_pinado, head_atual, arquivos_alterados, warnings}
+    `git status --porcelain` codifica o estado nos 2 primeiros bytes de CADA
+    linha (ex.: `' M arquivo.py'` — o espaço inicial é dado, não lixo de
+    formatação). Um `.strip()` do stdout inteiro remove exatamente esse byte
+    na PRIMEIRA linha e desalinha o parser de coluna fixa (`'M arquivo.py'`
+    vira `raw[3:] == '.py'`). Usado só onde a posição de coluna importa;
+    todo outro comando deste módulo (rev-parse, log, diff --name-only) não
+    tem esse problema e continua em `_git`.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, *args],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+        return r.stdout if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _dirty_worktree_files(repo: str) -> tuple[list[str], str | None]:
+    """Arquivos com mudança staged, unstaged ou não rastreada (F02).
+
+    `git status --porcelain --untracked-files=all` cobre os três casos num
+    único comando: os 2 primeiros caracteres de cada linha são o estado
+    (índice/worktree — '??' é não rastreado), e a partir da coluna 4 vem o
+    caminho. `--untracked-files=all` evita que uma pasta nova inteira vire
+    UMA linha só (o padrão do git) — sem isso, arquivos individuais dentro
+    de um diretório novo nunca entrariam no hash de conteúdo. Ignorados via
+    `.gitignore` continuam de fora, como em qualquer `git status`.
+
+    Rename ('R  old -> new') entra com os dois lados: o caminho antigo saiu
+    (equivale a uma deleção) e o novo tem conteúdo a hashear.
+
+    Devolve (arquivos_normalizados_ordenados, aviso_ou_None). Falha do git
+    aqui é degradação (aviso), nunca "sem sujeira" silencioso — mesmo
+    contrato das demais funções de drift desta seção.
+    """
+    out = _git_raw(repo, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all")
+    if out is None:
+        return [], "`git status` falhou: sujeira do worktree não verificável"
+    files: set[str] = set()
+    for raw in out.splitlines():
+        if len(raw) <= 3:
+            continue
+        body = raw[3:]
+        for part in body.split(" -> "):
+            p = normalize_repo_path(_unquote_git_path(part.strip()))
+            if p:
+                files.add(p)
+    return sorted(files), None
+
+
+def _dirty_content_hash(repo: str, dirty_files: list[str]) -> str:
+    """sha256-12 do conjunto {(path, hash-de-conteúdo)} dos arquivos sujos.
+
+    Lê o conteúdo ATUAL em disco (staged, unstaged e untracked são todos
+    "o que está no disco agora" do ponto de vista de quem lê o arquivo) —
+    não a versão indexada. Um arquivo sujo já apagado do disco (deleção
+    staged ou unstaged) entra como `path + "deleted"`: sem esse marcador,
+    uma deleção pura (nada para ler) ficaria fora do hash e "o arquivo
+    sumiu" não mudaria o `content_state`.
+    """
+    import hashlib
+
+    pieces = []
+    for p in sorted(dirty_files):
+        full = os.path.join(repo, *p.split("/"))
+        if os.path.isfile(full):
+            try:
+                with open(full, "rb") as f:
+                    h = hashlib.sha256(f.read()).hexdigest()
+                pieces.append(f"{p}\x00{h}")
+            except OSError:
+                pieces.append(f"{p}\x00unreadable")
+        else:
+            pieces.append(p + "deleted")
+    digest = hashlib.sha256("\n".join(pieces).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def drift_report(repo: str, pinned_head: str | None) -> dict:
+    """Compara o commit pinado (surface.json `git.head`) com o HEAD atual —
+    e, a partir de F02, também o worktree ATUAL contra esse HEAD, porque
+    HEAD parado não significa nada mudou: staged, unstaged e untracked em
+    escopo são drift real e antes passavam batido em silêncio.
+
+    Devolve sempre o mesmo formato (chaves antigas preservadas, 3 novas):
+      {disponivel, drift, head_pinado, head_atual, arquivos_alterados,
+       dirty, dirty_files, content_state, warnings}
+
+    `dirty`: True se há mudança staged/unstaged/untracked no worktree.
+    `dirty_files`: caminhos normalizados dessa mudança (pode ter itens que
+      também aparecem em `arquivos_alterados`, quando o mesmo arquivo mudou
+      no commit E segue sujo depois).
+    `content_state`: identidade estável do conteúdo analisado — `head_atual`
+      quando o worktree está limpo, ou `"<head_atual>+dirty:<hash12>"`
+      quando sujo (hash real do conteúdo sujo, ver `_dirty_content_hash`).
+      Dois `drift_report()` com o mesmo `content_state` viram o mesmo
+      conteúdo; comparar só `head_atual` não garante isso (F02).
     """
     report = {
         "disponivel": False,
@@ -438,6 +535,9 @@ def drift_report(repo: str, pinned_head: str | None) -> dict:
         "head_pinado": pinned_head or None,
         "head_atual": None,
         "arquivos_alterados": [],
+        "dirty": False,
+        "dirty_files": [],
+        "content_state": None,
         "warnings": [],
     }
     head = current_head(repo)
@@ -447,10 +547,23 @@ def drift_report(repo: str, pinned_head: str | None) -> dict:
             "sem git ou HEAD indisponível neste repo: drift não verificável"
         )
         return report
+
+    dirty_files, dirty_warning = _dirty_worktree_files(repo)
+    if dirty_warning:
+        report["warnings"].append(dirty_warning)
+    report["dirty"] = bool(dirty_files)
+    report["dirty_files"] = dirty_files
+    report["content_state"] = (
+        f"{head}+dirty:{_dirty_content_hash(repo, dirty_files)}"
+        if dirty_files
+        else head
+    )
+
     if not pinned_head:
         report["warnings"].append(
             "surface.json sem `git.head` pinado: drift não verificável"
         )
+        report["drift"] = report["dirty"]
         return report
 
     pinned_full = _resolve_commit(repo, pinned_head)
@@ -460,20 +573,24 @@ def drift_report(repo: str, pinned_head: str | None) -> dict:
             f"commit pinado {pinned_head} não existe neste repo "
             "(clone raso ou histórico reescrito): drift não verificável"
         )
+        report["drift"] = report["dirty"]
         return report
 
     report["disponivel"] = True
-    if pinned_full == head_full:
+    head_changed = pinned_full != head_full
+    if not head_changed and not report["dirty"]:
         return report
 
     report["drift"] = True
-    files = changed_files(repo, pinned_full)
-    if files is None:
-        report["warnings"].append(
-            f"drift detectado ({pinned_head} -> {head}), mas `git diff` falhou: "
-            "lista de arquivos alterados indisponível"
-        )
-        files = []
+    files = []
+    if head_changed:
+        files = changed_files(repo, pinned_full)
+        if files is None:
+            report["warnings"].append(
+                f"drift detectado ({pinned_head} -> {head}), mas `git diff` falhou: "
+                "lista de arquivos alterados indisponível"
+            )
+            files = []
     report["arquivos_alterados"] = files
     return report
 
