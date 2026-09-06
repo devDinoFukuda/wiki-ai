@@ -701,13 +701,13 @@ def _source_sha256(scripts_dir: str) -> str:
     `build_pyz.py:stage()` empacota no `.pyz`.
 
     Duplicado de propósito a partir de `build_pyz.py:_source_sha256`: o
-    `.pyz` não empacota `build_pyz.py` (só `wk/`, `codescan/`, `sbindex/`),
+    `.pyz` não empacota `build_pyz.py` (só os pacotes de `PACKAGES`),
     então este arquivo — rodando OU de dentro do `.pyz` OU de um `scripts/`
     solto — não pode importá-lo. Qualquer mudança aqui exige a mesma mudança
     lá, senão o comparador de `doctor` nunca bate mesmo com fonte idêntica.
     """
     entries = []
-    for pkg in ("wk", "codescan", "sbindex"):
+    for pkg in ("wk", "codescan", "sbindex", "knowledge", "analysis", "runtime", "ingestion", "publishing"):
         pkg_dir = os.path.join(scripts_dir, pkg)
         if not os.path.isdir(pkg_dir):
             continue
