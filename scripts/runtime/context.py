@@ -403,6 +403,26 @@ def _render_stmts(
     return "\n".join(pieces)
 
 
+def _is_omission_only(text: str) -> bool:
+    """`True` quando `text` não contém nenhuma linha de código real — só
+    marcador(es) de omissão (`# [orcamento] ...`) e/ou linhas em branco.
+
+    Existe para impedir um bug real: colar um corpo assim sob um cabeçalho
+    (`def ...:`, `if ...:`, `except ...:`) produz Python SINTATICAMENTE
+    INVÁLIDO — uma suite precisa de ao menos uma statement real; comentário
+    sozinho não conta como corpo (`IndentationError: expected an indented
+    block`). Quem chama trata um corpo assim como "não redutível por este
+    caminho" e deixa o nó INTEIRO (cabeçalho + corpo) virar um único
+    placeholder de omissão no nível ACIMA — nunca um cabeçalho com corpo
+    vazio.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return False
+    return True
+
+
 def _shrink_compound(
     node: ast.stmt, lines: Sequence[str], budget_chars: int, omitted: list[tuple[int, int]]
 ) -> str | None:
@@ -414,6 +434,14 @@ def _shrink_compound(
     que está DENTRO de cada bloco pode virar placeholder, um statement por
     vez, via `_render_stmts`. É esta garantia que barra "else sem if" e
     "except sem try" no resultado final.
+
+    Cada cláusula cujo corpo renderizado ficaria SÓ com marcador de omissão
+    (`_is_omission_only`) aborta esta reconstrução inteira (`return None`,
+    desfazendo em `omitted` o que essa tentativa descartada chegou a
+    registrar): um cabeçalho seguido de corpo vazio é Python inválido, e o
+    nó nunca pode ficar "parcialmente" reduzido dessa forma — quem chama
+    trata `None` como "não redutível por este caminho" e omite o nó INTEIRO
+    (cabeçalho incluso) como um único placeholder no nível de cima.
     """
     body = getattr(node, "body", None)
     if not body:
@@ -422,9 +450,14 @@ def _shrink_compound(
         # composto de uma linha só (`if x: y`): nada para subdividir com segurança.
         return None
 
+    omitted_checkpoint = len(omitted)
+
     header = "\n".join(lines[node.lineno - 1 : body[0].lineno - 1])
     used = len(header) + 1
     body_src = _render_stmts(body, lines, budget_chars - used, omitted)
+    if _is_omission_only(body_src):
+        del omitted[omitted_checkpoint:]
+        return None
     pieces = [header, body_src]
     used += len(body_src) + 1
 
@@ -432,6 +465,9 @@ def _shrink_compound(
         for handler in node.handlers:
             h_header = "\n".join(lines[handler.lineno - 1 : handler.body[0].lineno - 1])
             h_body = _render_stmts(handler.body, lines, budget_chars - used - len(h_header) - 1, omitted)
+            if _is_omission_only(h_body):
+                del omitted[omitted_checkpoint:]
+                return None
             pieces.append(h_header)
             pieces.append(h_body)
             used += len(h_header) + len(h_body) + 2
@@ -440,6 +476,9 @@ def _shrink_compound(
                 continue
             block_header = _find_header_line(lines, block[0].lineno)
             block_body = _render_stmts(block, lines, budget_chars - used - len(block_header) - 1, omitted)
+            if _is_omission_only(block_body):
+                del omitted[omitted_checkpoint:]
+                return None
             pieces.append(block_header)
             pieces.append(block_body)
             used += len(block_header) + len(block_body) + 2
@@ -459,6 +498,9 @@ def _shrink_compound(
             block_body = _render_stmts(
                 node.orelse, lines, budget_chars - used - len(block_header) - 1, omitted
             )
+            if _is_omission_only(block_body):
+                del omitted[omitted_checkpoint:]
+                return None
             pieces.append(block_header)
             pieces.append(block_body)
 

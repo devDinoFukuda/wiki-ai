@@ -40,6 +40,7 @@ class NoEmbedder:
 
 class AzureOpenAIEmbedder:
     available = True
+    provider = "azure"
 
     def __init__(self, endpoint, api_key, deployment, api_version="2024-02-01"):
         self.endpoint = endpoint.rstrip("/")
@@ -47,6 +48,22 @@ class AzureOpenAIEmbedder:
         self.deployment = deployment
         self.api_version = api_version
         self.name = f"azure:{deployment}"
+        self.model = deployment
+        # F06/W7: a dimensão real só se sabe depois de um embed() de verdade
+        # (a API não a declara antecipadamente) — fica None até lá, e depois
+        # cacheada aqui para as próximas chamadas de signature(). É essa
+        # dimensão observada, não uma suposta pelo nome do deployment, que
+        # vira embedding_spaces.dimension (store.get_or_create_space).
+        self._dimension: int | None = None
+
+    def signature(self) -> dict:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "deployment": self.deployment,
+            "dimension": self._dimension,
+            "config": {"api_version": self.api_version},
+        }
 
     def _url(self):
         return (
@@ -73,6 +90,8 @@ class AzureOpenAIEmbedder:
                     f"Azure OpenAI {e.code}: {e.read().decode()[:300]}"
                 ) from None
             out.extend(d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"]))
+        if out and self._dimension is None:
+            self._dimension = len(out[0])
         return out
 
 

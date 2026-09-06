@@ -137,5 +137,121 @@ class PackageCacheTest(unittest.TestCase):
         self.assertIsNotNone(cache)
 
 
+class TruncateSnippetTest(unittest.TestCase):
+    """Testes para truncate_snippet (F05/W7): nunca produz cláusula órfã."""
+
+    def test_truncate_snippet_python_if_else_complete(self):
+        """Corte Python com if/else: resultado COMPLETO (ambos presentes) ou NENHUM."""
+        snippet = """\
+if condition:
+    statement1()
+    statement2()
+else:
+    statement3()
+    statement4()
+"""
+        # Tenta cortar com orçamento pequeno
+        result, omitted, changed = CTX.truncate_snippet(snippet, "python", target_max_chars=50)
+
+        # Se houve mudança, resultado não pode ter `else` órfão
+        if changed:
+            # Resultado deve ter AMBOS if e else, ou NENHUM dos dois
+            has_if = "if " in result
+            has_else = "else:" in result
+            # XOR: ou tem ambos, ou nenhum
+            self.assertEqual(
+                has_if, has_else,
+                "Corte não pode deixar else órfão: if e else devem estar juntos ou ambos ausentes"
+            )
+
+    def test_truncate_snippet_python_try_except_complete(self):
+        """Corte Python com try/except: resultado COMPLETO ou NENHUM bloco."""
+        snippet = """\
+try:
+    operation()
+    risky_call()
+except ValueError:
+    handle_error()
+finally:
+    cleanup()
+"""
+        result, omitted, changed = CTX.truncate_snippet(snippet, "python", target_max_chars=50)
+
+        if changed:
+            # Se há try, deve haver except ou finally (nunca try órfão)
+            has_try = "try:" in result
+            has_except = "except" in result
+            has_finally = "finally:" in result
+
+            if has_try:
+                # Try isolado é inválido em Python
+                self.assertTrue(
+                    has_except or has_finally,
+                    "Try isolado sem except/finally é inválido; corte deve remover bloco inteiro"
+                )
+
+    def test_truncate_snippet_python_no_broken_blocks(self):
+        """Corte Python de função com if interno: sem cláusulas órfãs."""
+        snippet = """\
+def process_data(x):
+    if x > 10:
+        return x * 2
+    elif x > 5:
+        return x + 1
+    else:
+        return 0
+"""
+        result, omitted, changed = CTX.truncate_snippet(snippet, "python", target_max_chars=80)
+
+        # Resultado deve ser Python válido se changed=True
+        if changed:
+            # Tenta compilar; se sintaxe inválida, teste falha
+            try:
+                compile(result, "<string>", "exec")
+            except SyntaxError as e:
+                # Se levanta SyntaxError, pode ser por cláusula órfã (else sem if, etc)
+                self.fail(f"Corte produziu Python inválido: {e}")
+
+    def test_truncate_snippet_generic_braces_no_orphan_else(self):
+        """Corte genérico (chaves balanceadas) nunca deixa else/catch/finally órfão."""
+        snippet = """\
+if (x > 0) {
+  doSomething();
+  doMore();
+  doMore2();
+  doMore3();
+} else {
+  doOtherThing();
+  doMore4();
+}
+"""
+        result, omitted, changed = CTX.truncate_snippet(snippet, "javascript", target_max_chars=60)
+
+        if changed:
+            # Se há `else`, deve haver `if` antes
+            has_if_open = "{" in result.split("else")[0] if "else" in result else False
+            has_else = "else" in result
+
+            if has_else:
+                # Deve haver if antes do else (não órfão)
+                lines = result.split("\n")
+                else_line_idx = next(i for i, l in enumerate(lines) if "else" in l)
+                before_else = "\n".join(lines[:else_line_idx])
+                self.assertIn("if", before_else, "else não pode vir sem if antes")
+
+    def test_truncate_snippet_returns_valid_marker(self):
+        """Corte com budget muito apertado: retorna marcador ou `changed=False`."""
+        snippet = "x" * 1000  # Muito grande
+
+        result, omitted, changed = CTX.truncate_snippet(snippet, "text", target_max_chars=100)
+
+        # Não levanta exceção
+        self.assertIsNotNone(result)
+        # Se não coube nem mesmo o marcador, changed=False
+        # Se mudou, o resultado é menor
+        if changed:
+            self.assertLess(len(result), len(snippet), "Corte deve reduzir tamanho")
+
+
 if __name__ == "__main__":
     unittest.main()

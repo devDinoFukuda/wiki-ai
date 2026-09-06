@@ -79,15 +79,9 @@ def _cmd_reindex_body(a, conn) -> int:
 
     embedded = 0
     skipped_embed = False
+    space_switch = None
     if not a.lex_only and emb.available:
-        pend = store.chunks_without_embedding(conn)
-        for i in range(0, len(pend), embed_mod.BATCH):
-            batch = pend[i : i + embed_mod.BATCH]
-            vecs = emb.embed([r["text"] for r in batch])
-            for r, v in zip(batch, vecs):
-                store.set_embedding(conn, r["id"], v)
-            embedded += len(batch)
-        conn.commit()
+        embedded, space_switch = _reindex_embeddings(conn, emb)
     elif not a.lex_only:
         skipped_embed = True
 
@@ -99,6 +93,8 @@ def _cmd_reindex_body(a, conn) -> int:
         embedder=emb.name,
         exact_tokens=tokens_exact(),
     )
+    if space_switch:
+        out["embedding_space_switch"] = space_switch
     if skipped_embed:
         out["warning"] = (
             "embeddings não configurados: índice em modo léxico. "
@@ -107,6 +103,73 @@ def _cmd_reindex_body(a, conn) -> int:
         )
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
+
+
+def _reindex_embeddings(conn, emb) -> tuple[int, dict | None]:
+    """Passo de embedding do reindex, com detecção de troca de espaço (F06).
+
+    Compara a IDENTIDADE do embedder atual (provider/model/deployment/config
+    — SEM dimensão, que só se sabe depois de embedar) contra o space
+    atualmente ativo:
+
+    - identidade IGUAL (ou nenhum space ativo ainda): incremental — só os
+      chunks sem embedding (`chunks_without_embedding`) entram no space ativo
+      (ou num novo, se este é o primeiro reindex com embeddings do índice).
+    - identidade DIFERENTE (troca de modelo/deployment/config): a coleção
+      INTEIRA é reembedada num space novo, que nasce inativo; só depois que
+      TODOS os chunks foram escritos nele é que `activate_space` roda — e só
+      então o commit torna a troca visível. Enquanto isso, nada foi commitado:
+      o space antigo (ainda ativo) continua completo e é o que qualquer busca
+      concorrente enxerga. Se o processo morrer no meio, o rollback implícito
+      (nunca houve commit) devolve o índice ao estado anterior — nunca um
+      space novo ativo pela metade.
+
+    Devolve (quantidade embedada, dict de troca de espaço ou None).
+    """
+    sig = emb.signature()
+    config_json = json.dumps(sig.get("config") or {}, sort_keys=True, ensure_ascii=False)
+    active = store.get_active_space(conn)
+    same_identity = store.space_signature_matches(
+        active, sig["provider"], sig["model"], sig["deployment"], config_json
+    )
+
+    if same_identity:
+        pend = store.chunks_without_embedding(conn)
+        embedded = 0
+        for i in range(0, len(pend), embed_mod.BATCH):
+            batch = pend[i : i + embed_mod.BATCH]
+            vecs = emb.embed([r["text"] for r in batch])
+            for r, v in zip(batch, vecs):
+                store.set_embedding(conn, r["id"], v, active["space_id"])
+            embedded += len(batch)
+        conn.commit()
+        return embedded, None
+
+    # Identidade mudou (ou é o primeiro reindex com embeddings): reindex
+    # completo da coleção num space novo, ativado só ao final.
+    all_chunks = store.chunks_all(conn)
+    new_space_id = None
+    embedded = 0
+    for i in range(0, len(all_chunks), embed_mod.BATCH):
+        batch = all_chunks[i : i + embed_mod.BATCH]
+        vecs = emb.embed([r["text"] for r in batch])
+        if new_space_id is None:
+            dimension = len(vecs[0])
+            new_space_id = store.get_or_create_space(
+                conn, sig["provider"], sig["model"], sig["deployment"], dimension, sig["config"]
+            )
+        for r, v in zip(batch, vecs):
+            store.set_embedding(conn, r["id"], v, new_space_id)
+        embedded += len(batch)
+
+    if new_space_id is None:
+        # Coleção vazia (nenhum chunk pra embedar): nada a ativar ainda.
+        conn.rollback()
+        return 0, None
+
+    store.activate_space(conn, new_space_id)
+    conn.commit()
+    return embedded, {"from": active["space_id"] if active else None, "to": new_space_id}
 
 
 # ---------------- search ----------------
@@ -185,6 +248,7 @@ def _cmd_search_body(a, conn, intent, subs, filters) -> int:
     lists, weights, used = [], [], []
     need_vec = [s for s in subs if s[0] in ("vec", "hyde")]
     vecs = {}
+    space_id = None
     if need_vec:
         if not emb.available:
             print(
@@ -198,7 +262,46 @@ def _cmd_search_body(a, conn, intent, subs, filters) -> int:
                 file=sys.stderr,
             )
             return 2
+        active = store.get_active_space(conn)
+        if not active:
+            print(
+                json.dumps(
+                    {
+                        "error": "vec/hyde exigem um espaço de embeddings ativo; índice nunca reindexou com embeddings",
+                        "hint": "rode reindex com AZURE_OPENAI_* configurado",
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            return 2
         embedded = emb.embed([v for _, v in need_vec])
+        # F06: NUNCA compara vetor de espaço != do ativo, mesmo com dimensão
+        # igual por coincidência — a identidade do embedder (não só a
+        # dimensão) tem que bater com o space ativo do índice.
+        sig = emb.signature()
+        config_json = json.dumps(sig.get("config") or {}, sort_keys=True, ensure_ascii=False)
+        dim = len(embedded[0]) if embedded else None
+        matches_active = (
+            store.space_signature_matches(
+                active, sig["provider"], sig["model"], sig["deployment"], config_json
+            )
+            and active["dimension"] == dim
+        )
+        if not matches_active:
+            print(
+                json.dumps(
+                    {
+                        "error": "embedder atual não corresponde ao espaço ativo do índice",
+                        "impacto": "comparar vetores de espaços diferentes não mede similaridade nenhuma",
+                        "correcao": "rode reindex com este embedder para criar/ativar o espaço correspondente",
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        space_id = active["space_id"]
         vecs = {id(s): e for s, e in zip(need_vec, embedded)}
 
     for i, s in enumerate(subs):
@@ -207,7 +310,7 @@ def _cmd_search_body(a, conn, intent, subs, filters) -> int:
         if kind == "lex":
             lists.append(store.search_lex(conn, val, filters, pool))
         else:
-            lists.append(store.search_vec(conn, vecs[id(s)], filters, pool))
+            lists.append(store.search_vec(conn, vecs[id(s)], space_id, filters, pool))
         weights.append(w)
         used.append({"type": kind, "query": val, "weight": w})
 
@@ -559,6 +662,14 @@ def _cmd_status_body(a, conn) -> int:
         )
     }
     emb = embed_mod.get_embedder()
+    active = store.get_active_space(conn)
+    chunks_por_espaco = {
+        (str(r["embedding_space_id"]) if r["embedding_space_id"] is not None else "legado"): r["n"]
+        for r in conn.execute(
+            "SELECT embedding_space_id, COUNT(*) n FROM chunks "
+            "WHERE embedding IS NOT NULL GROUP BY embedding_space_id"
+        )
+    }
     out = dict(
         db=a.db,
         documentos=q("SELECT COUNT(*) FROM documents"),
@@ -574,6 +685,25 @@ def _cmd_status_body(a, conn) -> int:
         embedder=emb.name,
         contagem_de_tokens="tiktoken" if tokens_exact() else "aproximada (chars/3.6)",
         indice_sujo=stale,
+        # F06/W7: espaço de embedding ativo + distribuição de chunks por
+        # espaço/pendentes/legados — sem isto, uma troca de modelo/dimensão
+        # incompleta ou uma mistura de gerações fica invisível no status.
+        embedding_space_ativo=(
+            {
+                "space_id": active["space_id"],
+                "provider": active["provider"],
+                "model": active["model"],
+                "deployment": active["deployment"],
+                "dimension": active["dimension"],
+            }
+            if active
+            else None
+        ),
+        chunks_por_espaco=chunks_por_espaco,
+        chunks_pendentes=q("SELECT COUNT(*) FROM chunks WHERE embedding IS NULL"),
+        chunks_legados=q(
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND embedding_space_id IS NULL"
+        ),
     )
     print(json.dumps(out, ensure_ascii=False, indent=2))
     # frescor é requisito de correção: compile/lint não devem rodar sujos

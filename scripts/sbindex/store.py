@@ -14,6 +14,7 @@ Não é servidor: é um arquivo. Abre, consulta, fecha.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -92,6 +93,29 @@ CREATE TABLE IF NOT EXISTS doc_sources (
 CREATE INDEX IF NOT EXISTS idx_ds_src ON doc_sources(source_id);
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+
+-- F06/W7: schema versionado de embeddings. Um `space` é a assinatura exata do
+-- embedder (provider+model+deployment+dimension+config) que produziu um lote
+-- de vetores. Sem isto, trocar de modelo/dimensão mistura gerações de vetor
+-- no mesmo índice sem detecção — cosseno entre espaços diferentes é número
+-- sem significado, mas SQLite não recusa a conta sozinho.
+-- `chunks.embedding_space_id` (coluna, migrada via ALTER TABLE para bancos
+-- existentes — ver _migrate_schema) aponta para o space que gerou o vetor
+-- daquele chunk; NULL = legado (vetor de antes desta migração, nunca
+-- validado contra um space, e por isso nunca entra em busca vetorial nova).
+CREATE TABLE IF NOT EXISTS embedding_spaces (
+  space_id     INTEGER PRIMARY KEY,
+  provider     TEXT NOT NULL,
+  model        TEXT NOT NULL,
+  deployment   TEXT,
+  dimension    INTEGER NOT NULL,
+  config_json  TEXT NOT NULL DEFAULT '{}',
+  created_at   TEXT NOT NULL,
+  active       INTEGER NOT NULL DEFAULT 0    -- no máximo 1 linha com active=1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_espace_sig
+  ON embedding_spaces(provider, model, deployment, dimension, config_json);
+CREATE INDEX IF NOT EXISTS idx_espace_active ON embedding_spaces(active);
 """
 
 
@@ -114,7 +138,24 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate_schema(conn)
     return conn
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Migração aditiva para bancos existentes anteriores ao F06/W7.
+
+    `CREATE TABLE IF NOT EXISTS chunks (...)` no SCHEMA não adiciona coluna a
+    uma tabela `chunks` que já existia sem `embedding_space_id` — só
+    `ALTER TABLE` faz isso. Idempotente: só roda se a coluna ainda não existe.
+    Sem FK inline (`REFERENCES embedding_spaces`) de propósito — ALTER TABLE
+    ADD COLUMN com default NULL preserva os vetores legados como estão
+    (NULL = legado), sem exigir que já exista uma linha em embedding_spaces.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    if "embedding_space_id" not in cols:
+        conn.execute("ALTER TABLE chunks ADD COLUMN embedding_space_id INTEGER")
+        conn.commit()
 
 
 def content_hash(text: str) -> str:
@@ -251,14 +292,119 @@ def unpack(blob: bytes):
     return struct.unpack(f"{len(blob)//4}f", blob)
 
 
-def set_embedding(conn: sqlite3.Connection, chunk_id: int, vec) -> None:
-    conn.execute("UPDATE chunks SET embedding=? WHERE id=?", (pack(vec), chunk_id))
+def set_embedding(conn: sqlite3.Connection, chunk_id: int, vec, space_id: int) -> None:
+    """Grava o vetor de um chunk, sempre associado a um `space` (F06/W7).
+
+    `space_id` é obrigatório: um vetor sem espaço declarado é exatamente o
+    estado legado que a regra F06 quer evitar daqui pra frente. A dimensão
+    REAL do vetor é validada contra a dimensão registrada do space — mismatch
+    é erro, não silenciosamente aceito (misturar gerações de embedding no
+    mesmo índice é o defeito que este schema existe para impedir).
+    """
+    row = conn.execute(
+        "SELECT dimension FROM embedding_spaces WHERE space_id=?", (space_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"embedding_space_id desconhecido: {space_id!r}")
+    if len(vec) != row["dimension"]:
+        raise ValueError(
+            f"dimensão do vetor ({len(vec)}) não bate com a do espaço "
+            f"{space_id} ({row['dimension']}): reindex parcial misturaria gerações"
+        )
+    conn.execute(
+        "UPDATE chunks SET embedding=?, embedding_space_id=? WHERE id=?",
+        (pack(vec), space_id, chunk_id),
+    )
 
 
 def chunks_without_embedding(conn: sqlite3.Connection):
     return conn.execute(
         "SELECT id, text FROM chunks WHERE embedding IS NULL ORDER BY id"
     ).fetchall()
+
+
+def chunks_all(conn: sqlite3.Connection):
+    """Todos os chunks (id, text) — usado no reindex completo que precede a
+    ativação de um espaço de embedding novo (troca de modelo/dimensão)."""
+    return conn.execute("SELECT id, text FROM chunks ORDER BY id").fetchall()
+
+
+# ---------- espaços de embedding (F06/W7) ----------
+
+
+def get_or_create_space(
+    conn: sqlite3.Connection,
+    provider: str,
+    model: str,
+    deployment: str | None,
+    dimension: int,
+    config: dict | None = None,
+) -> int:
+    """Devolve o `space_id` da assinatura (provider, model, deployment,
+    dimension, config); cria se ainda não existir. NUNCA ativa sozinho — um
+    space novo nasce inativo (`active=0`); ativação é sempre explícita via
+    `activate_space`, e só depois que a coleção inteira foi reembedada nele
+    (ver cli._cmd_reindex_body). É isto que garante a troca atômica do F06:
+    nunca existe um estado em que buscas vejam um space parcialmente populado
+    como se fosse o ativo.
+    """
+    config_json = json.dumps(config or {}, sort_keys=True, ensure_ascii=False)
+    row = conn.execute(
+        """SELECT space_id FROM embedding_spaces
+           WHERE provider=? AND model=? AND deployment IS ?
+             AND dimension=? AND config_json=?""",
+        (provider, model, deployment, dimension, config_json),
+    ).fetchone()
+    if row:
+        return row["space_id"]
+    cur = conn.execute(
+        """INSERT INTO embedding_spaces
+             (provider, model, deployment, dimension, config_json, created_at, active)
+           VALUES (?,?,?,?,?,?,0)""",
+        (
+            provider,
+            model,
+            deployment,
+            dimension,
+            config_json,
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        ),
+    )
+    return cur.lastrowid
+
+
+def get_active_space(conn: sqlite3.Connection):
+    """A linha do space ativo (no máximo uma), ou None se o índice nunca
+    completou um reindex com embeddings."""
+    return conn.execute(
+        "SELECT * FROM embedding_spaces WHERE active=1 LIMIT 1"
+    ).fetchone()
+
+
+def activate_space(conn: sqlite3.Connection, space_id: int) -> None:
+    """Troca atômica de espaço ativo: desativa todos, ativa só `space_id`.
+
+    Chamado SOMENTE depois que a coleção inteira já foi reembedada no space
+    novo (ver cli._cmd_reindex_body) — nunca antes, e nunca sem commit logo em
+    seguida, senão a troca deixa de ser atômica.
+    """
+    conn.execute("UPDATE embedding_spaces SET active=0 WHERE space_id != ?", (space_id,))
+    conn.execute("UPDATE embedding_spaces SET active=1 WHERE space_id=?", (space_id,))
+
+
+def space_signature_matches(space_row, provider: str, model: str, deployment, config_json: str) -> bool:
+    """Compara a IDENTIDADE do embedder (provider/model/deployment/config) —
+    sem dimensão — contra um space existente. Usado para decidir, ANTES de
+    embedar qualquer coisa, se o reindex é incremental (mesma identidade do
+    space ativo) ou exige espaço novo (identidade mudou: outro modelo/
+    deployment/config, ainda que a dimensão viesse a coincidir por acaso)."""
+    return (
+        space_row is not None
+        and space_row["provider"] == provider
+        and space_row["model"] == model
+        and space_row["deployment"] == deployment
+        and space_row["config_json"] == config_json
+    )
 
 
 # ---------- filtros ----------
@@ -462,8 +608,15 @@ def search_lex(conn, query: str, filters: dict, limit: int) -> list[tuple[int, f
 # ---------- busca vetorial ----------
 
 
-def search_vec(conn, qvec, filters: dict, limit: int) -> list[tuple[int, float]]:
-    """Cosseno em memória.
+def search_vec(conn, qvec, space_id: int, filters: dict, limit: int) -> list[tuple[int, float]]:
+    """Cosseno em memória, restrito ao `space_id` da query (F06/W7).
+
+    `space_id` é obrigatório e nunca inferido: comparar vetores de espaços
+    diferentes (ou legados, `embedding_space_id IS NULL`) é número sem
+    significado — cosseno entre gerações de embedding distintas não mede
+    similaridade nenhuma, mesmo quando as dimensões batem por coincidência.
+    O chamador (cli.py) resolve o space da query e barra ANTES de chegar
+    aqui se o embedder atual não bater com o space ativo do índice.
 
     Na escala de uma wiki (dezenas de milhares de chunks) isso resolve. Só vale
     sqlite-vec/ANN acima de ~100k chunks — e aí o gargalo é outro.
@@ -474,8 +627,8 @@ def search_vec(conn, qvec, filters: dict, limit: int) -> list[tuple[int, float]]
     rows = conn.execute(
         f"""SELECT c.id AS cid, c.embedding AS e
             FROM chunks c JOIN documents d ON d.id = c.doc_id
-            WHERE c.embedding IS NOT NULL AND {where}""",
-        params,
+            WHERE c.embedding_space_id = ? AND {where}""",
+        (space_id, *params),
     ).fetchall()
     if not rows:
         return []
