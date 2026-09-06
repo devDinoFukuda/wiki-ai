@@ -5637,6 +5637,298 @@ def cmd_resume(a) -> int:
         store.close()
 
 
+# ---------- W5: ingest2 (fonte -> extract -> correlate; §7.1 plano de evolução) ----------
+#
+# Comando composto ADITIVO (W5-T5.3): não edita `ingestion/`, `knowledge/`,
+# `runtime/`, `analysis/` — só importa a infra pronta de lá. `wk ingest`
+# (legado, `cmd_ingest` acima) continua existindo; o rename/substituição é
+# W8 (o `help` de `ingest2` já avisa isso).
+#
+# Reusa a mesma localização de `knowledge.db` do bloco W4
+# (`_knowledge_db_path`/`_repo_key`) para que fatos gravados por `wk analyze`
+# e por `wk ingest2` vivam no mesmo grafo do store.
+
+_INGEST2_SUBDIR = ".ingest2"
+_INGEST2_PROFILE_FILE = "profile.json"
+#: Namespace default de fontes humanas/documento — deliberadamente distinto
+#: de `code/<repo>` (usado por `wk analyze`/`cmd_update`), para não misturar
+#: entidades estruturais de código com entidades de conhecimento de fonte
+#: (§8.1). Sobrescrevível por `--namespace`.
+_INGEST2_DEFAULT_NAMESPACE = "wiki"
+
+
+def _ingest2_profile_path(store_root: str) -> str:
+    return os.path.join(store_root, _INGEST2_SUBDIR, _INGEST2_PROFILE_FILE)
+
+
+def _load_ingest2_profile(store_root: str) -> dict:
+    path = _ingest2_profile_path(store_root)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_ingest2_profile(store_root: str, profile: dict) -> None:
+    _write_atomic(_ingest2_profile_path(store_root), json.dumps(profile, ensure_ascii=False, indent=2) + "\n")
+
+
+def _ingest2_dir_key(path_original: str) -> str:
+    """Diretório de origem de UMA fonte, normalizado — chave do perfil
+    persistido (§7.1: "última iniciativa usada por diretório de origem")."""
+    d = os.path.dirname(os.path.abspath(path_original)) or "."
+    return d.replace("\\", "/")
+
+
+def _ingest2_leaves(doc) -> tuple:
+    """Fontes-folha de um resultado de `ingestion.ingest` (§7.1).
+
+    Arquivo solto: o próprio documento. Diretório: um `SourceDocument` por
+    arquivo em `doc.children` (já é resultado achatado — `directory.py` só
+    produz filhos-folha, nunca filho-diretório, porque a varredura usa
+    `os.walk`)."""
+    return doc.children if doc.children else (doc,)
+
+
+def _ingest2_resolve_metadata(doc, dir_key: str, arg_initiative: str | None, arg_phase: str | None, profile: dict):
+    """Prioridade §7.1: argumento > frontmatter/metadata do arquivo > contexto
+    persistido do store (perfil por diretório de origem). Devolve
+    `(initiative, phase, source_initiative, source_phase)` — a origem de cada
+    valor vai para diagnóstico, nunca para decisão silenciosa."""
+    meta = doc.metadata if isinstance(doc.metadata, dict) else dict(doc.metadata or {})
+    persisted = profile.get(dir_key) or {}
+
+    if arg_initiative:
+        initiative, src_i = arg_initiative, "argumento"
+    elif meta.get("initiative_id"):
+        initiative, src_i = str(meta["initiative_id"]), "frontmatter"
+    elif persisted.get("initiative_id"):
+        initiative, src_i = str(persisted["initiative_id"]), "contexto_persistido"
+    else:
+        initiative, src_i = None, None
+
+    if arg_phase:
+        phase, src_p = arg_phase, "argumento"
+    elif meta.get("phase"):
+        phase, src_p = str(meta["phase"]), "frontmatter"
+    elif persisted.get("phase"):
+        phase, src_p = str(persisted["phase"]), "contexto_persistido"
+    else:
+        phase, src_p = None, None
+
+    return initiative, phase, src_i, src_p
+
+
+def _ingest2_apply_overrides(doc, initiative: str | None, phase: str | None):
+    """Copia o `SourceDocument` (frozen) com `initiative_id`/`phase` gravados
+    na metadata ANTES de `extract_candidates` — é lendo `doc.metadata` que
+    `extract._initiative_from`/`correlate._raw_metadata` enxergam a
+    iniciativa (§8.1: metadado é dado, segue passando pela whitelist fechada
+    de `normalize.py`, não é injeção de instrução)."""
+    import dataclasses
+
+    if initiative is None and phase is None:
+        return doc
+    new_meta = dict(doc.metadata or {})
+    if initiative is not None:
+        new_meta["initiative_id"] = initiative
+    if phase is not None:
+        new_meta["phase"] = phase
+    return dataclasses.replace(doc, metadata=new_meta)
+
+
+def _ingest2_diagnostico(causa: str, impacto: str, correcao_tentada: str, decisao_necessaria: str) -> dict:
+    return {
+        "causa": causa,
+        "impacto": impacto,
+        "correcao_tentada": correcao_tentada,
+        "decisao_necessaria": decisao_necessaria,
+    }
+
+
+def _ingest2_pending_to_dict(pending) -> dict:
+    return {
+        "key": pending.key,
+        "question": pending.question,
+        "options": list(pending.options),
+        "material_effect": pending.material_effect,
+    }
+
+
+def cmd_ingest2(a) -> int:
+    from ingestion import ingest as ing_ingest
+    from ingestion.extract import extract_candidates
+    from ingestion.correlate import correlate
+    from knowledge.repository import Repository
+
+    store_root = _store_root(a)
+    src_path = os.path.abspath(a.path)
+    if not os.path.exists(src_path):
+        print(json.dumps({
+            "error": f"origem não encontrada: {src_path}",
+            "causa": "caminho inexistente",
+            "impacto": "nenhuma fonte foi lida; nada foi gravado em knowledge.db",
+            "correcao_tentada": "nenhuma — falhou antes de tentar ler",
+            "decisao_necessaria": "confira `path` (arquivo ou diretório)",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    namespace = a.namespace or _INGEST2_DEFAULT_NAMESPACE
+    profile = _load_ingest2_profile(store_root)
+
+    try:
+        root_doc = ing_ingest(src_path)
+    except Exception as exc:
+        print(json.dumps({
+            "error": f"falha na ingestão (preservação/extração) de {src_path}: {exc}",
+            "tipo": type(exc).__name__,
+            "causa": "adapter de `ingestion` levantou exceção fora do contrato de resultado por fonte",
+            "impacto": "nenhuma fonte deste caminho foi processada",
+            "correcao_tentada": "nenhuma — `ingestion.ingest` não devolveu resultado",
+            "decisao_necessaria": "confira o arquivo/diretório; reporte se persistir (bug de adapter)",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    leaves = _ingest2_leaves(root_doc)
+
+    fontes: list[dict] = []
+    revisoes: list[str] = []
+    unidades_afetadas: set = set()
+    avisos: list[str] = []
+    ok_count = 0
+    fail_count = 0
+    pending_count = 0
+
+    repo = Repository.open(_knowledge_db_path(store_root))
+    try:
+        for leaf in leaves:
+            dir_key = _ingest2_dir_key(leaf.path_original)
+            initiative, phase, src_i, src_p = _ingest2_resolve_metadata(
+                leaf, dir_key, a.initiative, a.phase, profile
+            )
+            doc_for_extract = _ingest2_apply_overrides(leaf, initiative, phase)
+
+            entry: dict = {
+                "path": os.path.relpath(leaf.path_original, store_root).replace("\\", "/")
+                if leaf.path_original.startswith(store_root)
+                else leaf.path_original.replace("\\", "/"),
+                "status": leaf.status.value,
+            }
+            if leaf.unavailable:
+                entry["indisponivel"] = leaf.unavailable
+
+            # §7.1 roda extract->correlate para TODA fonte, mesmo
+            # `extraction_failed`/`unsupported`: preserva a proveniência
+            # (entidade da fonte + hash) mesmo sem conteúdo extraível —
+            # `correlate` aceita candidatos vazios sem erro. O status
+            # honesto do adapter (não o resultado de `correlate`) é quem
+            # decide se a fonte conta como sucesso para o exit code do lote.
+            try:
+                candidates = extract_candidates(doc_for_extract)
+                result = correlate(candidates, doc_for_extract, repo, namespace)
+            except Exception as exc:
+                entry["candidatos"] = None
+                entry["correlacionadas"] = 0
+                entry["diagnostico"] = _ingest2_diagnostico(
+                    causa=f"{type(exc).__name__}: {exc}",
+                    impacto="fonte preservada, mas sem extração/correlação nesta execução",
+                    correcao_tentada="extract_candidates/correlate levantaram exceção fora do "
+                                      "contrato de CorrelationResult.error",
+                    decisao_necessaria="reporte esta saída (error+tipo); não reingira até investigar",
+                )
+                fontes.append(entry)
+                fail_count += 1
+                continue
+
+            if result.error:
+                entry["candidatos"] = len(candidates.all())
+                entry["correlacionadas"] = 0
+                entry["diagnostico"] = _ingest2_diagnostico(
+                    causa=result.error,
+                    impacto="candidatos extraídos, mas a correlação desta fonte foi isolada e não "
+                            "gravou fatos/arestas (§7.1: falha isolada não derruba o lote)",
+                    correcao_tentada="revisão própria por fonte (correlate_batch); as demais fontes seguiram",
+                    decisao_necessaria="reporte esta saída; reingestão após correção não duplica (svid igual)",
+                )
+                fontes.append(entry)
+                fail_count += 1
+                continue
+
+            # persiste a referência EXPLÍCITA usada (argumento ou frontmatter),
+            # nunca a ausência — §7.1: "persistir referência ... para não
+            # perguntar de novo". Contexto meramente reaproveitado (já vinha do
+            # perfil) é reescrito de forma idempotente, sem efeito novo.
+            if initiative or phase:
+                entry_profile = dict(profile.get(dir_key) or {})
+                if initiative:
+                    entry_profile["initiative_id"] = initiative
+                if phase:
+                    entry_profile["phase"] = phase
+                entry_profile["fonte"] = {"initiative_id": src_i, "phase": src_p}
+                entry_profile["atualizado_em"] = _utc_now()
+                profile[dir_key] = entry_profile
+
+            entry["candidatos"] = len(candidates.all())
+            entry["correlacionadas"] = len(result.facts_written) + len(result.relations_written)
+            if result.duplicate:
+                entry["duplicada"] = True
+            if result.orphans:
+                entry["orfaos"] = len(result.orphans)
+            if result.pending_decisions:
+                entry["decisoes_pendentes"] = [
+                    _ingest2_pending_to_dict(p) for p in result.pending_decisions
+                ]
+                pending_count += 1
+            if result.revision_id:
+                revisoes.append(result.revision_id)
+            unidades_afetadas.update(result.affected_units)
+
+            # sucesso do LOTE (exit code) é o status honesto do adapter, não o
+            # de `correlate` — uma fonte `extraction_failed`/`unsupported`
+            # ganha entidade/proveniência, mas não conta como fonte útil.
+            if leaf.status.value in ("ingested", "partial"):
+                ok_count += 1
+            else:
+                fail_count += 1
+                entry["diagnostico"] = _ingest2_diagnostico(
+                    causa=f"extração incompleta (status={leaf.status.value})",
+                    impacto="proveniência preservada (entidade + hash), mas sem candidatos "
+                            "de conteúdo; correlação não gravou fatos desta fonte",
+                    correcao_tentada="preservação de bytes/hash concluída (§8.1); extração de "
+                                      "conteúdo não",
+                    decisao_necessaria="revise o arquivo de origem (formato sem adapter ou "
+                                        "corrompido/ilegível) e ingira de novo",
+                )
+            fontes.append(entry)
+
+        _save_ingest2_profile(store_root, profile)
+    finally:
+        repo.close()
+
+    avisos.append(
+        "republicacao_pendente_w6: unidades_afetadas listadas ainda não foram republicadas "
+        "fisicamente na wiki — a republicação é escopo de W6; este comando só registra o efeito"
+    )
+    if fail_count:
+        avisos.append(f"{fail_count} de {len(leaves)} fonte(s) falharam (extração ou correlação); "
+                       "ver 'fontes[].diagnostico'")
+    if pending_count:
+        avisos.append(f"{pending_count} fonte(s) com decisão pendente (iniciativa ambígua); "
+                       "ver 'fontes[].decisoes_pendentes' — aceitas sem bloqueio (§7.1)")
+
+    out = {
+        "fontes": fontes,
+        "revisoes": revisoes,
+        "unidades_afetadas": sorted(unidades_afetadas),
+        "avisos": avisos,
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if ok_count > 0 else 1
+
+
 # ---------- entrada ----------
 
 
@@ -5830,6 +6122,27 @@ def _build_parser() -> argparse.ArgumentParser:
     re_.add_argument("--engine", default=None, choices=["local", "claude-cli"],
                       help="executor de despacho (default: perfil salvo desta análise)")
     re_.set_defaults(fn=cmd_resume)
+
+    # ---- W5: ingest2 (fonte -> extract -> correlate em 1 comando; §7.1) ----
+    # Aditivo: NÃO substitui `wk ingest` (legado, converte 1 arquivo p/
+    # inbox/, sem tocar knowledge.db). Nome `ingest2` evita colisão com o
+    # legado ANTES do rename decidido pra W8. `_ingest_reserved_guard` só
+    # olha `argv[0] == "ingest"` (linha ~5960), então este nome nunca cai lá.
+    i2 = sub.add_parser(
+        "ingest2",
+        help="ingere arquivo OU diretório com extração+correlação em knowledge.db "
+             "(substituirá `wk ingest` na W8; até lá os dois convivem)",
+    )
+    i2.add_argument("path", help="arquivo ou diretório de origem a ingerir")
+    i2.add_argument("--initiative", default=None,
+                     help="id da iniciativa (prioridade: argumento > frontmatter/metadata "
+                          "do arquivo > contexto persistido por diretório de origem)")
+    i2.add_argument("--phase", default=None, choices=["inception", "refinement", "other"],
+                     help="fase da iniciativa (mesma prioridade de --initiative)")
+    i2.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    i2.add_argument("--namespace", default=None,
+                     help=f"namespace do knowledge.db (default: {_INGEST2_DEFAULT_NAMESPACE!r})")
+    i2.set_defaults(fn=cmd_ingest2)
 
     # Grupos repassados às CLIs internas: parsing fica com elas.
     for name, help_ in (
