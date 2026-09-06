@@ -21,7 +21,7 @@ import zipapp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "scripts")
-PACKAGES = ("wk", "codescan", "sbindex", "knowledge", "analysis")
+PACKAGES = ("wk", "codescan", "sbindex", "knowledge", "analysis", "runtime")
 
 # Nome do arquivo do manifesto embutido no .pyz (dentro do pacote `wk`, para
 # ser lido em runtime via `pkgutil.get_data("wk", ...)`, o mesmo mecanismo de

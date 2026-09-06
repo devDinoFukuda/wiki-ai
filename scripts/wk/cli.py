@@ -4710,6 +4710,933 @@ def _run_index(argv: list[str]) -> int:
         return sbindex_main(["--store", _store(g), *rest])
 
 
+# ---------- W4: analyze/update/status/resume (código -> conhecimento) ----------
+#
+# Caminho normal em UM comando (§7.1): `wk analyze` executa em sequência
+# automática snapshot -> inventário -> extração -> capacidades -> objetivos ->
+# tarefas (runtime.db) -> despacho (se a engine tiver dispatch) -> revisão
+# estrutural (knowledge.db). `wk update` só reanalisa o delta; `wk status`/
+# `wk resume` só LEEM/retomam runtime.db+knowledge.db. Nenhum destes comandos
+# remove os existentes (promote/compile/docx/finish); ficam em seção própria
+# do parser (`_build_parser`), sem gate humano novo.
+#
+# Infra importada (não editada): analysis/knowledge/runtime já prontos.
+
+_ANALYSIS_SUBDIR = ".analysis"
+_ANALYSIS_PROFILE_FILE = "profile.json"
+
+#: Autoria das entidades/fatos/relações estruturais escritas por `wk analyze`/
+#: `wk update`. Dois identificadores DIFERENTES de propósito: `_check_support`
+#: (knowledge/repository.py) rejeita `support_recorded_by == asserted_by` —
+#: quem afirma não pode registrar a própria sustentação (§5.3). Nenhum dos
+#: dois é LLM: os dois são `pipeline:*`, porque tudo que este bloco grava vem
+#: de extração/capacidades/investigação (código executável), nunca de saída
+#: de engine não verificada.
+_KG_ASSERTED_BY = "pipeline:wk-analyze"
+_KG_SUPPORT_BY = "pipeline:wk-analyze-verify"
+
+#: Estados default de `resultados` quando não houve despacho (engine
+#: bloqueada ou desconhecida) — mesmas chaves de `coordinator.RunReport.summary()`.
+_EMPTY_RESULTADOS = {
+    "submitted": 0, "accepted": 0, "rejected": 0, "retried": 0,
+    "blocked": 0, "failed": 0, "reused": 0, "cycles": 0,
+}
+
+#: Orçamento default de `context.build_package` (§7.3.1) para as tarefas que
+#: este arquivo cria. Sem isto, `task.budget` fica `{}` -> `Budget.coerce`
+#: zera `max_bytes`/`max_tokens` -> TODO pacote é `BudgetExceeded` mesmo vazio.
+_DEFAULT_TASK_BUDGET = {
+    "max_bytes": 200_000, "max_tokens": 60_000,
+    "overhead_bytes": 4_000, "output_reserve_tokens": 4_000,
+}
+
+
+def _snapshot_resolver(snapshot):
+    """`resolver(path, start, end)` de `context.build_package`, contra ESTE
+    snapshot — nunca lê disco por fora dele (mesma garantia de hash de
+    `analysis.snapshot.resolve_evidence`)."""
+    from analysis.snapshot import resolve_evidence
+
+    def _resolve(path: str, start: int, end: int):
+        return resolve_evidence(snapshot, path, start, end)
+
+    return _resolve
+
+
+def _analysis_dir(store_root: str) -> str:
+    return os.path.join(store_root, _ANALYSIS_SUBDIR)
+
+
+def _snapshots_dir(store_root: str) -> str:
+    return os.path.join(_analysis_dir(store_root), "snapshots")
+
+
+def _analysis_profile_path(store_root: str) -> str:
+    return os.path.join(_analysis_dir(store_root), _ANALYSIS_PROFILE_FILE)
+
+
+def _knowledge_db_path(store_root: str) -> str:
+    return os.path.join(store_root, "knowledge.db")
+
+
+def _runtime_db_path(store_root: str) -> str:
+    return os.path.join(store_root, "runtime.db")
+
+
+def _repo_key(repo_abs: str) -> str:
+    return repo_abs.replace("\\", "/")
+
+
+def _load_analysis_profile(store_root: str) -> dict:
+    path = _analysis_profile_path(store_root)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_analysis_profile(store_root: str, profile: dict) -> None:
+    _write_atomic(_analysis_profile_path(store_root), json.dumps(profile, ensure_ascii=False, indent=2) + "\n")
+
+
+def _repo_profile(profile: dict, repo_abs: str) -> dict:
+    return dict(profile.get(_repo_key(repo_abs)) or {})
+
+
+# -- snapshot: (de)serialização para o manifest de `wk update` -------------
+
+
+def _snapshot_to_dict(snap) -> dict:
+    return {
+        "repo": snap.repo,
+        "snapshot_id": snap.snapshot_id,
+        "head": snap.head,
+        "git_available": snap.git_available,
+        "files": [
+            {"path": f.path, "size": f.size, "sha256": f.sha256, "state": f.state.value}
+            for f in snap.files
+        ],
+        "warnings": list(snap.warnings),
+    }
+
+
+def _snapshot_from_dict(data: dict):
+    from analysis.snapshot import FileEntry, FileState, Snapshot
+
+    files = tuple(
+        FileEntry(path=f["path"], size=f.get("size"), sha256=f.get("sha256"), state=FileState(f["state"]))
+        for f in data.get("files", ())
+    )
+    return Snapshot(
+        repo=data["repo"], snapshot_id=data["snapshot_id"], head=data.get("head"),
+        git_available=bool(data.get("git_available")), files=files,
+        warnings=tuple(data.get("warnings", ())),
+    )
+
+
+def _save_snapshot_manifest(store_root: str, snap) -> str:
+    path = os.path.join(_snapshots_dir(store_root), snap.snapshot_id + ".json")
+    _write_atomic(path, json.dumps(_snapshot_to_dict(snap), ensure_ascii=False) + "\n")
+    return path
+
+
+def _load_snapshot_manifest(store_root: str, snapshot_id: str):
+    path = os.path.join(_snapshots_dir(store_root), snapshot_id + ".json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return _snapshot_from_dict(json.load(f))
+
+
+# -- pipeline determinístico: snapshot -> inventário -> extração -> capacidades -> objetivos
+
+
+def _analyze_pipeline(repo_abs: str, scope, namespace: str, precaptured=None):
+    """Roda o pipeline determinístico (sem LLM) até os objetivos de investigação.
+
+    `precaptured`: reaproveita um `Snapshot` já capturado (usado por
+    `cmd_update`, que precisa do snapshot novo ANTES deste pipeline para
+    calcular o diff — capturar duas vezes seria trabalho e I/O em dobro).
+    """
+    from analysis import capabilities as cap_mod
+    from analysis import inventory as inv_mod
+    from analysis import investigation as inv2_mod
+    from analysis import snapshot as snap_mod
+    from analysis.extractors import registry as ext_registry
+    from analysis.extractors.base import SourceFile
+
+    snapshot = precaptured if precaptured is not None else snap_mod.capture(repo_abs, scope=scope)
+    inventory = inv_mod.build(snapshot)
+    # Classes com conteúdo estrutural analisável. TEST entra porque
+    # `investigation.plan` liga testes a alvo via `extraction.references`
+    # (tests_by_target) — sem extrair teste, esse vínculo nunca existe.
+    keep = {
+        inv_mod.FileClass.CODE, inv_mod.FileClass.CONFIG, inv_mod.FileClass.MANIFEST,
+        inv_mod.FileClass.TEST, inv_mod.FileClass.MIGRATION,
+    }
+    files = []
+    for fc in inventory.files:
+        if fc.file_class not in keep:
+            continue
+        full = os.path.join(repo_abs, *fc.path.split("/"))
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        files.append(
+            SourceFile(path=fc.path, content=content, language=(fc.language.value if fc.language else ""))
+        )
+    extraction = ext_registry.default_registry().extract_all(files)
+    capability_map = cap_mod.discover(extraction, inventory, namespace=namespace, snapshot=snapshot)
+    objectives = inv2_mod.plan(capability_map, extraction, inventory=inventory, snapshot=snapshot)
+    return snapshot, inventory, extraction, capability_map, objectives
+
+
+def _objective_touched_paths(obj: dict, capability_map, symbol_path_index: dict) -> list:
+    """Arquivos que este objetivo descreve — a granularidade do "delta" (§7.1).
+
+    Capacidade: os `paths` da própria `CapabilityCandidate` (`capability_map`
+    é a fonte, não o objetivo — `obj["capability_id"]` é só a chave). Órfãos:
+    os arquivos dos símbolos listados no objetivo, via índice de símbolos.
+    """
+    cap_id = obj.get("capability_id") or ""
+    cap = capability_map.by_id(cap_id) if cap_id else None
+    if cap is not None:
+        return sorted(set(cap.paths))
+    paths = {symbol_path_index[q] for q in obj.get("symbols", ()) if q in symbol_path_index}
+    return sorted(paths)
+
+
+def _scope_source_versions(snapshot, paths) -> list:
+    fmap = snapshot.file_map()
+    out = []
+    for p in paths:
+        entry = fmap.get(p)
+        if entry is not None and entry.sha256:
+            out.append(f"{p}@{entry.sha256}")
+    return sorted(out)
+
+
+def _scope_id(objective_id: str, source_versions: list) -> str:
+    """Identidade de versão do ESCOPO do objetivo — nunca o snapshot inteiro.
+
+    Usar `snapshot.snapshot_id` (hash da árvore inteira) aqui quebraria o
+    aceite "wk update reanalisa apenas o delta": QUALQUER arquivo tocado em
+    QUALQUER lugar do repo mudaria `input_versions` de TODA tarefa, e nenhuma
+    seria reaproveitada por `effect_identity` (dedupe de `TaskStore.create_task`)
+    nem por `recovery.resume`. Escopo por arquivos tocados é o que faz uma
+    capacidade não afetada produzir o MESMO id run após run.
+    """
+    if not source_versions:
+        return f"scope:empty:{objective_id}"
+    return "scope:" + hashlib.sha256("|".join(source_versions).encode("utf-8")).hexdigest()[:24]
+
+
+def _lacunas_from_objectives(objectives) -> list:
+    out = []
+    for obj in objectives:
+        unmet = obj.unmet_obligations()
+        if unmet:
+            out.append({
+                "objective_id": obj.objective_id, "capability_id": obj.capability_id,
+                "nome": obj.name, "pendencias": unmet,
+            })
+    return out
+
+
+def _latest_tasks_by_objective(store) -> dict:
+    """Tarefa mais recente por `objective_id` (identidade estável da
+    capacidade/grupo de órfãos — ver `investigation._objective_for_capability`/
+    `_objective_for_orphans`). Necessário porque `create_task` nunca
+    ATUALIZA uma linha existente: uma capacidade cujo código mudou gera uma
+    tarefa NOVA (nova `effect_identity`), e a antiga fica como histórico. Sem
+    esta função, `wk status`/`wk update` contariam as duas como vigentes."""
+    latest: dict[str, Any] = {}
+    for t in store.all_tasks():
+        oid = t.objective.get("objective_id")
+        if not oid:
+            continue
+        cur = latest.get(oid)
+        if cur is None or (t.created_at, t.task_id) > (cur.created_at, cur.task_id):
+            latest[oid] = t
+    return latest
+
+
+def _local_structural_worker(*, objective, references, schema, cancel_event, **_extra):
+    """Callable real do `LocalThreadExecutor` (§7.3) — NUNCA invoca LLM.
+
+    Fecha a tarefa confirmando exatamente o que a extração estática já
+    estabeleceu (o `contract` pré-preenchido por `investigation.plan`), sem
+    inventar leitura adicional. `reading_needs` abertas permanecem abertas —
+    o objetivo continua `partial` até uma engine com leitura real (ex.:
+    `claude-cli`) resolvê-las; este worker nunca declara `complete` por conta
+    própria (`ConclusionRejected` protegeria isso de qualquer forma).
+    """
+    obj = dict(objective)
+    return {
+        "objective_id": obj.get("objective_id"),
+        "capability_id": obj.get("capability_id"),
+        "state": obj.get("state", "partial"),
+        "contract": obj.get("contract"),
+        "notes": list(obj.get("notes") or []) + [
+            "engine local: nenhuma leitura adicional de LLM realizada nesta execução; "
+            "resultado limitado ao que a extração estática já estabeleceu",
+        ],
+    }
+
+
+def _build_executor(engine_name: str):
+    """`runtime.executors.get_executor` com o registro do engine `local`
+    fechado neste arquivo (§7.3: nenhuma engine real de LLM é invocada por
+    `wk analyze`/`wk update`/`wk resume` — `claude-cli` só é usada quando o
+    binário `claude` está de fato disponível, sondado por `ClaudeCliExecutor`
+    em `capabilities()`)."""
+    from runtime.executors import get_executor
+
+    if engine_name == "local":
+        registry = {"capability": _local_structural_worker, "orphan_group": _local_structural_worker}
+        return get_executor("local", registry=registry, max_workers=4)
+    return get_executor(engine_name)
+
+
+def _dispatch_objectives(store, engine_name: str, resolver=None) -> tuple[dict, list]:
+    """Roda `coordinator.run` sobre as tarefas `ready` se a engine despachar;
+    senão registra o bloqueio de despacho UMA vez e devolve resultados vazios
+    (§7.3: análise estrutural determinística nunca fica presa a isso)."""
+    from runtime import coordinator as rt_coordinator
+
+    bloqueios: list = []
+    try:
+        executor = _build_executor(engine_name)
+    except ValueError as exc:
+        bloqueios.append({"tipo": "engine_desconhecida", "detalhe": str(exc)})
+        return dict(_EMPTY_RESULTADOS), bloqueios
+
+    caps = executor.capabilities() if callable(getattr(executor, "capabilities", None)) else {}
+    if caps.get("dispatch") is False:
+        bloqueios.append({
+            "tipo": "dispatch_indisponivel",
+            "engine": engine_name,
+            "motivo": caps.get("reason") or "engine sem despacho disponível",
+            "impacto": (
+                "análise estrutural determinística concluída (entidades/relações/fatos "
+                "com evidência de código); nenhuma leitura adicional via engine foi feita"
+            ),
+        })
+        return dict(_EMPTY_RESULTADOS), bloqueios
+
+    from runtime import context as rt_context
+
+    report = rt_coordinator.run(
+        store, executor, rt_context.build_package, max_concurrency=4, resolver=resolver
+    )
+    shutdown = getattr(executor, "shutdown", None)
+    if callable(shutdown):
+        shutdown(wait=True)
+    return report.summary(), bloqueios
+
+
+# -- knowledge.db: entidades/relações/fatos ESTRUTURAIS (nunca de saída de LLM) --
+
+
+def _component_key(path: str) -> str:
+    """Diretório imediato do arquivo — heurística de fronteira DECLARADA
+    (§6.1.7 do plano de análise: "diretório é pista, não fronteira" para
+    CAPACIDADE; para COMPONENTE, que é agrupamento estrutural/físico, e não
+    comportamental, o diretório é exatamente o sinal certo)."""
+    norm = (path or "").replace("\\", "/")
+    return norm.rsplit("/", 1)[0] if "/" in norm else "."
+
+
+def _register_file_version(repo, namespace: str, path: str, sha256: str | None):
+    """`SourceVersion` por ARQUIVO (não por snapshot inteiro): `version_label`
+    fixo ("sha256") e `content_hash`=sha do arquivo —o id só muda quando o
+    CONTEÚDO daquele arquivo muda, nunca por outro arquivo do repo ter sido
+    tocado. É o que mantém `put_entity`/`put_fact` idempotentes entre
+    execuções de `wk analyze` sobre árvore inalterada."""
+    from knowledge.models import SourceKind
+
+    if not sha256:
+        return None
+    src = repo.register_source(namespace, SourceKind.CODE, uri=path)
+    sv = repo.register_source_version(src, version_label="sha256", content_hash=sha256)
+    return sv.source_version_id
+
+
+def _source_version_id_for(namespace: str, path: str, sha256: str) -> str:
+    """Mesma fórmula de `_register_file_version`, sem tocar o banco — usado por
+    `cmd_update` para recalcular o id da versão ANTIGA de um arquivo mudado/
+    removido (para `knowledge.invalidate.mark_stale_for_source_version`)."""
+    from knowledge import identity as kg_identity
+
+    sid = kg_identity.source_id(namespace, path)
+    return kg_identity.source_version_id(sid, "sha256", sha256)
+
+
+def _kg_evidence_for(namespace: str, source_version_id: str | None, evref, content_kind):
+    """`knowledge.models.Evidence` a partir de um `analysis.capabilities.EvidenceRef`
+    já resolvido contra o snapshot. `None` quando não há localizador citável
+    (arquivo fora do snapshot/mudou sob a análise) OU sem `source_version_id`
+    — citação sem versão não é evidência (§5.4), nunca fabricada aqui."""
+    from knowledge import evidence as kg_evidence
+    from knowledge.models import SourceKind
+
+    if evref is None or not getattr(evref, "locator", None) or not source_version_id:
+        return None
+    locator = dict(evref.locator)
+    if evref.symbol and "symbol" not in locator:
+        locator["symbol"] = evref.symbol
+    try:
+        return kg_evidence.make_evidence(namespace, SourceKind.CODE, content_kind, source_version_id, locator)
+    except Exception:
+        return None
+
+
+def _write_structural_knowledge(store_root: str, namespace: str, snapshot, capability_map, extraction, reason: str) -> dict:
+    """Grava UMA revisão com entidades System/Component/Capability/Contract de
+    entrypoints e relações contains/calls (§7.1 W4). `nature=implemented` SÓ
+    sai com evidência EXECUTABLE resolvida contra o snapshot (§5.3/§5.4) — sem
+    isso a capacidade/contrato simplesmente não recebe o fato, sem inventar.
+
+    Nunca lê resultado de tarefa/engine: tudo aqui vem de
+    `capability_map`/`extraction`, que são saída do pipeline determinístico
+    (`analysis.*`), não de LLM.
+    """
+    from analysis.capabilities import evidence_ref_for
+    from knowledge.models import (
+        ContentKind, EntityDraft, EntityType, EpistemicStatus, FactDraft, FactNature,
+        LifecycleStatus, RelationDraft, RelationType,
+    )
+    from knowledge.repository import Repository
+
+    repo = Repository.open(_knowledge_db_path(store_root))
+    try:
+        svid_cache: dict[str, str | None] = {}
+
+        def svid_for(path: str):
+            if path not in svid_cache:
+                entry = snapshot.file_map().get(path)
+                svid_cache[path] = (
+                    _register_file_version(repo, namespace, path, entry.sha256) if entry else None
+                )
+            return svid_cache[path]
+
+        with repo.revision(author=_KG_ASSERTED_BY, reason=reason) as rev:
+            sys_key = snapshot.repo.replace("\\", "/")
+            sys_wr = rev.put_entity(EntityDraft(
+                namespace=namespace, entity_type=EntityType.SYSTEM, stable_key=sys_key,
+                title=os.path.basename(sys_key.rstrip("/")) or sys_key,
+            ))
+            system_id = sys_wr.target_id
+
+            components: dict[str, str] = {}
+            linked_system_component: set = set()
+            linked_component_capability: set = set()
+
+            def ensure_component(anchor_path: str) -> str:
+                key = _component_key(anchor_path)
+                if key in components:
+                    return components[key]
+                wr = rev.put_entity(EntityDraft(
+                    namespace=namespace, entity_type=EntityType.COMPONENT,
+                    stable_key=f"component:{key}", title=key, source_version_id=svid_for(anchor_path),
+                    attributes={"path": key},
+                ))
+                components[key] = wr.target_id
+                if wr.target_id not in linked_system_component:
+                    linked_system_component.add(wr.target_id)
+                    rev.put_relation(RelationDraft(
+                        namespace=namespace, source_entity_id=system_id, relation_type=RelationType.CONTAINS,
+                        target_entity_id=wr.target_id, scope="structure",
+                        epistemic_status=EpistemicStatus.INFERRED, lifecycle_status=LifecycleStatus.CURRENT,
+                        asserted_by=_KG_ASSERTED_BY,
+                    ))
+                return wr.target_id
+
+            for cap in capability_map.capabilities:
+                anchor_path = cap.entrypoints[0].path if cap.entrypoints else (cap.paths[0] if cap.paths else "")
+                cap_stable_key = "cap:" + "|".join(sorted(e.key for e in cap.entrypoints))
+                cap_wr = rev.put_entity(EntityDraft(
+                    namespace=namespace, entity_type=EntityType.CAPABILITY, stable_key=cap_stable_key,
+                    entity_id=cap.capability_id, title=cap.name,
+                    source_version_id=svid_for(anchor_path) if anchor_path else None,
+                    attributes={"grouping_basis": cap.grouping_basis.value, "modules": list(cap.modules)},
+                ))
+                capability_id = cap_wr.target_id
+
+                for path in sorted(set(cap.paths)):
+                    comp_id = ensure_component(path)
+                    pair = (comp_id, capability_id)
+                    if pair not in linked_component_capability:
+                        linked_component_capability.add(pair)
+                        rev.put_relation(RelationDraft(
+                            namespace=namespace, source_entity_id=comp_id, relation_type=RelationType.CONTAINS,
+                            target_entity_id=capability_id, scope="structure",
+                            epistemic_status=EpistemicStatus.INFERRED, lifecycle_status=LifecycleStatus.CURRENT,
+                            asserted_by=_KG_ASSERTED_BY,
+                        ))
+
+                cap_evidence_ids = []
+                for entry in cap.entrypoints:
+                    entry_svid = svid_for(entry.path)
+                    ev = _kg_evidence_for(namespace, entry_svid, entry.evidence, ContentKind.EXECUTABLE)
+                    ev_id = rev.add_evidence(ev) if ev else None
+                    contract_wr = rev.put_entity(EntityDraft(
+                        namespace=namespace, entity_type=EntityType.CONTRACT,
+                        stable_key=f"contract:{entry.key}", title=entry.name, source_version_id=entry_svid,
+                        attributes={
+                            "entrypoint_kind": entry.kind, "framework": entry.framework,
+                            "path": entry.path, "line": entry.line,
+                        },
+                        evidence_refs=(ev_id,) if ev_id else (),
+                    ))
+                    contract_id = contract_wr.target_id
+                    rev.put_relation(RelationDraft(
+                        namespace=namespace, source_entity_id=capability_id, relation_type=RelationType.CONTAINS,
+                        target_entity_id=contract_id, scope="structure",
+                        epistemic_status=EpistemicStatus.SUPPORTED if ev_id else EpistemicStatus.INFERRED,
+                        lifecycle_status=LifecycleStatus.CURRENT, asserted_by=_KG_ASSERTED_BY,
+                        support_recorded_by=_KG_SUPPORT_BY if ev_id else None,
+                        evidence_refs=(ev_id,) if ev_id else (),
+                    ))
+                    if ev_id:
+                        cap_evidence_ids.append(ev_id)
+                        rev.put_fact(FactDraft(
+                            namespace=namespace, subject_id=contract_id, predicate="implemented",
+                            value="true", scope=entry.key, nature=FactNature.IMPLEMENTED,
+                            epistemic_status=EpistemicStatus.SUPPORTED, lifecycle_status=LifecycleStatus.CURRENT,
+                            asserted_by=_KG_ASSERTED_BY, evidence_refs=(ev_id,),
+                            source_version_id=entry_svid, support_recorded_by=_KG_SUPPORT_BY,
+                        ))
+
+                if cap_evidence_ids:
+                    rev.put_fact(FactDraft(
+                        namespace=namespace, subject_id=capability_id, predicate="implemented",
+                        value="true", scope=cap.capability_id, nature=FactNature.IMPLEMENTED,
+                        epistemic_status=EpistemicStatus.SUPPORTED, lifecycle_status=LifecycleStatus.CURRENT,
+                        asserted_by=_KG_ASSERTED_BY, evidence_refs=tuple(cap_evidence_ids[:8]),
+                        source_version_id=svid_for(anchor_path) if anchor_path else None,
+                        support_recorded_by=_KG_SUPPORT_BY,
+                    ))
+
+            # relação calls entre componentes distintos, por referência resolvida
+            # (§6.2: só `resolved=True` sintático conta — heurística nunca vira aresta)
+            symbol_path = {(s.qualname or s.name): s.path for s in extraction.symbols}
+            seen_calls: set = set()
+            for ref in extraction.references:
+                if not ref.resolved or ref.kind not in ("call", "inherit", "implement"):
+                    continue
+                target_path = symbol_path.get(ref.target or "")
+                if not target_path:
+                    continue
+                from_key, to_key = _component_key(ref.path), _component_key(target_path)
+                if from_key == to_key or from_key not in components or to_key not in components:
+                    continue
+                pair = (components[from_key], components[to_key])
+                if pair in seen_calls:
+                    continue
+                seen_calls.add(pair)
+                ref_evref = evidence_ref_for(
+                    snapshot, ref.path, ref.line, ref.line_end or ref.line,
+                    role="calls_component", symbol=ref.from_symbol,
+                )
+                ev = _kg_evidence_for(namespace, svid_for(ref.path), ref_evref, ContentKind.EXECUTABLE)
+                ev_id = rev.add_evidence(ev) if ev else None
+                rev.put_relation(RelationDraft(
+                    namespace=namespace, source_entity_id=pair[0], relation_type=RelationType.CALLS,
+                    target_entity_id=pair[1], scope="structure",
+                    epistemic_status=EpistemicStatus.SUPPORTED if ev_id else EpistemicStatus.INFERRED,
+                    lifecycle_status=LifecycleStatus.CURRENT, asserted_by=_KG_ASSERTED_BY,
+                    support_recorded_by=_KG_SUPPORT_BY if ev_id else None,
+                    evidence_refs=(ev_id,) if ev_id else (),
+                ))
+
+            revision_id = rev.revision_id
+            change_count = rev.change_count
+
+        return {
+            "revision_id": revision_id, "mudancas": change_count,
+            "entidades": {"system": 1, "components": len(components), "capabilities": len(capability_map.capabilities)},
+        }
+    finally:
+        repo.close()
+
+
+# -- comandos -----------------------------------------------------------
+
+
+def cmd_analyze(a) -> int:
+    from runtime import tasks as rt_tasks
+    from runtime.coordinator import plan_from_objectives
+
+    store_root = _store_root(a)
+    repo_abs = os.path.abspath(a.repo)
+    if not os.path.isdir(repo_abs):
+        print(json.dumps({"error": f"repo não encontrado: {repo_abs}", "acao": "confira --repo"},
+                          ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    profile_all = _load_analysis_profile(store_root)
+    prior = _repo_profile(profile_all, repo_abs)
+    topic = a.topic if a.topic is not None else prior.get("topic")
+    engine_name = a.engine or prior.get("engine") or "local"
+    scope = prior.get("scope")
+    namespace = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
+
+    try:
+        snapshot, _inventory, extraction, capability_map, objectives = _analyze_pipeline(
+            repo_abs, scope, namespace
+        )
+    except Exception as exc:
+        print(json.dumps({
+            "error": f"falha na captura/extração do repositório: {exc}",
+            "tipo": type(exc).__name__,
+            "acao": "confira se --repo aponta para um diretório válido (git ou não)",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    _save_snapshot_manifest(store_root, snapshot)
+
+    symbol_path_index = {(s.qualname or s.name): s.path for s in extraction.symbols}
+    from analysis.investigation import objectives_to_dict
+    objective_dicts = objectives_to_dict(objectives)
+
+    store = rt_tasks.TaskStore.open(_runtime_db_path(store_root))
+    try:
+        capacidades_analisadas = []
+        for obj in objective_dicts:
+            paths = _objective_touched_paths(obj, capability_map, symbol_path_index)
+            svs = _scope_source_versions(snapshot, paths)
+            scope_id = _scope_id(str(obj.get("objective_id")), svs)
+            created = plan_from_objectives(
+                store, [obj], snapshot_id=scope_id, source_version_ids=svs,
+                kind=rt_tasks.TaskKind.INVESTIGATION, budget=_DEFAULT_TASK_BUDGET,
+            )
+            for t in created:
+                capacidades_analisadas.append({
+                    "objective_id": obj.get("objective_id"), "capability_id": obj.get("capability_id"),
+                    "task_id": t.task_id, "reaproveitada": bool(t.reused), "estado": t.state.value,
+                })
+
+        resultados, bloqueios = _dispatch_objectives(store, engine_name, resolver=_snapshot_resolver(snapshot))
+
+        reason = f"wk analyze --repo {repo_abs}" + (f" --topic {topic}" if topic else "")
+        kg_summary = _write_structural_knowledge(store_root, namespace, snapshot, capability_map, extraction, reason)
+
+        current_oids = sorted({str(o.get("objective_id")) for o in objective_dicts if o.get("objective_id")})
+        profile_all[_repo_key(repo_abs)] = {
+            "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
+            "last_snapshot_id": snapshot.snapshot_id, "last_revision_id": kg_summary.get("revision_id"),
+            "current_objective_ids": current_oids, "updated_at": _utc_now(),
+        }
+        _save_analysis_profile(store_root, profile_all)
+
+        out = {
+            "capacidades_analisadas": capacidades_analisadas,
+            "revisao": kg_summary,
+            "resultados": resultados,
+            "lacunas": _lacunas_from_objectives(objectives),
+            "bloqueios": bloqueios,
+            "escopo_efetivo": {
+                "repo": repo_abs, "topic": topic, "engine": engine_name,
+                "scope": scope, "namespace": namespace, "store": store_root,
+            },
+        }
+        if bloqueios:
+            out["proximo_passo"] = (
+                "configure o binário/credenciais da engine e rode `wk resume --repo "
+                f"{repo_abs}` para despachar a leitura adicional pendente; a análise "
+                "estrutural já concluída não precisa ser refeita"
+            )
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_update(a) -> int:
+    from runtime import recovery as rt_recovery
+    from runtime import tasks as rt_tasks
+    from runtime.coordinator import plan_from_objectives
+
+    store_root = _store_root(a)
+    repo_abs = os.path.abspath(a.repo)
+    if not os.path.isdir(repo_abs):
+        print(json.dumps({"error": f"repo não encontrado: {repo_abs}"}, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    profile_all = _load_analysis_profile(store_root)
+    prior = _repo_profile(profile_all, repo_abs)
+    if not prior.get("last_snapshot_id"):
+        print(json.dumps({
+            "error": "nenhuma análise anterior encontrada para este repo",
+            "acao": f"rode `wk analyze --repo {repo_abs}` primeiro",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    old_snapshot = _load_snapshot_manifest(store_root, prior["last_snapshot_id"])
+    if old_snapshot is None:
+        print(json.dumps({
+            "error": f"manifesto do snapshot anterior não encontrado: {prior['last_snapshot_id']}",
+            "acao": f"rode `wk analyze --repo {repo_abs}` novamente para recriar o manifesto",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    from analysis import snapshot as snap_mod
+
+    scope = prior.get("scope")
+    try:
+        new_snapshot = snap_mod.capture(repo_abs, scope=scope)
+    except Exception as exc:
+        print(json.dumps({"error": f"falha na captura do repositório: {exc}", "tipo": type(exc).__name__},
+                          ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    if new_snapshot.snapshot_id == old_snapshot.snapshot_id:
+        print(json.dumps({
+            "mudou": False, "mensagem": "sem mudanças desde a última análise; nada foi reexecutado",
+            "snapshot_id": new_snapshot.snapshot_id,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    delta = snap_mod.diff(old_snapshot, new_snapshot)
+    namespace = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
+    topic = prior.get("topic")
+    engine_name = a.engine or prior.get("engine") or "local"
+
+    store = rt_tasks.TaskStore.open(_runtime_db_path(store_root))
+    try:
+        rt_recovery.resume(store)  # housekeeping: libera leases expirados de uma execução anterior
+
+        _, _inventory, extraction, capability_map, objectives = _analyze_pipeline(
+            repo_abs, scope, namespace, precaptured=new_snapshot
+        )
+        symbol_path_index = {(s.qualname or s.name): s.path for s in extraction.symbols}
+        from analysis.investigation import objectives_to_dict
+        objective_dicts = objectives_to_dict(objectives)
+
+        changed_paths = set(delta["added"]) | set(delta["removed"]) | set(delta["changed"])
+        latest_by_objective = _latest_tasks_by_objective(store)
+        current_oids = {str(o.get("objective_id")) for o in objective_dicts if o.get("objective_id")}
+
+        # Capacidade que sumiu do replanejamento (reagrupamento de entradas, não
+        # só edição de arquivo) não tem mais objective_id equivalente nesta
+        # rodada: `wk status`/`current_objective_ids` a excluem da leitura
+        # vigente (não requeued aqui — sem objective_id atual ela NUNCA seria
+        # replanejada, e devolvê-la a `pending` só a deixaria presa em
+        # despacho eterno sem nunca ser reaproveitada).
+        objetivos_obsoletos = sorted(set(latest_by_objective) - current_oids)
+
+        objetivos_invalidados, capacidades_analisadas = [], []
+        for obj in objective_dicts:
+            oid = str(obj.get("objective_id"))
+            paths = _objective_touched_paths(obj, capability_map, symbol_path_index)
+            if changed_paths.intersection(paths):
+                # SOMENTE o dependente afetado entra aqui (§7.1 aceite): tarefa cujo
+                # escopo não intersecta o delta nunca é tocada. `create_task`
+                # abaixo já dedupe por `effect_identity` (conteúdo+escopo) — um
+                # arquivo tocado sob esta capacidade produz `scope_id` novo e,
+                # portanto, tarefa NOVA (não reaproveitada); a tarefa antiga fica
+                # como histórico (não é redespachada: só a mais recente por
+                # `objective_id` é `ready`/considerada vigente).
+                objetivos_invalidados.append(oid)
+            svs = _scope_source_versions(new_snapshot, paths)
+            scope_id = _scope_id(oid, svs)
+            created = plan_from_objectives(
+                store, [obj], snapshot_id=scope_id, source_version_ids=svs,
+                kind=rt_tasks.TaskKind.INVESTIGATION, budget=_DEFAULT_TASK_BUDGET,
+            )
+            for t in created:
+                capacidades_analisadas.append({
+                    "objective_id": oid, "task_id": t.task_id,
+                    "reaproveitada": bool(t.reused), "estado": t.state.value,
+                })
+
+        resultados, bloqueios = _dispatch_objectives(store, engine_name, resolver=_snapshot_resolver(new_snapshot))
+
+        from knowledge import invalidate as kg_invalidate
+        from knowledge.repository import Repository
+
+        conhecimento_invalidado = []
+        repo_kg = Repository.open(_knowledge_db_path(store_root))
+        try:
+            for path in sorted(set(delta["changed"]) | set(delta["removed"])):
+                entry = old_snapshot.file_map().get(path)
+                if entry is None or not entry.sha256:
+                    continue
+                old_svid = _source_version_id_for(namespace, path, entry.sha256)
+                inv_report = kg_invalidate.mark_stale_for_source_version(
+                    repo_kg, old_svid, recorded_by="pipeline:wk-update",
+                    reason=f"arquivo alterado/removido: {path}",
+                )
+                if inv_report.changed:
+                    conhecimento_invalidado.append({
+                        "path": path,
+                        "entidades": len(inv_report.dependents.entities),
+                        "fatos": len(inv_report.dependents.facts),
+                        "relacoes": len(inv_report.dependents.relations),
+                    })
+            reason = f"wk update --repo {repo_abs}"
+            kg_summary = _write_structural_knowledge(
+                store_root, namespace, new_snapshot, capability_map, extraction, reason
+            )
+        finally:
+            repo_kg.close()
+
+        _save_snapshot_manifest(store_root, new_snapshot)
+        profile_all[_repo_key(repo_abs)] = {
+            "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
+            "last_snapshot_id": new_snapshot.snapshot_id, "last_revision_id": kg_summary.get("revision_id"),
+            "current_objective_ids": sorted(current_oids), "updated_at": _utc_now(),
+        }
+        _save_analysis_profile(store_root, profile_all)
+
+        out = {
+            "mudou": True,
+            "delta": {"adicionados": delta["added"], "removidos": delta["removed"], "alterados": delta["changed"]},
+            "objetivos_invalidados": objetivos_invalidados,
+            "objetivos_obsoletos": objetivos_obsoletos,
+            "conhecimento_invalidado": conhecimento_invalidado,
+            "capacidades_analisadas": capacidades_analisadas,
+            "revisao": kg_summary,
+            "resultados": resultados,
+            "lacunas": _lacunas_from_objectives(objectives),
+            "bloqueios": bloqueios,
+            "escopo_efetivo": {
+                "repo": repo_abs, "topic": topic, "engine": engine_name,
+                "scope": scope, "namespace": namespace, "store": store_root,
+            },
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_status(a) -> int:
+    store_root = _store_root(a)
+    repo_abs = os.path.abspath(a.repo)
+    profile_all = _load_analysis_profile(store_root)
+    prior = _repo_profile(profile_all, repo_abs)
+
+    runtime_db = _runtime_db_path(store_root)
+    if not os.path.exists(runtime_db):
+        print(json.dumps({
+            "error": "nenhuma análise encontrada (runtime.db ausente)",
+            "acao": f"rode `wk analyze --repo {repo_abs}` primeiro",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    from runtime import tasks as rt_tasks
+
+    store = rt_tasks.TaskStore.open(runtime_db)
+    try:
+        latest = _latest_tasks_by_objective(store)
+        # `current_objective_ids` (gravado por `wk analyze`/`wk update`) filtra
+        # capacidade que sumiu por reagrupamento — sem isto, uma tarefa "done"
+        # de uma capacidade que não existe mais no último replanejamento
+        # continuaria contada como vigente. Perfil antigo sem a chave (build
+        # anterior a este comando): não filtra, para não esconder nada.
+        current_oids = prior.get("current_objective_ids")
+        capacidades_obsoletas = 0
+        por_estado: dict = {}
+        lacunas = []
+        for oid, t in latest.items():
+            if current_oids is not None and oid not in current_oids:
+                capacidades_obsoletas += 1
+                continue
+            por_estado[t.state.value] = por_estado.get(t.state.value, 0) + 1
+            try:
+                from analysis.investigation import InvestigationObjective
+                unmet = InvestigationObjective.from_dict(t.objective).unmet_obligations()
+            except Exception:
+                unmet = []
+            if unmet:
+                lacunas.append({
+                    "objective_id": t.objective.get("objective_id"),
+                    "capability_id": t.objective.get("capability_id"),
+                    "pendencias": unmet,
+                })
+
+        revisao = None
+        efeitos_pendentes: list = []
+        knowledge_db = _knowledge_db_path(store_root)
+        if os.path.exists(knowledge_db) and prior.get("last_revision_id"):
+            from knowledge.repository import Repository
+
+            repo_kg = Repository.open(knowledge_db)
+            try:
+                rv = repo_kg.get_revision(prior["last_revision_id"])
+                if rv is not None:
+                    revisao = {
+                        "revision_id": rv.revision_id, "created_at": rv.created_at,
+                        "author": rv.author, "reason": rv.reason, "change_count": rv.change_count,
+                    }
+                efeitos_pendentes = [
+                    {"effect_id": e.effect_id, "effect_type": e.effect_type} for e in repo_kg.pending_effects()
+                ]
+            finally:
+                repo_kg.close()
+
+        out = {
+            "repo": repo_abs,
+            "escopo_efetivo": {
+                "topic": prior.get("topic"), "engine": prior.get("engine"),
+                "namespace": prior.get("namespace"), "scope": prior.get("scope"),
+            },
+            "ultimo_snapshot": prior.get("last_snapshot_id"),
+            "tarefas_por_estado": por_estado,
+            "tarefas_total_historico": len(store.all_tasks()),
+            "capacidades_obsoletas": capacidades_obsoletas,
+            "revisao": revisao,
+            "lacunas": lacunas,
+            "efeitos_pendentes": efeitos_pendentes,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_resume(a) -> int:
+    store_root = _store_root(a)
+    repo_abs = os.path.abspath(a.repo)
+    profile_all = _load_analysis_profile(store_root)
+    prior = _repo_profile(profile_all, repo_abs)
+    engine_name = a.engine or prior.get("engine") or "local"
+
+    runtime_db = _runtime_db_path(store_root)
+    if not os.path.exists(runtime_db):
+        print(json.dumps({
+            "error": "nenhuma análise encontrada (runtime.db ausente)",
+            "acao": f"rode `wk analyze --repo {repo_abs}` primeiro",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    from runtime import recovery as rt_recovery
+    from runtime import tasks as rt_tasks
+
+    resolver = None
+    if prior.get("last_snapshot_id"):
+        snap = _load_snapshot_manifest(store_root, prior["last_snapshot_id"])
+        if snap is not None:
+            resolver = _snapshot_resolver(snap)
+
+    store = rt_tasks.TaskStore.open(runtime_db)
+    try:
+        resume_plan = rt_recovery.resume(store)
+        resultados, bloqueios = _dispatch_objectives(store, engine_name, resolver=resolver)
+        out = {"retomada": resume_plan.summary(), "resultados": resultados, "bloqueios": bloqueios}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
 # ---------- entrada ----------
 
 
@@ -4864,6 +5791,45 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fi.add_argument("--no-docx", action="store_true", help="pula o passo opcional de geração de wiki-docx/")
     fi.set_defaults(fn=cmd_finish)
+
+    # ---- W4: analyze/update/status/resume (código -> conhecimento; §7.1) ----
+    # Seção própria do parser: não reaproveita nem remove `wk code <sub>`
+    # (codescan.cli, fase 3/SDD) — este bloco fala com analysis/knowledge/
+    # runtime diretamente, em comandos compostos (1 comando = pipeline inteiro).
+
+    an = sub.add_parser(
+        "analyze",
+        help="pipeline completo do repositório em 1 comando: snapshot->extração->capacidades->"
+             "objetivos->tarefas->(despacho se a engine tiver)->revisão estrutural em knowledge.db",
+    )
+    an.add_argument("--repo", required=True, help="caminho do repositório a analisar")
+    an.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    an.add_argument("--topic", default=None, help="rótulo opcional do tópico (persistido no perfil)")
+    an.add_argument("--engine", default=None, choices=["local", "claude-cli"],
+                     help="executor de despacho (default: perfil salvo, senão 'local')")
+    an.set_defaults(fn=cmd_analyze)
+
+    up = sub.add_parser(
+        "update",
+        help="reanalisa SOMENTE o delta desde a última `wk analyze`/`wk update` (sem mudança: no-op)",
+    )
+    up.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    up.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    up.add_argument("--engine", default=None, choices=["local", "claude-cli"],
+                     help="executor de despacho (default: perfil salvo desta análise)")
+    up.set_defaults(fn=cmd_update)
+
+    st = sub.add_parser("status", help="leitura de runtime.db+knowledge.db: tarefas, revisão, lacunas, efeitos")
+    st.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    st.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    st.set_defaults(fn=cmd_status)
+
+    re_ = sub.add_parser("resume", help="libera leases expirados e retoma tarefas ready/invalidadas")
+    re_.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    re_.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    re_.add_argument("--engine", default=None, choices=["local", "claude-cli"],
+                      help="executor de despacho (default: perfil salvo desta análise)")
+    re_.set_defaults(fn=cmd_resume)
 
     # Grupos repassados às CLIs internas: parsing fica com elas.
     for name, help_ in (
