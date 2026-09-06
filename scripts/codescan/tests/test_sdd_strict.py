@@ -108,7 +108,12 @@ class StrictAuditTest(unittest.TestCase):
                 self.assertEqual(report["score"], 0)
                 self.assertIn("agent-runs obrigatório ausente", self._blockers(report))
 
-    def test_warning_nunca_permite_score_100(self):
+    def test_secao_ausente_vira_aviso_cerimonial_e_nao_reduz_score(self):
+        """W8-T8.3 (plano §3.1: "Score baseado em ... quantidade de seções
+        ... apresentado como medida de entendimento"): seção obrigatória
+        ausente não é mais `warning` nem reduz `score` — vira
+        `avisos_cerimoniais` informativo. Integridade OK + "poucas seções"
+        agora passa (comportamento desejado pelo plano)."""
         tmp, wd = self._wd()
         with tmp:
             path = os.path.join(wd, "artifact.md")
@@ -137,10 +142,12 @@ class StrictAuditTest(unittest.TestCase):
                 ),
             )
 
-        self.assertEqual(len(result["warnings"]), 1)
-        self.assertTrue(result["warnings"][0].startswith("seção ausente: Ausente"))
-        self.assertIn("artifact.md", result["warnings"][0])
-        self.assertLess(result["score"], 100)
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(len(result["avisos_cerimoniais"]), 1)
+        self.assertTrue(result["avisos_cerimoniais"][0].startswith("seção sugerida ausente: Ausente"))
+        self.assertIn("artifact.md", result["avisos_cerimoniais"][0])
+        self.assertEqual(result["score"], 100)
+        self.assertEqual(result["status"], "pass")
 
     def test_audit_file_aceita_generics_java_sem_placeholder(self):
         tmp, wd = self._wd()

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import hashlib
 import html
 import io
@@ -3748,7 +3749,14 @@ def _ingest_asset(
     return dest, asset_rel
 
 
-def cmd_ingest(a) -> int:
+#: W8: `wk ingest` deixou de ser este comando (virou o composto de
+#: `cmd_ingest2`, renomeado); este é o comportamento antigo (1 arquivo -> 1
+#: página em inbox/, sem tocar knowledge.db), preservado como `ingest-legacy`
+#: (mesmo código, aviso aditivo abaixo — ver `_build_parser`).
+_AVISO_MIGRACAO_INGEST_LEGACY = "fluxo legado; use `wk ingest` — será removido"
+
+
+def cmd_ingest_legacy(a) -> int:
     from sbindex.frontmatter import VALID_SOURCE_TYPES
 
     if not os.path.isfile(a.file):
@@ -3842,6 +3850,7 @@ def cmd_ingest(a) -> int:
         out["derived_from"] = derived_ids
     if asset_rel:
         out["asset"] = asset_rel
+    out["aviso_migracao"] = _AVISO_MIGRACAO_INGEST_LEGACY
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
@@ -4401,6 +4410,9 @@ def cmd_finish(a) -> int:
         out.update(extra)
         if acao is not None:
             out["acao"] = acao
+        # W8-T8.2: campo aditivo — não muda comportamento nem exit code de
+        # `finish` (continua sendo o fechamento composto do fluxo legado).
+        out["aviso_migracao"] = "fluxo legado; use `wk analyze` — será removido"
         print(json.dumps(out, ensure_ascii=False, indent=2), file=(sys.stdout if code == 0 else sys.stderr))
         return code
 
@@ -4680,6 +4692,32 @@ def _is_help_request(argv: list[str]) -> bool:
     return any(tok in ("-h", "--help") for tok in argv)
 
 
+#: W8-T8.2: `wk code <sub>` é o fan-out do pipeline legado (`codescan.cli`,
+#: fase 3/SDD) — não editado aqui (dono: outro componente). Este aviso é só
+#: um campo aditivo no JSON que o comando já imprime; comportamento e exit
+#: code de `codescan.cli.main` continuam intactos.
+_AVISO_MIGRACAO_CODE_LEGADO = "fluxo legado; use `wk analyze` — será removido"
+
+
+def _with_aviso_migracao(text: str, aviso: str) -> tuple[str, bool]:
+    """Decodifica `text` como objeto JSON e acrescenta `aviso_migracao`.
+
+    Texto que não é um objeto JSON (help, linha solta, etc.) volta
+    INALTERADO — nunca reformata o que não é o JSON de resultado do comando.
+    Devolve `(texto, True)` só quando de fato injetou o campo."""
+    stripped = text.strip()
+    if not stripped:
+        return text, False
+    try:
+        payload = json.loads(stripped)
+    except ValueError:
+        return text, False
+    if not isinstance(payload, dict) or "aviso_migracao" in payload:
+        return text, False
+    payload["aviso_migracao"] = aviso
+    return json.dumps(payload, ensure_ascii=False, indent=2), True
+
+
 def _run_code(argv: list[str]) -> int:
     from codescan.cli import main as codescan_main
 
@@ -4689,11 +4727,32 @@ def _run_code(argv: list[str]) -> int:
     repo = g.get("repo") or os.environ.get("WK_REPO")
     if not repo:
         print(
-            json.dumps({"error": "informe --repo <caminho> (ou WK_REPO)"}),
+            json.dumps({
+                "error": "informe --repo <caminho> (ou WK_REPO)",
+                "aviso_migracao": _AVISO_MIGRACAO_CODE_LEGADO,
+            }),
             file=sys.stderr,
         )
         return 2
-    return codescan_main(["--store", _store(g), "--repo", repo, *rest])
+
+    # Captura para poder acrescentar `aviso_migracao` ao JSON já impresso por
+    # `codescan_main` sem tocar em `codescan/cli.py`. `finally` garante que o
+    # texto capturado (modificado ou não) sempre chega ao stdout/stderr REAL
+    # antes de qualquer exceção (incluindo `SystemExit`) continuar subindo —
+    # nunca perde a saída de um comando que só imprimiu e não retornou ainda.
+    out_buf, err_buf = io.StringIO(), io.StringIO()
+    code = 1
+    try:
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            code = codescan_main(["--store", _store(g), "--repo", repo, *rest])
+    finally:
+        out_final, out_changed = _with_aviso_migracao(out_buf.getvalue(), _AVISO_MIGRACAO_CODE_LEGADO)
+        err_final, err_changed = _with_aviso_migracao(err_buf.getvalue(), _AVISO_MIGRACAO_CODE_LEGADO)
+        if out_final:
+            sys.stdout.write(out_final + ("\n" if out_changed else ""))
+        if err_final:
+            sys.stderr.write(err_final + ("\n" if err_changed else ""))
+    return code
 
 
 def _run_index(argv: list[str]) -> int:
@@ -5266,6 +5325,67 @@ def _write_structural_knowledge(store_root: str, namespace: str, snapshot, capab
         repo.close()
 
 
+#: Publicação local (`store/publicacoes/`): raiz relativa ao store, fixa —
+#: `wk analyze`/`wk update`/`wk ingest` (W8-T8.2) publicam sempre aqui, com o
+#: pipeline REAL de W6 (`publishing.planner`+`publishing.release`, renderers
+#: `publishing.markdown`/`publishing.word`, validadores reais default do
+#: próprio `release.publish_revision`). Nenhum motor de publicação novo é
+#: criado por este módulo — só a costura de infra já pronta.
+_PUBLICACOES_DIRNAME = "publicacoes"
+
+
+def _publish_local(store_root: str, namespace: str, revision_id: str | None) -> dict:
+    """Publica localmente a revisão `revision_id` (Markdown+Word+manifest.json).
+
+    Falha de publicação NUNCA desfaz a revisão de conhecimento já gravada em
+    `knowledge.db` — `release.publish_revision` já garante isso (§10.6/F09:
+    staging isolado, promoção só se tudo validar; revisão anterior de
+    publicação continua ativa/servível). Aqui só reportamos o resultado como
+    `bloqueios`; o chamador (`cmd_analyze`/`cmd_update`/`cmd_ingest`) sempre
+    retorna 0 mesmo com bloqueio de publicação — a revisão de conhecimento em
+    si já terminou com sucesso antes desta função ser chamada.
+
+    `revision_id=None` (nada foi gravado nesta execução) não tenta publicar.
+    """
+    rel_root = _PUBLICACOES_DIRNAME
+    if not revision_id:
+        return {"revisao": None, "bloqueios": ["nenhuma revisão nova para publicar"]}
+
+    out_root = os.path.join(store_root, _PUBLICACOES_DIRNAME)
+    publicacoes = {
+        "revisao": revision_id,
+        "markdown": f"{rel_root}/markdown",
+        "word": f"{rel_root}/word",
+        "manifesto": f"{rel_root}/manifest.json",
+    }
+    try:
+        from knowledge.repository import Repository
+        from publishing import markdown as pub_markdown
+        from publishing import release as pub_release
+        from publishing import word as pub_word
+        from publishing.planner import plan as pub_plan
+
+        class _Renderers:
+            markdown = pub_markdown
+            word = pub_word
+
+        repo = Repository.open(_knowledge_db_path(store_root))
+        try:
+            plan_obj = pub_plan(repo, revision_id, namespace=namespace)
+            result = pub_release.publish_revision(
+                plan_obj, out_root, _Renderers(), revision_id=revision_id,
+            )
+        finally:
+            repo.close()
+    except Exception as exc:  # publicação nunca derruba o comando que a chama
+        publicacoes["bloqueios"] = [f"{type(exc).__name__}: {exc}"]
+        return publicacoes
+
+    if not result.ok:
+        publicacoes["bloqueios"] = list(result.blocked_by)
+    return publicacoes
+
+
 # -- comandos -----------------------------------------------------------
 
 
@@ -5326,6 +5446,7 @@ def cmd_analyze(a) -> int:
 
         reason = f"wk analyze --repo {repo_abs}" + (f" --topic {topic}" if topic else "")
         kg_summary = _write_structural_knowledge(store_root, namespace, snapshot, capability_map, extraction, reason)
+        publicacoes = _publish_local(store_root, namespace, kg_summary.get("revision_id"))
 
         current_oids = sorted({str(o.get("objective_id")) for o in objective_dicts if o.get("objective_id")})
         profile_all[_repo_key(repo_abs)] = {
@@ -5338,6 +5459,7 @@ def cmd_analyze(a) -> int:
         out = {
             "capacidades_analisadas": capacidades_analisadas,
             "revisao": kg_summary,
+            "publicacoes": publicacoes,
             "resultados": resultados,
             "lacunas": _lacunas_from_objectives(objectives),
             "bloqueios": bloqueios,
@@ -5487,6 +5609,12 @@ def cmd_update(a) -> int:
         finally:
             repo_kg.close()
 
+        # Republica só quando houve mudança (§7.1/W8): esta função inteira só
+        # roda dentro do ramo `mudou=True` — o `if new_snapshot.snapshot_id ==
+        # old_snapshot.snapshot_id` acima já retorna sem chegar aqui quando
+        # não há delta, então `wk update` sem mudança nunca republica.
+        publicacoes = _publish_local(store_root, namespace, kg_summary.get("revision_id"))
+
         _save_snapshot_manifest(store_root, new_snapshot)
         profile_all[_repo_key(repo_abs)] = {
             "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
@@ -5503,6 +5631,7 @@ def cmd_update(a) -> int:
             "conhecimento_invalidado": conhecimento_invalidado,
             "capacidades_analisadas": capacidades_analisadas,
             "revisao": kg_summary,
+            "publicacoes": publicacoes,
             "resultados": resultados,
             "lacunas": _lacunas_from_objectives(objectives),
             "bloqueios": bloqueios,
@@ -5637,12 +5766,14 @@ def cmd_resume(a) -> int:
         store.close()
 
 
-# ---------- W5: ingest2 (fonte -> extract -> correlate; §7.1 plano de evolução) ----------
+# ---------- W5/W8: ingest (fonte -> extract -> correlate -> publica; §7.1) ----------
 #
-# Comando composto ADITIVO (W5-T5.3): não edita `ingestion/`, `knowledge/`,
-# `runtime/`, `analysis/` — só importa a infra pronta de lá. `wk ingest`
-# (legado, `cmd_ingest` acima) continua existindo; o rename/substituição é
-# W8 (o `help` de `ingest2` já avisa isso).
+# Comando composto (W5-T5.3, renomeado de `ingest2` para `ingest` na W8): não
+# edita `ingestion/`, `knowledge/`, `runtime/`, `analysis/`, `publishing/` —
+# só importa a infra pronta de lá. O comportamento antigo de `wk ingest` (1
+# arquivo -> 1 página em inbox/, sem knowledge.db) sobrevive como
+# `cmd_ingest_legacy`/`wk ingest-legacy`; `ingest2` continua funcionando como
+# alias oculto deste mesmo comando (compatibilidade, ver `_build_parser`).
 #
 # Reusa a mesma localização de `knowledge.db` do bloco W4
 # (`_knowledge_db_path`/`_repo_key`) para que fatos gravados por `wk analyze`
@@ -5758,7 +5889,7 @@ def _ingest2_pending_to_dict(pending) -> dict:
     }
 
 
-def cmd_ingest2(a) -> int:
+def cmd_ingest(a) -> int:
     from ingestion import ingest as ing_ingest
     from ingestion.extract import extract_candidates
     from ingestion.correlate import correlate
@@ -5908,10 +6039,6 @@ def cmd_ingest2(a) -> int:
     finally:
         repo.close()
 
-    avisos.append(
-        "republicacao_pendente_w6: unidades_afetadas listadas ainda não foram republicadas "
-        "fisicamente na wiki — a republicação é escopo de W6; este comando só registra o efeito"
-    )
     if fail_count:
         avisos.append(f"{fail_count} de {len(leaves)} fonte(s) falharam (extração ou correlação); "
                        "ver 'fontes[].diagnostico'")
@@ -5919,14 +6046,112 @@ def cmd_ingest2(a) -> int:
         avisos.append(f"{pending_count} fonte(s) com decisão pendente (iniciativa ambígua); "
                        "ver 'fontes[].decisoes_pendentes' — aceitas sem bloqueio (§7.1)")
 
+    # W8-T8.2: publica de verdade (markdown+word+manifest.json em
+    # store/publicacoes/) a revisão mais recente escrita por este lote — não
+    # roda quando nenhuma fonte gravou revisão nova (nada mudou em
+    # knowledge.db). Bloqueio de publicação vira aviso; nunca desfaz o que já
+    # foi correlacionado/gravado acima.
+    publicacoes = None
+    if revisoes:
+        publicacoes = _publish_local(store_root, namespace, revisoes[-1])
+        if publicacoes.get("bloqueios"):
+            avisos.append(
+                "publicacao_com_bloqueio: " + "; ".join(publicacoes["bloqueios"])
+            )
+
     out = {
         "fontes": fontes,
         "revisoes": revisoes,
         "unidades_afetadas": sorted(unidades_afetadas),
         "avisos": avisos,
     }
+    if publicacoes is not None:
+        out["publicacoes"] = publicacoes
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0 if ok_count > 0 else 1
+
+
+# ---------- W8: migrate (corpus legado -> knowledge.db; §16.1) ----------
+#
+# Fachada fina sobre `knowledge.migrate` (dono exclusivo daquele módulo,
+# NÃO editado aqui): inventory_legacy -> backup -> migrate -> verify_migration,
+# nessa ordem, contra o `knowledge.db` do `--store` informado. Backup é
+# pré-condição obrigatória de `migrate()` — sem um `--backup-dir` novo/vazio
+# (ou um default gerado aqui, sempre novo via `tempfile.mkdtemp`), a migração
+# é recusada pelo próprio `knowledge.migrate` (nenhuma reimplementação da
+# regra aqui, só propagação do erro).
+
+_MIGRATE_BACKUP_SUBDIR = ".migrate-backup"
+
+
+def cmd_migrate(a) -> int:
+    from knowledge.migrate import BackupError, backup as kg_backup, inventory_legacy, migrate as kg_migrate, verify_migration
+    from knowledge.repository import Repository
+
+    store_root = _store_root(a)
+    if not os.path.isdir(store_root):
+        print(json.dumps({
+            "error": f"store não encontrado: {store_root}",
+            "acao": "rode `wk store init <store>` primeiro",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    namespace = a.namespace or _INGEST2_DEFAULT_NAMESPACE
+    backup_dir = a.backup_dir
+    if not backup_dir:
+        parent = os.path.join(store_root, _MIGRATE_BACKUP_SUBDIR)
+        os.makedirs(parent, exist_ok=True)
+        backup_dir = tempfile.mkdtemp(prefix="backup-", dir=parent)
+    else:
+        backup_dir = os.path.abspath(backup_dir)
+
+    inv = inventory_legacy(store_root)
+
+    try:
+        bkp = kg_backup(store_root, backup_dir)
+    except BackupError as exc:
+        print(json.dumps({
+            "error": f"backup falhou: {exc}",
+            "acao": "informe um --backup-dir novo/vazio; migração é recusada sem backup válido",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    repo = Repository.open(_knowledge_db_path(store_root))
+    try:
+        try:
+            result = kg_migrate(store_root, repo, namespace, backup_dir=backup_dir)
+        except BackupError as exc:
+            print(json.dumps({
+                "error": f"migração recusada: {exc}",
+                "acao": "confira o --backup-dir informado (precisa bater com o backup feito)",
+            }, ensure_ascii=False), file=sys.stderr)
+            return 2
+        report = verify_migration(store_root, repo, result)
+    finally:
+        repo.close()
+
+    out = {
+        "namespace": result.namespace,
+        "backup": {
+            "dir": bkp.backup_dir,
+            "manifesto": bkp.manifest_path,
+            "arquivos": bkp.file_count,
+            "bytes": bkp.total_bytes,
+        },
+        "inventario": dict(inv.counts),
+        "migrados": [dataclasses.asdict(m) for m in result.migrados],
+        "pulados": [dataclasses.asdict(s) for s in result.pulados],
+        "avisos": result.avisos,
+        "verificacao": {
+            "ok": report.ok,
+            "fontes_faltantes": report.missing_sources,
+            "fatos_proibidos": report.forbidden_facts,
+            "divergencia_contagem": report.count_mismatch,
+            "problemas": report.issues,
+        },
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if report.ok else 1
 
 
 # ---------- entrada ----------
@@ -5936,6 +6161,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wk",
         description="Wiki AI — pipeline de conhecimento e análise de codebase",
+        epilog=(
+            "Fluxo principal (padrão; plano de evolução §7.1): analyze, ingest, "
+            "update, status, resume, migrate.\n"
+            "Legado (comportamento preservado; JSON de saída ganha "
+            "'aviso_migracao'; será removido): promote, compile, docx, lint, "
+            "ingest-legacy, publish, finish, e o fan-out `wk code <sub>`."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action="version", version=f"wiki-ai {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -5984,6 +6217,91 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("store_cmd", choices=("init",), help="init")
     s.add_argument("path", nargs="?", default="./store", help="caminho (default: ./store)")
     s.set_defaults(fn=cmd_store)
+
+    # ==== Fluxo principal (W4/W5/W8, §7.1): 1 comando = pipeline inteiro ====
+    # analyze/update/status/resume falam com analysis/knowledge/runtime
+    # diretamente; ingest fala com ingestion/knowledge; migrate fala com
+    # knowledge.migrate. Nenhum destes reaproveita ou remove `wk code <sub>`
+    # (codescan.cli, fase 3/SDD — seção "Legado" mais abaixo).
+
+    an = sub.add_parser(
+        "analyze",
+        help="pipeline completo do repositório em 1 comando: snapshot->extração->capacidades->"
+             "objetivos->tarefas->(despacho se a engine tiver)->revisão estrutural em knowledge.db"
+             "->publicação local (markdown+word) da revisão",
+    )
+    an.add_argument("--repo", required=True, help="caminho do repositório a analisar")
+    an.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    an.add_argument("--topic", default=None, help="rótulo opcional do tópico (persistido no perfil)")
+    an.add_argument("--engine", default=None, choices=["local", "claude-cli"],
+                     help="executor de despacho (default: perfil salvo, senão 'local')")
+    an.set_defaults(fn=cmd_analyze)
+
+    def _add_ingest_args(sp: argparse.ArgumentParser) -> None:
+        """Argumentos do `ingest` composto (W5-T5.3) — reaproveitado por
+        `ingest` e pelo alias oculto `ingest2` (compatibilidade), garantindo
+        que os dois nunca divirjam de assinatura."""
+        sp.add_argument("path", help="arquivo ou diretório de origem a ingerir")
+        sp.add_argument("--initiative", default=None,
+                         help="id da iniciativa (prioridade: argumento > frontmatter/metadata "
+                              "do arquivo > contexto persistido por diretório de origem)")
+        sp.add_argument("--phase", default=None, choices=["inception", "refinement", "other"],
+                         help="fase da iniciativa (mesma prioridade de --initiative)")
+        sp.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+        sp.add_argument("--namespace", default=None,
+                         help=f"namespace do knowledge.db (default: {_INGEST2_DEFAULT_NAMESPACE!r})")
+        sp.set_defaults(fn=cmd_ingest)
+
+    ig_new = sub.add_parser(
+        "ingest",
+        help="ingere arquivo OU diretório com extração+correlação em knowledge.db "
+             "e publica localmente a revisão resultante (markdown+word)",
+    )
+    _add_ingest_args(ig_new)
+
+    # Alias oculto (compatibilidade W5->W8, mesma função `cmd_ingest`):
+    # `help=argparse.SUPPRESS` tira do listing de `-h`, sem tirar do CLI.
+    ig_alias = sub.add_parser("ingest2", help=argparse.SUPPRESS)
+    _add_ingest_args(ig_alias)
+
+    up = sub.add_parser(
+        "update",
+        help="reanalisa SOMENTE o delta desde a última `wk analyze`/`wk update` (sem mudança: "
+             "no-op); republica a revisão só quando houve mudança",
+    )
+    up.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    up.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    up.add_argument("--engine", default=None, choices=["local", "claude-cli"],
+                     help="executor de despacho (default: perfil salvo desta análise)")
+    up.set_defaults(fn=cmd_update)
+
+    st = sub.add_parser("status", help="leitura de runtime.db+knowledge.db: tarefas, revisão, lacunas, efeitos")
+    st.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    st.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    st.set_defaults(fn=cmd_status)
+
+    re_ = sub.add_parser("resume", help="libera leases expirados e retoma tarefas ready/invalidadas")
+    re_.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    re_.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    re_.add_argument("--engine", default=None, choices=["local", "claude-cli"],
+                      help="executor de despacho (default: perfil salvo desta análise)")
+    re_.set_defaults(fn=cmd_resume)
+
+    mi = sub.add_parser(
+        "migrate",
+        help="migra corpus legado (raw/wiki/.codescan sdd) para knowledge.db, com backup "
+             "imutável obrigatório antes de migrar",
+    )
+    mi.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    mi.add_argument("--backup-dir", dest="backup_dir", default=None,
+                     help="diretório NOVO/vazio para o backup imutável (default: gerado sob "
+                          "<store>/.migrate-backup/)")
+    mi.add_argument("--namespace", default=None,
+                     help=f"namespace do knowledge.db (default: {_INGEST2_DEFAULT_NAMESPACE!r})")
+    mi.set_defaults(fn=cmd_migrate)
+
+    # ==== Legado (comportamento preservado; JSON de saída ganha ============
+    # ==== 'aviso_migracao'; será removido — usar o Fluxo principal acima) ===
 
     pr = sub.add_parser("promote", help="promove fontes seguras de inbox/ para raw/")
     pr.add_argument("target", nargs="?", help="id ou caminho em inbox/; vazio varre inbox/**/*.md")
@@ -6036,7 +6354,11 @@ def _build_parser() -> argparse.ArgumentParser:
     li.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     li.set_defaults(fn=cmd_lint)
 
-    ig = sub.add_parser("ingest", help="converte arquivo externo em inbox/ com proveniência")
+    ig = sub.add_parser(
+        "ingest-legacy",
+        help="[legado] converte arquivo externo em inbox/ com proveniência (1 arquivo, sem "
+             "knowledge.db) — use `wk ingest` para o fluxo composto",
+    )
     ig.add_argument("file", help="arquivo a converter (.md/.txt/.vtt/.srt/.html/.xml/.xmi/.json)")
     ig.add_argument("--source-type", dest="source_type", required=True,
                     help="human-transcript | human-doc | code-repo | agent-output | web-clip")
@@ -6048,9 +6370,9 @@ def _build_parser() -> argparse.ArgumentParser:
                          "separados por vírgula (F-26: alimenta o L4 do lint e o gate de "
                          "realimentação do promote)")
     ig.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
-    ig.set_defaults(fn=cmd_ingest)
+    ig.set_defaults(fn=cmd_ingest_legacy)
 
-    pu = sub.add_parser("publish", help="leva a árvore SDD de um workdir do codescan para inbox/")
+    pu = sub.add_parser("publish", help="[legado] leva a árvore SDD de um workdir do codescan para inbox/")
     pu.add_argument("--workdir", required=True, help="workdir do codescan (.codescan/<repo>-<hash>)")
     # F-18: obrigatório de fato, mas checado em `cmd_publish` (não aqui) para
     # que a ausência saia como JSON com `acao`, igual aos demais erros do
@@ -6062,7 +6384,7 @@ def _build_parser() -> argparse.ArgumentParser:
     fi = sub.add_parser(
         "finish",
         help=(
-            "fechamento composto da fase 3D (substitui verify+audit+publish+"
+            "[legado] fechamento composto da fase 3D (substitui verify+audit+publish+"
             "promote+compile+index reindex+lint(+docx))"
         ),
     )
@@ -6084,69 +6406,11 @@ def _build_parser() -> argparse.ArgumentParser:
     fi.add_argument("--no-docx", action="store_true", help="pula o passo opcional de geração de wiki-docx/")
     fi.set_defaults(fn=cmd_finish)
 
-    # ---- W4: analyze/update/status/resume (código -> conhecimento; §7.1) ----
-    # Seção própria do parser: não reaproveita nem remove `wk code <sub>`
-    # (codescan.cli, fase 3/SDD) — este bloco fala com analysis/knowledge/
-    # runtime diretamente, em comandos compostos (1 comando = pipeline inteiro).
-
-    an = sub.add_parser(
-        "analyze",
-        help="pipeline completo do repositório em 1 comando: snapshot->extração->capacidades->"
-             "objetivos->tarefas->(despacho se a engine tiver)->revisão estrutural em knowledge.db",
-    )
-    an.add_argument("--repo", required=True, help="caminho do repositório a analisar")
-    an.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
-    an.add_argument("--topic", default=None, help="rótulo opcional do tópico (persistido no perfil)")
-    an.add_argument("--engine", default=None, choices=["local", "claude-cli"],
-                     help="executor de despacho (default: perfil salvo, senão 'local')")
-    an.set_defaults(fn=cmd_analyze)
-
-    up = sub.add_parser(
-        "update",
-        help="reanalisa SOMENTE o delta desde a última `wk analyze`/`wk update` (sem mudança: no-op)",
-    )
-    up.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
-    up.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
-    up.add_argument("--engine", default=None, choices=["local", "claude-cli"],
-                     help="executor de despacho (default: perfil salvo desta análise)")
-    up.set_defaults(fn=cmd_update)
-
-    st = sub.add_parser("status", help="leitura de runtime.db+knowledge.db: tarefas, revisão, lacunas, efeitos")
-    st.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
-    st.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
-    st.set_defaults(fn=cmd_status)
-
-    re_ = sub.add_parser("resume", help="libera leases expirados e retoma tarefas ready/invalidadas")
-    re_.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
-    re_.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
-    re_.add_argument("--engine", default=None, choices=["local", "claude-cli"],
-                      help="executor de despacho (default: perfil salvo desta análise)")
-    re_.set_defaults(fn=cmd_resume)
-
-    # ---- W5: ingest2 (fonte -> extract -> correlate em 1 comando; §7.1) ----
-    # Aditivo: NÃO substitui `wk ingest` (legado, converte 1 arquivo p/
-    # inbox/, sem tocar knowledge.db). Nome `ingest2` evita colisão com o
-    # legado ANTES do rename decidido pra W8. `_ingest_reserved_guard` só
-    # olha `argv[0] == "ingest"` (linha ~5960), então este nome nunca cai lá.
-    i2 = sub.add_parser(
-        "ingest2",
-        help="ingere arquivo OU diretório com extração+correlação em knowledge.db "
-             "(substituirá `wk ingest` na W8; até lá os dois convivem)",
-    )
-    i2.add_argument("path", help="arquivo ou diretório de origem a ingerir")
-    i2.add_argument("--initiative", default=None,
-                     help="id da iniciativa (prioridade: argumento > frontmatter/metadata "
-                          "do arquivo > contexto persistido por diretório de origem)")
-    i2.add_argument("--phase", default=None, choices=["inception", "refinement", "other"],
-                     help="fase da iniciativa (mesma prioridade de --initiative)")
-    i2.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
-    i2.add_argument("--namespace", default=None,
-                     help=f"namespace do knowledge.db (default: {_INGEST2_DEFAULT_NAMESPACE!r})")
-    i2.set_defaults(fn=cmd_ingest2)
-
-    # Grupos repassados às CLIs internas: parsing fica com elas.
+    # Grupos repassados às CLIs internas: parsing fica com elas. `code` é o
+    # fan-out do pipeline legado (codescan.cli, fase 3/SDD) — ver
+    # `_run_code`/`_AVISO_MIGRACAO_CODE_LEGADO`.
     for name, help_ in (
-        ("code", "pipeline de repositório (exige --repo)"),
+        ("code", "[legado] pipeline de repositório (exige --repo)"),
         ("index", "manutenção do índice: reindex, status"),
     ):
         g = sub.add_parser(name, help=help_, add_help=False)
@@ -6234,7 +6498,7 @@ def main(argv=None) -> int:
         return _run_index(argv[1:])
     if argv and argv[0] in _PASSTHROUGH_INDEX:
         return _run_index(argv)
-    if argv and argv[0] == "ingest":
+    if argv and argv[0] in ("ingest", "ingest-legacy"):
         guard = _ingest_reserved_guard(argv[1:])
         if guard is not None:
             print(json.dumps(guard, ensure_ascii=False), file=sys.stderr)

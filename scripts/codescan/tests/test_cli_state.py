@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 
+from codescan import cli as cli_mod
 from codescan import sdd as sdd_mod
 from codescan import state as st_mod
 from codescan.cli import main
@@ -503,33 +504,49 @@ class CliStateContractTest(unittest.TestCase):
         self.assertEqual(stage["status"], "in_progress")
         self.assertEqual(stage["done"], [])
 
-    def test_done_modules_rejeita_boilerplate_em_ingles(self):
+    def test_done_modules_aceita_ingles_com_aviso_cerimonial_de_idioma(self):
+        """W8-T8.3 (plano-evolucao-wiki-ai.md §3.1: "Score baseado em idioma
+        ... apresentado como medida de entendimento"): artefato
+        majoritariamente em inglês, mas com integridade real (citações
+        válidas, escala de confiança, sem placeholder, detalhamento
+        operacional suficiente) deixa de ser reprovado — vira
+        `avisos_cerimoniais`, informativo. Substitui
+        `test_done_modules_rejeita_boilerplate_em_ingles`, que fiscalizava
+        exatamente essa cerimônia (idioma) como `blocker`; a reprovação por
+        integridade real (placeholder/boilerplate de fato) continua coberta
+        em `test_done_modules_rejeita_placeholders_reais`."""
         st_mod.set_pending(self.wd, "modules", ["src/payments"])
         _write(
             os.path.join(self.wd, "modules", "src-payments.md"),
             "\n".join(
                 [
-                    "# Payments",
+                    "# Payments Module",
                     "",
                     "## Overview",
-                    f"- This module handles payments. {GREEN} `src/payments.py:1`",
+                    f"- The module coordinates payment attempts and validates required input before returning a boolean result. {GREEN} `src/payments.py:1`",
                     "",
                     "## Responsibility",
-                    f"- Responsibility: process checkout. {GREEN} `src/payments.py:2`",
+                    f"- Retry policy is centralized to avoid divergence between internal calls. {GREEN} `src/payments.py:2`",
+                    "",
+                    "## Data Structures",
+                    f"- The main operational entity is the payment identifier received by the flow. {GREEN} `src/payments.py:3`",
+                    "",
+                    "## Main Flow",
+                    f"- Receive identifier, validate absence of value, execute attempt and return success. {YELLOW}",
                     "",
                     "## Dependencies",
-                    f"- Dependencies: repository and gateway. {GREEN} `src/payments.py:3`",
+                    f"- The module depends only on the local retry-limit policy in the analyzed excerpt. {YELLOW}",
                 ]
             ),
         )
 
-        code, _out, err = _run(self._argv("done", "modules", "--item", "src/payments"))
+        code, out, err = _run(self._argv("done", "modules", "--item", "src/payments"))
 
-        self.assertEqual(code, 2)
-        self.assertIn("PT-BR", err)
-        stage = st_mod.load(self.wd)["stages"]["modules"]
-        self.assertEqual(stage["status"], "in_progress")
-        self.assertEqual(stage["done"], [])
+        self.assertEqual(code, 0, err)
+        stage = json.loads(out)
+        self.assertEqual(stage["done"], ["src/payments"])
+        avisos = "\n".join(stage.get("avisos_cerimoniais", []))
+        self.assertIn("PT-BR", avisos)
 
     def test_done_modules_aceita_artifact_com_profundidade_e_evidencia(self):
         st_mod.set_pending(self.wd, "modules", ["src/payments"])
@@ -548,10 +565,16 @@ class CliStateContractTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("code-analysis.md", err)
 
+        # W8-T8.3 (plano-evolucao-wiki-ai.md §3.1: "Score baseado em ...
+        # tamanho de texto apresentado como medida de entendimento"):
+        # "# Análise curta\n" tem tamanho insuficiente, mas isso não reprova
+        # mais sozinho — vira `avisos_cerimoniais`. A reprovação abaixo é por
+        # integridade real: 0 citações no artefato (mínimo 5).
         _write(os.path.join(self.wd, "sdd", "code-analysis.md"), "# Análise curta\n")
         code, _out, err = _run(self._argv("done", "modules"))
         self.assertEqual(code, 2)
-        self.assertIn("profundidade insuficiente", err)
+        self.assertIn("rastreabilidade insuficiente", err)
+        self.assertIn("tamanho abaixo do sugerido", err)
 
         _write(os.path.join(self.wd, "sdd", "code-analysis.md"), _code_analysis_doc())
         _write_agent_runs(self.wd, "modules", ["src/payments"])
@@ -879,10 +902,16 @@ class CliStateContractTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("domain.md", err)
 
+        # W8-T8.3 (plano-evolucao-wiki-ai.md §3.1: "Score baseado em ...
+        # tamanho de texto apresentado como medida de entendimento"):
+        # "# Domínio\n" tem tamanho insuficiente, mas isso não reprova mais
+        # sozinho — vira `avisos_cerimoniais`. A reprovação abaixo é por
+        # integridade real: 0 citações no artefato (mínimo 4).
         _write(os.path.join(self.wd, "sdd", "domain.md"), "# Domínio\n")
         code, _out, err = _run(self._argv("done", "rules"))
         self.assertEqual(code, 2)
-        self.assertIn("profundidade insuficiente", err)
+        self.assertIn("rastreabilidade insuficiente", err)
+        self.assertIn("tamanho abaixo do sugerido", err)
 
         code, _out, err = _run(self._argv("done", "architecture", "--artifact", os.path.join(self.wd, "inferred.md")))
         self.assertEqual(code, 2)
@@ -1051,43 +1080,26 @@ class CliStateContractTest(unittest.TestCase):
         self.assertTrue(any("Mermaid" in blocker for blocker in report["blockers"]))
         self.assertTrue(any("quadrantChart" in blocker or "pontos" in blocker for blocker in report["blockers"]))
 
-    def test_audit_specs_reprova_gaps_incompleto_em_doc_level_completo_e_detalhado(self):
-        for level in ("completo", "detalhado"):
-            with self.subTest(level=level):
-                with tempfile.TemporaryDirectory() as tmp:
-                    repo = os.path.join(tmp, "repo")
-                    store = os.path.join(tmp, "store")
-                    os.makedirs(repo, exist_ok=True)
-                    wd = st_mod.workdir(store, repo)
-                    st_mod.init(wd, repo, topic=None)
-                    st = st_mod.load(wd)
-                    st["sdd"] = {"doc_level": level}
-                    st["stages"]["specs"] = {
-                        "status": "in_progress",
-                        "pending": [],
-                        "done": ["checkout"],
-                        "blocked": [],
-                        "failed": [],
-                    }
-                    st_mod.save(wd, st)
-                    root = os.path.join(wd, "sdd", "specs", "checkout")
-                    _write(os.path.join(root, "requirements.md"), _requirements_doc())
-                    _write(os.path.join(root, "design.md"), _design_doc())
-                    _write(os.path.join(root, "tasks.md"), _tasks_doc())
-                    _write(os.path.join(wd, "sdd", "confidence-report.md"), _confidence_doc())
-                    _write(os.path.join(wd, "sdd", "traceability", "code-spec-matrix.md"), _traceability_matrix_doc())
-                    _write(os.path.join(wd, "sdd", "gaps.md"), _incomplete_gaps_doc())
+    def test_audit_gaps_incompleto_vira_aviso_cerimonial_em_vez_de_reprovacao(self):
+        """W8-T8.3 (plano-evolucao-wiki-ai.md §3.1: "Score baseado em ...
+        quantidade de seções ... apresentado como medida de entendimento"):
+        gaps.md sem as subseções nomeadas (Lacunas críticas/moderadas,
+        Perguntas abertas, Impacto) deixou de reprovar — vira
+        `avisos_cerimoniais` informativo. Substitui o teste anterior
+        (`test_audit_specs_reprova_gaps_incompleto_...`), que fiscalizava
+        exatamente essa cerimônia removida. A reprovação por integridade real
+        (citações/proveniência) continua coberta em outros testes deste
+        arquivo (ex.: `test_done_modules_rejeita_artifact_sem_evidencia`)."""
+        rule = sdd_mod.rule_for_rel("sdd/gaps.md")
+        self.assertIsNotNone(rule)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "gaps.md")
+            _write(path, _incomplete_gaps_doc())
+            result = sdd_mod._audit_file(path, rule)
 
-                    report = sdd_mod.audit(wd, "specs", st_mod.load(wd))
-
-                blockers = "\n".join(
-                    blocker
-                    for stage in report["stages"]
-                    for blocker in stage["blockers"]
-                )
-                self.assertNotEqual(report["status"], "pass")
-                self.assertIn("gaps.md", blockers)
-                self.assertRegex(blockers, r"gaps\.md|conte.do insuficiente|incomplet")
+        self.assertFalse(any("seção ausente" in b for b in result["blockers"]))
+        self.assertTrue(any("seção sugerida ausente" in a for a in result["avisos_cerimoniais"]))
+        self.assertEqual(result["status"], "pass", result["blockers"])
 
 class RunStageContractTest(unittest.TestCase):
     def setUp(self):
@@ -1355,6 +1367,79 @@ class RunStageContractTest(unittest.TestCase):
         stage_state = json.loads(out)
         self.assertEqual(stage_state["status"], "done")
         self.assertTrue(stage_state["finalized"])
+
+
+class CliCeremonialGateW8T83Test(unittest.TestCase):
+    """P-W8-1 (fechamento W8, §3.1): `sdd.py` já reclassificara ADR
+    retroativo/histórias de usuário/diagrama vazio/tamanho/seções/idioma
+    como `avisos_cerimoniais` (W8-T8.3, `sdd_mod.CEREMONIAL_RULES`) — mas
+    `cli.py::_stage_artifact_quality` e os quatro checks de
+    "doc_level completo/detalhado exige X em sdd/Y/" dentro de
+    `_validate_stage_done_blockers` mantinham a MESMA cerimônia como
+    `blocker` independente, fora do controle de `CEREMONIAL_RULES`. Este
+    grupo fiscaliza a reclassificação simétrica aplicada em `cli.py`,
+    testando as funções internas diretamente (sem precisar reproduzir um
+    `done` de estágio inteiro, já coberto — com `audit` incluso — pelos
+    outros testes desta suíte)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = os.path.join(self.tmp.name, "repo")
+        self.store = os.path.join(self.tmp.name, "store")
+        os.makedirs(self.repo, exist_ok=True)
+        self.wd = st_mod.workdir(self.store, self.repo)
+        st_mod.init(self.wd, self.repo, topic=None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _set_doc_level(self, level: str) -> None:
+        st = st_mod.load(self.wd)
+        st["sdd"] = {"doc_level": level}
+        st_mod.save(self.wd, st)
+
+    def test_adrs_ausente_vira_aviso_nao_blocker_em_done_rules(self):
+        self._set_doc_level("completo")
+        blockers, avisos = cli_mod._validate_stage_done_blockers(self.wd, "rules")
+        self.assertFalse(any("ADR" in b.get("error", "") for b in blockers))
+        self.assertTrue(any("ADR" in a for a in avisos))
+
+    def test_sequences_ausente_vira_aviso_nao_blocker_em_done_architecture(self):
+        self._set_doc_level("detalhado")
+        blockers, avisos = cli_mod._validate_stage_done_blockers(self.wd, "architecture")
+        self.assertFalse(any("sequences" in b.get("error", "") for b in blockers))
+        self.assertTrue(any("sequência" in a for a in avisos))
+
+    def test_user_stories_ausente_vira_aviso_nao_blocker_em_done_specs(self):
+        self._set_doc_level("completo")
+        blockers, avisos = cli_mod._validate_stage_done_blockers(self.wd, "specs")
+        self.assertFalse(any("user-stories" in b.get("error", "") for b in blockers))
+        self.assertTrue(any("histórias" in a for a in avisos))
+
+    def test_flowcharts_ausente_continua_blocker_em_done_modules(self):
+        """`sdd/flowcharts/*.md` NÃO está em `sdd_mod.CEREMONIAL_RULES` — nem
+        `sdd.py` reclassificou esta existência (ver `sdd_mod.RULES["modules"]`,
+        sem gate em `CEREMONIAL_RULES`); continua bloqueando `done modules`
+        sob doc_level completo, tratamento idêntico ao de `audit`."""
+        self._set_doc_level("completo")
+        blockers, avisos = cli_mod._validate_stage_done_blockers(self.wd, "modules")
+        self.assertTrue(any("flowchart" in b.get("error", "") for b in blockers))
+        self.assertFalse(any("flowchart" in a for a in avisos))
+
+    def test_validate_required_artifacts_reclassifica_so_o_que_esta_em_ceremonial_rules(self):
+        """`sdd/state-machines.md` (em `CEREMONIAL_RULES`) ausente vira
+        aviso; `sdd/permissions.md` (fora de `CEREMONIAL_RULES`) ausente
+        continua bloqueando — mesma constante que `sdd_mod._audit_stage`
+        consulta, reusada em vez de duplicada."""
+        required = [
+            os.path.join(self.wd, "sdd", "state-machines.md"),
+            os.path.join(self.wd, "sdd", "permissions.md"),
+        ]
+        _, error, avisos = cli_mod._validate_required_artifacts(self.wd, required)
+        self.assertIsNotNone(error)
+        self.assertIn("permissions.md", error)
+        self.assertNotIn("state-machines.md", error)
+        self.assertTrue(any("state-machines.md" in a for a in avisos))
 
 
 if __name__ == "__main__":

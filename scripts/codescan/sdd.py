@@ -261,6 +261,39 @@ RULES: dict[str, tuple[ArtifactRule, ...]] = {
 }
 
 
+# W8-T8.3 (plano-evolucao-wiki-ai.md §3.1 "Remoções obrigatórias"): a
+# EXIGÊNCIA DE EXISTÊNCIA destes artefatos é cerimônia do legado, não
+# checagem de integridade. Ausência de qualquer um deles deixa de ser
+# `blocker`/zerar score de estágio e vira `avisos_cerimoniais` (informativo).
+# Quando o artefato EXISTE, as checagens de integridade normais (citações,
+# proveniência, placeholder, etc.) continuam valendo e bloqueando — só a
+# obrigatoriedade de ele existir foi removida. Mapeamento (rel -> bullet de
+# §3.1):
+#   sdd/adrs/*.md          -> "ADR retroativo obrigatório apenas para
+#                              satisfazer nível de documentação"
+#   sdd/user-stories/*.md  -> "Histórias de usuário geradas automaticamente
+#                              como comprovação de análise de código"
+#   sdd/state-machines.md  -> "Máquina de estados ... vazio/genérico quando o
+#                              sistema não contém informação que os justifique"
+#   sdd/erd-complete.md    -> "... ERD ... vazio/genérico quando o sistema
+#                              não contém informação que os justifique"
+#   sdd/sequences/*.md     -> "... diagrama de sequência vazio/genérico
+#                              quando o sistema não contém informação que os
+#                              justifique"
+#   modules/*.md           -> "Arquivo intermediário exigido exclusivamente
+#                              porque um estágio anterior o produzia" (saída
+#                              por-módulo, intermediária, consolidada em
+#                              sdd/code-analysis.md pelo próprio estágio)
+CEREMONIAL_RULES: frozenset[str] = frozenset({
+    "sdd/adrs/*.md",
+    "sdd/user-stories/*.md",
+    "sdd/state-machines.md",
+    "sdd/erd-complete.md",
+    "sdd/sequences/*.md",
+    "modules/*.md",
+})
+
+
 SCAFFOLDS: dict[str, str] = {
     "sdd/code-analysis.md": "# Análise de código\n\n## Visão geral\n\n## Módulos\n\n## Fluxos\n\n## Riscos\n",
     "sdd/data-dictionary.md": "# Dicionário de dados\n\n## Entidades\n\n## Campos\n\n## Origem\n",
@@ -562,13 +595,21 @@ def audit_stages(wd: str, stages: list[str], st: dict) -> dict:
             score is not None and score >= MIN_DONE_SCORE and all(r["status"] == "pass" for r in results)
         ) else ("failed" if any(r["status"] == "failed" for r in results) else "degraded")
 
+    # W8-T8.3 (§3.1): transparência da reclassificação — cerimônia removida
+    # (ADR retroativo, histórias autogeradas, diagrama vazio, arquivo
+    # intermediário, score por idioma/seções/tamanho) some da agregação
+    # bloqueante, mas não fica invisível: consolidada aqui para quem lê o
+    # relatório de auditoria completo, sem afetar `status`/`score`.
+    avisos_cerimoniais = [a for r in results for a in r.get("avisos_cerimoniais", [])]
     report = {
         "status": status,
         "score": score,
         "threshold": MIN_DONE_SCORE,
+        "criterio": "integridade",
         "stages": results,
         "stages_evaluated": stages_evaluated,
         "artifacts_checked": artifacts_checked,
+        "avisos_cerimoniais": avisos_cerimoniais,
     }
     if status == "sem_evidencia":
         report["message"] = _no_evidence_message(
@@ -621,6 +662,7 @@ def _audit_stage(wd: str, stage: str, st: dict) -> dict:
     artifacts = []
     blockers: list[str] = []
     warnings: list[str] = []
+    avisos_cerimoniais: list[str] = []
     source_tree_error = _source_tree_error(wd)
     if source_tree_error:
         blockers.append(source_tree_error)
@@ -630,14 +672,43 @@ def _audit_stage(wd: str, stage: str, st: dict) -> dict:
     for rule in stage_rules(stage, level):
         paths = paths_for_rule(wd, rule)
         if not paths:
+            if rule.rel in CEREMONIAL_RULES:
+                # W8-T8.3 (§3.1): a existência deste artefato é cerimônia —
+                # ver CEREMONIAL_RULES. Ausência vira aviso informativo,
+                # nunca `blocker` nem entra no cálculo de `artifact_score`.
+                avisos_cerimoniais.append(
+                    f"ausente (informativo, não bloqueia — §3.1): {rule.rel}"
+                )
+                artifacts.append(
+                    {"rule": rule.rel, "status": "ausente_cerimonial", "criterio": "cerimonia"}
+                )
+                continue
             blockers.append(f"ausente: {rule.rel}")
             artifacts.append({"rule": rule.rel, "status": "missing"})
             continue
         for path in paths:
             item = _audit_file(path, rule, wd=wd, repo=repo)
+            # W8-T8.3 (§3.1): regra NÃO-glob (ex.: sdd/state-machines.md,
+            # sdd/erd-complete.md) sempre devolve um candidato de
+            # `paths_for_rule` mesmo quando o arquivo não existe no disco —
+            # o `if not paths` acima só cobre regra glob (adrs/user-stories/
+            # sequences). Arquivo ausente cai aqui, em `_audit_file`, que
+            # devolve `status: "missing"`; para as regras em CEREMONIAL_RULES
+            # essa ausência é a MESMA cerimônia (exigência de existência), só
+            # que chega por outro caminho — tratamento idêntico ao `if not
+            # paths` acima: aviso informativo, nunca `blocker`.
+            if item.get("status") == "missing" and rule.rel in CEREMONIAL_RULES:
+                avisos_cerimoniais.append(
+                    f"ausente (informativo, não bloqueia — §3.1): {rule.rel}"
+                )
+                artifacts.append(
+                    {"rule": rule.rel, "status": "ausente_cerimonial", "criterio": "cerimonia"}
+                )
+                continue
             artifacts.append(item)
             blockers.extend(item["blockers"])
             warnings.extend(item["warnings"])
+            avisos_cerimoniais.extend(item.get("avisos_cerimoniais", []))
             if item["score"] < MIN_DONE_SCORE:
                 blockers.append(f"{os.path.relpath(path, wd)} score {item['score']}/{MIN_DONE_SCORE}")
 
@@ -682,13 +753,23 @@ def _audit_stage(wd: str, stage: str, st: dict) -> dict:
             "status": "sem_evidencia",
             "score": None,
             "threshold": MIN_DONE_SCORE,
+            "criterio": "integridade",
             "blockers": blockers,
             "warnings": warnings,
+            "avisos_cerimoniais": avisos_cerimoniais,
             "artifacts": artifacts,
             "artifacts_checked": 0,
         }
 
-    artifact_score = min(a.get("score", 0) for a in artifacts)
+    # W8-T8.3 (§3.1): artefatos "ausente_cerimonial" (ver CEREMONIAL_RULES)
+    # não têm `score` real — são ausência tolerada, não avaliação. Antes desta
+    # mudança, TODO artefato ausente (inclusive os cerimoniais) caía no
+    # `a.get("score", 0)` default e zerava `artifact_score` do estágio
+    # inteiro; artefatos legitimamente obrigatórios continuam zerando por
+    # este mesmo mecanismo (não estão em CEREMONIAL_RULES, então permanecem
+    # com status "missing" e são incluídos no cálculo).
+    scoreable_artifacts = [a for a in artifacts if a.get("status") != "ausente_cerimonial"]
+    artifact_score = min((a.get("score", 0) for a in scoreable_artifacts), default=100)
     score = min(artifact_score, max(0, 100 - 20 * len(blockers) - 5 * len(warnings)))
     if blockers:
         score = min(score, 60)
@@ -702,8 +783,10 @@ def _audit_stage(wd: str, stage: str, st: dict) -> dict:
         "status": status,
         "score": score,
         "threshold": MIN_DONE_SCORE,
+        "criterio": "integridade",
         "blockers": blockers,
         "warnings": warnings,
+        "avisos_cerimoniais": avisos_cerimoniais,
         "artifacts": artifacts,
         "artifacts_checked": artifacts_checked,
     }
@@ -1863,9 +1946,18 @@ def _audit_file(
 ) -> dict:
     blockers: list[str] = []
     warnings: list[str] = []
+    avisos_cerimoniais: list[str] = []
     rel = _rel_to_wd(wd, path) if wd else os.path.basename(path)
     if not os.path.isfile(path):
-        return {"path": path, "status": "missing", "score": 0, "blockers": [f"arquivo ausente: {rel}"], "warnings": []}
+        return {
+            "path": path,
+            "status": "missing",
+            "score": 0,
+            "blockers": [f"arquivo ausente: {rel}"],
+            "warnings": [],
+            "avisos_cerimoniais": [],
+            "criterio": "integridade",
+        }
     with open(path, encoding="utf-8-sig", errors="replace") as f:
         text = f.read()
     lower = text.lower()
@@ -1874,10 +1966,14 @@ def _audit_file(
     checks: dict[str, bool] = {}
     content_bytes = len(text.strip())
     if content_bytes < rule.min_bytes:
-        blockers.append(
-            f"conteúdo insuficiente em {rel}: medido {content_bytes} bytes, esperado >= {rule.min_bytes} bytes"
+        # W8-T8.3 (§3.1): "tamanho de texto apresentado como medida de
+        # entendimento" é cerimônia — informativo, não reprova nem reduz
+        # score. Integridade (citações/paths/proveniência) segue abaixo,
+        # intacta e bloqueante.
+        avisos_cerimoniais.append(
+            f"tamanho abaixo do sugerido em {rel}: medido {content_bytes} bytes, sugerido >= {rule.min_bytes} "
+            "bytes (informativo, não bloqueia — §3.1)"
         )
-        score -= 15
     else:
         checks["profundidade"] = True
     # F-21: só a prosa fora de ``` fences conta como placeholder pendente.
@@ -1892,14 +1988,18 @@ def _audit_file(
         # `section` é uma string (seção única) ou uma tupla de aliases
         # sinônimos — ex.: ("Decisões", "Decisões arquiteturais"). Qualquer
         # alias presente satisfaz a regra; a mensagem cita todos os aliases.
+        #
+        # W8-T8.3 (§3.1): "quantidade de seções ... apresentado como medida
+        # de entendimento" é cerimônia — seção ausente vira aviso
+        # informativo (não mais `warnings`, que reduzia score em
+        # `_audit_stage`), nunca reprova nem reduz score.
         aliases = section if isinstance(section, tuple) else (section,)
         if not any(f"## {alias}".lower() in lower or f"# {alias}".lower() in lower for alias in aliases):
             label = "/".join(aliases)
-            warnings.append(
-                f"seção ausente: {label} em {rel} (obrigatória; observado ausente, esperado presente)"
+            avisos_cerimoniais.append(
+                f"seção sugerida ausente: {label} em {rel} (informativo, não bloqueia — §3.1)"
             )
-            score -= 5
-    if rule.sections and not any(w.startswith("seção ausente") for w in warnings):
+    if rule.sections and not any(a.startswith("seção sugerida ausente") for a in avisos_cerimoniais):
         checks["secoes"] = True
     citations = ev_mod.citations(text)
     if len(citations) < rule.min_citations:
@@ -1965,12 +2065,13 @@ def _audit_file(
     # dominante E robusto: pelo menos o dobro dos marcadores PT-BR, E pelo
     # menos 8 marcadores EN no total — um artefato majoritariamente em
     # inglês, não um artefato PT-BR com jargão técnico.
+    # W8-T8.3 (§3.1): "score baseado em idioma ... apresentado como medida de
+    # entendimento" é cerimônia — informativo, não reprova nem reduz score.
     if en_hits >= 2 * pt_hits and en_hits >= 8:
-        blockers.append(
-            f"provável saída em inglês em {rel}: não demonstra idioma PT-BR técnico suficiente "
-            f"(marcadores pt-br={pt_hits}, en={en_hits}; esperado en<8 ou en<2x pt-br)"
+        avisos_cerimoniais.append(
+            f"provável saída em inglês em {rel} (informativo, não bloqueia — §3.1): "
+            f"marcadores pt-br={pt_hits}, en={en_hits}"
         )
-        score -= 20
     elif pt_hits >= 2 or rule.min_citations == 0:
         checks["ptbr"] = True
     if rule.min_citations > 0 and not any(marker in text for marker in CONFIDENCE_MARKERS):
@@ -2006,9 +2107,19 @@ def _audit_file(
             blockers.append("Mermaid quadrantChart com rótulo técnico frágil")
             score -= 20
     diagram_blocker, diagram_warning = _diagram_requirement_issue(text, rule)
-    if diagram_blocker:
+    is_ceremonial_diagram = rule.rel in CEREMONIAL_RULES
+    if diagram_blocker and is_ceremonial_diagram:
+        # W8-T8.3 (§3.1): "máquina de estados/ERD/diagrama de sequência
+        # vazio/genérico ... quando o sistema não contém informação que os
+        # justifique" — para os artefatos em CEREMONIAL_RULES a exigência de
+        # o diagrama existir vira aviso, não reprova. C4/architecture.md
+        # (fora de CEREMONIAL_RULES) continuam bloqueando normalmente abaixo.
+        avisos_cerimoniais.append(diagram_blocker + " (informativo, não bloqueia — §3.1)")
+    elif diagram_blocker:
         blockers.append(diagram_blocker)
         score -= 25
+    elif diagram_warning and is_ceremonial_diagram:
+        avisos_cerimoniais.append(diagram_warning)
     elif diagram_warning:
         warnings.append(diagram_warning)
         score -= 5
@@ -2025,6 +2136,8 @@ def _audit_file(
         "checks": checks,
         "blockers": blockers,
         "warnings": warnings,
+        "avisos_cerimoniais": avisos_cerimoniais,
+        "criterio": "integridade",
     }
 
 

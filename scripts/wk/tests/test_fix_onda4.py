@@ -170,7 +170,9 @@ class F26IngestDerivedFromTests(unittest.TestCase):
             temp_file.close()
 
             code, out, err = _run([
-                "ingest",
+                # W8: `--derived-from` é argumento do legado (`ingest-legacy`);
+                # `wk ingest` (novo) é o composto extração+correlação.
+                "ingest-legacy",
                 "--store", self.store,
                 temp_file.name,
                 "--source-type", "human-doc",
@@ -206,7 +208,7 @@ class F26IngestDerivedFromTests(unittest.TestCase):
             temp_file.close()
 
             code, out, err = _run([
-                "ingest",
+                "ingest-legacy",
                 "--store", self.store,
                 temp_file.name,
                 "--source-type", "human-doc",

@@ -240,6 +240,10 @@ class SddGatesQualityTest(unittest.TestCase):
     # ---- Tarefa 2: auditar todos os módulos ---------------------------------
 
     def test_modules_glob_rule_reprova_arquivo_curto_demais(self):
+        """Reprova continua acontecendo, mas agora pela checagem de
+        integridade real (citações insuficientes) — "tamanho" deixou de ser
+        motivo de reprovação (W8-T8.3, plano §3.1: "Score baseado em ...
+        tamanho de texto apresentado como medida de entendimento")."""
         tmp, wd = self._wd()
         with tmp:
             path = os.path.join(wd, "modules", "curto.md")
@@ -248,7 +252,37 @@ class SddGatesQualityTest(unittest.TestCase):
             result = sdd_mod._audit_file(path, rule, wd=wd)
 
         self.assertNotEqual(result["status"], "pass")
-        self.assertTrue(any("conteúdo insuficiente" in b for b in result["blockers"]))
+        self.assertTrue(any("citações insuficientes" in b for b in result["blockers"]))
+        self.assertFalse(any("conteúdo insuficiente" in b for b in result["blockers"]))
+        self.assertTrue(any("tamanho abaixo do sugerido" in a for a in result["avisos_cerimoniais"]))
+
+    def test_modules_glob_rule_nao_reprova_mais_so_por_tamanho(self):
+        """W8-T8.3 (plano §3.1): artefato curto porém com integridade real
+        (citações válidas, sem placeholder) passa — tamanho vira aviso
+        informativo (`avisos_cerimoniais`), nunca `blocker`."""
+        tmp, wd = self._wd()
+        with tmp:
+            path = os.path.join(wd, "modules", "curto.md")
+            _write(
+                path,
+                "\n".join(
+                    [
+                        "# Curto",
+                        "",
+                        f"- {GREEN} fluxo com erro, dependencia, entrada, saida e teste em src/a.py:1.",
+                        f"- {GREEN} regra operacional cobre criterio e rastreabilidade em src/a.py:2.",
+                        "- estado do processo cobre integracao entre etapas do fluxo.",
+                        "- reimplementacao do teste cobre criterio de aceite do fluxo.",
+                        "- dependencia externa registra entrada e saida do processo.",
+                        "",
+                    ]
+                ),
+            )
+            rule = next(r for r in sdd_mod.RULES["modules"] if r.rel == "modules/*.md")
+            result = sdd_mod._audit_file(path, rule, wd=wd)
+
+        self.assertEqual(result["status"], "pass", result["blockers"])
+        self.assertTrue(any("tamanho abaixo do sugerido" in a for a in result["avisos_cerimoniais"]))
 
     def test_modules_glob_rule_vale_para_todos_os_doc_levels(self):
         rule = next(r for r in sdd_mod.RULES["modules"] if r.rel == "modules/*.md")
@@ -352,7 +386,11 @@ class SddGatesQualityTest(unittest.TestCase):
 
     # ---- Tarefa 6: blockers acionáveis (caminho + medido + esperado) --------
 
-    def test_blocker_conteudo_insuficiente_inclui_caminho_medido_e_esperado(self):
+    def test_aviso_cerimonial_tamanho_inclui_caminho_medido_e_sugerido(self):
+        """W8-T8.3 (plano §3.1: "Score baseado em ... tamanho de texto
+        apresentado como medida de entendimento"): tamanho insuficiente não é
+        mais `blocker` — vira `avisos_cerimoniais`, mas continua acionável
+        (caminho + medido + sugerido)."""
         tmp, wd = self._wd()
         with tmp:
             path = os.path.join(wd, "modules", "curto.md")
@@ -360,9 +398,10 @@ class SddGatesQualityTest(unittest.TestCase):
             rule = sdd_mod.ArtifactRule("modules/curto.md", min_bytes=600, min_citations=2)
             result = sdd_mod._audit_file(path, rule, wd=wd)
 
-        joined = "\n".join(result["blockers"])
+        self.assertFalse(any("conteúdo insuficiente" in b for b in result["blockers"]))
+        joined = "\n".join(result["avisos_cerimoniais"])
         self.assertIn("modules/curto.md", joined)
-        self.assertIn("esperado", joined)
+        self.assertIn("sugerido", joined)
         self.assertRegex(joined, r"\d")
 
     def test_blocker_escala_de_confianca_ausente_inclui_caminho_e_valores(self):
@@ -538,6 +577,148 @@ class SddGatesQualityTest(unittest.TestCase):
 
         self.assertEqual(report_dup["score"], 0)
         self.assertEqual(len(report_dup["blockers"]), len(set(report_dup["blockers"])))
+
+
+class CeremonialRulesW8T83Test(unittest.TestCase):
+    """W8-T8.3 (plano-evolucao-wiki-ai.md §3.1 "Remoções obrigatórias"): a
+    EXIGÊNCIA DE EXISTÊNCIA de ADR retroativo, histórias de usuário
+    autogeradas, máquina de estados/ERD/diagrama de sequência vazio e
+    arquivo intermediário (`modules/*.md`) deixou de bloquear/zerar score de
+    estágio — vira `avisos_cerimoniais`. Cobre os dois caminhos de
+    `_audit_stage` que precisam do mesmo tratamento: regra glob (`paths_for_rule`
+    devolve lista vazia) e regra não-glob (`paths_for_rule` sempre devolve um
+    candidato; a ausência só aparece depois, em `_audit_file`)."""
+
+    def _wd(self) -> tuple[tempfile.TemporaryDirectory[str], str]:
+        tmp = tempfile.TemporaryDirectory()
+        repo = os.path.join(tmp.name, "repo")
+        store = os.path.join(tmp.name, "store")
+        os.makedirs(os.path.join(repo, "src"), exist_ok=True)
+        _write(os.path.join(repo, "src", "a.py"), "\n".join(f"linha {i}" for i in range(1, 10)))
+        wd = st_mod.workdir(store, repo)
+        st_mod.init(wd, repo, topic=None)
+        return tmp, wd
+
+    def _healthy(self, extra_sections: str = "") -> str:
+        bullets = "\n".join(
+            f"- {GREEN} fluxo com erro, dependencia, entrada, saida, criterio e teste "
+            f"rastreavel entre codigo e requisito em src/a.py:{i}."
+            for i in range(1, 6)
+        )
+        return f"{extra_sections}\n\n{bullets}\n"
+
+    def test_ceremonial_rules_set_cobre_os_seis_artefatos_do_3_1(self):
+        self.assertEqual(
+            sdd_mod.CEREMONIAL_RULES,
+            frozenset({
+                "sdd/adrs/*.md",
+                "sdd/user-stories/*.md",
+                "sdd/state-machines.md",
+                "sdd/erd-complete.md",
+                "sdd/sequences/*.md",
+                "modules/*.md",
+            }),
+        )
+
+    def _agent_runs_ok(self, wd: str, stage: str) -> None:
+        input_path = os.path.join(wd, "agent-outputs", "in.txt")
+        _write(input_path, "conteudo do input")
+        manifest = {
+            "schema": "wiki-ai.agent-runs.v2",
+            "stage": stage,
+            "runs": [{
+                "stage": stage,
+                "input": input_path,
+                "input_sha256": st_mod.sha256_file(input_path),
+                "input_bytes": os.path.getsize(input_path),
+                "agent": None,
+                "items": [],
+                "items_count": 1,
+                "artifacts_count": 0,
+                "created_at": "2026-01-01T00:00:00Z",
+            }],
+        }
+        _write_json(os.path.join(wd, "agent-runs", f"{stage}.json"), manifest)
+
+    def test_rules_stage_passa_sem_adr_retroativo_e_sem_maquina_de_estados(self):
+        """`sdd/adrs/*.md` (glob) e `sdd/state-machines.md` (não-glob) ausentes
+        — nenhum dos dois bloqueia nem zera o score do estágio `rules`."""
+        tmp, wd = self._wd()
+        with tmp:
+            st = st_mod.load(wd)
+            st["sdd"] = {"doc_level": "completo"}
+            st_mod.save(wd, st)
+            _write(
+                os.path.join(wd, "sdd", "domain.md"),
+                self._healthy("# Domínio\n\n## Glossário\n\n## Regras de negócio\n\n## Lacunas"),
+            )
+            _write(
+                os.path.join(wd, "sdd", "permissions.md"),
+                self._healthy("# Permissões\n\n## Matriz\n\n## Lacunas"),
+            )
+            self._agent_runs_ok(wd, "rules")
+            # sdd/adrs/*.md e sdd/state-machines.md ausentes de propósito.
+
+            report = sdd_mod._audit_stage(wd, "rules", st_mod.load(wd))
+
+        self.assertEqual(report["status"], "pass", report["blockers"])
+        self.assertEqual(report["score"], 100)
+        self.assertEqual(report["blockers"], [])
+        joined_avisos = "\n".join(report["avisos_cerimoniais"])
+        self.assertIn("sdd/adrs/*.md", joined_avisos)
+        self.assertIn("sdd/state-machines.md", joined_avisos)
+
+    def test_specs_stage_passa_sem_historias_de_usuario_autogeradas(self):
+        """`sdd/user-stories/*.md` (glob, completo/detalhado) ausente não
+        bloqueia nem zera o score do estágio `specs`."""
+        tmp, wd = self._wd()
+        with tmp:
+            st = st_mod.load(wd)
+            st["sdd"] = {"doc_level": "completo"}
+            st["stages"]["specs"] = {"status": "in_progress", "pending": [], "done": ["checkout"], "blocked": [], "failed": []}
+            st_mod.save(wd, st)
+            root = os.path.join(wd, "sdd", "specs", "checkout")
+            _write(os.path.join(root, "requirements.md"), self._healthy("# Requisitos"))
+            _write(os.path.join(root, "design.md"), self._healthy("# Design"))
+            _write(os.path.join(root, "tasks.md"), self._healthy("# Tarefas"))
+            _write(
+                os.path.join(wd, "sdd", "confidence-report.md"),
+                self._healthy("# Confiança\n\n## Contagem\n\n## Rebaixados\n\n## Lacunas"),
+            )
+            _write(
+                os.path.join(wd, "sdd", "traceability", "code-spec-matrix.md"),
+                "# Matriz\n\n## Matriz\n\n| Código | Regra | Requisito | Design | Tarefa |\n|---|---|---|---|---|\n| C1 | R1 | Q1 | D1 | T1 |\n",
+            )
+            self._agent_runs_ok(wd, "specs")
+            # sdd/user-stories/*.md ausente de propósito.
+
+            report = sdd_mod._audit_stage(wd, "specs", st_mod.load(wd))
+
+        self.assertFalse(any("user-stories" in b for b in report["blockers"]))
+        self.assertIn("sdd/user-stories/*.md", "\n".join(report["avisos_cerimoniais"]))
+
+    def test_modules_intermediario_ausente_nao_zera_score_quando_code_analysis_ok(self):
+        """`modules/*.md` (glob, arquivo intermediário do próprio estágio)
+        ausente não bloqueia nem zera o score de `modules` quando o artefato
+        consolidado (`sdd/code-analysis.md`) está íntegro."""
+        tmp, wd = self._wd()
+        with tmp:
+            st = st_mod.load(wd)
+            st_mod.save(wd, st)
+            _write(
+                os.path.join(wd, "sdd", "code-analysis.md"),
+                self._healthy("# Análise\n\n## Visão geral\n\n## Módulos\n\n## Fluxos\n\n## Riscos\n\n## Rastreabilidade"),
+            )
+            self._agent_runs_ok(wd, "modules")
+            st = st_mod.load(wd)
+            st.setdefault("stages", {})["modules"] = {"status": "done", "pending": [], "done": ["src/a"], "blocked": [], "failed": []}
+            st_mod.save(wd, st)
+            # modules/*.md ausente de propósito.
+
+            report = sdd_mod._audit_stage(wd, "modules", st_mod.load(wd))
+
+        self.assertFalse(any("modules/*.md" in b for b in report["blockers"]))
+        self.assertIn("modules/*.md", "\n".join(report["avisos_cerimoniais"]))
 
 
 if __name__ == "__main__":

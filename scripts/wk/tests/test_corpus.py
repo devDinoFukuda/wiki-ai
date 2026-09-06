@@ -248,8 +248,11 @@ class IngestTests(StoreTestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def _ingest(self, path: str, source_type: str = "human-transcript", origin: str = "Reuniao X"):
+        # W8: `wk ingest` virou o fluxo composto (extração+correlação em
+        # knowledge.db); o comportamento testado aqui (1 arquivo -> 1 página
+        # em inbox/, --source-type/--origin) é o legado, agora `ingest-legacy`.
         return _run(
-            ["ingest", path, "--source-type", source_type, "--origin", origin,
+            ["ingest-legacy", path, "--source-type", source_type, "--origin", origin,
              "--topic", "demo", "--store", self.store]
         )
 

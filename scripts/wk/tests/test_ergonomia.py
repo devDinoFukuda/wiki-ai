@@ -68,8 +68,10 @@ class IngestCodebaseGuardTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write("# conteudo real\n")
 
+        # W8: --source-type/--origin são do legado (`ingest-legacy`); `wk
+        # ingest` (novo) é o composto extração+correlação em knowledge.db.
         code, out, err = _run(
-            ["ingest", path, "--source-type", "human-doc", "--origin", "teste",
+            ["ingest-legacy", path, "--source-type", "human-doc", "--origin", "teste",
              "--topic", "demo", "--store", store]
         )
         self.assertEqual(code, 0, err)
@@ -96,7 +98,7 @@ class IngestCodebaseGuardTests(unittest.TestCase):
         os.chdir(tmp)
         try:
             code, _out, err = _run(
-                ["ingest", "codebase", "--source-type", "human-doc", "--origin", "teste",
+                ["ingest-legacy", "codebase", "--source-type", "human-doc", "--origin", "teste",
                  "--topic", "demo", "--store", store]
             )
         finally:

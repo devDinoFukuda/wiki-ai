@@ -726,12 +726,27 @@ def _quality_errors(
     required_sections: tuple[tuple[str, ...], ...],
     min_pt_markers: int = 3,
     require_confidence: bool = True,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """Blockers de integridade + avisos cerimoniais do mesmo texto.
+
+    W8-T8.3 (plano-evolucao-wiki-ai.md §3.1 "Remoções obrigatórias"):
+    reclassificação simétrica à de `sdd_mod._audit_file` (sdd.py, já feita em
+    W8-T8.3) — tamanho de texto, quantidade de seções e idioma "apresentados
+    como medida de entendimento" deixam de reprovar `done`; viram
+    `avisos_cerimoniais` (segundo item retornado), informativo. Integridade
+    real do artefato (citações, escala de confiança, placeholder/boilerplate,
+    fallback operacional, detalhamento operacional mínimo) continua
+    bloqueando sem exceção (primeiro item retornado).
+    """
     stripped = text.strip()
     lower = stripped.lower()
     errors: list[str] = []
+    avisos: list[str] = []
     if len(stripped) < min_chars:
-        errors.append(f"{kind} com profundidade insuficiente: {len(stripped)}/{min_chars} caracteres")
+        avisos.append(
+            f"{kind} com tamanho abaixo do sugerido: {len(stripped)}/{min_chars} caracteres "
+            "(informativo, não bloqueia — §3.1)"
+        )
     citation_count = len(ev_mod.citations(text))
     if citation_count < min_citations:
         errors.append(f"{kind} com rastreabilidade insuficiente: {citation_count}/{min_citations} citações")
@@ -740,9 +755,13 @@ def _quality_errors(
     pt_hits = sum(1 for marker in PT_BR_MARKERS if marker in lower)
     en_hits = sum(1 for marker in EN_MARKERS if marker in lower)
     if ENGLISH_HEADING_RE.search(text):
-        errors.append(f"{kind} contém cabeçalho/template em inglês; contrato exige PT-BR")
+        avisos.append(
+            f"{kind} contém cabeçalho/template em inglês (informativo, não bloqueia — §3.1)"
+        )
     if pt_hits < min_pt_markers or en_hits > pt_hits:
-        errors.append(f"{kind} não demonstra idioma PT-BR técnico suficiente")
+        avisos.append(
+            f"{kind} não demonstra idioma PT-BR técnico suficiente (informativo, não bloqueia — §3.1)"
+        )
     if FAILED_ANALYSIS_RE.search(text):
         errors.append(f"{kind} contém falha de leitura/fallback; marque blocked/failed/degraded")
     found_boilerplate = ev_mod.find_boilerplate_markers(text, BOILERPLATE_TEXT_MARKERS)
@@ -750,23 +769,25 @@ def _quality_errors(
         errors.append(f"{kind} contém placeholder/boilerplate: {', '.join(found_boilerplate[:3])}")
     missing_sections = ["/".join(section[0] for section in (aliases,)) for aliases in required_sections if not _has_section(text, aliases)]
     if missing_sections:
-        errors.append(f"{kind} sem seções obrigatórias: {', '.join(missing_sections)}")
+        avisos.append(
+            f"{kind} sem seções sugeridas: {', '.join(missing_sections)} (informativo, não bloqueia — §3.1)"
+        )
     bullet_count = len(re.findall(r"(?m)^\s*(?:[-*]|\d+\.)\s+", text))
     table_count = len(re.findall(r"(?m)^\s*\|.+\|\s*$", text))
     if bullet_count + table_count < 4:
         errors.append(f"{kind} sem detalhamento operacional mínimo")
-    return errors
+    return errors, avisos
 
 
-def _validate_module_done(wd: str, item: str) -> tuple[str | None, str | None]:
+def _validate_module_done(wd: str, item: str) -> tuple[str | None, str | None, list[str]]:
     artifact = _module_artifact(wd, item)
     if not os.path.isfile(artifact):
-        return artifact, "artifact de módulo não encontrado"
+        return artifact, "artifact de módulo não encontrado", []
     with open(artifact, encoding="utf-8-sig", errors="replace") as f:
         text = f.read()
     if not text.strip():
-        return artifact, "artifact de módulo vazio"
-    errors = _quality_errors(
+        return artifact, "artifact de módulo vazio", []
+    errors, avisos = _quality_errors(
         text,
         kind="artifact de módulo",
         min_chars=900,
@@ -780,8 +801,8 @@ def _validate_module_done(wd: str, item: str) -> tuple[str | None, str | None]:
         ),
     )
     if errors:
-        return artifact, "; ".join(errors)
-    return artifact, None
+        return artifact, "; ".join(errors), avisos
+    return artifact, None, avisos
 
 
 def _spec_dir(wd: str, unit: str) -> str:
@@ -792,11 +813,11 @@ def _spec_dir(wd: str, unit: str) -> str:
     raise ValueError("unit de spec fora de sdd/specs")
 
 
-def _validate_spec_done(wd: str, unit: str) -> tuple[list[str], str | None]:
+def _validate_spec_done(wd: str, unit: str) -> tuple[list[str], str | None, list[str]]:
     try:
         root = _spec_dir(wd, unit)
     except ValueError as e:
-        return [], str(e)
+        return [], str(e), []
     required = [
         os.path.join(root, "requirements.md"),
         os.path.join(root, "design.md"),
@@ -804,7 +825,7 @@ def _validate_spec_done(wd: str, unit: str) -> tuple[list[str], str | None]:
     ]
     missing = [p for p in required if not os.path.isfile(p)]
     if missing:
-        return required, "arquivos de spec ausentes: " + ", ".join(os.path.basename(p) for p in missing)
+        return required, "arquivos de spec ausentes: " + ", ".join(os.path.basename(p) for p in missing), []
     rules = {
         "requirements.md": {
             "kind": "requirements.md",
@@ -846,30 +867,32 @@ def _validate_spec_done(wd: str, unit: str) -> tuple[list[str], str | None]:
         },
     }
     file_errors: list[str] = []
+    avisos: list[str] = []
     for path in required:
         with open(path, encoding="utf-8-sig", errors="replace") as f:
             text = f.read()
         rule = rules[os.path.basename(path)]
-        errors = _quality_errors(
+        errors, file_avisos = _quality_errors(
             text,
             kind=rule["kind"],
             min_chars=rule["min_chars"],
             min_citations=rule["min_citations"],
             required_sections=rule["sections"],
         )
+        avisos.extend(file_avisos)
         if errors:
             file_errors.append(f"{os.path.basename(path)} inválido: " + "; ".join(errors))
     if file_errors:
-        return required, "; ".join(file_errors)
-    return required, None
+        return required, "; ".join(file_errors), avisos
+    return required, None, avisos
 
 
-def _validate_item_done(wd: str, stage: str, item: str) -> tuple[str | list[str] | None, str | None]:
+def _validate_item_done(wd: str, stage: str, item: str) -> tuple[str | list[str] | None, str | None, list[str]]:
     if stage == "modules":
         return _validate_module_done(wd, item)
     if stage == "specs":
         return _validate_spec_done(wd, item)
-    return None, None
+    return None, None, []
 
 
 def _doc_level(st: dict) -> str:
@@ -935,14 +958,37 @@ def _required_stage_artifacts(wd: str, stage: str, st: dict) -> list[str]:
     return required
 
 
-def _validate_required_artifacts(required: list[str]) -> tuple[list[str], str | None]:
+def _validate_required_artifacts(wd: str, required: list[str]) -> tuple[list[str], str | None, list[str]]:
+    """Existência dos artefatos SDD obrigatórios do estágio.
+
+    W8-T8.3 (plano-evolucao-wiki-ai.md §3.1): a EXIGÊNCIA DE EXISTÊNCIA dos
+    artefatos listados em `sdd_mod.CEREMONIAL_RULES` (aqui, na prática,
+    `sdd/state-machines.md` e `sdd/erd-complete.md`) é cerimônia — reusa a
+    MESMA constante que `sdd_mod._audit_stage` já consulta, em vez de
+    duplicar a lista. Ausência de um artefato ceremonial vira
+    `avisos_cerimoniais`, informativo; os demais artefatos (não-ceremoniais)
+    continuam bloqueando `done` quando ausentes/vazios, sem exceção.
+    """
     missing = [p for p in required if not _nonempty(p)]
-    if missing:
-        return required, "artefatos SDD obrigatórios ausentes ou vazios: " + ", ".join(
-            os.path.relpath(p, os.path.commonpath(required)) if len(required) > 1 else p
-            for p in missing
-        )
-    return required, None
+    if not missing:
+        return required, None, []
+    ceremonial_missing = [
+        p for p in missing
+        if os.path.relpath(p, wd).replace("\\", "/") in sdd_mod.CEREMONIAL_RULES
+    ]
+    blocking_missing = [p for p in missing if p not in ceremonial_missing]
+    avisos = [
+        f"artefato SDD ausente (informativo, não bloqueia — §3.1): "
+        f"{os.path.relpath(p, wd).replace(chr(92), '/')}"
+        for p in ceremonial_missing
+    ]
+    if not blocking_missing:
+        return required, None, avisos
+    error = "artefatos SDD obrigatórios ausentes ou vazios: " + ", ".join(
+        os.path.relpath(p, os.path.commonpath(required)) if len(required) > 1 else p
+        for p in blocking_missing
+    )
+    return required, error, avisos
 
 
 def _audit_error(report: dict) -> str | None:
@@ -970,7 +1016,7 @@ def _audit_error(report: dict) -> str | None:
     )
 
 
-def _stage_artifact_quality(wd: str, stage: str, artifact: str) -> str | None:
+def _stage_artifact_quality(wd: str, stage: str, artifact: str) -> tuple[str | None, list[str]]:
     """Gate de qualidade de `done <stage>` para os artefatos SDD nomeados.
 
     Antes desta unificação (BQ5) esta função mantinha uma tabela própria de
@@ -981,14 +1027,21 @@ def _stage_artifact_quality(wd: str, stage: str, artifact: str) -> str | None:
     seções vêm de `sdd_mod.rule_for_rel`, a MESMA tabela que `audit` consulta
     via `_audit_stage`; só a formatação da mensagem (`_quality_errors`, usada
     também pelos gates por item de módulos/specs) permanece local a `done`.
+
+    W8-T8.3 (plano-evolucao-wiki-ai.md §3.1): devolve `(blocker, avisos)` —
+    antes desta tarefa, `done` reprovava por tamanho/seções/idioma mesmo
+    depois de `sdd.py` já ter reclassificado essas mesmas checagens como
+    `avisos_cerimoniais` em `audit` (W8-T8.3 anterior); `_quality_errors`
+    agora aplica a MESMA reclassificação aqui, então os dois gates (`done` e
+    `audit`) concordam de novo.
     """
     rel = os.path.relpath(artifact, wd).replace("\\", "/")
     rule = sdd_mod.rule_for_rel(rel)
     if not rule:
-        return None
+        return None, []
     with open(artifact, encoding="utf-8-sig", errors="replace") as f:
         text = f.read()
-    errors = _quality_errors(
+    errors, avisos = _quality_errors(
         text,
         kind=os.path.basename(rel),
         min_chars=rule.min_bytes,
@@ -999,8 +1052,8 @@ def _stage_artifact_quality(wd: str, stage: str, artifact: str) -> str | None:
         require_confidence=rule.min_citations > 0,
     )
     if errors:
-        return "; ".join(errors)
-    return None
+        return "; ".join(errors), avisos
+    return None, avisos
 
 
 def _audit_blockers(wd: str, stage: str, report: dict) -> list[dict]:
@@ -1054,10 +1107,22 @@ def _fanout_gate_error(wd: str, stage: str) -> str | None:
     return None
 
 
-def _validate_stage_done_blockers(wd: str, stage: str) -> list[dict]:
+def _validate_stage_done_blockers(wd: str, stage: str) -> tuple[list[dict], list[str]]:
+    """Blockers de `done <stage>` + `avisos_cerimoniais` (W8-T8.3, plano
+    §3.1) — segundo item do retorno, informativo, nunca impede o `done`.
+
+    As quatro checagens de "doc_level completo/detalhado exige X em sdd/Y/"
+    abaixo tratam a EXISTÊNCIA do artefato: `sdd/adrs/*.md`,
+    `sdd/sequences/*.md` e `sdd/user-stories/*.md` estão em
+    `sdd_mod.CEREMONIAL_RULES` (mesma constante que `sdd_mod._audit_stage`
+    consulta) e viram aviso quando ausentes; `sdd/flowcharts/*.md` NÃO está
+    em `CEREMONIAL_RULES` (nem em sdd.py) — continua bloqueando, tratamento
+    idêntico ao de `audit`.
+    """
     st = st_mod.load(wd) or {}
     s = st.get("stages", {}).get(stage, {})
     blockers: list[dict] = []
+    avisos_cerimoniais: list[str] = []
     fanout_error = _fanout_gate_error(wd, stage)
     if fanout_error:
         blockers.append(_blocker(wd, stage, os.path.join(_agent_runs_dir(wd), f"{stage}.json"), fanout_error))
@@ -1075,18 +1140,21 @@ def _validate_stage_done_blockers(wd: str, stage: str) -> list[dict]:
                     f"estágio {stage} ainda tem itens {problem}: {', '.join(items[:10])}",
                 ))
         for item in done:
-            artifact, error = _validate_item_done(wd, stage, item)
+            artifact, error, item_avisos = _validate_item_done(wd, stage, item)
+            avisos_cerimoniais.extend(f"{item}: {a}" for a in item_avisos)
             if error:
                 blockers.append(_blocker(wd, stage, artifact, f"{item}: {error}", item=item))
 
     required = _required_stage_artifacts(wd, stage, st)
-    artifact, error = _validate_required_artifacts(required)
+    artifact, error, required_avisos = _validate_required_artifacts(wd, required)
+    avisos_cerimoniais.extend(required_avisos)
     if error:
         blockers.append(_blocker(wd, stage, artifact, error))
     for path in required:
         if not _nonempty(path):
             continue
-        quality_error = _stage_artifact_quality(wd, stage, path)
+        quality_error, quality_avisos = _stage_artifact_quality(wd, stage, path)
+        avisos_cerimoniais.extend(f"{_rel_to_wd(wd, path)}: {a}" for a in quality_avisos)
         if quality_error:
             blockers.append(_blocker(wd, stage, path, quality_error))
 
@@ -1097,15 +1165,21 @@ def _validate_stage_done_blockers(wd: str, stage: str) -> list[dict]:
     if stage == "rules" and _doc_level(st) in ("completo", "detalhado"):
         root = _sdd(wd, "adrs")
         if not _glob_nonempty(root):
-            blockers.append(_blocker(wd, stage, root, "doc_level completo exige ADRs retroativos em sdd/adrs/"))
+            avisos_cerimoniais.append(
+                f"{_rel_to_wd(wd, root)}: ADR retroativo ausente (informativo, não bloqueia — §3.1)"
+            )
     if stage == "architecture" and _doc_level(st) == "detalhado":
         root = _sdd(wd, "sequences")
         if not _glob_nonempty(root):
-            blockers.append(_blocker(wd, stage, root, "doc_level detalhado exige diagramas de sequência em sdd/sequences/"))
+            avisos_cerimoniais.append(
+                f"{_rel_to_wd(wd, root)}: diagrama de sequência ausente (informativo, não bloqueia — §3.1)"
+            )
     if stage == "specs" and _doc_level(st) in ("completo", "detalhado"):
         root = _sdd(wd, "user-stories")
         if not _glob_nonempty(root):
-            blockers.append(_blocker(wd, stage, root, "doc_level completo exige user stories em sdd/user-stories/"))
+            avisos_cerimoniais.append(
+                f"{_rel_to_wd(wd, root)}: histórias de usuário ausentes (informativo, não bloqueia — §3.1)"
+            )
     if stage == "specs":
         units = s.get("done") or []
         if not units:
@@ -1119,11 +1193,13 @@ def _validate_stage_done_blockers(wd: str, stage: str) -> list[dict]:
         error = _audit_error(report)
         if error:
             blockers.extend(_audit_blockers(wd, stage, report))
-    return _dedupe_blockers(blockers)
+        avisos_cerimoniais.extend(report.get("avisos_cerimoniais") or [])
+    return _dedupe_blockers(blockers), list(dict.fromkeys(avisos_cerimoniais))
 
 
 def _validate_stage_done(wd: str, stage: str) -> tuple[str | list[str] | None, str | None]:
-    return _primary_blocker(_validate_stage_done_blockers(wd, stage))
+    blockers, _avisos_cerimoniais = _validate_stage_done_blockers(wd, stage)
+    return _primary_blocker(blockers)
 
 
 def _validate_artifact_was_merged(wd: str, stage: str, artifact: str) -> str | None:
@@ -1202,10 +1278,10 @@ def cmd_done(a) -> int:
         st_now = st_mod.load(wd) or {}
         a.item = _resolve_stored_item(st_now.get("stages", {}).get(a.stage, {}), a.item)
     if a.item:
-        artifact, error = _validate_item_done(wd, a.stage, a.item)
+        artifact, error, avisos_cerimoniais = _validate_item_done(wd, a.stage, a.item)
         blockers = [_blocker(wd, a.stage, artifact, f"{a.item}: {error}", item=a.item)] if error else []
     else:
-        blockers = _validate_stage_done_blockers(wd, a.stage)
+        blockers, avisos_cerimoniais = _validate_stage_done_blockers(wd, a.stage)
         artifact, error = _primary_blocker(blockers)
     if error:
         artifact_out = _rel_to_wd(wd, artifact)
@@ -1213,6 +1289,13 @@ def cmd_done(a) -> int:
         extra = {"artifact": artifact_out}
         if len(blockers) > 1:
             extra["blockers"] = blockers
+        # W8-T8.3 (plano-evolucao-wiki-ai.md §3.1): cerimônia removida
+        # (tamanho/seções/idioma/ADR/histórias/diagrama/arquivo
+        # intermediário) não bloqueia mais `done`, mas continua visível no
+        # JSON de erro quando outro blocker real (integridade) recusou o
+        # mesmo `done` — nunca escondida, só nunca decisiva sozinha.
+        if avisos_cerimoniais:
+            extra["avisos_cerimoniais"] = avisos_cerimoniais
         _err(error, **extra)
         return 2
     if a.item:
@@ -1238,6 +1321,13 @@ def cmd_done(a) -> int:
     # derivado para dentro de state.json em um save posterior.
     out = dict(st["stages"][a.stage])
     out["progresso"] = _progresso(wd, st, a.stage)
+    # W8-T8.3 (plano-evolucao-wiki-ai.md §3.1): campo aditivo — cerimônia
+    # (tamanho/seções/idioma/ADR/histórias/diagrama vazio/arquivo
+    # intermediário) não impediu este `done`, mas fica visível para quem lê
+    # o resultado, do mesmo jeito que `sdd.audit` já expõe
+    # `avisos_cerimoniais` no relatório de auditoria.
+    if avisos_cerimoniais:
+        out["avisos_cerimoniais"] = avisos_cerimoniais
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
