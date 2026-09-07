@@ -48,6 +48,15 @@ Invariantes em código, não em prosa
    409). `_consequence_of` extrai a consequência, `_consequence_guard` exige que
    ela seja confirmada MECANICAMENTE no trecho, e rebaixa (`inferred`) ou
    contradiz (`disputed`) a frase inteira quando não é.
+7b. **Condição e efeito precisam estar no MESMO RAMO.** Confirmar a consequência
+   no trecho não bastava: em `if total > 1000: return 409` seguido de
+   `return 200`, "quando total > 1000 retorna 200" citando a função inteira
+   achava o `200` — no ramo errado — e saía `supported` (achado nº1 da 3ª
+   auditoria). `_branch_association` localiza no `ast` o `if` cujo teste é a
+   condição afirmada (inversão de operandos conta) e só confirma o efeito dentro
+   daquele ramo; efeito no caminho oposto não confirma, ramo com efeito
+   incompatível vira `disputed`, e condição não localizável ou trecho não-Python
+   têm teto `inferred`.
 8. **Integração é ESCOPADA.** `integrate` exige `objectives`/`objective_ids` e
    descarta (em `IntegrationReport.descartados`) resultado de objetivo fora do
    escopo ou cujas entradas não pertencem ao snapshot corrente. Dois repositórios
@@ -71,6 +80,7 @@ Imports: stdlib + `knowledge` + `analysis` (verification/snapshot/investigation)
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import re
 import unicodedata
@@ -102,6 +112,14 @@ from analysis.verification import (
     verification_summary,
     verify_claim,
 )
+# Reuso deliberado das PRIMITIVAS de `verification` (nunca reimplementadas aqui):
+# `_parse_python` é o mesmo parser defensivo (dedent + wrap em função/classe) que
+# `extract_comparisons`/`extract_effects` usam, e `_operand_equal` é a MESMA
+# igualdade de operandos que `check_support` aplica (`self.x` ≡ `x`, `0` ≡ `0.0`).
+# Duplicar qualquer uma faria a associação condição→ramo divergir da checagem que
+# aprovou a condição — que é justamente o buraco do achado nº1.
+from analysis.verification import _operand_equal as _operand_equal
+from analysis.verification import _parse_python as _parse_python_fragment
 from runtime import tasks as rt_tasks
 
 from . import evidence as ev_mod
@@ -781,38 +799,368 @@ def _literal_in(text: str, snippet: str) -> bool:
     return bool(compact) and compact in collapsed
 
 
-def _consequence_confirmed(cons: _Consequence, verdict: Verdict) -> bool:
-    """A consequência aparece MECANICAMENTE em alguma citação que resolveu?
+def _consequence_in(cons: _Consequence, code: str, path: str) -> bool:
+    """A consequência aparece MECANICAMENTE neste PEDAÇO de código?
 
-    Literal presente basta e é deliberado: "devolve 409" contra
-    `raise ConflictError(409)` continua sustentado — o valor afirmado ESTÁ no
-    trecho, e exigir a forma `return` reprovaria uma afirmação verdadeira. O que
-    não passa é o valor AUSENTE ("HTTP 200" contra o mesmo trecho).
+    `code` é um trecho citado inteiro OU o corpo de um ramo (a associação
+    condição→ramo usa a MESMA regra de confirmação, para que "está no trecho" e
+    "está no ramo" não divirjam). Literal presente basta e é deliberado:
+    "devolve 409" contra `raise ConflictError(409)` continua sustentado — o valor
+    afirmado ESTÁ ali, e exigir a forma `return` reprovaria uma afirmação
+    verdadeira. O que não passa é o valor AUSENTE ("HTTP 200" contra o mesmo
+    trecho).
     """
     if not cons.verifiable:
         return False
+    if cons.literals and not all(_literal_in(lit, code) for lit in cons.literals):
+        return False
+    if cons.exception:
+        effects = extract_effects(code, path)
+        leaf = cons.exception.rsplit(".", 1)[-1]
+        if not any(r.rsplit(".", 1)[-1] == leaf for r in effects.raises if r):
+            return False
+    if not cons.literals and not cons.exception:
+        effects = extract_effects(code, path)
+        observed = {
+            "return": effects.returns,
+            "raise": effects.raises,
+            "publish": tuple(effects.publishes),
+            "write": tuple(effects.writes),
+        }.get(cons.effect_kind, ())
+        if not observed:
+            return False
+    return True
+
+
+def _consequence_confirmed(cons: _Consequence, verdict: Verdict) -> bool:
+    """A consequência aparece em alguma citação que resolveu?
+
+    Regra de PRESENÇA, sem vínculo de controle: só é usada quando o enunciado
+    NÃO traz condição mecânica (frase não condicional). Frase condicional passa
+    por `_branch_association` — presença no trecho não prova que o efeito
+    pertence ao ramo da condição (achado nº1 da 3ª auditoria).
+    """
+    if not cons.verifiable:
+        return False
+    return any(
+        loc.ok and _consequence_in(cons, loc.snippet, loc.path) for loc in verdict.locations
+    )
+
+
+# --------------------------------------------------------------------------
+# Associação condição -> ramo -> efeito (achado nº1 da 3ª auditoria)
+# --------------------------------------------------------------------------
+#
+# O buraco: `_consequence_confirmed` respondia "o literal afirmado está no
+# trecho?". Para
+#
+#     def approve(total):
+#         if total > 1000:
+#             return {"status": 409}
+#         return {"status": 200}
+#
+# e o claim "quando total > 1000, retorna HTTP 200" citando a função INTEIRA, a
+# resposta era SIM — o `200` está no trecho, no ramo ERRADO. Condição e
+# consequência em ramos diferentes viravam `supported`. Aqui a pergunta passa a
+# ser "o efeito está DENTRO do ramo governado pela condição?", respondida pela
+# gramática (`ast`), nunca por proximidade textual.
+
+#: Comparador espelhado quando os operandos trocam de lado (`a > b` ≡ `b < a`).
+_MIRROR_CMP: Mapping[str, str] = {
+    ">": "<", "<": ">", ">=": "<=", "<=": ">=", "==": "==", "!=": "!=",
+}
+#: Comparador negado — o que vale no caminho COMPLEMENTAR do mesmo `if`.
+_NEGATE_CMP: Mapping[str, str] = {
+    ">": "<=", "<": ">=", ">=": "<", "<=": ">", "==": "!=", "!=": "==",
+}
+#: Comparadores do enunciado que não vêm normalizados de `_statement_parse`.
+_CMP_CANON: Mapping[str, str] = {"===": "==", "!==": "!=", "<>": "!=", "=": "=="}
+_AST_CMP_SYM: Mapping[type, str] = {
+    ast.Gt: ">", ast.GtE: ">=", ast.Lt: "<", ast.LtE: "<=",
+    ast.Eq: "==", ast.NotEq: "!=", ast.Is: "==", ast.IsNot: "!=",
+}
+
+#: Vereditos da associação. Só os dois primeiros deixam a frase `supported`.
+_ASSOC_INSIDE = "inside"            # efeito DENTRO do ramo da condição
+_ASSOC_COMPLEMENT = "complement"    # condição complementar + efeito no else/fallthrough do MESMO if
+_ASSOC_CONTRARY = "contrary"        # o ramo faz outra coisa, incompatível
+_ASSOC_OUTSIDE = "outside"          # efeito existe, mas fora do ramo
+_ASSOC_UNDETERMINED = "undetermined"  # condição não localizada como ramo no trecho
+_ASSOC_HEURISTIC = "heuristic"      # trecho não parseável como Python
+_ASSOC_NONE = ""                    # enunciado sem condição mecânica: regra antiga
+
+
+@dataclass(frozen=True)
+class _Condition:
+    """A condição do enunciado em forma comparável com um `if` do código."""
+
+    left: str
+    op: str
+    right: str
+
+    def render(self) -> str:
+        return f"{self.left} {self.op} {self.right}"
+
+
+def _condition_of(fields: Mapping[str, Any]) -> _Condition | None:
+    """Condição mecânica do enunciado, ou `None` quando a frase não traz uma."""
+    left = _norm_ws(fields.get("condition"))
+    right = _norm_ws(fields.get("value"))
+    op = _norm_ws(fields.get("comparator"))
+    op = _CMP_CANON.get(op, op)
+    if not left or not right or op not in _NEGATE_CMP:
+        return None
+    return _Condition(left, op, right)
+
+
+@dataclass(frozen=True)
+class _Branch:
+    """Um ramo do código: o que roda QUANDO a condição do claim vale.
+
+    `taken` é o caminho governado pela condição afirmada; `other` é o caminho
+    oposto — usado só para DIZER que a consequência apareceu do lado errado.
+    """
+
+    taken: tuple[Any, ...]
+    other: tuple[Any, ...]
+    test_src: str
+    via: str
+    complementary: bool = False
+
+
+def _src(node: Any) -> str:
+    try:
+        return ast.unparse(node)
+    except (AttributeError, ValueError, TypeError, RecursionError):
+        return ""
+
+
+def _block_src(stmts: Sequence[Any]) -> str:
+    return "\n".join(s for s in (_src(node) for node in stmts) if s)
+
+
+def _stmt_lists(tree: ast.AST) -> Iterable[list[Any]]:
+    """Todo bloco de statements do trecho (corpo, else, finally) — inclusive
+    aninhados, porque o efeito pode estar num `if` interno do mesmo ramo."""
+    for node in ast.walk(tree):
+        for name in ("body", "orelse", "finalbody"):
+            seq = getattr(node, name, None)
+            if isinstance(seq, list) and all(isinstance(s, ast.stmt) for s in seq):
+                yield seq
+
+
+def _terminates(stmts: Sequence[Any]) -> bool:
+    """O bloco SEMPRE sai (return/raise)?
+
+    É a condição mecânica para o `fallthrough` — o código DEPOIS do `if`, sem
+    `else` — ser o caminho complementar: se o corpo sempre retorna/levanta, o que
+    vem depois só executa quando a condição é FALSA. Sem isso, "depois do if" não
+    prova nada e a associação fica indeterminada.
+    """
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if isinstance(last, (ast.Return, ast.Raise)):
+        return True
+    if isinstance(last, ast.If):
+        return _terminates(last.body) and _terminates(last.orelse)
+    return False
+
+
+def _and_parts(node: Any, negated: bool) -> Iterable[tuple[Any, bool]]:
+    """Condições que precisam TODAS valer para entrar no corpo.
+
+    `and` distribui (entrar no corpo implica cada conjunto verdadeiro); `or` NÃO
+    (entrar não implica o ramo específico), então só é aberto sob negação, onde
+    `not (a or b)` ≡ `not a and not b`.
+    """
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        yield from _and_parts(node.operand, not negated)
+        return
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And) and not negated:
+            for value in node.values:
+                yield from _and_parts(value, False)
+            return
+        if isinstance(node.op, ast.Or) and negated:
+            for value in node.values:
+                yield from _and_parts(value, True)
+            return
+    yield node, negated
+
+
+def _cmp_same(sym: str, left: str, right: str, cond: _Condition) -> bool:
+    """`left sym right` é a MESMA comparação que a condição do enunciado?
+
+    Inversão de operandos conta: `total > 1000` ≡ `1000 < total`.
+    """
+    if sym == cond.op and _operand_equal(left, cond.left) and _operand_equal(right, cond.right):
+        return True
+    return (
+        sym == _MIRROR_CMP[cond.op]
+        and _operand_equal(left, cond.right)
+        and _operand_equal(right, cond.left)
+    )
+
+
+def _test_relation(test: Any, cond: _Condition) -> str | None:
+    """`direct` (o teste é a condição), `complement` (é a negação dela) ou None."""
+    for part, negated in _and_parts(test, False):
+        if not isinstance(part, ast.Compare) or len(part.ops) != 1:
+            continue
+        sym = _AST_CMP_SYM.get(type(part.ops[0]))
+        if sym is None:
+            continue
+        if negated:
+            sym = _NEGATE_CMP[sym]
+        left, right = _src(part.left), _src(part.comparators[0])
+        if _cmp_same(sym, left, right, cond):
+            return "direct"
+        if _cmp_same(_NEGATE_CMP[sym], left, right, cond):
+            return "complement"
+    return None
+
+
+def _branches_for(tree: ast.AST, cond: _Condition) -> list[_Branch]:
+    """Ramos do trecho governados pela condição do enunciado."""
+    out: list[_Branch] = []
+    for body in _stmt_lists(tree):
+        for idx, node in enumerate(body):
+            if not isinstance(node, ast.If):
+                continue
+            relation = _test_relation(node.test, cond)
+            if relation is None:
+                continue
+            fall = tuple(body[idx + 1:]) if (not node.orelse and _terminates(node.body)) else ()
+            test_src = _src(node.test)
+            if relation == "direct":
+                out.append(
+                    _Branch(tuple(node.body), tuple(node.orelse) + fall, test_src, "corpo do if")
+                )
+                continue
+            complement = tuple(node.orelse) or fall
+            if complement:
+                out.append(
+                    _Branch(
+                        complement,
+                        tuple(node.body),
+                        test_src,
+                        "else/fallthrough imediato do mesmo if",
+                        complementary=True,
+                    )
+                )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.IfExp):
+            continue
+        relation = _test_relation(node.test, cond)
+        if relation is None:
+            continue
+        yes, no = (ast.Expr(node.body),), (ast.Expr(node.orelse),)
+        direct = relation == "direct"
+        out.append(
+            _Branch(
+                yes if direct else no,
+                no if direct else yes,
+                _src(node.test),
+                "ramo do ternário",
+                complementary=not direct,
+            )
+        )
+    return out
+
+
+def _branch_contradiction(cons: _Consequence, code: str, path: str) -> str:
+    """O ramo faz algo INCOMPATÍVEL com a consequência afirmada? O quê."""
+    codes = {lit for lit in cons.literals if _STATUS_CODE.fullmatch(lit or "")}
+    found = {m.group(1) for m in _STATUS_CODE.finditer(code or "")}
+    if codes and found and not (codes & found):
+        return f"usa código {', '.join(sorted(found))}, não {', '.join(sorted(codes))}"
+    effects = extract_effects(code, path)
+    named = sorted({r for r in effects.raises if r})
+    if cons.exception:
+        # Guard-rail simétrico: exceção nomeada segue a MESMA regra de ramo.
+        leaf = cons.exception.rsplit(".", 1)[-1]
+        if named and effects.raises_all_named and not any(
+            r.rsplit(".", 1)[-1] == leaf for r in named
+        ):
+            return f"levanta {', '.join(named)}, não {cons.exception}"
+    elif cons.polarity == "positive" and named and effects.raises_all_named:
+        return f"levanta {', '.join(named)} (consequência afirmada é de aprovação/retorno)"
+    return ""
+
+
+def _branch_association(cons: _Consequence, cond: _Condition, verdict: Verdict) -> tuple[str, str]:
+    """(veredito, motivo) do vínculo condição→ramo→efeito nas citações que resolveram.
+
+    Precedência: uma citação que CONFIRMA vence; senão contradição de ramo vence
+    "só existe fora do ramo", que vence "condição não localizada". Nenhum
+    resultado que não seja `inside`/`complement` pode deixar a frase `supported`.
+    """
+    best: tuple[str, str] | None = None
+    order = {
+        _ASSOC_CONTRARY: 0,
+        _ASSOC_OUTSIDE: 1,
+        _ASSOC_UNDETERMINED: 2,
+        _ASSOC_HEURISTIC: 3,
+    }
     for loc in verdict.locations:
         if not loc.ok:
             continue
-        if cons.literals and not all(_literal_in(lit, loc.snippet) for lit in cons.literals):
-            continue
-        if cons.exception:
-            effects = extract_effects(loc.snippet, loc.path)
-            leaf = cons.exception.rsplit(".", 1)[-1]
-            if not any(r.rsplit(".", 1)[-1] == leaf for r in effects.raises if r):
-                continue
-        if not cons.literals and not cons.exception:
-            effects = extract_effects(loc.snippet, loc.path)
-            observed = {
-                "return": effects.returns,
-                "raise": effects.raises,
-                "publish": tuple(effects.publishes),
-                "write": tuple(effects.writes),
-            }.get(cons.effect_kind, ())
-            if not observed:
-                continue
-        return True
-    return False
+        assoc, why = _branch_association_at(cons, cond, loc.snippet, loc.path, loc.language)
+        why = f"{why} (trecho em {loc.span})"
+        if assoc in (_ASSOC_INSIDE, _ASSOC_COMPLEMENT):
+            return assoc, why
+        if best is None or order[assoc] < order[best[0]]:
+            best = (assoc, why)
+    if best is None:
+        return _ASSOC_UNDETERMINED, "nenhuma citação resolvida para associar condição e efeito"
+    return best
+
+
+def _branch_association_at(
+    cons: _Consequence, cond: _Condition, snippet: str, path: str, language: str = ""
+) -> tuple[str, str]:
+    """Associação condição→ramo→efeito DENTRO de um trecho citado."""
+    if language and language != "python":
+        return (
+            _ASSOC_HEURISTIC,
+            f"trecho em {language}: associação condição→ramo só é resolvida por gramática Python",
+        )
+    tree = _parse_python_fragment(snippet or "")
+    if tree is None:
+        return (
+            _ASSOC_HEURISTIC,
+            "trecho não parseável como Python: associação condição→ramo seria heurística",
+        )
+    branches = _branches_for(tree, cond)
+    if not branches:
+        return (
+            _ASSOC_UNDETERMINED,
+            f"condição `{cond.render()}` não localizada como ramo (if/ternário) no trecho",
+        )
+    contrary = ""
+    outside = ""
+    for branch in branches:
+        taken = _block_src(branch.taken)
+        if _consequence_in(cons, taken, path):
+            assoc = _ASSOC_COMPLEMENT if branch.complementary else _ASSOC_INSIDE
+            return assoc, f"efeito afirmado está no {branch.via} de `{branch.test_src}`"
+        why = _branch_contradiction(cons, taken, path)
+        if why and not contrary:
+            contrary = f"o {branch.via} de `{branch.test_src}` {why}"
+        if not outside and _consequence_in(cons, _block_src(branch.other), path):
+            outside = (
+                f"a consequência aparece APENAS FORA do {branch.via} de `{branch.test_src}` "
+                "(outro caminho de execução)"
+            )
+    if contrary:
+        return _ASSOC_CONTRARY, contrary
+    if outside:
+        return _ASSOC_OUTSIDE, outside
+    return (
+        _ASSOC_OUTSIDE,
+        f"efeito afirmado não observado no ramo de `{cond.render()}`",
+    )
 
 
 def _contrary_consequence(cons: _Consequence, verdict: Verdict) -> str:
@@ -854,14 +1202,35 @@ def _consequence_guard(claim: Claim, verdict: Verdict) -> tuple[Verdict, str]:
     a CONSEQUÊNCIA também for confirmada no trecho; se o trecho mostra a
     consequência contrária, o claim vira `disputed`; se a consequência não é
     mecanicamente verificável, cai para `inferred`. Nunca promove nada.
+
+    3ª auditoria: confirmar a consequência no TRECHO não bastava — em
+    `if total > 1000: return 409` / `return 200`, o claim "quando total > 1000
+    retorna 200" citando a função inteira achava o `200` no ramo ERRADO e saía
+    `supported`. Frase com condição mecânica passa agora por
+    `_branch_association`: o efeito tem de estar DENTRO do ramo governado pela
+    condição (ou no caminho complementar, quando a condição afirmada é a
+    complementar). Fora do ramo, sem ramo localizável, ou trecho não parseável
+    como Python: nunca `supported`.
     """
-    consequence = _statement_parse(claim.statement)[1]
+    fields, consequence = _statement_parse(claim.statement)
     if consequence is None:
         return verdict, ""
-    if _consequence_confirmed(consequence, verdict):
+    # Frase CONDICIONAL passa pela associação condição→ramo→efeito (3ª auditoria):
+    # presença do literal no trecho não prova que o efeito pertence ao ramo da
+    # condição. Frase sem condição mecânica (ou consequência sem forma mecânica)
+    # segue pela regra de presença, que é tudo que há para checar.
+    condition = _condition_of(fields) if consequence.verifiable else None
+    assoc, assoc_why = (
+        _branch_association(consequence, condition, verdict)
+        if condition is not None
+        else (_ASSOC_NONE, "")
+    )
+    if assoc in (_ASSOC_INSIDE, _ASSOC_COMPLEMENT):
+        return verdict, f"frase completa: condição e consequência no mesmo ramo — {assoc_why}"
+    if assoc == _ASSOC_NONE and _consequence_confirmed(consequence, verdict):
         return verdict, "frase completa: condição e consequência confirmadas no trecho"
 
-    contrary = _contrary_consequence(consequence, verdict)
+    contrary = assoc_why if assoc == _ASSOC_CONTRARY else _contrary_consequence(consequence, verdict)
     if contrary:
         reasons = verdict.reasons + (
             f"consequência afirmada ({consequence.text!r}) CONTRADITA pelo trecho: {contrary}",
@@ -888,6 +1257,20 @@ def _consequence_guard(claim: Claim, verdict: Verdict) -> tuple[Verdict, str]:
             "(sem literal, efeito ou exceção a confrontar)"
         )
     )
+    if assoc == _ASSOC_OUTSIDE:
+        motivo = (
+            f"consequência afirmada ({consequence.text!r}) não confirmada NO RAMO da condição "
+            f"`{condition.render()}`: {assoc_why}"
+        )
+    elif assoc == _ASSOC_UNDETERMINED:
+        motivo = (
+            f"vínculo condição→efeito não estabelecido para ({consequence.text!r}): {assoc_why}"
+        )
+    elif assoc == _ASSOC_HEURISTIC:
+        motivo = (
+            f"vínculo condição→efeito não estabelecido para ({consequence.text!r}): {assoc_why} "
+            "— associação heurística nunca sustenta a frase inteira"
+        )
     escopo = f"apenas a condição — {motivo}"
     if verdict.epistemic is not EpistemicStatus.SUPPORTED:
         return verdict, escopo

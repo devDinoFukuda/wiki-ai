@@ -479,6 +479,7 @@ class TaskStore:
         config: Mapping[str, Any] | None = None,
         task_id: str | None = None,
         now: str | None = None,
+        identity_objective: Mapping[str, Any] | None = None,
     ) -> Task:
         """Persiste uma tarefa; se a `effect_identity` já existe, devolve a existente.
 
@@ -487,10 +488,25 @@ class TaskStore:
         objetivo sobre o mesmo snapshot NÃO cria segunda tarefa — e se a
         primeira já está `done`, o resultado dela está aqui para ser
         reutilizado (`Task.reused is True`).
+
+        `identity_objective`: quando informado, é o que entra em
+        `effect_identity` NO LUGAR de `objective` — `objective` continua
+        sendo o que é PERSISTIDO e devolvido. Uso: `create_continuation_tasks`
+        (Onda11-T2a) grava um objetivo de continuação rico (com
+        `contract_state`/`parent_result`/`capability_context` para que o
+        pacote de contexto tenha o que precisa), mas a identidade do efeito
+        precisa continuar dependendo só de `objective_id`+`round`+
+        `hash(needs)`+`input_versions` (§7.2) — conteúdo extra NUNCA pode
+        mudar a identidade, senão a mesma continuação "duplicaria" a cada
+        chamada com um resumo de resultado-mãe ligeiramente diferente.
         """
         kind = TaskKind(kind)
         moment = now or utc_now()
-        identity = effect_identity(objective, input_versions, config)
+        identity = effect_identity(
+            identity_objective if identity_objective is not None else objective,
+            input_versions,
+            config,
+        )
         with self.immediate() as conn:
             row = conn.execute(
                 "SELECT * FROM tasks WHERE effect_identity=?", (identity,)
@@ -1109,6 +1125,77 @@ def _reading_needs_hash(needs: Sequence[Mapping[str, Any]]) -> str:
     return sha256_hex(canonical_json([dict(n) for n in needs]))
 
 
+#: Onda11-T2a (achado BLOQUEANTE #2, 3ª auditoria externa, parte runtime) —
+#: chaves aceitas para o par de linhas de um localizador de evidência dentro
+#: de `need["evidence"]`. `line_start`/`line_end` é a convenção já usada por
+#: `analysis.capabilities.EvidenceRef` e por `runtime.context._evidence_source_key`
+#: (é o formato que `resolver(path, start, end)` espera); `start_line`/`end_line`
+#: é aceito por compatibilidade com quem grava a evidência com essa outra
+#: ordem de palavras — sempre NORMALIZADO para `line_start`/`line_end` na
+#: gravação, para que `context.build_package` tenha um único formato para ler.
+def _normalize_locator(loc: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(loc)
+    if "line_start" not in out and "start_line" in out:
+        out["line_start"] = out.get("start_line")
+    if "line_end" not in out and "end_line" in out:
+        out["line_end"] = out.get("end_line")
+    return out
+
+
+def _normalize_need_evidence(need: Mapping[str, Any]) -> dict[str, Any]:
+    """Normaliza `need["evidence"]` para uma LISTA de localizadores.
+
+    Aceita tanto uma lista de localizadores quanto um único localizador
+    (`Mapping`, formato anterior de `ReadingNeed.evidence`) — sempre grava
+    como lista, para que `context.build_package` monte uma `PackagePart` por
+    localizador resolvível. Ausência de `evidence` (ou lista vazia) é
+    preservada tal como veio: `context.build_package` é quem decide o
+    diagnóstico ("need sem localizador"), nunca este módulo.
+    """
+    out = dict(need)
+    raw = out.get("evidence")
+    if raw is None:
+        return out
+    if isinstance(raw, Mapping):
+        out["evidence"] = [_normalize_locator(raw)]
+    elif isinstance(raw, (list, tuple)):
+        out["evidence"] = [
+            _normalize_locator(loc) if isinstance(loc, Mapping) else loc for loc in raw
+        ]
+    return out
+
+
+def _summarize_parent_result(parent_result: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Resumo do resultado ACEITO da tarefa-mãe: campos preenchidos + evidence_refs.
+
+    Nunca copia o resultado inteiro para dentro do objetivo de continuação —
+    isso reabriria histórico de execução dentro do grafo de tarefas (o que o
+    módulo declara não fazer, ver cabeçalho). Só entram: os NOMES dos campos
+    com conteúdo não vazio (`filled_fields` — o que a tarefa-mãe já
+    preencheu, então a continuação não repete) e as referências de evidência
+    já citadas (`evidence_refs`, do topo do resultado e de cada campo do
+    `contract`), para orientar o worker sem inflar o objetivo.
+    """
+    if not isinstance(parent_result, Mapping):
+        return {}
+    filled_fields = sorted(
+        key for key, value in parent_result.items() if value not in (None, "", [], {})
+    )
+    evidence_refs: list[dict[str, Any]] = []
+    top_evidence = parent_result.get("evidence")
+    if isinstance(top_evidence, (list, tuple)):
+        evidence_refs.extend(dict(e) for e in top_evidence if isinstance(e, Mapping))
+    contract = parent_result.get("contract")
+    if isinstance(contract, Mapping):
+        for field_value in contract.values():
+            if not isinstance(field_value, Mapping):
+                continue
+            for e in field_value.get("evidence_refs", ()) or ():
+                if isinstance(e, Mapping):
+                    evidence_refs.append(dict(e))
+    return {"filled_fields": filled_fields, "evidence_refs": evidence_refs}
+
+
 def create_continuation_tasks(
     store: "TaskStore",
     *,
@@ -1120,9 +1207,33 @@ def create_continuation_tasks(
     round_no: int,
     max_rounds: int | None = None,
     config: Mapping[str, Any] | None = None,
+    contract_state: Mapping[str, Any] | None = None,
+    parent_result: Mapping[str, Any] | None = None,
+    capability_context: Mapping[str, Any] | None = None,
     now: str | None = None,
 ) -> list[str]:
     """Cria a tarefa de continuação (kind=investigation) para leituras pendentes.
+
+    Onda11-T2a (achado BLOQUEANTE #2, 3ª auditoria externa): antes desta
+    mudança o objetivo gravado era o mínimo `{objective_id, continuation,
+    round, needs, parent_task_id}` — sem evidência resolvível por need, sem
+    o estado do contrato acumulado e sem o resultado da tarefa-mãe, então
+    `context.build_package` não achava trecho nenhum para citar (pacote com
+    0 `parts`) e o worker da continuação recomeçava do zero a cada rodada.
+    Agora o objetivo grava um pacote RICO:
+
+    * cada item de `needs` pode trazer `evidence` (um localizador ou uma
+      lista deles, `{path, line_start, line_end, snippet_hash?}` — também
+      aceita `start_line`/`end_line`, normalizado na gravação — ver
+      `_normalize_need_evidence`); é isso que `context.build_package` resolve
+      em `PackagePart`s reais quando `objective["continuation"]` é `True`;
+    * `contract_state`: os campos §6.3 acumulados até aqui, serializados como
+      vieram (este módulo não interpreta o formato, só persiste);
+    * `parent_result`: resumo do resultado aceito da tarefa-mãe — ver
+      `_summarize_parent_result` (campos preenchidos + evidence_refs, nunca o
+      resultado inteiro);
+    * `capability_context`: entradas/símbolos/módulos relevantes, como o
+      chamador os enviar.
 
     Recusa — devolve `[]`, NUNCA levanta e NUNCA cria tarefa — quando:
       * `needs` está vazio (nada concreto para investigar de novo);
@@ -1132,15 +1243,22 @@ def create_continuation_tasks(
         do teto, porque quem decide `round_no` é `task_round(parent) + 1`
         (monótono na cadeia de tarefas-mãe), não um contador externo.
 
-    `effect_identity` (via `create_task`) inclui objective_id, `round`,
-    `hash(needs)` e `input_versions` — chamar de novo com os MESMOS argumentos
-    devolve a MESMA tarefa (`Task.reused`) em vez de duplicar (§7.2).
+    `effect_identity` (via `create_task`, com `identity_objective`) continua
+    dependendo SÓ de `objective_id`, `continuation`, `round`, `needs` e
+    `parent_task_id` — exatamente o que já entrava antes desta mudança.
+    `contract_state`/`parent_result`/`capability_context` NUNCA entram no
+    hash: são conteúdo adicional para o pacote de contexto, não parte da
+    identidade do efeito. Chamar de novo com os MESMOS `needs` (mesmo que o
+    resumo do resultado-mãe tenha mudado de forma) devolve a MESMA tarefa
+    (`Task.reused`) em vez de duplicar (§7.2).
 
     `depends_on=[parent_task_id]`: a tarefa-mãe já terminou (é dela que veio
     o resultado `partial`), então a continuação nasce imediatamente elegível
     — `refresh_states` a promove a `ready` nesta mesma chamada.
     """
-    needs = [dict(n) for n in needs if isinstance(n, Mapping)]
+    needs = [
+        _normalize_need_evidence(n) for n in needs if isinstance(n, Mapping)
+    ]
     if not needs:
         return []
     round_no = int(round_no)
@@ -1148,13 +1266,22 @@ def create_continuation_tasks(
     if round_no > limit:
         return []
     moment = now or utc_now()
-    objective = {
+    # Subconjunto que determina a IDENTIDADE do efeito — idêntico ao objetivo
+    # inteiro de antes desta mudança (§7.2: conteúdo extra não pode mudar a
+    # identidade de uma continuação já criada).
+    identity_objective = {
         "objective_id": objective_id,
         "continuation": True,
         "round": round_no,
         "needs": needs,
         "parent_task_id": parent_task_id,
     }
+    objective = dict(identity_objective)
+    objective["contract_state"] = dict(contract_state) if isinstance(contract_state, Mapping) else {}
+    objective["parent_result"] = _summarize_parent_result(parent_result)
+    objective["capability_context"] = (
+        dict(capability_context) if isinstance(capability_context, Mapping) else {}
+    )
     cfg = dict(config or {})
     cfg.setdefault("continuation_needs_hash", _reading_needs_hash(needs))
     depends = (parent_task_id,) if parent_task_id else ()
@@ -1166,6 +1293,7 @@ def create_continuation_tasks(
         budget=budget,
         config=cfg,
         now=moment,
+        identity_objective=identity_objective,
     )
     store.refresh_states(moment)
     return [task.task_id]

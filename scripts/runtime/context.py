@@ -646,7 +646,7 @@ def _objective_envelope(objective_dict: Mapping[str, Any]) -> dict[str, Any]:
         "state": objective_dict.get("state"),
         "closure": objective_dict.get("closure"),
     }
-    return {
+    envelope: dict[str, Any] = {
         "kind": "objective",
         "ref_id": "objective",
         "objective_id": objective_dict.get("objective_id"),
@@ -658,6 +658,20 @@ def _objective_envelope(objective_dict: Mapping[str, Any]) -> dict[str, Any]:
         "schema": schema,
         "known_limits": known_limits,
     }
+    if objective_dict.get("continuation"):
+        # Onda11-T2a (achado BLOQUEANTE #2, 3ª auditoria): a continuação
+        # precisa do estado do contrato acumulado e de um resumo do que a
+        # tarefa-mãe já produziu — sem isso o worker da continuação recomeça
+        # do zero a cada rodada. Campos contam no teto F05 como o resto do
+        # payload (`serialized_bytes`/`_fit_to_budget`); não há tratamento
+        # especial de tamanho para eles.
+        envelope["continuation"] = True
+        envelope["round"] = objective_dict.get("round")
+        envelope["parent_task_id"] = objective_dict.get("parent_task_id")
+        envelope["contract_state"] = dict(objective_dict.get("contract_state") or {})
+        envelope["parent_result"] = dict(objective_dict.get("parent_result") or {})
+        envelope["capability_context"] = dict(objective_dict.get("capability_context") or {})
+    return envelope
 
 
 def _evidence_source_key(ev: Mapping[str, Any]) -> tuple[str, int, int] | None:
@@ -697,10 +711,13 @@ def build_package(
     `evidence_refs` do objetivo, `evidence_refs` de CADA campo do contrato
     (`identidade`/`gatilho`/`dependencias`/`lacunas`/`verificacao` etc.),
     `evidence` de cada `reading_need` ainda ABERTO (satisfeito/dispensado não
-    precisa de trecho novo), e a justificativa de cada célula da matriz
-    §6.5 marcada. Deduplicadas por `(path, start, end)` — múltiplas
-    referências para a MESMA faixa viram uma só `PackagePart` com vários
-    `refs`; faixas diferentes (mesmo com texto igual) NUNCA se fundem.
+    precisa de trecho novo), a justificativa de cada célula da matriz
+    §6.5 marcada e — quando `objective_dict["continuation"]` é `True`
+    (Onda11-T2a, objetivo gravado por `runtime.tasks.create_continuation_tasks`)
+    — `evidence` de CADA item de `objective_dict["needs"]`. Deduplicadas por
+    `(path, start, end)` — múltiplas referências para a MESMA faixa viram uma
+    só `PackagePart` com vários `refs`; faixas diferentes (mesmo com texto
+    igual) NUNCA se fundem.
     """
     objective_id = str(objective_dict.get("objective_id", ""))
     if not objective_id:
@@ -726,6 +743,48 @@ def build_package(
             sources.append(
                 {"ref_id": str(need.get("need_id")), "ev": ev, "kind": "reading_need", "need": need}
             )
+
+    # Onda11-T2a (achado BLOQUEANTE #2, 3ª auditoria) — objetivo de
+    # continuação (`objective_dict["continuation"] is True`, gravado por
+    # `runtime.tasks.create_continuation_tasks`): as partes citáveis vêm de
+    # `needs[].evidence` (uma lista de localizadores por need, já normalizada
+    # para `line_start`/`line_end` na gravação), NUNCA de `reading_needs`
+    # (formato de `analysis.investigation.ReadingNeed`, que a continuação não
+    # usa). Need sem NENHUM localizador ainda entra como fonte com `ev={}`:
+    # `_evidence_source_key({})` devolve `None`, e o laço abaixo já grava
+    # `unavailable_reason` no `ref` correspondente — diagnóstico no pacote,
+    # nunca ausência silenciosa (é exatamente o que este achado exige).
+    if objective_dict.get("continuation"):
+        for idx, need in enumerate(objective_dict.get("needs", ()) or ()):
+            if not isinstance(need, Mapping):
+                continue
+            need_ref = str(need.get("need_id") or need.get("target") or f"idx{idx}")
+            raw_evidence = need.get("evidence")
+            if isinstance(raw_evidence, Mapping):
+                evidence_list: list[Any] = [raw_evidence]
+            elif isinstance(raw_evidence, (list, tuple)):
+                evidence_list = list(raw_evidence)
+            else:
+                evidence_list = []
+            if not evidence_list:
+                sources.append(
+                    {
+                        "ref_id": f"continuation_need:{need_ref}:0",
+                        "ev": {},
+                        "kind": "continuation_need",
+                        "need": need,
+                    }
+                )
+                continue
+            for j, ev in enumerate(evidence_list):
+                sources.append(
+                    {
+                        "ref_id": f"continuation_need:{need_ref}:{j}",
+                        "ev": ev if isinstance(ev, Mapping) else {},
+                        "kind": "continuation_need",
+                        "need": need,
+                    }
+                )
 
     matrix = objective_dict.get("matrix") or {}
     for cell in matrix.get("cells", ()) or ():
@@ -791,7 +850,7 @@ def build_package(
             "path": ev.get("path"),
             "part_id": part_id,
         }
-        if src["kind"] == "reading_need":
+        if src["kind"] in ("reading_need", "continuation_need"):
             need = src["need"]
             entry.update(
                 {

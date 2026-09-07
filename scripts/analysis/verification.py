@@ -110,6 +110,7 @@ STATEMENT_FIELDS: frozenset[str] = frozenset(
 CHECK_NAMES: tuple[str, ...] = (
     "symbol_present",
     "predicate_polarity",
+    "complement_condition",
     "effect_present",
     "exception_present",
     "literal_preserved",
@@ -166,7 +167,10 @@ _CMP_ALIASES: dict[str, str] = {
     "not in": "not in",
 }
 
-#: Operador oposto — usado só para DESCREVER a divergência encontrada.
+#: Operador oposto (negação lógica: NOT(a op b) == a _OPPOSITE[op] b). Serve a
+#: dois papéis: DESCREVER a divergência encontrada quando é contradição real,
+#: e (Onda 11-T1) RECONHECER a condição COMPLEMENTAR exata de um `if` — mesmos
+#: operandos, operador negado — que não é contradição.
 _OPPOSITE: dict[str, str] = {
     "==": "!=",
     "!=": "==",
@@ -178,6 +182,21 @@ _OPPOSITE: dict[str, str] = {
     "is not": "is",
     "in": "not in",
     "not in": "in",
+}
+
+#: Comparador espelhado quando os operandos trocam de lado — MESMA comparação,
+#: não o oposto (`a > b` ≡ `b < a`; `a >= b` ≡ `b <= a`). Onda 11-T1: sem isto,
+#: um claim `total > 1000` sobre um trecho `1000 < total` não batia com
+#: nenhuma comparação extraída e caía em `inferred` por falta de checagem
+#: aplicável. Mesmo mapeamento que `knowledge.integrate._MIRROR_CMP`,
+#: reproduzido aqui porque este módulo não importa `knowledge.integrate`.
+_MIRROR_CMP: dict[str, str] = {
+    ">": "<",
+    "<": ">",
+    ">=": "<=",
+    "<=": ">=",
+    "==": "==",
+    "!=": "!=",
 }
 
 #: Helpers de teste que EXPRESSAM uma comparação. Sem isto, um claim sobre
@@ -720,10 +739,21 @@ class _Comparison:
     right: str
     negated: bool = False
     origin: str = "syntactic"
+    #: Texto REAL do trecho quando esta comparação é a forma espelhada
+    #: (operandos trocados) de uma comparação extraída — `None` na forma
+    #: original. Só existe para que a mensagem cite o que está de fato escrito
+    #: no trecho, nunca a forma reescrita (Onda 11-T1).
+    mirror_of: str | None = None
 
     def render(self) -> str:
         core = f"{self.left} {self.op} {self.right}"
         return f"not ({core})" if self.negated else core
+
+    @property
+    def display(self) -> str:
+        """Texto a citar em mensagens: o literal do trecho, mesmo quando o
+        casamento veio pela forma espelhada."""
+        return self.mirror_of if self.mirror_of is not None else self.render()
 
 
 def _src(node: ast.AST) -> str:
@@ -796,6 +826,29 @@ def _walk_comparisons(node: ast.AST, negated: bool, out: list[_Comparison]) -> N
                 out.append(_Comparison(_src(args[0]), op, _src(args[1]), negated))
     for child in ast.iter_child_nodes(node):
         _walk_comparisons(child, negated, out)
+
+
+def _mirror_comparison(c: _Comparison) -> _Comparison | None:
+    """A MESMA comparação vista com os operandos trocados, ou `None` quando o
+    operador não tem espelho definido (`is`/`in` não são de ordem)."""
+    mirrored_op = _MIRROR_CMP.get(c.op)
+    if mirrored_op is None:
+        return None
+    return _Comparison(
+        left=c.right, op=mirrored_op, right=c.left, negated=c.negated,
+        origin=c.origin, mirror_of=c.render(),
+    )
+
+
+def _with_mirrors(comparisons: Sequence[_Comparison]) -> list[_Comparison]:
+    """Comparações extraídas + suas formas espelhadas, para casamento de
+    predicado tolerante a operandos trocados (Onda 11-T1)."""
+    out = list(comparisons)
+    for c in comparisons:
+        mirrored = _mirror_comparison(c)
+        if mirrored is not None and mirrored not in out:
+            out.append(mirrored)
+    return out
 
 
 @dataclass(frozen=True)
@@ -1183,6 +1236,20 @@ def _check_predicate(claim: Claim, snippet: str, path: str, scope: str) -> Check
     É a checagem que fecha a regressão §15.2 nº1: claim `x > 0` com trecho
     `return x < 0` encontra a mesma dupla de operandos sob operador diferente e
     devolve `contradicted`, não silêncio.
+
+    Onda 11-T1, dois refinos sobre a mesma checagem:
+
+    1. Operandos trocados com operador espelhado (`a > b` ≡ `b < a`) são a
+       MESMA comparação, não uma ausência de casamento — ver `_with_mirrors`.
+    2. Quando nenhum candidato bate exatamente mas o trecho contém a condição
+       COMPLEMENTAR exata do afirmado (mesmos operandos, operador de negação
+       lógica de `_OPPOSITE`, mesmo valor), isso NÃO é contradição: é o outro
+       ramo do MESMO `if`. Devolve `complement_condition`, neutro
+       (`passed=None`), e deixa a sustentação para quem enxerga o ramo
+       (`knowledge.integrate._branch_association`, que já resolve
+       `complement`). Só a divergência REAL — mesmo operador com valor
+       diferente, ou operador oposto que não bate no valor — continua caindo
+       no `contradicted` abaixo.
     """
     comparator = _norm_comparator(claim.field("comparator"))
     condition = claim.field("condition")
@@ -1204,8 +1271,9 @@ def _check_predicate(claim: Claim, snippet: str, path: str, scope: str) -> Check
             resolution=resolution, scope_examined=scope,
         )
 
+    candidates = _with_mirrors(comparisons)
     left_matches = [
-        c for c in comparisons
+        c for c in candidates
         if (condition is not None and _operand_equal(c.left, str(condition)))
         or (condition is None and value is not None and _operand_equal(c.right, str(value)))
     ]
@@ -1224,11 +1292,35 @@ def _check_predicate(claim: Claim, snippet: str, path: str, scope: str) -> Check
         if op_ok and val_ok and pol_ok:
             return Check(
                 "predicate_polarity", True, True,
-                f"trecho contém `{c.render()}`, com a mesma polaridade do afirmado",
+                f"trecho contém `{c.display}`, com a mesma polaridade do afirmado",
                 resolution=resolution, scope_examined=scope,
             )
 
-    found = ", ".join(sorted({c.render() for c in left_matches}))
+    # Nenhum candidato bate exatamente. Antes de acusar contradição: é o
+    # caminho COMPLEMENTAR do mesmo `if` (mesmos operandos, operador negado,
+    # mesmo valor)? Só reconhecido quando o claim não afirma negação própria
+    # — combinar `negated` com complemento é ambiguidade que não afrouxamos.
+    if comparator is not None and value is not None and not negated_claim:
+        negated_op = _OPPOSITE.get(comparator)
+        complement_matches = [
+            c for c in left_matches
+            if c.op == negated_op and not c.negated and _operand_equal(c.right, str(value))
+        ]
+        if negated_op is not None and complement_matches:
+            c = complement_matches[0]
+            return Check(
+                "complement_condition", True, None,
+                detail=(
+                    f"trecho contém `{c.display}`, condição COMPLEMENTAR de "
+                    f"`{condition} {comparator} {value}` afirmado (mesmo valor, operador negado "
+                    f"{c.op!r} de {comparator!r}): não é contradição — é o outro ramo do mesmo "
+                    "`if`; sustentação depende de onde o efeito afirmado está (associação de "
+                    "ramo em knowledge.integrate)"
+                ),
+                resolution=resolution, scope_examined=scope,
+            )
+
+    found = ", ".join(sorted({c.display for c in left_matches}))
     asserted = f"{condition} {comparator or '?'} {value}".strip()
     if negated_claim:
         asserted = f"not ({asserted})"
@@ -1947,9 +2039,16 @@ def verification_summary(verdicts: Sequence[Verdict]) -> dict[str, Any]:
     counts = {status.value: 0 for status in EpistemicStatus}
     insufficient = 0
     mocked = 0
-    by_check: dict[str, dict[str, int]] = {
-        name: {"applicable": 0, "passed": 0, "failed": 0, "contradicted": 0} for name in CHECK_NAMES
-    }
+
+    def _row() -> dict[str, int]:
+        # `neutral` é o balde do `complement_condition` (Onda 11-T1):
+        # `applicable=True`, `passed=None`, `contradicted=False` — nem passou
+        # nem falhou, a resolução foi deferida para a associação de ramo do
+        # consumidor. Contá-lo como `failed` seria um falso-negativo no
+        # resumo; `neutral` mantém a distinção visível.
+        return {"applicable": 0, "passed": 0, "failed": 0, "contradicted": 0, "neutral": 0}
+
+    by_check: dict[str, dict[str, int]] = {name: _row() for name in CHECK_NAMES}
 
     for verdict in verdicts:
         counts[verdict.epistemic.value] += 1
@@ -1958,16 +2057,16 @@ def verification_summary(verdicts: Sequence[Verdict]) -> dict[str, Any]:
         if verdict.mocked:
             mocked += 1
         for check in verdict.checks:
-            row = by_check.setdefault(
-                check.name, {"applicable": 0, "passed": 0, "failed": 0, "contradicted": 0}
-            )
+            row = by_check.setdefault(check.name, _row())
             if not check.applicable:
                 continue
             row["applicable"] += 1
             if check.contradicted:
                 row["contradicted"] += 1
-            elif check.passed:
+            elif check.passed is True:
                 row["passed"] += 1
+            elif check.passed is None:
+                row["neutral"] += 1
             else:
                 row["failed"] += 1
 

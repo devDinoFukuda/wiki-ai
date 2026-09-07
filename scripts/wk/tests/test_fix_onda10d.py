@@ -434,57 +434,20 @@ def test_objetivo_fora_do_plano_corrente_e_recusado_com_motivo():
 
 # --------------------------------------------------------------------------
 # nº3 — a tarefa de continuação PRECISA ser executável pela engine local
+#
+# SUPERSEDIDO pela Onda11-T2b (achado BLOQUEANTE #2/3ª auditoria): a engine
+# `local` deixou de "executar" tarefas de continuação sem ler nada — agora
+# ela nunca CHEGA a receber uma, porque `_plan_continuation_round` passa
+# `engine_capabilities=executor.capabilities()` a
+# `coordinator.plan_continuations`, que recusa CRIAR a tarefa quando
+# `capabilities()["deepening"]` é `False` (o caso de `local`). Os três testes
+# que viviam aqui (`test_engine_local_despacha_objetivo_de_continuacao`,
+# `test_worker_local_de_continuacao_nao_fecha_leitura_nem_regride_contrato`,
+# `test_resultado_do_worker_de_continuacao_passa_no_schema_fechado`)
+# exercitavam `_local_continuation_worker`/`_LocalEngineEnvelope`, removidos
+# em `cli.py` (ver comentário acima de `_build_executor`) — os testes que
+# cobrem o comportamento novo estão em `test_fix_onda11_t2b.py`.
 # --------------------------------------------------------------------------
-
-
-def test_engine_local_despacha_objetivo_de_continuacao():
-    """`create_continuation_tasks` monta o objetivo sem `kind` (vocabulário do
-    plano, não do runtime) e `LocalThreadExecutor` escolhe o worker por ele.
-    Sem o envelope, toda continuação morria `blocked:transient` no submit."""
-    executor = cli._build_executor("local", {"obj_1": {"capability_id": "cap1", "contract": {}}})
-    try:
-        objetivo_continuacao = {
-            "objective_id": "obj_1",
-            "continuation": True,
-            "round": 1,
-            "needs": [{"need_id": "n1", "target": "app/a.py::f", "motivo": "x"}],
-            "parent_task_id": "task_mae",
-        }
-        execution_id = executor.submit("task_filha", objetivo_continuacao, [], {}, {})
-        assert isinstance(execution_id, str) and execution_id
-    finally:
-        executor.shutdown(wait=True)
-
-
-def test_worker_local_de_continuacao_nao_fecha_leitura_nem_regride_contrato():
-    """A engine local não lê nada: devolve o contrato que a extração estática já
-    estabeleceu (não regride o que foi gravado) e mantém as leituras ABERTAS."""
-    worker = cli._local_continuation_worker({"obj_1": {"capability_id": "cap1", "contract": {"identidade": {}}}})
-    out = worker(
-        objective={
-            "objective_id": "obj_1", "continuation": True, "round": 2,
-            "needs": [{"need_id": "n1", "target": "app/a.py::f", "motivo": "x"}],
-        },
-        references=[], schema={}, cancel_event=None,
-    )
-    assert out["objective_id"] == "obj_1"
-    assert out["capability_id"] == "cap1"
-    assert out["contract"] == {"identidade": {}}
-    assert out["state"] == "partial"
-    assert out["reading_needs"] == [{"need_id": "n1", "target": "app/a.py::f", "motivo": "x"}]
-    assert "reading_satisfied" not in out  # nunca declara ter lido
-
-
-def test_resultado_do_worker_de_continuacao_passa_no_schema_fechado():
-    """§13.1: o schema do coordenador é fechado — campo não declarado é recusa."""
-    from runtime.coordinator import DEFAULT_SCHEMA
-
-    worker = cli._local_continuation_worker({})
-    out = worker(
-        objective={"objective_id": "obj_1", "continuation": True, "round": 1, "needs": []},
-        references=[], schema={}, cancel_event=None,
-    )
-    assert DEFAULT_SCHEMA.validate(out) == []
 
 
 def test_dispatch_disponivel_le_o_bloqueio_ja_emitido():

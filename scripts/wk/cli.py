@@ -32,7 +32,6 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Mapping
 
 from . import __version__
 
@@ -5094,72 +5093,27 @@ def _local_structural_worker(*, objective, references, schema, cancel_event, **_
     }
 
 
-#: `kind` sintético das tarefas de CONTINUAÇÃO na engine `local`.
-#: `runtime.tasks.create_continuation_tasks` monta o objetivo da continuação
-#: com `{objective_id, continuation, round, needs, parent_task_id}` — sem
-#: `kind`, que é o vocabulário do PLANO (`capability`/`orphan_group`), não do
-#: runtime. `LocalThreadExecutor` escolhe o worker por `objective["kind"]`, e
-#: sem ele recusa o despacho ("submit falhou") e a continuação morre `blocked`
-#: sem nunca ter rodado. O `kind` é atribuído no envelope abaixo, na fronteira
-#: da engine local (que este arquivo é dono), nunca gravado na tarefa.
-_CONTINUATION_KIND = "continuation"
-
-
-def _local_continuation_worker(plan_objectives: dict):
-    """Worker local da tarefa de continuação (§7.3: NUNCA invoca LLM).
-
-    Devolve o MESMO resultado que `_local_structural_worker` daria para a
-    tarefa-mãe (o contrato pré-preenchido pela extração estática, buscado em
-    `plan_objectives` pelo `objective_id`), acrescido das `reading_needs` que
-    a continuação carrega. Duas consequências desejadas:
-
-    * reintegrar a continuação é idempotente — o payload descreve o mesmo
-      estado do código, então nenhum fato já gravado regride;
-    * as obrigações de leitura continuam ABERTAS e visíveis no resultado, que
-      é a verdade: uma engine sem leitura real não fecha leitura nenhuma. O
-      objetivo segue `partial`, e a rodada seguinte é decisão de quem opera
-      (`wk resume`), até o teto de `get_max_continuation_rounds`.
-    """
-
-    def _worker(*, objective, references, schema, cancel_event, **_extra):
-        obj = dict(objective)
-        oid = obj.get("objective_id")
-        base = dict(plan_objectives.get(str(oid or "")) or {})
-        needs = [dict(n) for n in (obj.get("needs") or ()) if isinstance(n, Mapping)]
-        return {
-            "objective_id": oid,
-            "capability_id": base.get("capability_id"),
-            "state": "partial",
-            "contract": base.get("contract"),
-            "reading_needs": needs,
-            "notes": list(base.get("notes") or []) + [
-                f"continuação (rodada {obj.get('round')}): engine local não realiza leitura "
-                f"adicional; {len(needs)} obrigação(ões) de leitura continuam abertas",
-            ],
-        }
-
-    return _worker
-
-
-class _LocalEngineEnvelope:
-    """Envelope do `LocalThreadExecutor` que dá `kind` ao objetivo de continuação.
-
-    Só a chamada de `submit` é envolvida — `capabilities`/`status`/`result`/
-    `cancel`/`shutdown` seguem para o executor real por `__getattr__`. O
-    objetivo é COPIADO antes de receber o `kind`: o que está gravado em
-    `runtime.db` continua sendo o que `create_continuation_tasks` escreveu.
-    """
-
-    def __init__(self, inner) -> None:
-        self._inner = inner
-
-    def __getattr__(self, name: str):
-        return getattr(self._inner, name)
-
-    def submit(self, task_id, objective, references=None, schema=None, policy=None):
-        if isinstance(objective, Mapping) and "kind" not in objective and objective.get("continuation"):
-            objective = {**dict(objective), "kind": _CONTINUATION_KIND}
-        return self._inner.submit(task_id, objective, references, schema, policy)
+#: Onda11-T2b (achado BLOQUEANTE #2/3ª auditoria externa, parte runtime) —
+#: `_local_continuation_worker`/`_LocalEngineEnvelope`/`_CONTINUATION_KIND`
+#: (introduzidos na onda 10, commit `e724553`) foram REMOVIDOS deste arquivo.
+#: Eles faziam a engine `local` "responder" a uma tarefa de continuação sem
+#: nunca ler código novo (a mesma limitação declarada em
+#: `_local_structural_worker` acima, só que para a continuação) — o que
+#: consumia uma rodada do teto de `get_max_continuation_rounds` por uma
+#: resposta que nunca fechava leitura nenhuma: exatamente o desperdício que
+#: este achado remove.
+#:
+#: A correção não é "não executar" — é não CRIAR a tarefa: `_plan_continuation_round`
+#: agora repassa `engine_capabilities=executor.capabilities()` a
+#: `coordinator.plan_continuations`, que recusa quando `capabilities()["deepening"]`
+#: é `False` (o caso de `LocalThreadExecutor`, ver `runtime/executors/local_thread.py`)
+#: ANTES de qualquer `round_no`/`task_round` ser lido — nenhuma rodada é
+#: consumida (ver `_continuation_cycle`). Com isso, uma tarefa de continuação
+#: (`objective["continuation"] is True`) nunca mais chega a
+#: `_build_executor("local", ...)`: o worker que a "executaria" sem ler nada
+#: deixou de ter para quem trabalhar. O código antigo sobrevive no histórico
+#: do git (commit `e724553` em diante); não foi movido para lugar nenhum
+#: porque não há mais chamador — reintroduzi-lo reabriria este achado.
 
 
 def _build_executor(engine_name: str, plan_objectives: dict | None = None):
@@ -5167,17 +5121,54 @@ def _build_executor(engine_name: str, plan_objectives: dict | None = None):
     fechado neste arquivo (§7.3: nenhuma engine real de LLM é invocada por
     `wk analyze`/`wk update`/`wk resume` — `claude-cli` só é usada quando o
     binário `claude` está de fato disponível, sondado por `ClaudeCliExecutor`
-    em `capabilities()`)."""
+    em `capabilities()`).
+
+    `plan_objectives` não é mais consultado aqui (Onda11-T2b: ver comentário
+    acima — a engine `local` só executa `capability`/`orphan_group`, que já
+    carregam o próprio `contract` no objetivo). O parâmetro sobrevive por
+    compatibilidade de assinatura com `_dispatch_objectives`/`_engine_capabilities`
+    e com os chamadores existentes (`cmd_analyze`/`cmd_update`/`cmd_resume`).
+    """
     from runtime.executors import get_executor
 
     if engine_name == "local":
         registry = {
             "capability": _local_structural_worker,
             "orphan_group": _local_structural_worker,
-            _CONTINUATION_KIND: _local_continuation_worker(dict(plan_objectives or {})),
         }
-        return _LocalEngineEnvelope(get_executor("local", registry=registry, max_workers=4))
+        return get_executor("local", registry=registry, max_workers=4)
     return get_executor(engine_name)
+
+
+def _engine_capabilities(engine_name: str, plan_objectives: dict | None = None) -> dict:
+    """`executor.capabilities()` desta engine, sem despachar nada.
+
+    Onda11-T2b (achado BLOQUEANTE #2/3ª auditoria): usada por
+    `_continuation_cycle`/`_plan_continuation_round` para decidir, ANTES de
+    criar qualquer tarefa de continuação, se a engine desta invocação
+    consegue aprofundar leitura (`capabilities()["deepening"]`) — a MESMA
+    engine que `_dispatch_objectives` usaria para executar, aqui só sondada.
+    Nenhum despacho acontece: `local` fecha o `ThreadPoolExecutor` ocioso
+    imediatamente (nenhuma thread chegou a ser criada — nenhuma tarefa foi
+    submetida); `claude-cli` só sonda o binário via `--version` dentro do seu
+    próprio `__init__` (`ClaudeCliExecutor._detect`), nunca invoca a engine de
+    verdade — a mesma garantia declarada em `_check_dispatch`/§7.3.
+
+    `engine_name` desconhecida devolve `{}` (`deepening` ausente ⇒
+    `coordinator.plan_continuations` trata como "sem capacidade" e recusa) em
+    vez de propagar `ValueError` aqui: quem relata erro de configuração de
+    engine para o operador é `_dispatch_objectives` (via `bloqueios`), não
+    este sondador auxiliar.
+    """
+    try:
+        executor = _build_executor(engine_name, plan_objectives)
+    except ValueError:
+        return {}
+    caps = executor.capabilities() if callable(getattr(executor, "capabilities", None)) else {}
+    shutdown = getattr(executor, "shutdown", None)
+    if callable(shutdown):
+        shutdown(wait=True)
+    return dict(caps)
 
 
 def _dispatch_objectives(store, engine_name: str, resolver=None, plan_objectives: dict | None = None) -> tuple[dict, list]:
@@ -5185,9 +5176,9 @@ def _dispatch_objectives(store, engine_name: str, resolver=None, plan_objectives
     senão registra o bloqueio de despacho UMA vez e devolve resultados vazios
     (§7.3: análise estrutural determinística nunca fica presa a isso).
 
-    `plan_objectives` (`objective_id -> objetivo do plano`) só serve à engine
-    `local`: é dele que o worker de continuação tira o contrato já estabelecido
-    pela extração estática.
+    `plan_objectives` (`objective_id -> objetivo do plano`) é repassado a
+    `_build_executor` por compatibilidade — a engine `local` não o consulta
+    mais (Onda11-T2b: ver comentário acima de `_build_executor`).
     """
     from runtime import coordinator as rt_coordinator
 
@@ -5723,7 +5714,7 @@ def _integrate_results(
 #: a saída não precisar distinguir "não planejei" de "planejei e não criei".
 _EMPTY_CONTINUACAO = {
     "round": 0, "round_historico": 0, "max_rounds": 0,
-    "criadas": [], "recusadas": [], "executadas": {},
+    "criadas": [], "recusadas": [], "executadas": {}, "motivo": None,
 }
 
 
@@ -5740,17 +5731,32 @@ def _dispatch_disponivel(bloqueios) -> bool:
     )
 
 
-def _unmet_needs_of(objective, outcome: dict) -> list:
+def _unmet_needs_of(objective, outcome: dict, reread_obligations=()) -> list:
     """Obrigações de leitura ABERTAS do objetivo, no formato de `plan_continuations`.
 
     Fonte: as `reading_needs` do objetivo do PLANO corrente (nunca do payload
     devolvido pelo worker — um worker não escolhe o que ainda precisa ler),
     menos as que ESTA integração fechou com evidência resolvida
-    (`leituras_satisfeitas` com `satisfeita=True`).
+    (`leituras_satisfeitas` com `satisfeita=True`) — mais as obrigações de
+    releitura da fonte primária que a VERIFICAÇÃO abriu para este objetivo
+    (`reread_obligations`, achado BLOQUEANTE #2/3ª auditoria/Onda11-T2b: um
+    veredito `disputed`/`unresolved` de `knowledge.integrate.reread_obligations`
+    antes só ficava no relatório — nunca virava pedido de leitura de verdade).
+
+    Onda11-T2a já resolve `needs[].evidence` em trecho de código real
+    (`runtime.tasks.create_continuation_tasks` + `runtime.context.build_package`);
+    a causa do achado NESTE arquivo era `_unmet_needs_of` descartar a evidência
+    ao serializar cada `ReadingNeed`/obrigação de releitura — corrigido aqui:
+    cada item carrega `evidence`, de `ReadingNeed.evidence.to_dict()`
+    (`{path, line_start, line_end, ...}`) para as necessidades do objetivo, e
+    de `reread_obligation["primary_source"]` (`{path, start_line, end_line}`,
+    já no formato que `runtime.tasks._normalize_locator` aceita) para as
+    releituras.
 
     Só entra necessidade com `target`: `plan_continuations` recusa objetivo
     `partial` sem alvo concreto, e criar tarefa para repetir o mesmo impasse
-    seria exatamente o laço que o achado nº3 pede para não existir.
+    seria exatamente o laço que o achado nº3 (2ª auditoria) pede para não
+    existir.
     """
     fechadas_ids = set()
     fechadas_targets = set()
@@ -5771,16 +5777,103 @@ def _unmet_needs_of(objective, outcome: dict) -> list:
         if not target or need_id in fechadas_ids or target in fechadas_targets:
             continue
         kind = getattr(need, "kind", None)
+        evidence_ref = getattr(need, "evidence", None)
+        to_dict = getattr(evidence_ref, "to_dict", None)
         needs.append({
             "need_id": need_id,
             "kind": getattr(kind, "value", kind) or "",
             "target": target,
             "motivo": str(getattr(need, "motivo", "") or ""),
+            "evidence": to_dict() if callable(to_dict) else None,
+        })
+
+    oid = str(getattr(objective, "objective_id", "") or outcome.get("objective_id") or "")
+    for ob in reread_obligations or ():
+        if not isinstance(ob, dict) or str(ob.get("objective_id") or "") != oid:
+            continue  # obrigação de releitura de OUTRO objetivo: não pertence a esta lista
+        primary = ob.get("primary_source")
+        if not isinstance(primary, dict) or not primary.get("path"):
+            continue  # sem fonte primária resolvida: nada citável, não vira need
+        claim_id = str(ob.get("claim_id") or "")
+        target = str(ob.get("statement") or claim_id)
+        if not target:
+            continue
+        needs.append({
+            "need_id": f"reread:{claim_id}" if claim_id else f"reread:{len(needs)}",
+            "kind": str(ob.get("kind") or "reread_primary_source"),
+            "target": target,
+            "motivo": (
+                "; ".join(str(t) for t in (ob.get("triggers") or ()))
+                or "releitura da fonte primária exigida pela verificação"
+            ),
+            "evidence": {
+                "path": primary.get("path"),
+                "line_start": primary.get("start_line"),
+                "line_end": primary.get("end_line"),
+            },
         })
     return needs
 
 
-def _plan_continuation_round(store, report: dict, objectives_by_id: dict, input_versions_by_objective: dict) -> dict:
+def _contract_state_of(objective) -> dict:
+    """Campos do §6.3 já PREENCHIDOS (`status == "filled"`) do objetivo do
+    plano corrente — vira `objective["contract_state"]` da continuação
+    (Onda11-T2b, achado BLOQUEANTE #2/3ª auditoria) para que o worker da
+    rodada seguinte não repita pergunta sobre o que já foi explicado.
+
+    Lido do objetivo do PLANO (o mesmo que `_unmet_needs_of` usa), não do
+    payload bruto do worker: é o objetivo quem aplica a regra de
+    preenchimento do §6.3 (`ContractField.fill`/`exclude`/`unresolve`); o
+    resultado do worker é só o que alimentou essa aplicação em
+    `knowledge.integrate._write_objective` (que este arquivo não importa).
+    Só os campos `filled` entram — `pending`/`unresolved`/`excluded` não são
+    "estado já preenchido" (achado #3, `unmet_obligations`, continua sendo
+    quem decide o que falta).
+    """
+    contract = getattr(objective, "contract", None) or {}
+    out: dict = {}
+    for name, fld in contract.items():
+        status = getattr(getattr(fld, "status", None), "value", None)
+        if status != "filled":
+            continue
+        to_dict = getattr(fld, "to_dict", None)
+        out[name] = to_dict() if callable(to_dict) else {"status": status}
+    return out
+
+
+def _capability_context_of(objective) -> dict:
+    """Entradas/símbolos/módulos da capacidade — `objective["capability_context"]`
+    da continuação (Onda11-T2b, achado BLOQUEANTE #2/3ª auditoria): o
+    suficiente para o worker da rodada seguinte re-situar a capacidade sem
+    precisar do plano inteiro de novo. `modules` vem dos `path` já resolvidos
+    em `objective.evidence_refs` — o objetivo não guarda uma lista de módulos
+    à parte, e inventar uma aqui duplicaria (e poderia divergir de)
+    `_objective_touched_paths`.
+    """
+    entry_keys = list(getattr(objective, "entry_keys", ()) or ())
+    symbols = list(getattr(objective, "symbols", ()) or ())
+    modules = sorted({
+        str(getattr(ev, "path", "") or "")
+        for ev in (getattr(objective, "evidence_refs", ()) or ())
+        if getattr(ev, "path", "")
+    })
+    return {
+        "capability_id": str(getattr(objective, "capability_id", "") or ""),
+        "entry_keys": entry_keys,
+        "symbols": symbols,
+        "modules": modules,
+    }
+
+
+def _plan_continuation_round(
+    store,
+    report: dict,
+    objectives_by_id: dict,
+    input_versions_by_objective: dict,
+    *,
+    engine_capabilities: dict | None = None,
+    engine_name: str = "local",
+) -> dict:
     """Uma rodada de `coordinator.plan_continuations` sobre o relatório recém-gerado.
 
     Chamada UMA VEZ POR OBJETIVO de propósito: `input_versions` é por escopo
@@ -5788,11 +5881,30 @@ def _plan_continuation_round(store, report: dict, objectives_by_id: dict, input_
     continuação nascer com entradas que não são as da tarefa-mãe — a
     integração seguinte a descartaria por `input_versions_hash` divergente
     (achado nº5) e a continuação nunca fecharia nada.
+
+    `engine_capabilities` (Onda11-T2b, achado BLOQUEANTE #2/3ª auditoria):
+    repassado a `coordinator.plan_continuations` — que recusa CRIAR a tarefa
+    (não só executá-la) quando `capabilities()["deepening"]` é `False`, ANTES
+    de ler `round_no`/`task_round`, então nenhuma rodada é consumida (ver
+    `coordinator.plan_continuations`). `None` (default, usado pelos testes
+    que não passam engine nenhuma) preserva o comportamento anterior a esta
+    onda — a mesma compatibilidade que `plan_continuations` já documenta.
+    `contract_state`/`parent_result`/`capability_context` também são
+    montados aqui por objetivo (nunca em lote): são conteúdo do PACOTE da
+    continuação (`runtime.context.build_package`), não da identidade do
+    efeito, mas cada objetivo tem o seu próprio (§7.2 — `create_task` só
+    dedupe pela identidade; o conteúdo extra é livre por chamada). O
+    `parent_result` não é sobrescrito aqui: a chave fica ausente no `outcome`
+    passado adiante, e `plan_continuations` já usa o resultado ACEITO da
+    própria tarefa-mãe (`parent.result`, lido de `runtime.db` pelo
+    `task_id` do outcome) como default — reescrevê-lo aqui seria a mesma
+    leitura duas vezes sem nenhum ganho.
     """
     from runtime import coordinator as rt_coordinator
     from runtime import tasks as rt_tasks
 
     max_rounds = rt_tasks.get_max_continuation_rounds(store)
+    reread = report.get("reread_obligations") or ()
     criadas: list = []
     recusadas: list = []
     round_historico = 0
@@ -5811,13 +5923,27 @@ def _plan_continuation_round(store, report: dict, objectives_by_id: dict, input_
             continue
         plano = rt_coordinator.plan_continuations(
             store,
-            [{**outcome, "unmet_needs": _unmet_needs_of(objective, outcome)}],
+            [{
+                **outcome,
+                "unmet_needs": _unmet_needs_of(objective, outcome, reread),
+                "contract_state": _contract_state_of(objective),
+                "capability_context": _capability_context_of(objective),
+            }],
             input_versions=inputs,
             budget=_DEFAULT_TASK_BUDGET,
             max_rounds=max_rounds,
+            engine_capabilities=engine_capabilities,
         )
         criadas.extend(plano.get("criadas") or ())
-        recusadas.extend(plano.get("recusadas") or ())
+        for recusada in plano.get("recusadas") or ():
+            # A recusa por falta de `deepening` é decidida ANTES do laço por
+            # objetivo em `plan_continuations` (§ ver docstring de lá) e por
+            # isso sai sem `objective_id` — anexado aqui para que
+            # `continuacao.recusadas` no JSON continue rastreável por
+            # objetivo, igual às demais recusas desta função.
+            recusadas.append(
+                recusada if "objective_id" in recusada else {**recusada, "objective_id": oid}
+            )
         round_historico = max(round_historico, rt_tasks.continuation_rounds(store, oid))
 
     # `round` é a rodada CRIADA AGORA (lida da própria tarefa), não a maior já
@@ -5831,14 +5957,29 @@ def _plan_continuation_round(store, report: dict, objectives_by_id: dict, input_
             rounds_criados.append(rt_tasks.task_round(store.get(task_id)))
         except Exception:
             continue
-    return {
+    resultado = {
         "round": max(rounds_criados, default=0),
         "round_historico": round_historico,
         "max_rounds": max_rounds,
         "criadas": criadas,
         "recusadas": recusadas,
         "executadas": dict(_EMPTY_RESULTADOS),
+        "motivo": None,
     }
+    # Onda11-T2b: quando TODA recusa desta rodada veio da falta de
+    # `deepening` (não de outro motivo, ex.: objetivo fora do plano), o JSON
+    # ganha um `motivo` de topo — resumo único e acionável, em vez de o
+    # operador ter que ler `recusadas[*].motivo` item a item para perceber
+    # que o problema é sempre o mesmo (a engine desta invocação não lê
+    # código). `_proximo_passo_continuacao` usa esta chave para orientar o
+    # comando exato.
+    if recusadas and all("deepening=False" in str(r.get("motivo") or "") for r in recusadas):
+        resultado["motivo"] = (
+            f"engine {engine_name!r} não aprofunda leitura (capabilities()['deepening'] "
+            "é False); nenhuma continuação foi criada — use --engine claude-cli para "
+            "leitura adicional real"
+        )
+    return resultado
 
 
 def _continuation_cycle(
@@ -5872,14 +6013,28 @@ def _continuation_cycle(
       as executa é o `wk resume` seguinte, com a engine configurada. Criar a
       tarefa mesmo sem poder executá-la é deliberado: é ela que carrega, no
       banco, QUAIS leituras faltam.
+    * engine sem `deepening` (Onda11-T2b, achado BLOQUEANTE #2/3ª auditoria)
+      — NENHUMA tarefa é criada (`_plan_continuation_round` recusa antes de
+      qualquer leitura de rodada): uma engine que não lê código novo (ex.:
+      `local`) não tem o que fazer com uma continuação, e criar a tarefa
+      mesmo assim só gastaria uma rodada do teto por uma resposta que nunca
+      fecha leitura nenhuma — o desperdício que este achado remove.
     """
-    continuacao = _plan_continuation_round(store, report, objectives_by_id, inputs_by_objective)
+    plan_objectives = {oid: o.to_dict() for oid, o in objectives_by_id.items()}
+    # Sondada ANTES de planejar (não só antes de despachar): é esta mesma
+    # engine que `_plan_continuation_round` repassa a
+    # `coordinator.plan_continuations` para decidir se vale a pena CRIAR a
+    # tarefa — nunca só se vale a pena executá-la.
+    engine_caps = _engine_capabilities(engine_name, plan_objectives)
+    continuacao = _plan_continuation_round(
+        store, report, objectives_by_id, inputs_by_objective,
+        engine_capabilities=engine_caps, engine_name=engine_name,
+    )
     if not continuacao["criadas"] or not _dispatch_disponivel(bloqueios):
         return continuacao, None
 
     continuacao["executadas"], bloqueios_cont = _dispatch_objectives(
-        store, engine_name, resolver=resolver,
-        plan_objectives={oid: o.to_dict() for oid, o in objectives_by_id.items()},
+        store, engine_name, resolver=resolver, plan_objectives=plan_objectives,
     )
     if bloqueios_cont:
         continuacao["bloqueios"] = bloqueios_cont
@@ -5893,6 +6048,18 @@ def _continuation_cycle(
 def _proximo_passo_continuacao(repo_abs: str, continuacao: dict, bloqueios) -> str | None:
     """Frase de `proximo_passo` quando a continuação depende do operador."""
     criadas = len(continuacao.get("criadas") or ())
+    motivo = continuacao.get("motivo")
+    if motivo:
+        # Onda11-T2b (achado BLOQUEANTE #2/3ª auditoria): engine sem
+        # `deepening` — nenhuma tarefa foi criada (`criadas` é sempre vazio
+        # aqui), e o comando exato para desbloquear é trocar de engine, não
+        # `wk resume` na mesma engine (que recusaria de novo, sem consumir
+        # rodada, mas também sem progresso).
+        return (
+            f"{motivo}; rode `wk analyze`/`wk update`/`wk resume --repo {repo_abs} "
+            "--engine claude-cli` (com o binário `claude` configurado) para que a "
+            "continuação seja criada e executada"
+        )
     if criadas and not _dispatch_disponivel(bloqueios):
         return (
             f"{criadas} tarefa(s) de continuação (rodada {continuacao.get('round')}) ficaram "
@@ -6781,6 +6948,40 @@ _INGEST2_PROFILE_FILE = "profile.json"
 #: (§8.1). Sobrescrevível por `--namespace`.
 _INGEST2_DEFAULT_NAMESPACE = "wiki"
 
+#: Padrão do mangling de path do MSYS2/Git Bash (achado D5, validação README
+#: Onda 11): o shell reescreve um argumento com cara de caminho absoluto
+#: (`code/C:/Users/...`) para o prefixo de instalação do Git, produzindo algo
+#: como `code\C;C:\Program Files\Git\Users\...`. Sem barreira, isso vira
+#: silenciosamente um namespace ERRADO gravado no knowledge.db.
+_MSYS_MANGLING_RE = re.compile(r"program\s*files[\\/]+git", re.IGNORECASE)
+
+
+def _validate_namespace(ns: str) -> dict | None:
+    """`None` quando `ns` é um namespace válido; senão um diagnóstico
+    `{causa, correcao}` pronto para virar a saída de erro do comando
+    (achado D5). Não reescreve nem tenta "consertar" o valor — só barra
+    antes de `correlate()`/`migrate()` gravarem o namespace corrompido.
+
+    Namespace legítimo com barras normais (`code/C:/tmp/x`, `wiki`) passa
+    inalterado; o que muda de comportamento é só o resultado da corrupção
+    do shell: backslash, `;` ou o padrão de instalação do Git Bash."""
+    motivos = []
+    if "\\" in ns:
+        motivos.append("contém `\\`")
+    if ";" in ns:
+        motivos.append("contém `;`")
+    if "\n" in ns:
+        motivos.append("contém quebra de linha")
+    if _MSYS_MANGLING_RE.search(ns):
+        motivos.append("contém o padrão de mangling do MSYS (`Program Files/Git`)")
+    if not motivos:
+        return None
+    return {
+        "causa": "namespace corrompido pelo shell (conversão de caminho do Git Bash)",
+        "correcao": "use MSYS2_ARG_CONV_EXCL='*' antes do comando, ou aspas simples",
+        "detalhe": f"namespace {ns!r}: " + "; ".join(motivos),
+    }
+
 
 def _ingest2_profile_path(store_root: str) -> str:
     return os.path.join(store_root, _INGEST2_SUBDIR, _INGEST2_PROFILE_FILE)
@@ -6902,6 +7103,13 @@ def cmd_ingest(a) -> int:
         return 2
 
     namespace = a.namespace or _INGEST2_DEFAULT_NAMESPACE
+    ns_erro = _validate_namespace(namespace)
+    if ns_erro:
+        print(json.dumps({
+            "error": f"namespace inválido: {namespace!r}",
+            **ns_erro,
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
     profile = _load_ingest2_profile(store_root)
 
     try:
@@ -6927,6 +7135,7 @@ def cmd_ingest(a) -> int:
     fail_count = 0
     pending_count = 0
     incompletas_count = 0
+    duplicadas_count = 0
 
     repo = Repository.open(_knowledge_db_path(store_root))
     try:
@@ -7001,6 +7210,15 @@ def cmd_ingest(a) -> int:
             entry["correlacionadas"] = len(result.facts_written) + len(result.relations_written)
             if result.duplicate:
                 entry["duplicada"] = True
+                # Achado D8 (validação README Onda 11): o curto-circuito por
+                # `svid` (`correlate` §8.2.1) devolve `completa=True`/
+                # `referencias_orfas=()` de DEFAULT — nunca reexecuta a
+                # correlação desta fonte. Sem este campo aditivo, `entry`
+                # pareceria uma avaliação NOVA (0 incompletas), mascarando
+                # pendências (ex.: referência órfã RN-023) da ingestão
+                # original que continuam abertas.
+                entry["correlacao_reavaliada"] = False
+                duplicadas_count += 1
             if result.orphans:
                 entry["orfaos"] = len(result.orphans)
 
@@ -7064,6 +7282,14 @@ def cmd_ingest(a) -> int:
             f"{incompletas_count} fonte(s) correlacionada(s) de forma INCOMPLETA (referência "
             "explícita sem entidade correspondente); ver 'fontes[].referencias_orfas' — o "
             "status_geral desta execução é no mínimo `parcial` (achado nº4)"
+        )
+    if duplicadas_count:
+        # Achado D8: aviso literal para não ler `fontes_incompletas: 0`/
+        # `status_geral: "completo"` desta execução como "nada pendente" —
+        # a reingestão idêntica não reavaliou nada, só confirmou o hash.
+        avisos.append(
+            "reingestao identica: correlacao nao reexecutada; pendencias anteriores "
+            "(referencias orfas/decisoes) permanecem — consulte wk status"
         )
 
     # W8-T8.2: publica de verdade (markdown+word+manifest.json em
@@ -7140,6 +7366,13 @@ def cmd_migrate(a) -> int:
         return 2
 
     namespace = a.namespace or _INGEST2_DEFAULT_NAMESPACE
+    ns_erro = _validate_namespace(namespace)
+    if ns_erro:
+        print(json.dumps({
+            "error": f"namespace inválido: {namespace!r}",
+            **ns_erro,
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
     backup_dir = a.backup_dir
     if not backup_dir:
         parent = os.path.join(store_root, _MIGRATE_BACKUP_SUBDIR)

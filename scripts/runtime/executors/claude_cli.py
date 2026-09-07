@@ -215,6 +215,11 @@ class ClaudeCliExecutor(BaseExecutor):
                 "structured_output": False,
                 "telemetry": False,
                 "reason": self._detect_reason,
+                # Onda11-T2a: sem despacho não há aprofundamento possível —
+                # `plan_continuations` já recusaria por `dispatch: False`
+                # antes de chegar a olhar `deepening`, mas a chave fica
+                # explícita (nunca ausente) para quem só olha capabilities().
+                "deepening": False,
             }
         return {
             "dispatch": True,
@@ -223,6 +228,11 @@ class ClaudeCliExecutor(BaseExecutor):
             "tools": [],
             "structured_output": True,
             "telemetry": False,
+            # Onda11-T2a (achado BLOQUEANTE #2, 3ª auditoria, parte runtime):
+            # binário detectado e funcional (F07 `_detect`) — a engine LÊ o
+            # prompt+evidências enviados e pode aprofundar investigação numa
+            # continuação, ao contrário de `LocalThreadExecutor`.
+            "deepening": True,
         }
 
     # -- submit ------------------------------------------------------------------

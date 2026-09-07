@@ -524,9 +524,28 @@ def plan_continuations(
     input_versions: Mapping[str, Any],
     budget: Mapping[str, Any] | None = None,
     max_rounds: int | None = None,
+    engine_capabilities: Mapping[str, Any] | None = None,
     now: str | None = None,
 ) -> dict[str, list[Any]]:
     """Cria tarefas de continuação para objetivos `partial` com pendência concreta.
+
+    `engine_capabilities` (Onda11-T2a, achado BLOQUEANTE #2 da 3ª auditoria,
+    parte runtime): o `capabilities()` da engine que EXECUTARIA a
+    continuação, quando quem planeja já o tem em mãos (ex.:
+    `executor.capabilities()` do laço de `run()`). Quando informado e a
+    chave `deepening` é `False` (ou ausente — tratado como sem capacidade),
+    NENHUMA tarefa é criada: engine sem capacidade de aprofundamento (ex.:
+    `LocalThreadExecutor`, que só roda callables determinísticos já
+    registrados — nunca lê código novo) consumiria uma rodada de
+    continuação sem poder investigar coisa alguma, e a rodada é justamente o
+    recurso escasso que a trava de `round_no > max_rounds` protege. A recusa
+    acontece ANTES de qualquer leitura de `round_no`/`task_round` — nenhuma
+    tarefa nasce, nenhum contador de rodada avança
+    (`T.continuation_rounds` fica inalterado, porque nada foi inserido em
+    `tasks`). `engine_capabilities=None` (default) preserva o comportamento
+    anterior a esta mudança — quem chama sem informar a capacidade da engine
+    continua podendo planejar continuações (compatibilidade com chamadores
+    existentes, ex. `wk.cli._plan_continuation_round`).
 
     `integration_outcomes` é o resumo por objetivo — o formato serializado do
     `IntegrationReport` de `knowledge.integrate`, recebido aqui como `dict`
@@ -553,6 +572,19 @@ def plan_continuations(
     por teto de rodada excedido: essas são recusas registradas, não erros do
     laço (§7.4 "mecanismo interno, nunca laço infinito").
     """
+    if engine_capabilities is not None and not dict(engine_capabilities).get("deepening", False):
+        return {
+            "criadas": [],
+            "recusadas": [
+                {
+                    "motivo": (
+                        "engine sem capacidade de aprofundamento (deepening=False); "
+                        "continuações exigem engine com leitura (ex.: claude-cli)"
+                    )
+                }
+            ],
+        }
+
     criadas: list[str] = []
     recusadas: list[dict[str, str]] = []
     for raw_outcome in integration_outcomes:
@@ -614,6 +646,12 @@ def plan_continuations(
             )
             continue
 
+        # Onda11-T2a: `parent_result` vem do resultado ACEITO da tarefa-mãe
+        # (já carregado acima), a menos que o outcome traga um resumo
+        # próprio — `contract_state`/`capability_context` só existem quando
+        # quem monta o outcome (ex.: `knowledge.integrate`) os inclui;
+        # ausência é `None`, e `create_continuation_tasks` trata `None` como
+        # "nada a acrescentar" (nunca falha por ausência).
         task_ids = T.create_continuation_tasks(
             store,
             parent_task_id=parent_task_id,
@@ -623,6 +661,9 @@ def plan_continuations(
             budget=budget,
             round_no=round_no,
             max_rounds=max_rounds,
+            contract_state=outcome.get("contract_state"),
+            parent_result=outcome.get("parent_result", parent.result),
+            capability_context=outcome.get("capability_context"),
             now=now,
         )
         if task_ids:

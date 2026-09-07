@@ -11,7 +11,8 @@ from pathlib import Path
 from analysis.verification import (
     verify_claim, Claim, ClaimEvidence, detect_mocks, check_consistency,
     apply_inconsistencies, reread_obligations, verification_summary,
-    VerificationError, SUPPORT_RECORDER, extract_comparisons, extract_effects
+    VerificationError, SUPPORT_RECORDER, extract_comparisons, extract_effects,
+    check_support,
 )
 from analysis.snapshot import capture
 from knowledge.models import ContentKind, EpistemicStatus, SourceKind
@@ -360,6 +361,115 @@ def test_process(mock_service):
         self.assertEqual(verdict.epistemic, EpistemicStatus.UNRESOLVED)
         self.assertTrue(verdict.insufficient)
 
+    def test_mirror_claim_ends_supported(self):
+        """Onda 11-T1, refino 1, fim-a-fim — ACEITE nº1: claim `total > 1000`
+        sobre `if 1000 < total: raise Conflict(409)` (operandos trocados,
+        operador espelhado) → SUPPORTED via verify_claim direto."""
+        mirror_file = self.repo / "billing.py"
+        mirror_file.write_text(
+            "def process(total):\n"
+            "    if 1000 < total:\n"
+            "        raise Conflict(409)\n"
+            "    return total\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "billing"],
+            cwd=self.repo, check=True, capture_output=True,
+        )
+        snapshot = capture(str(self.repo))
+
+        claim = Claim(
+            claim_id="mirror_e2e_001",
+            subject="total",
+            predicate_kind="behavior",
+            statement_fields={
+                "condition": "total",
+                "comparator": ">",
+                "value": "1000",
+                "exception": "Conflict",
+            },
+            evidence_refs=[
+                ClaimEvidence(
+                    path="billing.py",
+                    start_line=2,
+                    end_line=3,
+                    content_kind=ContentKind.EXECUTABLE,
+                )
+            ],
+            asserted_by="external_reviewer",
+        )
+
+        verdict = verify_claim(claim, snapshot)
+
+        self.assertEqual(verdict.epistemic, EpistemicStatus.SUPPORTED)
+        predicate = next(c for c in verdict.checks if c.name == "predicate_polarity")
+        self.assertTrue(predicate.passed)
+        self.assertFalse(predicate.contradicted)
+
+    def test_complement_claim_ends_supported_via_integrate(self):
+        """Onda 11-T1, refino 2, fim-a-fim — ACEITE nº2: claim
+        `total <= 1000 -> retorna 200` sobre
+        `if total > 1000: raise Conflict(409)` + fallthrough `return 200`.
+
+        `verify_claim` (aqui) não pode mais marcar `disputed` por polaridade —
+        o trecho contém a condição COMPLEMENTAR exata do afirmado, não o
+        oposto com valor divergente. A associação de ramo de
+        `knowledge.integrate` (já resolve `complement`; não tocada por esta
+        tarefa) confirma o veredito final `SUPPORTED`.
+        """
+        billing_file = self.repo / "billing.py"
+        billing_file.write_text(
+            "def process(total):\n"
+            "    if total > 1000:\n"
+            "        raise Conflict(409)\n"
+            "    return 200\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "billing"],
+            cwd=self.repo, check=True, capture_output=True,
+        )
+        snapshot = capture(str(self.repo))
+
+        claim = Claim(
+            claim_id="complement_e2e_001",
+            subject="total",
+            predicate_kind="behavior",
+            statement="Quando total <= 1000, retorna 200",
+            statement_fields={
+                "condition": "total",
+                "comparator": "<=",
+                "value": "1000",
+                "effect": "return 200",
+            },
+            evidence_refs=[
+                ClaimEvidence(
+                    path="billing.py",
+                    start_line=1,
+                    end_line=4,
+                    content_kind=ContentKind.EXECUTABLE,
+                )
+            ],
+            asserted_by="external_reviewer",
+        )
+
+        verdict = verify_claim(claim, snapshot)
+
+        # Refino 2: nada de "operador OPOSTO" derrubando o veredito aqui.
+        self.assertNotEqual(verdict.epistemic, EpistemicStatus.DISPUTED)
+        complement_checks = [c for c in verdict.checks if c.name == "complement_condition"]
+        self.assertEqual(len(complement_checks), 1)
+        self.assertFalse(complement_checks[0].contradicted)
+        self.assertIsNone(complement_checks[0].passed)
+
+        # Fim-a-fim: a associação de ramo do knowledge.integrate confirma —
+        # ela só rebaixa ou mantém, nunca promove por si.
+        from knowledge.integrate import _consequence_guard
+
+        adjusted, _escopo = _consequence_guard(claim, verdict)
+        self.assertEqual(adjusted.epistemic, EpistemicStatus.SUPPORTED)
+
     def test_mock_with_test_predicate_returns_supported(self):
         """Cenário 5a: Mock + predicate_kind=test → SUPPORTED test_expectation mocked=True."""
         claim = Claim(
@@ -463,6 +573,138 @@ def test_process(mock_service):
 
         # Arquivo alterado deve resultar em UNRESOLVED
         self.assertEqual(verdict.epistemic, EpistemicStatus.UNRESOLVED)
+
+
+class TestMirroredPredicate(unittest.TestCase):
+    """Onda 11-T1, refino 1: operandos trocados com operador espelhado são a
+    MESMA comparação (`a > b` ≡ `b < a`), não ausência de casamento."""
+
+    def test_check_support_recognizes_mirrored_comparison(self):
+        """Claim `total > 1000` sobre `if 1000 < total: raise Conflict(409)`:
+        predicate_polarity passa (não fica cego à comparação espelhada)."""
+        claim = Claim(
+            claim_id="mirror_001",
+            subject="total",
+            predicate_kind="behavior",
+            statement_fields={
+                "condition": "total",
+                "comparator": ">",
+                "value": "1000",
+                "exception": "Conflict",
+            },
+        )
+        snippet = "if 1000 < total:\n    raise Conflict(409)\n"
+
+        result = check_support(claim, snippet)
+
+        predicate = next(c for c in result.checks if c.name == "predicate_polarity")
+        self.assertTrue(predicate.passed)
+        self.assertFalse(predicate.contradicted)
+        self.assertEqual(result.outcome, "supported")
+
+    def test_mirror_does_not_hide_true_inversion(self):
+        """Inversão VERDADEIRA apresentada com operandos trocados continua
+        `contradicted` — o espelho não é licença geral (§15.2 nº1 intacto).
+
+        `total > 1000` é o afirmado; o trecho `1000 > total` é a forma
+        espelhada de `total < 1000`, o OPOSTO do afirmado, não o mesmo.
+        """
+        claim = Claim(
+            claim_id="mirror_002",
+            subject="total",
+            predicate_kind="behavior",
+            statement_fields={
+                "condition": "total",
+                "comparator": ">",
+                "value": "1000",
+            },
+        )
+        snippet = "if 1000 > total:\n    return total\n"
+
+        result = check_support(claim, snippet)
+
+        predicate = next(c for c in result.checks if c.name == "predicate_polarity")
+        self.assertTrue(predicate.contradicted)
+        self.assertEqual(result.outcome, "contradicted")
+
+
+class TestComplementCondition(unittest.TestCase):
+    """Onda 11-T1, refino 2: condição COMPLEMENTAR de um `if` não é
+    contradição — é o outro ramo do MESMO `if`."""
+
+    def test_complement_condition_is_neutral_not_contradicted(self):
+        """Claim `total <= 1000 -> return 200` sobre
+        `if total > 1000: raise Conflict(409)` + fallthrough `return 200`: a
+        checagem de predicado vira `complement_condition` neutra
+        (`passed=None`, `contradicted=False`), e `effect_present` (return 200
+        está mesmo no trecho) ainda sustenta — outcome `supported`, nunca
+        `contradicted` por "operador OPOSTO"."""
+        claim = Claim(
+            claim_id="complement_001",
+            subject="total",
+            predicate_kind="behavior",
+            statement_fields={
+                "condition": "total",
+                "comparator": "<=",
+                "value": "1000",
+                "effect": "return 200",
+            },
+        )
+        snippet = "if total > 1000:\n    raise Conflict(409)\nreturn 200\n"
+
+        result = check_support(claim, snippet)
+
+        names = [c.name for c in result.checks]
+        self.assertNotIn("predicate_polarity", names)
+        complement = next(c for c in result.checks if c.name == "complement_condition")
+        self.assertIsNone(complement.passed)
+        self.assertFalse(complement.contradicted)
+        self.assertEqual(result.outcome, "supported")
+        self.assertEqual(result.divergences, ())
+
+    def test_same_operator_different_value_still_contradicted(self):
+        """Não afrouxar: mesmo operador (`>`), valor DIVERGENTE (1000 vs
+        5000) continua contradição real, não complemento."""
+        claim = Claim(
+            claim_id="complement_002",
+            subject="total",
+            predicate_kind="behavior",
+            statement_fields={
+                "condition": "total",
+                "comparator": ">",
+                "value": "1000",
+                "exception": "Conflict",
+            },
+        )
+        snippet = "if total > 5000:\n    raise Conflict(409)\n"
+
+        result = check_support(claim, snippet)
+
+        predicate = next(c for c in result.checks if c.name == "predicate_polarity")
+        self.assertTrue(predicate.contradicted)
+        self.assertEqual(result.outcome, "contradicted")
+
+    def test_opposite_operator_different_value_still_contradicted(self):
+        """Não afrouxar: operador OPOSTO com valor DIFERENTE do afirmado
+        (não é a mesma condição complementar) continua contradição real."""
+        claim = Claim(
+            claim_id="complement_003",
+            subject="total",
+            predicate_kind="behavior",
+            statement_fields={
+                "condition": "total",
+                "comparator": "<=",
+                "value": "1000",
+                "effect": "return 200",
+            },
+        )
+        snippet = "if total > 5000:\n    raise Conflict(409)\nreturn 200\n"
+
+        result = check_support(claim, snippet)
+
+        predicate = next(c for c in result.checks if c.name == "predicate_polarity")
+        self.assertTrue(predicate.contradicted)
+        self.assertEqual(result.outcome, "contradicted")
 
 
 if __name__ == "__main__":

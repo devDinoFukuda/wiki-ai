@@ -61,6 +61,13 @@ class LocalThreadExecutor(BaseExecutor):
             "tools": sorted(self._registry.keys()),
             "structured_output": True,
             "telemetry": True,
+            # Onda11-T2a (achado BLOQUEANTE #2, 3ª auditoria, parte runtime):
+            # este executor roda callables Python DETERMINÍSTICOS já
+            # registrados — não lê código novo, não aprofunda investigação.
+            # `coordinator.plan_continuations` usa esta chave para recusar
+            # continuações em vez de gastar uma rodada com uma engine que não
+            # pode ler evidência nova.
+            "deepening": False,
         }
 
     # -- submit ----------------------------------------------------------------
