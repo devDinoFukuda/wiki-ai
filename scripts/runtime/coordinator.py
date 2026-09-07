@@ -118,6 +118,28 @@ CONTROL_FIELDS = frozenset(
 )
 
 
+#: Onda10-C — campos de DADOS (não controle) que descrevem investigação
+#: parcial: leituras que o worker precisaria para fechar o objetivo
+#: (`reading_needs`) e leituras que ele já conseguiu satisfazer nesta rodada
+#: (`reading_satisfied`). Validação aqui é ESTRUTURAL (lista de objetos com
+#: chaves string) — o conteúdo de cada item é dado de domínio de
+#: `analysis`/`knowledge`, não deste módulo.
+READING_LIST_FIELDS = ("reading_needs", "reading_satisfied")
+
+
+def _invalid_reading_list(name: str, value: Any) -> str | None:
+    """`None` quando `value` é uma lista de objetos com chaves string; senão o motivo."""
+    if not isinstance(value, list):
+        return f"{name} deve ser uma lista; veio {type(value).__name__}"
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            return f"{name}[{index}] deve ser um objeto; veio {type(item).__name__}"
+        for key in item:
+            if not isinstance(key, str):
+                return f"{name}[{index}] tem chave não textual: {key!r}"
+    return None
+
+
 @dataclass(frozen=True)
 class ResultSchema:
     """Schema FECHADO de saída (§13.1): o que não está declarado não entra.
@@ -136,6 +158,13 @@ class ResultSchema:
         "gaps",
         "matrix",
         "notes",
+        # Onda10-C (achado #3, 2ª auditoria externa): DADOS de leitura pendente
+        # e leitura satisfeita, não CONTROLE. O worker pode devolvê-los junto
+        # do resultado sem que o schema fechado os trate como campo inesperado
+        # — quem decide o que fazer com eles é `coordinator.plan_continuations`,
+        # nunca o próprio worker (isso continua vedado pelos CONTROL_FIELDS).
+        "reading_needs",
+        "reading_satisfied",
         "relations",
         "state",
         "unresolved",
@@ -198,6 +227,11 @@ class ResultSchema:
                         f"tipo inválido em {name}: {type(output[name]).__name__}",
                     )
                 )
+        for name in READING_LIST_FIELDS:
+            if name in output:
+                detail = _invalid_reading_list(name, output[name])
+                if detail is not None:
+                    problems.append((RejectionReason.SCHEMA_INVALID, detail))
         return problems
 
 
@@ -476,6 +510,128 @@ def plan_from_objectives(
         remaining = deferred
     store.refresh_states(moment)
     return created
+
+
+# --------------------------------------------------------------------------
+# Continuação de investigação parcial (Onda10-C, achado #3 da 2ª auditoria)
+# --------------------------------------------------------------------------
+
+
+def plan_continuations(
+    store: T.TaskStore,
+    integration_outcomes: Iterable[Mapping[str, Any]],
+    *,
+    input_versions: Mapping[str, Any],
+    budget: Mapping[str, Any] | None = None,
+    max_rounds: int | None = None,
+    now: str | None = None,
+) -> dict[str, list[Any]]:
+    """Cria tarefas de continuação para objetivos `partial` com pendência concreta.
+
+    `integration_outcomes` é o resumo por objetivo — o formato serializado do
+    `IntegrationReport` de `knowledge.integrate`, recebido aqui como `dict`
+    (nunca a classe: este módulo não importa `knowledge`). Cada item esperado:
+
+        {"objective_id": ..., "task_id": ..., "state": "partial"|"complete"|"blocked",
+         "unmet_needs": [{"kind":..., "target":..., "motivo":...}, ...]}
+
+    Regra de geração (§13.1/§7.2, achado #3):
+      * `complete` — objetivo fechado, nada a continuar.
+      * `blocked`  — já é estado terminal; continuação não destrava bloqueio.
+      * `partial`  — só gera tarefa quando existe ao menos uma `unmet_needs`
+        com `target` resolvível (string não vazia). Objetivo `partial` sem
+        need concreta é recusado (nada para investigar de novo) em vez de
+        criar uma tarefa que repetiria o mesmo impasse.
+
+    `round_no` de cada continuação vem de `T.task_round(tarefa_mãe) + 1`: é
+    por isso que chamar `plan_continuations` de novo com o MESMO outcome
+    NUNCA duplica — a tarefa-mãe não mudou, então o round pedido é o mesmo, e
+    `effect_identity` faz `create_task` devolver a tarefa já existente.
+
+    Devolve `{"criadas": [task_id, ...], "recusadas": [{"objective_id",
+    "motivo"}, ...]}` — nunca levanta por objetivo individual malformado ou
+    por teto de rodada excedido: essas são recusas registradas, não erros do
+    laço (§7.4 "mecanismo interno, nunca laço infinito").
+    """
+    criadas: list[str] = []
+    recusadas: list[dict[str, str]] = []
+    for raw_outcome in integration_outcomes:
+        outcome = dict(raw_outcome) if isinstance(raw_outcome, Mapping) else {}
+        objective_id = str(outcome.get("objective_id") or "")
+        state = str(outcome.get("state") or "").strip().lower()
+
+        if state != "partial":
+            continue  # complete/blocked: nunca geram continuação
+
+        parent_task_id = str(outcome.get("task_id") or "")
+        if not objective_id or not parent_task_id:
+            recusadas.append(
+                {
+                    "objective_id": objective_id,
+                    "motivo": "outcome sem objective_id/task_id da tarefa que o produziu",
+                }
+            )
+            continue
+
+        raw_needs = outcome.get("unmet_needs")
+        if raw_needs is None:
+            raw_needs = outcome.get("needs") or []
+        needs = [
+            dict(n)
+            for n in raw_needs
+            if isinstance(n, Mapping) and str(n.get("target") or "").strip()
+        ]
+        if not needs:
+            recusadas.append(
+                {
+                    "objective_id": objective_id,
+                    "motivo": "partial sem nenhuma unmet_needs com target resolvível",
+                }
+            )
+            continue
+
+        try:
+            parent = store.get(parent_task_id)
+        except T.UnknownTask:
+            recusadas.append(
+                {
+                    "objective_id": objective_id,
+                    "motivo": f"tarefa {parent_task_id!r} não existe em runtime.db",
+                }
+            )
+            continue
+
+        round_no = T.task_round(parent) + 1
+        limit = (
+            T.get_max_continuation_rounds(store) if max_rounds is None else max(0, int(max_rounds))
+        )
+        if round_no > limit:
+            recusadas.append(
+                {
+                    "objective_id": objective_id,
+                    "motivo": f"round {round_no} excede o máximo de {limit} rodadas de continuação",
+                }
+            )
+            continue
+
+        task_ids = T.create_continuation_tasks(
+            store,
+            parent_task_id=parent_task_id,
+            objective_id=objective_id,
+            needs=needs,
+            input_versions=input_versions,
+            budget=budget,
+            round_no=round_no,
+            max_rounds=max_rounds,
+            now=now,
+        )
+        if task_ids:
+            criadas.extend(task_ids)
+        else:  # defensivo: teto/needs já checados acima, mas nunca confiar 2x
+            recusadas.append(
+                {"objective_id": objective_id, "motivo": "create_continuation_tasks recusou"}
+            )
+    return {"criadas": criadas, "recusadas": recusadas}
 
 
 # --------------------------------------------------------------------------
@@ -958,7 +1114,9 @@ __all__ = [
     "ResultSchema",
     "RunReport",
     "SUCCESS_STATES",
+    "READING_LIST_FIELDS",
     "accept_result",
+    "plan_continuations",
     "plan_from_objectives",
     "run",
 ]

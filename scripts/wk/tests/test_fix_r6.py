@@ -63,6 +63,41 @@ def test_status_geral_erro_material_sai_dois():
     assert cli._status_geral(erro_material=True, revisao_nova=True) == ("bloqueado", 2)
 
 
+# -- Onda10-D: a tabela-verdade ganhou UMA linha (achado nº4 da 2ª auditoria) --
+#
+# `fontes_incompletas` é o `CorrelationResult.completa is False` do `wk ingest`
+# (hoje: referência explícita a um id de padrão conhecido que não resolveu nem
+# por `stable_key` nem por alias). Antes desta onda, uma fonte com órfão
+# técnico e sem nenhuma outra pendência saía `completo`/exit 0 — a leitura
+# exatamente errada, porque a aresta que dependeria daquela referência não
+# nasceu. As demais linhas da tabela seguem idênticas: nada aqui torna a
+# incompletude um ERRO (exit 2), porque a fonte É aceita e o lote não trava.
+
+
+def test_status_geral_parcial_com_fonte_incompleta():
+    assert cli._status_geral(fontes_incompletas=1, revisao_nova=True) == ("parcial", 0)
+
+
+def test_status_geral_fonte_incompleta_nunca_sai_completo():
+    """Órfão técnico rebaixa `completo` para `parcial` mesmo sem mais nada aberto."""
+    assert cli._status_geral(
+        objetivos_por_estado={"complete": 3, "partial": 0, "blocked": 0},
+        decisoes_pendentes=0,
+        bloqueios_execucao=0,
+        fontes_incompletas=1,
+        revisao_nova=True,
+    ) == ("parcial", 0)
+
+
+def test_status_geral_sem_fonte_incompleta_continua_completo():
+    """A linha nova não sequestra o caso feliz: zero incompletas segue `completo`."""
+    assert cli._status_geral(
+        objetivos_por_estado={"complete": 3, "partial": 0, "blocked": 0},
+        fontes_incompletas=0,
+        revisao_nova=True,
+    ) == ("completo", 0)
+
+
 # --------------------------------------------------------------------------
 # nº6 — IntegrationReport -> investigation_states / resumo
 # --------------------------------------------------------------------------
@@ -133,6 +168,10 @@ def test_integration_summary_conta_estados_fatos_e_lacunas():
     assert resumo["fatos"] == {"supported": 1, "disputed": 1, "unresolved": 2}
     assert resumo["lacunas_totais"] == 1
     assert resumo["reread_obligations"] == 1
+    # Onda10-D: as chaves novas existem mesmo quando o relatório não as traz —
+    # quem lê a saída não precisa distinguir "campo ausente" de "zero".
+    assert resumo["descartados"] == {"total": 0, "motivos": []}
+    assert resumo["rejeitados"] == {"total": 0, "itens": []}
 
 
 def test_integration_summary_de_relatorio_vazio_nao_explode():

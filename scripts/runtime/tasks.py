@@ -986,6 +986,191 @@ class TaskStore:
         ]
 
 
+# --------------------------------------------------------------------------
+# Continuação de investigação parcial (Onda10-C, achado #3 da 2ª auditoria)
+# --------------------------------------------------------------------------
+#
+# Um resultado `partial` (worker devolveu `reading_needs`/`state=partial` em
+# vez de fechar o objetivo) não pode gerar retentativa da MESMA tarefa: a
+# tarefa já terminou com um resultado aceito (`done`), e §7.2 proíbe reabrir
+# tarefa concluída. O que existe em vez disso é uma NOVA tarefa de
+# investigação — a "continuação" — que herda o objetivo original acrescido
+# das leituras pendentes e de um número de rodada.
+#
+# A chave contra laço infinito é dupla: (1) `round_no` cresce a partir da
+# própria tarefa-mãe (`task_round(parent) + 1`), então repetir a mesma
+# chamada para a mesma tarefa-mãe sempre pede a MESMA rodada — e
+# `effect_identity` (que inclui objective_id+round+hash(needs)+input_versions)
+# faz `create_task` devolver a tarefa já existente em vez de duplicar
+# trabalho; (2) `round_no > max_rounds` é recusa peremptória, sem exceção.
+
+#: Chave usada na tabela `policies` (PK livre, sem CHECK) para persistir o
+#: teto de rodadas de continuação. Não colide com nenhum `ErrorClass` de
+#: `recovery.py` (todos em minúsculas com nomes de classe de erro).
+CONTINUATION_ROUNDS_POLICY_KEY = "runtime:continuation_max_rounds"
+
+#: Default do plano: no máximo 3 rodadas de continuação por objetivo antes de
+#: exigir decisão humana (o objetivo fica `partial` sem nova tarefa).
+DEFAULT_MAX_CONTINUATION_ROUNDS = 3
+
+
+def get_max_continuation_rounds(store: "TaskStore", *, default: int = DEFAULT_MAX_CONTINUATION_ROUNDS) -> int:
+    """Teto de rodadas de continuação persistido em `policies`, ou `default`.
+
+    Leitura pura (não semeia a tabela): ausência de linha é "usar o default",
+    igual a como `load_policies` trata classes de erro ausentes antes de
+    escrever — aqui não escrevemos até alguém chamar `set_max_continuation_rounds`.
+    """
+    row = store.conn.execute(
+        "SELECT policy_json FROM policies WHERE error_class=?",
+        (CONTINUATION_ROUNDS_POLICY_KEY,),
+    ).fetchone()
+    if row is None:
+        return default
+    try:
+        data = json.loads(row["policy_json"])
+        return max(0, int(data.get("max_rounds", default)))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+
+
+def set_max_continuation_rounds(
+    store: "TaskStore", max_rounds: int, *, now: str | None = None
+) -> int:
+    """Persiste o teto de rodadas de continuação. Devolve o valor efetivamente gravado."""
+    value = max(0, int(max_rounds))
+    moment = now or utc_now()
+    with store.immediate() as conn:
+        conn.execute(
+            "INSERT INTO policies(error_class, policy_json, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(error_class) DO UPDATE SET policy_json=excluded.policy_json, "
+            "updated_at=excluded.updated_at",
+            (
+                CONTINUATION_ROUNDS_POLICY_KEY,
+                canonical_json({"max_rounds": value}),
+                moment,
+            ),
+        )
+    return value
+
+
+def task_round(task: "Task") -> int:
+    """Rodada de continuação da PRÓPRIA tarefa: 0 se não é uma continuação.
+
+    Lida com o objetivo já carregado em `Task.objective` — nunca reabre o
+    banco. Uma tarefa original (planejada por `plan_from_objectives`) não tem
+    `continuation`/`round` no objetivo, então vale 0; a próxima continuação
+    dela é `task_round(parent) + 1 == 1`.
+    """
+    objective = task.objective if isinstance(task.objective, Mapping) else {}
+    if not objective.get("continuation"):
+        return 0
+    try:
+        return max(0, int(objective.get("round", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def continuation_rounds(store: "TaskStore", objective_id: str) -> int:
+    """Maior rodada de continuação já criada para `objective_id` (0 se nenhuma).
+
+    Uso: quem planeja quer saber "em que rodada este objetivo está" sem
+    precisar rastrear task_ids manualmente. Varredura em Python (não JSON1):
+    `runtime.db` é o grafo operacional de uma auditoria, não uma tabela de
+    fatos de grande volume — o custo de desserializar `objective_json` aqui é
+    aceitável e evita depender de extensão SQLite opcional.
+    """
+    best = 0
+    rows = store.conn.execute(
+        "SELECT objective_json FROM tasks WHERE kind=?",
+        (TaskKind.INVESTIGATION.value,),
+    )
+    for row in rows:
+        try:
+            objective = json.loads(row["objective_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(objective, dict):
+            continue
+        if not objective.get("continuation"):
+            continue
+        if str(objective.get("objective_id") or "") != objective_id:
+            continue
+        try:
+            round_no = int(objective.get("round", 0))
+        except (TypeError, ValueError):
+            continue
+        if round_no > best:
+            best = round_no
+    return best
+
+
+def _reading_needs_hash(needs: Sequence[Mapping[str, Any]]) -> str:
+    return sha256_hex(canonical_json([dict(n) for n in needs]))
+
+
+def create_continuation_tasks(
+    store: "TaskStore",
+    *,
+    parent_task_id: str,
+    objective_id: str,
+    needs: Sequence[Mapping[str, Any]],
+    input_versions: Mapping[str, Any],
+    budget: Mapping[str, Any] | None = None,
+    round_no: int,
+    max_rounds: int | None = None,
+    config: Mapping[str, Any] | None = None,
+    now: str | None = None,
+) -> list[str]:
+    """Cria a tarefa de continuação (kind=investigation) para leituras pendentes.
+
+    Recusa — devolve `[]`, NUNCA levanta e NUNCA cria tarefa — quando:
+      * `needs` está vazio (nada concreto para investigar de novo);
+      * `round_no` excede o teto (`max_rounds`, ou o persistido em `policies`
+        via `get_max_continuation_rounds` quando `max_rounds` é `None`). Esta
+        é a trava contra laço infinito: nenhuma quantidade de chamadas passa
+        do teto, porque quem decide `round_no` é `task_round(parent) + 1`
+        (monótono na cadeia de tarefas-mãe), não um contador externo.
+
+    `effect_identity` (via `create_task`) inclui objective_id, `round`,
+    `hash(needs)` e `input_versions` — chamar de novo com os MESMOS argumentos
+    devolve a MESMA tarefa (`Task.reused`) em vez de duplicar (§7.2).
+
+    `depends_on=[parent_task_id]`: a tarefa-mãe já terminou (é dela que veio
+    o resultado `partial`), então a continuação nasce imediatamente elegível
+    — `refresh_states` a promove a `ready` nesta mesma chamada.
+    """
+    needs = [dict(n) for n in needs if isinstance(n, Mapping)]
+    if not needs:
+        return []
+    round_no = int(round_no)
+    limit = get_max_continuation_rounds(store) if max_rounds is None else max(0, int(max_rounds))
+    if round_no > limit:
+        return []
+    moment = now or utc_now()
+    objective = {
+        "objective_id": objective_id,
+        "continuation": True,
+        "round": round_no,
+        "needs": needs,
+        "parent_task_id": parent_task_id,
+    }
+    cfg = dict(config or {})
+    cfg.setdefault("continuation_needs_hash", _reading_needs_hash(needs))
+    depends = (parent_task_id,) if parent_task_id else ()
+    task = store.create_task(
+        TaskKind.INVESTIGATION,
+        objective,
+        input_versions,
+        depends_on=depends,
+        budget=budget,
+        config=cfg,
+        now=moment,
+    )
+    store.refresh_states(moment)
+    return [task.task_id]
+
+
 def _attempt(row: sqlite3.Row) -> Attempt:
     return Attempt(
         task_id=row["task_id"],
@@ -1003,7 +1188,9 @@ def _attempt(row: sqlite3.Row) -> Attempt:
 __all__ = [
     "AttemptOutcome",
     "Attempt",
+    "CONTINUATION_ROUNDS_POLICY_KEY",
     "DDL",
+    "DEFAULT_MAX_CONTINUATION_ROUNDS",
     "EffectState",
     "InvalidTransition",
     "Lease",
@@ -1022,10 +1209,15 @@ __all__ = [
     "apply_schema",
     "canonical_json",
     "connect",
+    "continuation_rounds",
+    "create_continuation_tasks",
     "effect_identity",
+    "get_max_continuation_rounds",
     "input_versions_hash",
     "new_id",
+    "set_max_continuation_rounds",
     "sha256_hex",
     "shift",
+    "task_round",
     "utc_now",
 ]

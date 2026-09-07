@@ -326,6 +326,20 @@ class CorrelationResult:
     affected_units: tuple[str, ...] = ()
     effects: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    #: Achado #4 (2ª auditoria externa): id explícito de padrão técnico/negócio
+    #: conhecido (`ExplicitId.entity_type is not None`) que NENHUMA camada de
+    #: `_resolve_explicit_ids` resolveu — nem stable_key literal, nem alias.
+    #: Formato ESTÁVEL e literal (contrato do achado): ``{"id": ..., "blocos": (...)}}``.
+    #: Ao contrário de `orphans` (prosa sem id), aqui alguém CITOU um id que
+    #: deveria existir e não foi encontrado: a diferença é material o bastante
+    #: para nunca ficar só num diagnóstico de texto (ver `completa`).
+    referencias_orfas: tuple[Mapping[str, Any], ...] = ()
+    #: `False` sempre que `referencias_orfas` não é vazio (ou `error` setado).
+    #: É o requisito do achado #4: a fonte é aceita e o lote não trava
+    #: (`referencias_orfas` não impede a revisão), mas o resultado nunca pode
+    #: ser lido como "completo" com uma referência técnica órfã dentro dele.
+    completa: bool = True
+    motivo_incompleta: str = ""
     error: str | None = None
 
     @property
@@ -341,7 +355,8 @@ class CorrelationResult:
         return (
             f"entidades={len(self.entities_touched)} fatos={len(self.facts_written)} "
             f"arestas={len(self.relations_written)} candidatas={len(self.candidate_relations)} "
-            f"orfaos={len(self.orphans)} pendencias={len(self.pending_decisions)}"
+            f"orfaos={len(self.orphans)} pendencias={len(self.pending_decisions)} "
+            f"referencias_orfas={len(self.referencias_orfas)} completa={self.completa}"
         )
 
 
@@ -692,6 +707,52 @@ def _entity_lifecycle(entity_type: EntityType, candidates: Sequence[Candidate]) 
     return LifecycleStatus.CURRENT
 
 
+def _resolve_by_alias(repo: Any, ns: str, etype: EntityType, value: str) -> str | None:
+    """Camada (b) de `_resolve_explicit_ids` — achado #4, 2ª auditoria externa.
+
+    A camada (a) (`identity.resolve_identity` por `stable_key` literal) nunca
+    casa quando a entidade tem `stable_key` COMPOSTO — o caso real do achado:
+    uma `BusinessRule` do analisador de código nasce com algo como
+    ``businessrule:<capability_id>:rn-023``, e o refinamento que cita
+    ``RN-023`` em prosa ficava órfão mesmo com a regra já existindo no MESMO
+    namespace. Nenhuma resolução por semelhança entra aqui — é exatamente o
+    tipo de fusão por score que §8.2.7 proíbe; o que muda é só o CANAL de
+    identidade (stable_key vs. alias), nunca o critério.
+
+    `knowledge.identity.find_by_alias` é quem sabe procurar por alias — outro
+    agente está adicionando essa função e o registro do alias na criação da
+    entidade técnica, em paralelo a esta remediação (mesmo arquivo,
+    `scripts/knowledge/identity.py`, fora do escopo desta função). Import
+    tardio/`getattr` de propósito: enquanto a função não existir nesta
+    instalação — ou se aparecer com assinatura diferente da esperada
+    (`(conn, namespace, id_explicito) -> str | None`) — esta camada é PULADA
+    sem levantar; a referência cai para a camada (c) e vira órfã como antes.
+    Nunca quebra a ingestão por causa de um vizinho ainda em construção.
+    """
+    finder = getattr(identity, "find_by_alias", None)
+    if finder is None:
+        return None
+    try:
+        try:
+            # Assinatura esperada hoje (`scripts/knowledge/identity.py`):
+            # `find_by_alias(target, namespace, alias, entity_type=None)`.
+            found = finder(repo.conn, ns, value, entity_type=etype)
+        except TypeError:
+            # Assinatura sem `entity_type` (versão anterior/futura do vizinho):
+            # chama só o essencial e confere o tipo manualmente abaixo.
+            found = finder(repo.conn, ns, value)
+    except Exception:  # inclui IdentityConflict (alias ambíguo): pula, não derruba
+        return None
+    if not found:
+        return None
+    # Nunca cruza tipo (nem namespace: `ns` já é argumento da própria busca).
+    # Um alias que aponte para uma entidade de outro tipo não é usado — a
+    # fusão por semelhança de texto continua proibida mesmo vindo por alias.
+    if repo.entity_type_of(found) is not etype:
+        return None
+    return found
+
+
 def _resolve_explicit_ids(
     rev: Any,
     repo: Any,
@@ -726,9 +787,24 @@ def _resolve_explicit_ids(
             )
             continue
 
+        # (a) stable_key literal — como sempre foi.
         existing = identity.resolve_identity(repo.conn, ns, etype, identifier.value)
+        via_alias = False
+        if not existing:
+            # (b) NOVO (achado #4): alias registrado pelo analisador, quando a
+            # função do vizinho já existir. Ordem determinística: só tentada
+            # depois de (a) falhar, e nunca decide por semelhança de texto.
+            existing = _resolve_by_alias(repo, ns, etype, identifier.value)
+            via_alias = existing is not None
+
         if existing:
-            resolved[identifier.value] = ResolvedRef(identifier, existing, etype, False, "id explícito")
+            reason = (
+                "id explícito"
+                if not via_alias
+                else "resolvido por alias (knowledge.identity.find_by_alias): "
+                "stable_key da entidade diverge do id citado (achado #4, 2ª auditoria)"
+            )
+            resolved[identifier.value] = ResolvedRef(identifier, existing, etype, False, reason)
             touched.append(existing)
             if create and etype in CREATABLE_TYPES:
                 _refresh_lineage(rev, repo, ns, existing, svid, evidence_by_id.get(identifier.value, ()))
@@ -978,6 +1054,52 @@ def _affected_units(repo: Any, touched: Iterable[str]) -> tuple[str, ...]:
 # --------------------------------------------------------------------------
 
 
+def _orphan_blocks(value: str, candidates: Sequence[Candidate]) -> tuple[str, ...]:
+    """Blocos (na ordem de aparição, sem repetir) que citam o id `value`.
+
+    É o que dá corpo a `referencias_orfas` além do id isolado: sem o bloco, a
+    pendência gerada por `_pending_orphan_decision` não teria onde apontar
+    quem decide a resolução para conferir a citação original.
+    """
+    return tuple(
+        dict.fromkeys(
+            c.primary_block.block_id
+            for c in candidates
+            if any(i.value == value for i in c.explicit_ids)
+        )
+    )
+
+
+def _pending_orphan_decision(referencias_orfas: Sequence[Mapping[str, Any]]) -> PendingDecision | None:
+    """Pendência material do achado #4 (2ª auditoria externa).
+
+    Uma referência explícita a um id de padrão técnico/negócio conhecido
+    (prefixo em `extract.ID_PREFIX_TYPES`) que nenhuma camada resolveu muda um
+    vínculo material só de existir — a aresta que dependeria dela (ex.:
+    `proposes_change_to`) simplesmente não é criada. Por isso ela usa o MESMO
+    mecanismo de `_pending_initiative_decision`: pede UMA decisão humana e não
+    trava o lote (aceite W5) — a fonte é preservada, só não pode ser lida como
+    `completa` enquanto a referência ficar solta.
+    """
+    if not referencias_orfas:
+        return None
+    ids = tuple(sorted(str(o["id"]) for o in referencias_orfas))
+    return PendingDecision(
+        key="referencia_orfa",
+        question=(
+            "A qual entidade cada referência explícita abaixo corresponde? Ela não "
+            "resolveu por stable_key nem por alias registrado — nenhuma aresta que "
+            "dependeria dela (ex.: proposes_change_to) foi criada (§8.2.3, achado #4/"
+            "2ª auditoria externa)."
+        ),
+        options=ids,
+        material_effect=(
+            f"{len(ids)} referência(s) explícita(s) sem entidade correspondente: "
+            "vínculo(s) que dependeriam dela(s) ficam de fora até a decisão"
+        ),
+    )
+
+
 def _pending_initiative_decision(
     initiative_key: str | None,
     intent_entities: Sequence[str],
@@ -1208,6 +1330,27 @@ def correlate(
         result.initiative_key = initiative_key
         result.initiative_id = initiative_id
 
+        # ---------------------------- achado #4 (2ª auditoria): órfãos técnicos
+        # `resolved` está completo aqui (identificadores dos blocos + o extra da
+        # iniciativa). Um id de padrão conhecido (`entity_type is not None`) que
+        # nenhuma camada de `_resolve_explicit_ids` resolveu é referência ÓRFÃ —
+        # nunca um resultado silenciosamente "completo" (ver `completa` abaixo).
+        referencias_orfas = tuple(
+            {"id": r.identifier.value, "blocos": _orphan_blocks(r.identifier.value, all_candidates)}
+            for r in resolved.values()
+            if not r.resolved and r.entity_type is not None
+        )
+        result.referencias_orfas = referencias_orfas
+        result.completa = not referencias_orfas
+        if referencias_orfas:
+            ids_txt = ", ".join(str(o["id"]) for o in referencias_orfas)
+            result.motivo_incompleta = (
+                f"referência(s) explícita(s) não resolvida(s) por stable_key nem alias: "
+                f"{ids_txt} (achado #4, 2ª auditoria externa) — fonte aceita, lote não "
+                "travado, mas o resultado não é `completa` (pendência registrada)"
+            )
+            diagnostics.append(result.motivo_incompleta)
+
         # --------------------------------------------- sujeito do documento
         subject_ref = _document_subject(resolved, doc)
 
@@ -1335,7 +1478,14 @@ def correlate(
             result.orphans,
             [s.entity_title for s in suggestions if s.entity_type is EntityType.INITIATIVE],
         )
-        result.pending_decisions = (pending,) if pending else ()
+        pending_list: list[PendingDecision] = [pending] if pending else []
+        # Mesmo mecanismo de `_pending_initiative_decision`: referência técnica
+        # órfã (achado #4) também é decisão que MUDARIA um vínculo material, e
+        # também não trava o lote (aceite W5) — só vira pendência.
+        orphan_pending = _pending_orphan_decision(referencias_orfas)
+        if orphan_pending:
+            pending_list.append(orphan_pending)
+        result.pending_decisions = tuple(pending_list)
 
         # -------------------------------- passo 10: republicação via outbox
         effect = rev.enqueue_effect(

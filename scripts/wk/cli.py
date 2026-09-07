@@ -32,6 +32,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+from collections.abc import Mapping
 
 from . import __version__
 
@@ -4996,6 +4997,50 @@ def _scope_id(objective_id: str, source_versions: list) -> str:
     return "scope:" + hashlib.sha256("|".join(source_versions).encode("utf-8")).hexdigest()[:24]
 
 
+def _objective_input_versions(objective_dicts, snapshot, capability_map, symbol_path_index) -> dict:
+    """`objective_id -> input_versions` EXATAMENTE como `plan_from_objectives` grava.
+
+    A fórmula é a mesma de `cmd_analyze`/`cmd_update` (`{snapshot_id: escopo,
+    source_version_ids: [caminho@sha]}`), calculada UMA vez e reusada em três
+    lugares que precisam concordar bit a bit (achado nº5 da 2ª auditoria):
+
+    1. a criação da tarefa (`plan_from_objectives`);
+    2. o `expected_input_versions_hash` da integração — resultado cujo hash de
+       entradas não bate descreve OUTRO código e é descartado;
+    3. a tarefa de continuação (`plan_continuations`) — se ela nascesse com
+       outras entradas, o resultado dela seria descartado pela própria
+       integração seguinte, e o laço nunca fecharia.
+    """
+    out: dict = {}
+    for obj in objective_dicts:
+        oid = str(obj.get("objective_id") or "")
+        if not oid:
+            continue
+        paths = _objective_touched_paths(obj, capability_map, symbol_path_index)
+        svs = _scope_source_versions(snapshot, paths)
+        out[oid] = {
+            "snapshot_id": _scope_id(oid, svs),
+            "source_version_ids": sorted(str(s) for s in svs),
+        }
+    return out
+
+
+def _expected_input_hashes(input_versions_by_objective: dict) -> dict:
+    """`objective_id -> input_versions_hash` para `knowledge.integrate.integrate`.
+
+    É o segundo filtro do achado nº5 (o primeiro é o escopo de `objectives`):
+    a MESMA capacidade, analisada antes com outra versão dos arquivos, tem
+    resultado antigo `done` no mesmo `runtime.db` — integrá-lo gravaria
+    conhecimento vencido por cima do atual.
+    """
+    from runtime import tasks as rt_tasks
+
+    return {
+        oid: rt_tasks.input_versions_hash(iv)
+        for oid, iv in (input_versions_by_objective or {}).items()
+    }
+
+
 def _lacunas_from_objectives(objectives) -> list:
     out = []
     for obj in objectives:
@@ -5049,7 +5094,75 @@ def _local_structural_worker(*, objective, references, schema, cancel_event, **_
     }
 
 
-def _build_executor(engine_name: str):
+#: `kind` sintético das tarefas de CONTINUAÇÃO na engine `local`.
+#: `runtime.tasks.create_continuation_tasks` monta o objetivo da continuação
+#: com `{objective_id, continuation, round, needs, parent_task_id}` — sem
+#: `kind`, que é o vocabulário do PLANO (`capability`/`orphan_group`), não do
+#: runtime. `LocalThreadExecutor` escolhe o worker por `objective["kind"]`, e
+#: sem ele recusa o despacho ("submit falhou") e a continuação morre `blocked`
+#: sem nunca ter rodado. O `kind` é atribuído no envelope abaixo, na fronteira
+#: da engine local (que este arquivo é dono), nunca gravado na tarefa.
+_CONTINUATION_KIND = "continuation"
+
+
+def _local_continuation_worker(plan_objectives: dict):
+    """Worker local da tarefa de continuação (§7.3: NUNCA invoca LLM).
+
+    Devolve o MESMO resultado que `_local_structural_worker` daria para a
+    tarefa-mãe (o contrato pré-preenchido pela extração estática, buscado em
+    `plan_objectives` pelo `objective_id`), acrescido das `reading_needs` que
+    a continuação carrega. Duas consequências desejadas:
+
+    * reintegrar a continuação é idempotente — o payload descreve o mesmo
+      estado do código, então nenhum fato já gravado regride;
+    * as obrigações de leitura continuam ABERTAS e visíveis no resultado, que
+      é a verdade: uma engine sem leitura real não fecha leitura nenhuma. O
+      objetivo segue `partial`, e a rodada seguinte é decisão de quem opera
+      (`wk resume`), até o teto de `get_max_continuation_rounds`.
+    """
+
+    def _worker(*, objective, references, schema, cancel_event, **_extra):
+        obj = dict(objective)
+        oid = obj.get("objective_id")
+        base = dict(plan_objectives.get(str(oid or "")) or {})
+        needs = [dict(n) for n in (obj.get("needs") or ()) if isinstance(n, Mapping)]
+        return {
+            "objective_id": oid,
+            "capability_id": base.get("capability_id"),
+            "state": "partial",
+            "contract": base.get("contract"),
+            "reading_needs": needs,
+            "notes": list(base.get("notes") or []) + [
+                f"continuação (rodada {obj.get('round')}): engine local não realiza leitura "
+                f"adicional; {len(needs)} obrigação(ões) de leitura continuam abertas",
+            ],
+        }
+
+    return _worker
+
+
+class _LocalEngineEnvelope:
+    """Envelope do `LocalThreadExecutor` que dá `kind` ao objetivo de continuação.
+
+    Só a chamada de `submit` é envolvida — `capabilities`/`status`/`result`/
+    `cancel`/`shutdown` seguem para o executor real por `__getattr__`. O
+    objetivo é COPIADO antes de receber o `kind`: o que está gravado em
+    `runtime.db` continua sendo o que `create_continuation_tasks` escreveu.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def submit(self, task_id, objective, references=None, schema=None, policy=None):
+        if isinstance(objective, Mapping) and "kind" not in objective and objective.get("continuation"):
+            objective = {**dict(objective), "kind": _CONTINUATION_KIND}
+        return self._inner.submit(task_id, objective, references, schema, policy)
+
+
+def _build_executor(engine_name: str, plan_objectives: dict | None = None):
     """`runtime.executors.get_executor` com o registro do engine `local`
     fechado neste arquivo (§7.3: nenhuma engine real de LLM é invocada por
     `wk analyze`/`wk update`/`wk resume` — `claude-cli` só é usada quando o
@@ -5058,20 +5171,29 @@ def _build_executor(engine_name: str):
     from runtime.executors import get_executor
 
     if engine_name == "local":
-        registry = {"capability": _local_structural_worker, "orphan_group": _local_structural_worker}
-        return get_executor("local", registry=registry, max_workers=4)
+        registry = {
+            "capability": _local_structural_worker,
+            "orphan_group": _local_structural_worker,
+            _CONTINUATION_KIND: _local_continuation_worker(dict(plan_objectives or {})),
+        }
+        return _LocalEngineEnvelope(get_executor("local", registry=registry, max_workers=4))
     return get_executor(engine_name)
 
 
-def _dispatch_objectives(store, engine_name: str, resolver=None) -> tuple[dict, list]:
+def _dispatch_objectives(store, engine_name: str, resolver=None, plan_objectives: dict | None = None) -> tuple[dict, list]:
     """Roda `coordinator.run` sobre as tarefas `ready` se a engine despachar;
     senão registra o bloqueio de despacho UMA vez e devolve resultados vazios
-    (§7.3: análise estrutural determinística nunca fica presa a isso)."""
+    (§7.3: análise estrutural determinística nunca fica presa a isso).
+
+    `plan_objectives` (`objective_id -> objetivo do plano`) só serve à engine
+    `local`: é dele que o worker de continuação tira o contrato já estabelecido
+    pela extração estática.
+    """
     from runtime import coordinator as rt_coordinator
 
     bloqueios: list = []
     try:
-        executor = _build_executor(engine_name)
+        executor = _build_executor(engine_name, plan_objectives)
     except ValueError as exc:
         bloqueios.append({"tipo": "engine_desconhecida", "detalhe": str(exc)})
         return dict(_EMPTY_RESULTADOS), bloqueios
@@ -5414,10 +5536,59 @@ def _integration_states(report: dict) -> dict:
     return states
 
 
+#: Quantos itens de descarte/rejeição o JSON mostra por extenso antes de só
+#: contar. O total NUNCA é truncado — o que se abrevia é a amostra.
+_INTEGRATION_SAMPLE = 10
+
+
+def _leituras_do_relatorio(report: dict) -> dict:
+    """Leituras que os resultados desta integração fecharam — e as que não.
+
+    `leituras_satisfeitas` (achado nº3) é o registro por objetivo do que
+    `knowledge.integrate._satisfy_readings` aceitou: `satisfeita=True` só
+    quando a evidência RESOLVEU no snapshot. O item com `satisfeita=False` é
+    justamente o caso interessante — o worker declarou ter lido e a citação
+    não bateu — e por isso ele aparece com motivo, não some no total.
+    """
+    satisfeitas: list = []
+    pendentes: list = []
+    for obj in report.get("objetivos") or ():
+        if not isinstance(obj, dict):
+            continue
+        oid = obj.get("objective_id")
+        for item in obj.get("leituras_satisfeitas") or ():
+            if not isinstance(item, dict):
+                continue
+            registro = {
+                "objective_id": oid,
+                "need_id": item.get("need_id"),
+                "target": item.get("target"),
+            }
+            if item.get("satisfeita"):
+                satisfeitas.append(registro)
+            else:
+                pendentes.append({**registro, "motivo": item.get("motivo")})
+    return {
+        "satisfeitas": len(satisfeitas),
+        "nao_satisfeitas": len(pendentes),
+        "itens_satisfeitos": satisfeitas[:_INTEGRATION_SAMPLE],
+        "itens_nao_satisfeitos": pendentes[:_INTEGRATION_SAMPLE],
+    }
+
+
 def _integration_summary(report: dict) -> dict:
-    """Resumo do relatório para o JSON dos comandos (contrato do achado nº1)."""
+    """Resumo do relatório para o JSON dos comandos (contrato do achado nº1).
+
+    `descartados`/`rejeitados` (achado nº5 da 2ª auditoria) entram aqui porque
+    "não integrei este resultado" é INFORMAÇÃO, não silêncio: o primeiro conta
+    resultados aceitos pelo coordenador que esta integração recusou por escopo
+    (outro repositório no mesmo `runtime.db`) ou por versão de entrada; o
+    segundo conta afirmações que não viraram fato por citarem caminho fora do
+    snapshot ou sujeito de outro namespace.
+    """
     por_estado = {"complete": 0, "partial": 0, "blocked": 0}
     supported = disputed = unresolved = lacunas = 0
+    rejeitados: list = []
     for obj in report.get("objetivos") or ():
         if not isinstance(obj, dict):
             continue
@@ -5428,6 +5599,11 @@ def _integration_summary(report: dict) -> dict:
         disputed += int(obj.get("disputed") or 0)
         unresolved += int(obj.get("unresolved") or 0)
         lacunas += len(obj.get("lacunas") or ())
+        for item in obj.get("rejeitados") or ():
+            if isinstance(item, dict):
+                rejeitados.append({"objective_id": obj.get("objective_id"), **item})
+
+    descartados = [d for d in (report.get("descartados") or ()) if isinstance(d, dict)]
     return {
         "revisao": report.get("revisao"),
         "mudancas": int(report.get("mudancas") or 0),
@@ -5436,6 +5612,22 @@ def _integration_summary(report: dict) -> dict:
         "fatos_gravados": int(report.get("fatos_gravados") or 0),
         "lacunas_totais": lacunas,
         "reread_obligations": len(report.get("reread_obligations") or ()),
+        "descartados": {
+            "total": len(descartados),
+            "motivos": [
+                {
+                    "objective_id": d.get("objective_id"),
+                    "task_id": d.get("task_id"),
+                    "motivo": d.get("motivo"),
+                }
+                for d in descartados[:_INTEGRATION_SAMPLE]
+            ],
+        },
+        "rejeitados": {
+            "total": len(rejeitados),
+            "itens": rejeitados[:_INTEGRATION_SAMPLE],
+        },
+        "leituras": _leituras_do_relatorio(report),
         "bloqueios": list(report.get("bloqueios") or ()),
     }
 
@@ -5450,13 +5642,30 @@ def _integrate_results(
     capability_map,
     *,
     reason: str,
-) -> tuple[dict, dict, str | None]:
-    """`knowledge.integrate.integrate` -> `(resumo, investigation_states, revisão)`.
+    expected_input_versions_hash: dict | None = None,
+) -> tuple[dict, dict, str | None, dict]:
+    """`knowledge.integrate.integrate` -> `(resumo, investigation_states, revisão, relatório)`.
 
     `capability_entity_map` é `{capability_id: capability_id}` porque é
     exatamente a convenção com que `_write_structural_knowledge` grava a
     Capability (`EntityDraft(entity_id=cap.capability_id)`); quem chama já
     resolveu essa identidade, e `knowledge.integrate` não a reimplementa.
+
+    ESCOPO (achado nº5 da 2ª auditoria) viaja SEMPRE por duas vias, e as duas
+    são obrigatórias aqui:
+
+    * `objectives` — os objetivos CORRENTES desta análise. `integrate` bloqueia
+      a integração inteira sem eles, e descarta com motivo todo resultado de
+      objetivo fora do conjunto. Um `runtime.db` é compartilhado pelos repos do
+      mesmo store: sem escopo, a análise do repo B integrava o objetivo do A.
+    * `expected_input_versions_hash` — o hash das entradas do snapshot da
+      análise CORRENTE, por objetivo (`_expected_input_hashes`). Resultado
+      `done` de uma execução anterior, sobre outra versão dos arquivos, é
+      descartado em vez de gravar conhecimento vencido.
+
+    O quarto item do retorno é o relatório BRUTO (`IntegrationReport.to_dict`),
+    necessário para planejar continuações: `task_id`/`state` por objetivo só
+    existem nele, não no resumo.
 
     Falha aqui NUNCA derruba o comando nem desfaz a revisão estrutural já
     gravada: vira `bloqueios` no resumo, e a publicação segue com a revisão que
@@ -5479,6 +5688,7 @@ def _integrate_results(
             namespace,
             objectives=objectives,
             capability_entity_map=cap_map,
+            expected_input_versions_hash=dict(expected_input_versions_hash or {}) or None,
             reason=reason,
         )
         data = report.to_dict()
@@ -5486,13 +5696,230 @@ def _integrate_results(
         data = {
             "revisao": None,
             "objetivos": [],
+            "descartados": [],
             "bloqueios": [f"{type(exc).__name__}: {exc}"],
         }
     finally:
         repo.close()
 
     _save_last_integration(store_root, namespace, data)
-    return _integration_summary(data), _integration_states(data), data.get("revisao")
+    return _integration_summary(data), _integration_states(data), data.get("revisao"), data
+
+
+# -- laço BOUNDED de continuação (achado nº3 da 2ª auditoria) --------------
+#
+# O laço tem DOIS níveis, e nenhum deles é infinito:
+#
+# 1. DENTRO de uma invocação: no máximo UMA rodada. Integrar -> planejar
+#    continuações -> executar as criadas -> reintegrar -> publicar. Nunca
+#    "enquanto houver pendência": um comando que não termina não é comando.
+# 2. ENTRE invocações: quem dirige é o operador com `wk resume`, e o teto é
+#    `runtime.tasks.get_max_continuation_rounds` (default 3). Chegado o teto,
+#    `plan_continuations` devolve `recusadas` com motivo e nada é criado — o
+#    objetivo fica `partial` esperando decisão humana, que é o desfecho certo
+#    para uma leitura que 3 rodadas não fecharam.
+
+#: Estado neutro de `continuacao` no JSON — mesmas chaves sempre, para quem lê
+#: a saída não precisar distinguir "não planejei" de "planejei e não criei".
+_EMPTY_CONTINUACAO = {
+    "round": 0, "round_historico": 0, "max_rounds": 0,
+    "criadas": [], "recusadas": [], "executadas": {},
+}
+
+
+def _dispatch_disponivel(bloqueios) -> bool:
+    """A engine desta execução despachou? (lido dos bloqueios de `_dispatch_objectives`)
+
+    Reconsultar `executor.capabilities()` aqui sondaria o binário de novo e
+    registraria o MESMO bloqueio duas vezes na saída; o bloqueio já emitido é
+    a resposta.
+    """
+    return not any(
+        isinstance(b, dict) and b.get("tipo") in ("dispatch_indisponivel", "engine_desconhecida")
+        for b in (bloqueios or ())
+    )
+
+
+def _unmet_needs_of(objective, outcome: dict) -> list:
+    """Obrigações de leitura ABERTAS do objetivo, no formato de `plan_continuations`.
+
+    Fonte: as `reading_needs` do objetivo do PLANO corrente (nunca do payload
+    devolvido pelo worker — um worker não escolhe o que ainda precisa ler),
+    menos as que ESTA integração fechou com evidência resolvida
+    (`leituras_satisfeitas` com `satisfeita=True`).
+
+    Só entra necessidade com `target`: `plan_continuations` recusa objetivo
+    `partial` sem alvo concreto, e criar tarefa para repetir o mesmo impasse
+    seria exatamente o laço que o achado nº3 pede para não existir.
+    """
+    fechadas_ids = set()
+    fechadas_targets = set()
+    for item in outcome.get("leituras_satisfeitas") or ():
+        if not isinstance(item, dict) or not item.get("satisfeita"):
+            continue
+        if item.get("need_id"):
+            fechadas_ids.add(str(item["need_id"]))
+        if item.get("target"):
+            fechadas_targets.add(str(item["target"]))
+
+    needs: list = []
+    for need in getattr(objective, "reading_needs", ()) or ():
+        if not getattr(need, "open", False):
+            continue
+        need_id = str(getattr(need, "need_id", "") or "")
+        target = str(getattr(need, "target", "") or "")
+        if not target or need_id in fechadas_ids or target in fechadas_targets:
+            continue
+        kind = getattr(need, "kind", None)
+        needs.append({
+            "need_id": need_id,
+            "kind": getattr(kind, "value", kind) or "",
+            "target": target,
+            "motivo": str(getattr(need, "motivo", "") or ""),
+        })
+    return needs
+
+
+def _plan_continuation_round(store, report: dict, objectives_by_id: dict, input_versions_by_objective: dict) -> dict:
+    """Uma rodada de `coordinator.plan_continuations` sobre o relatório recém-gerado.
+
+    Chamada UMA VEZ POR OBJETIVO de propósito: `input_versions` é por escopo
+    (`_objective_input_versions`), e um único mapa para o lote inteiro faria a
+    continuação nascer com entradas que não são as da tarefa-mãe — a
+    integração seguinte a descartaria por `input_versions_hash` divergente
+    (achado nº5) e a continuação nunca fecharia nada.
+    """
+    from runtime import coordinator as rt_coordinator
+    from runtime import tasks as rt_tasks
+
+    max_rounds = rt_tasks.get_max_continuation_rounds(store)
+    criadas: list = []
+    recusadas: list = []
+    round_historico = 0
+    for outcome in report.get("objetivos") or ():
+        if not isinstance(outcome, dict) or str(outcome.get("state") or "") != "partial":
+            continue
+        oid = str(outcome.get("objective_id") or "")
+        objective = objectives_by_id.get(oid)
+        inputs = input_versions_by_objective.get(oid)
+        if objective is None or inputs is None:
+            recusadas.append({
+                "objective_id": oid,
+                "motivo": "objetivo não pertence ao plano corrente deste repositório "
+                          "(sem escopo de entradas para continuar)",
+            })
+            continue
+        plano = rt_coordinator.plan_continuations(
+            store,
+            [{**outcome, "unmet_needs": _unmet_needs_of(objective, outcome)}],
+            input_versions=inputs,
+            budget=_DEFAULT_TASK_BUDGET,
+            max_rounds=max_rounds,
+        )
+        criadas.extend(plano.get("criadas") or ())
+        recusadas.extend(plano.get("recusadas") or ())
+        round_historico = max(round_historico, rt_tasks.continuation_rounds(store, oid))
+
+    # `round` é a rodada CRIADA AGORA (lida da própria tarefa), não a maior já
+    # existente para o objetivo: depois de um `wk update`, as entradas mudaram,
+    # a tarefa-mãe é nova e a cadeia recomeça em 1 — informar "3" ali seria
+    # dizer que resta 1 rodada quando restam 3. `round_historico` guarda a
+    # outra leitura, que é a que `wk status` mostra por objetivo.
+    rounds_criados = []
+    for task_id in criadas:
+        try:
+            rounds_criados.append(rt_tasks.task_round(store.get(task_id)))
+        except Exception:
+            continue
+    return {
+        "round": max(rounds_criados, default=0),
+        "round_historico": round_historico,
+        "max_rounds": max_rounds,
+        "criadas": criadas,
+        "recusadas": recusadas,
+        "executadas": dict(_EMPTY_RESULTADOS),
+    }
+
+
+def _continuation_cycle(
+    store_root: str,
+    namespace: str,
+    store,
+    snapshot,
+    extraction,
+    objectives,
+    capability_map,
+    *,
+    report: dict,
+    objectives_by_id: dict,
+    inputs_by_objective: dict,
+    expected_input_versions_hash: dict,
+    engine_name: str,
+    resolver,
+    bloqueios,
+    reason: str,
+) -> tuple[dict, tuple | None]:
+    """Uma rodada de continuação: planejar -> (executar -> reintegrar).
+
+    Devolve `(continuacao, reintegrado)`, onde `reintegrado` é o retorno de
+    `_integrate_results` da segunda passada ou `None` quando não houve o que
+    reintegrar. `None` significa "o que o chamador já tem continua valendo" —
+    e é o caso de:
+
+    * nenhuma continuação criada (objetivos completos, ou teto de rodadas
+      atingido: as recusas viajam em `continuacao["recusadas"]`);
+    * engine sem despacho — as tarefas ficam `ready` em `runtime.db` e quem
+      as executa é o `wk resume` seguinte, com a engine configurada. Criar a
+      tarefa mesmo sem poder executá-la é deliberado: é ela que carrega, no
+      banco, QUAIS leituras faltam.
+    """
+    continuacao = _plan_continuation_round(store, report, objectives_by_id, inputs_by_objective)
+    if not continuacao["criadas"] or not _dispatch_disponivel(bloqueios):
+        return continuacao, None
+
+    continuacao["executadas"], bloqueios_cont = _dispatch_objectives(
+        store, engine_name, resolver=resolver,
+        plan_objectives={oid: o.to_dict() for oid, o in objectives_by_id.items()},
+    )
+    if bloqueios_cont:
+        continuacao["bloqueios"] = bloqueios_cont
+    reintegrado = _integrate_results(
+        store_root, namespace, store, snapshot, extraction, objectives, capability_map,
+        reason=reason, expected_input_versions_hash=expected_input_versions_hash,
+    )
+    return continuacao, reintegrado
+
+
+def _proximo_passo_continuacao(repo_abs: str, continuacao: dict, bloqueios) -> str | None:
+    """Frase de `proximo_passo` quando a continuação depende do operador."""
+    criadas = len(continuacao.get("criadas") or ())
+    if criadas and not _dispatch_disponivel(bloqueios):
+        return (
+            f"{criadas} tarefa(s) de continuação (rodada {continuacao.get('round')}) ficaram "
+            f"`ready` em runtime.db com as leituras que faltam; configure o binário/credenciais "
+            f"da engine e rode `wk resume --repo {repo_abs}` para executá-las e reintegrar — a "
+            "análise estrutural já concluída não precisa ser refeita"
+        )
+    if bloqueios:
+        return (
+            "configure o binário/credenciais da engine e rode `wk resume --repo "
+            f"{repo_abs}` para despachar a leitura adicional pendente; a análise "
+            "estrutural já concluída não precisa ser refeita"
+        )
+    if continuacao.get("recusadas"):
+        return (
+            f"{len(continuacao['recusadas'])} objetivo(s) `partial` não geraram continuação "
+            f"(ver `continuacao.recusadas`: teto de {continuacao.get('max_rounds')} rodadas ou "
+            "nenhuma leitura com alvo concreto); o fechamento depende de decisão humana"
+        )
+    if criadas:
+        return (
+            f"{criadas} continuação(ões) executada(s) nesta invocação (rodada "
+            f"{continuacao.get('round')}); rode `wk resume --repo {repo_abs}` para a próxima "
+            f"rodada enquanto houver objetivo `partial` e o teto de "
+            f"{continuacao.get('max_rounds')} rodadas não for atingido"
+        )
+    return None
 
 
 def _status_geral(
@@ -5503,6 +5930,7 @@ def _status_geral(
     revisao_nova: bool = False,
     bloqueios_execucao: int = 0,
     erro_material: bool = False,
+    fontes_incompletas: int = 0,
 ) -> tuple[str, int]:
     """`status_geral` + exit code do comando (achado nº6a).
 
@@ -5512,8 +5940,16 @@ def _status_geral(
     |---|---|---|
     | `bloqueado` | erro material, ou publicação bloqueada SEM revisão nova (nada de útil saiu) | 2 |
     | | (`revisao_nova` é revisão COM mudança: reexecutar sobre árvore inalterada abre revisão idempotente de 0 mudanças, que não é resultado útil nenhum) | |
-    | `parcial` | objetivo `partial`/`blocked`, decisão pendente, bloqueio de execução (despacho/integração) ou publicação bloqueada COM revisão gravada | 0 |
+    | `parcial` | objetivo `partial`/`blocked`, decisão pendente, fonte incompleta, bloqueio de execução (despacho/integração) ou publicação bloqueada COM revisão gravada | 0 |
     | `completo` | nada pendente | 0 |
+
+    `fontes_incompletas` (achado nº4 da 2ª auditoria) é o `CorrelationResult`
+    com `completa=False` — hoje, referência explícita a um id de padrão
+    conhecido que não resolveu nem por `stable_key` nem por alias. A fonte é
+    aceita e o lote NÃO trava (o vínculo que dependeria dela é que não nasce),
+    mas o resultado nunca pode sair como `completo`: um órfão técnico dentro
+    de uma ingestão declarada completa é exatamente a leitura errada que o
+    achado descreve.
 
     `parcial` sai com 0 DE PROPÓSITO: houve resultado útil (revisão gravada), e
     o que falta está explícito no JSON — falhar aqui obrigaria o operador a
@@ -5525,7 +5961,13 @@ def _status_geral(
     parciais = int(estados.get("partial") or 0) + int(estados.get("blocked") or 0)
     if erro_material or (publicacao_bloqueada and not revisao_nova):
         return "bloqueado", 2
-    if parciais or decisoes_pendentes or publicacao_bloqueada or bloqueios_execucao:
+    if (
+        parciais
+        or decisoes_pendentes
+        or fontes_incompletas
+        or publicacao_bloqueada
+        or bloqueios_execucao
+    ):
         return "parcial", 0
     return "completo", 0
 
@@ -5719,13 +6161,18 @@ def cmd_analyze(a) -> int:
 
     store = rt_tasks.TaskStore.open(_runtime_db_path(store_root))
     try:
+        inputs_by_objective = _objective_input_versions(
+            objective_dicts, snapshot, capability_map, symbol_path_index
+        )
+        objectives_by_id = {o.objective_id: o for o in objectives}
+
         capacidades_analisadas = []
         for obj in objective_dicts:
-            paths = _objective_touched_paths(obj, capability_map, symbol_path_index)
-            svs = _scope_source_versions(snapshot, paths)
-            scope_id = _scope_id(str(obj.get("objective_id")), svs)
+            inputs = inputs_by_objective[str(obj.get("objective_id"))]
             created = plan_from_objectives(
-                store, [obj], snapshot_id=scope_id, source_version_ids=svs,
+                store, [obj],
+                snapshot_id=inputs["snapshot_id"],
+                source_version_ids=inputs["source_version_ids"],
                 kind=rt_tasks.TaskKind.INVESTIGATION, budget=_DEFAULT_TASK_BUDGET,
             )
             for t in created:
@@ -5734,7 +6181,11 @@ def cmd_analyze(a) -> int:
                     "task_id": t.task_id, "reaproveitada": bool(t.reused), "estado": t.state.value,
                 })
 
-        resultados, bloqueios = _dispatch_objectives(store, engine_name, resolver=_snapshot_resolver(snapshot))
+        resolver = _snapshot_resolver(snapshot)
+        resultados, bloqueios = _dispatch_objectives(
+            store, engine_name, resolver=resolver,
+            plan_objectives={o.objective_id: o.to_dict() for o in objectives},
+        )
 
         reason = f"wk analyze --repo {repo_abs}" + (f" --topic {topic}" if topic else "")
         kg_summary = _write_structural_knowledge(store_root, namespace, snapshot, capability_map, extraction, reason)
@@ -5743,10 +6194,27 @@ def cmd_analyze(a) -> int:
         # worker afirmou é confrontado com o snapshot e vira fato; a publicação
         # usa a revisão PÓS-integração (`integ_revisao`), senão sairia o estado
         # anterior aos fatos que acabaram de ser gravados.
-        integracao, investigation_states, integ_revisao = _integrate_results(
+        esperados = _expected_input_hashes(inputs_by_objective)
+        integracao, investigation_states, integ_revisao, integ_report = _integrate_results(
             store_root, namespace, store, snapshot, extraction, objectives, capability_map,
             reason=f"integração de resultados — {reason}",
+            expected_input_versions_hash=esperados,
         )
+
+        # Achado nº3: UMA rodada de continuação por invocação. Publicar antes
+        # disto sairia com o estado anterior às leituras que a continuação
+        # acabou de fechar — o mesmo buraco do achado nº1, um passo adiante.
+        continuacao, reintegrado = _continuation_cycle(
+            store_root, namespace, store, snapshot, extraction, objectives, capability_map,
+            report=integ_report, objectives_by_id=objectives_by_id,
+            inputs_by_objective=inputs_by_objective, expected_input_versions_hash=esperados,
+            engine_name=engine_name, resolver=resolver, bloqueios=bloqueios,
+            reason=f"integração de continuações — {reason}",
+        )
+        if reintegrado is not None:
+            integracao, investigation_states, nova_revisao, _ = reintegrado
+            integ_revisao = nova_revisao or integ_revisao
+
         revisao_publicada = integ_revisao or kg_summary.get("revision_id")
         publicacoes = _publish_local(
             store_root, namespace, revisao_publicada, investigation_states
@@ -5773,6 +6241,7 @@ def cmd_analyze(a) -> int:
             "capacidades_analisadas": capacidades_analisadas,
             "revisao": kg_summary,
             "integracao": integracao,
+            "continuacao": continuacao,
             "publicacoes": publicacoes,
             "resultados": resultados,
             "lacunas": _lacunas_from_objectives(objectives),
@@ -5782,12 +6251,9 @@ def cmd_analyze(a) -> int:
                 "scope": scope, "namespace": namespace, "store": store_root,
             },
         }
-        if bloqueios:
-            out["proximo_passo"] = (
-                "configure o binário/credenciais da engine e rode `wk resume --repo "
-                f"{repo_abs}` para despachar a leitura adicional pendente; a análise "
-                "estrutural já concluída não precisa ser refeita"
-            )
+        proximo = _proximo_passo_continuacao(repo_abs, continuacao, bloqueios)
+        if proximo:
+            out["proximo_passo"] = proximo
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return exit_code
     finally:
@@ -5867,6 +6333,11 @@ def cmd_update(a) -> int:
         # despacho eterno sem nunca ser reaproveitada).
         objetivos_obsoletos = sorted(set(latest_by_objective) - current_oids)
 
+        inputs_by_objective = _objective_input_versions(
+            objective_dicts, new_snapshot, capability_map, symbol_path_index
+        )
+        objectives_by_id = {o.objective_id: o for o in objectives}
+
         objetivos_invalidados, capacidades_analisadas = [], []
         for obj in objective_dicts:
             oid = str(obj.get("objective_id"))
@@ -5880,10 +6351,11 @@ def cmd_update(a) -> int:
                 # como histórico (não é redespachada: só a mais recente por
                 # `objective_id` é `ready`/considerada vigente).
                 objetivos_invalidados.append(oid)
-            svs = _scope_source_versions(new_snapshot, paths)
-            scope_id = _scope_id(oid, svs)
+            inputs = inputs_by_objective[oid]
             created = plan_from_objectives(
-                store, [obj], snapshot_id=scope_id, source_version_ids=svs,
+                store, [obj],
+                snapshot_id=inputs["snapshot_id"],
+                source_version_ids=inputs["source_version_ids"],
                 kind=rt_tasks.TaskKind.INVESTIGATION, budget=_DEFAULT_TASK_BUDGET,
             )
             for t in created:
@@ -5892,7 +6364,11 @@ def cmd_update(a) -> int:
                     "reaproveitada": bool(t.reused), "estado": t.state.value,
                 })
 
-        resultados, bloqueios = _dispatch_objectives(store, engine_name, resolver=_snapshot_resolver(new_snapshot))
+        resolver = _snapshot_resolver(new_snapshot)
+        resultados, bloqueios = _dispatch_objectives(
+            store, engine_name, resolver=resolver,
+            plan_objectives={o.objective_id: o.to_dict() for o in objectives},
+        )
 
         from knowledge import invalidate as kg_invalidate
         from knowledge.repository import Repository
@@ -5923,12 +6399,28 @@ def cmd_update(a) -> int:
         finally:
             repo_kg.close()
 
-        # Mesma fiação do `wk analyze` (achado nº1): integrar antes de publicar,
-        # e publicar a revisão pós-integração.
-        integracao, investigation_states, integ_revisao = _integrate_results(
+        # Mesma fiação do `wk analyze` (achados nº1, nº3 e nº5): integrar com
+        # escopo antes de publicar, rodar UMA rodada de continuação e publicar
+        # a revisão pós-integração. `wk update` compartilha a fiação de
+        # propósito — deixá-la só em `analyze`/`resume` reabriria o buraco pela
+        # porta do delta.
+        esperados = _expected_input_hashes(inputs_by_objective)
+        integracao, investigation_states, integ_revisao, integ_report = _integrate_results(
             store_root, namespace, store, new_snapshot, extraction, objectives, capability_map,
             reason=f"integração de resultados — {reason}",
+            expected_input_versions_hash=esperados,
         )
+        continuacao, reintegrado = _continuation_cycle(
+            store_root, namespace, store, new_snapshot, extraction, objectives, capability_map,
+            report=integ_report, objectives_by_id=objectives_by_id,
+            inputs_by_objective=inputs_by_objective, expected_input_versions_hash=esperados,
+            engine_name=engine_name, resolver=resolver, bloqueios=bloqueios,
+            reason=f"integração de continuações — {reason}",
+        )
+        if reintegrado is not None:
+            integracao, investigation_states, nova_revisao, _ = reintegrado
+            integ_revisao = nova_revisao or integ_revisao
+
         revisao_publicada = integ_revisao or kg_summary.get("revision_id")
 
         # Republica só quando houve mudança (§7.1/W8): esta função inteira só
@@ -5965,6 +6457,7 @@ def cmd_update(a) -> int:
             "capacidades_analisadas": capacidades_analisadas,
             "revisao": kg_summary,
             "integracao": integracao,
+            "continuacao": continuacao,
             "publicacoes": publicacoes,
             "resultados": resultados,
             "lacunas": _lacunas_from_objectives(objectives),
@@ -5974,6 +6467,9 @@ def cmd_update(a) -> int:
                 "scope": scope, "namespace": namespace, "store": store_root,
             },
         }
+        proximo = _proximo_passo_continuacao(repo_abs, continuacao, bloqueios)
+        if proximo:
+            out["proximo_passo"] = proximo
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return exit_code
     finally:
@@ -6052,6 +6548,7 @@ def cmd_status(a) -> int:
         integ = (_load_last_integration(store_root).get("integracao") or {})
         objetivos_por_estado = {"complete": 0, "partial": 0, "blocked": 0}
         objetivos_pendentes = []
+        rounds_por_objetivo: dict = {}
         for obj in integ.get("objetivos") or ():
             if not isinstance(obj, dict):
                 continue
@@ -6062,6 +6559,13 @@ def cmd_status(a) -> int:
             if estado in objetivos_por_estado:
                 objetivos_por_estado[estado] += 1
             unmet_obj = [str(u) for u in (obj.get("unmet") or ())]
+            # Achado nº3: "em que rodada de continuação este objetivo está" é
+            # a pergunta que decide se `wk resume` ainda tem o que fazer ou se
+            # o teto foi atingido e falta decisão humana. A resposta está em
+            # `runtime.db` (tarefas de continuação), não no relatório.
+            round_obj = rt_tasks.continuation_rounds(store, oid) if oid else 0
+            if round_obj:
+                rounds_por_objetivo[oid] = round_obj
             if estado != "complete" or unmet_obj:
                 objetivos_pendentes.append({
                     "objective_id": oid,
@@ -6069,8 +6573,10 @@ def cmd_status(a) -> int:
                     "estado": estado,
                     "unmet": unmet_obj,
                     "lacunas": len(obj.get("lacunas") or ()),
+                    "continuacao_round": round_obj,
                 })
 
+        leituras = _leituras_do_relatorio(integ)
         out = {
             "repo": repo_abs,
             "escopo_efetivo": {
@@ -6080,9 +6586,16 @@ def cmd_status(a) -> int:
             "ultimo_snapshot": prior.get("last_snapshot_id"),
             "objetivos_por_estado": objetivos_por_estado,
             "objetivos_pendentes": objetivos_pendentes,
+            "continuacao": {
+                "max_rounds": rt_tasks.get_max_continuation_rounds(store),
+                "round_maximo": max(rounds_por_objetivo.values(), default=0),
+                "por_objetivo": rounds_por_objetivo,
+            },
+            "leituras": leituras,
             "integracao": {
                 "revisao": integ.get("revisao"),
                 "fatos_gravados": integ.get("fatos_gravados"),
+                "descartados": len(integ.get("descartados") or ()),
                 "bloqueios": list(integ.get("bloqueios") or ()),
             } if integ else None,
             "tarefas_por_estado": por_estado,
@@ -6129,15 +6642,45 @@ def cmd_resume(a) -> int:
     store = rt_tasks.TaskStore.open(runtime_db)
     try:
         resume_plan = rt_recovery.resume(store)
-        resultados, bloqueios = _dispatch_objectives(store, engine_name, resolver=resolver)
+
+        # O plano é reconstruído ANTES do despacho (e não depois, como até a
+        # Onda10-C): as tarefas `ready` desta retomada incluem as CONTINUAÇÕES
+        # criadas pela invocação anterior, e o worker local delas precisa do
+        # contrato do objetivo do plano para devolver o mesmo resultado que a
+        # tarefa-mãe devolveu. Despachar antes de saber o plano faria a
+        # continuação responder com contrato vazio e regredir o que já estava
+        # gravado.
+        extraction = capability_map = objectives = None
+        pipeline_erro = None
+        if snap is not None:
+            try:
+                _snapshot, _inventory, extraction, capability_map, objectives = _analyze_pipeline(
+                    repo_abs, scope, namespace, precaptured=snap
+                )
+            except Exception as exc:
+                extraction = capability_map = objectives = None
+                pipeline_erro = exc
+
+        plan_objectives = (
+            {o.objective_id: o.to_dict() for o in objectives} if objectives is not None else {}
+        )
+        resultados, bloqueios = _dispatch_objectives(
+            store, engine_name, resolver=resolver, plan_objectives=plan_objectives
+        )
 
         # Achado nº6b: retomar não é só despachar. Sem o MESMO pós-processamento
         # do `wk analyze`, o resultado que esta retomada acabou de aceitar
         # ficaria em `runtime.db` — a tarefa `done` e o fato inexistente em
         # `knowledge.db`, exatamente o buraco do achado nº1 reaberto pela porta
         # de trás. Por isso: integrar -> `investigation_states` -> republicar.
+        #
+        # Onda10-D (achado nº3): `wk resume` é também o passo que FECHA o laço
+        # de continuação — resume + run + integrar + planejar continuações +
+        # rodar as novas (UMA rodada) + republicar. É por invocação de `wk
+        # resume` que o laço avança; nunca dentro de um `while` interno.
         integracao: dict = {}
         publicacoes: dict = {}
+        continuacao: dict = dict(_EMPTY_CONTINUACAO)
         revisao_publicada = None
         if snap is None:
             bloqueios = list(bloqueios) + [{
@@ -6150,22 +6693,38 @@ def cmd_resume(a) -> int:
                 "acao": f"rode `wk analyze --repo {repo_abs}` para recriar o manifesto",
             }]
         else:
-            try:
-                _snapshot, _inventory, extraction, capability_map, objectives = _analyze_pipeline(
-                    repo_abs, scope, namespace, precaptured=snap
-                )
-            except Exception as exc:
-                extraction = capability_map = objectives = None
+            if pipeline_erro is not None:
                 bloqueios = list(bloqueios) + [{
                     "tipo": "extracao_indisponivel",
-                    "detalhe": f"{type(exc).__name__}: {exc}",
+                    "detalhe": f"{type(pipeline_erro).__name__}: {pipeline_erro}",
                     "impacto": "resultados não puderam ser confrontados com o código nesta retomada",
                 }]
             if objectives is not None:
-                integracao, investigation_states, revisao_publicada = _integrate_results(
+                from analysis.investigation import objectives_to_dict
+
+                symbol_path_index = {(s.qualname or s.name): s.path for s in extraction.symbols}
+                inputs_by_objective = _objective_input_versions(
+                    objectives_to_dict(objectives), snap, capability_map, symbol_path_index
+                )
+                objectives_by_id = {o.objective_id: o for o in objectives}
+                esperados = _expected_input_hashes(inputs_by_objective)
+
+                integracao, investigation_states, revisao_publicada, integ_report = _integrate_results(
                     store_root, namespace, store, snap, extraction, objectives, capability_map,
                     reason=f"integração de resultados — wk resume --repo {repo_abs}",
+                    expected_input_versions_hash=esperados,
                 )
+                continuacao, reintegrado = _continuation_cycle(
+                    store_root, namespace, store, snap, extraction, objectives, capability_map,
+                    report=integ_report, objectives_by_id=objectives_by_id,
+                    inputs_by_objective=inputs_by_objective,
+                    expected_input_versions_hash=esperados,
+                    engine_name=engine_name, resolver=resolver, bloqueios=bloqueios,
+                    reason=f"integração de continuações — wk resume --repo {repo_abs}",
+                )
+                if reintegrado is not None:
+                    integracao, investigation_states, nova_revisao, _ = reintegrado
+                    revisao_publicada = nova_revisao or revisao_publicada
                 revisao_publicada = revisao_publicada or prior.get("last_revision_id")
                 publicacoes = _publish_local(
                     store_root, namespace, revisao_publicada, investigation_states
@@ -6188,9 +6747,13 @@ def cmd_resume(a) -> int:
             "retomada": resume_plan.summary(),
             "resultados": resultados,
             "integracao": integracao,
+            "continuacao": continuacao,
             "publicacoes": publicacoes,
             "bloqueios": bloqueios,
         }
+        proximo = _proximo_passo_continuacao(repo_abs, continuacao, bloqueios)
+        if proximo:
+            out["proximo_passo"] = proximo
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return exit_code
     finally:
@@ -6363,6 +6926,7 @@ def cmd_ingest(a) -> int:
     ok_count = 0
     fail_count = 0
     pending_count = 0
+    incompletas_count = 0
 
     repo = Repository.open(_knowledge_db_path(store_root))
     try:
@@ -6439,6 +7003,25 @@ def cmd_ingest(a) -> int:
                 entry["duplicada"] = True
             if result.orphans:
                 entry["orfaos"] = len(result.orphans)
+
+            # Achados nº4/nº5 (2ª auditoria): `referencias_orfas` é id explícito
+            # de padrão conhecido (ex.: `RN-023`) que não resolveu nem por
+            # `stable_key` nem por alias — alguém CITOU algo que deveria existir.
+            # A aresta que dependeria dele (ex.: `proposes_change_to`) não nasce.
+            # A fonte é aceita e o lote não trava, mas `completa=False` do
+            # `CorrelationResult` é levado a sério: o `status_geral` desta
+            # execução nunca sai `completo` com um órfão técnico dentro.
+            referencias_orfas = [
+                {"id": str(o.get("id")), "blocos": list(o.get("blocos") or ())}
+                for o in (result.referencias_orfas or ())
+            ]
+            if referencias_orfas:
+                entry["referencias_orfas"] = referencias_orfas
+            if not result.completa:
+                entry["completa"] = False
+                entry["motivo_incompleta"] = result.motivo_incompleta
+                incompletas_count += 1
+
             if result.pending_decisions:
                 entry["decisoes_pendentes"] = [
                     _ingest2_pending_to_dict(p) for p in result.pending_decisions
@@ -6474,8 +7057,14 @@ def cmd_ingest(a) -> int:
         avisos.append(f"{fail_count} de {len(leaves)} fonte(s) falharam (extração ou correlação); "
                        "ver 'fontes[].diagnostico'")
     if pending_count:
-        avisos.append(f"{pending_count} fonte(s) com decisão pendente (iniciativa ambígua); "
-                       "ver 'fontes[].decisoes_pendentes' — aceitas sem bloqueio (§7.1)")
+        avisos.append(f"{pending_count} fonte(s) com decisão pendente (iniciativa ambígua ou "
+                       "referência órfã); ver 'fontes[].decisoes_pendentes' — aceitas sem bloqueio (§7.1)")
+    if incompletas_count:
+        avisos.append(
+            f"{incompletas_count} fonte(s) correlacionada(s) de forma INCOMPLETA (referência "
+            "explícita sem entidade correspondente); ver 'fontes[].referencias_orfas' — o "
+            "status_geral desta execução é no mínimo `parcial` (achado nº4)"
+        )
 
     # W8-T8.2: publica de verdade (markdown+word+manifest.json em
     # store/publicacoes/) a revisão mais recente escrita por este lote — não
@@ -6505,6 +7094,7 @@ def cmd_ingest(a) -> int:
     # fonte ok, ou publicação bloqueada sem revisão nova.
     status, exit_code = _status_geral(
         decisoes_pendentes=pending_count,
+        fontes_incompletas=incompletas_count,
         publicacao_bloqueada=bool((publicacoes or {}).get("bloqueios")),
         revisao_nova=bool(revisoes),
         bloqueios_execucao=fail_count,
@@ -6513,6 +7103,7 @@ def cmd_ingest(a) -> int:
     out = {
         "status_geral": status,
         "fontes": fontes,
+        "fontes_incompletas": incompletas_count,
         "revisoes": revisoes,
         "unidades_afetadas": sorted(unidades_afetadas),
         "avisos": avisos,

@@ -38,6 +38,7 @@ from knowledge.models import (
 
 from .document import (
     ALL_LIFECYCLE,
+    ANALYSIS_STATE_LABEL,
     AnalysisState,
     Belonging,
     DocKind,
@@ -53,7 +54,18 @@ from .document import (
     link_cross_state,
     resolve_belonging,
     units_for_entity,
+    worst_analysis_state,
 )
+
+#: Espécies de documento cuja completude é DERIVADA das obrigações que as
+#: sustentam, não só das próprias unidades (achado bloqueante nº2 da 2ª
+#: auditoria): um contrato não é mais completo do que a capacidade que o expõe
+#: ou consome. Sem esta herança, a capacidade saía `parcial` e o contrato
+#: `completo` no MESMO conjunto, sobre a mesma investigação.
+INHERITING_DOC_KINDS: frozenset[DocKind] = frozenset({DocKind.CONTRATO_DEPENDENCIA})
+
+#: Tipos de entidade cujo estado de análise SUSTENTA o documento herdeiro.
+SUSTAINING_ENTITY_TYPES: tuple[EntityType, ...] = (EntityType.CAPABILITY,)
 
 #: Consumidores previstos em §9.1/§11.3. Fazem parte do plano como metadado
 #: declarado: o manifesto registra para quem a revisão foi preparada.
@@ -206,13 +218,25 @@ def plan(
     do próprio namespace porque a travessia parte das entidades dele.
 
     `investigation_states` é OPCIONAL e vem de quem conduziu a investigação
-    (objetivos e lacunas do FLUXO 3). Chave: `document_id`, `entity_id`,
-    `stable_key` ou título da âncora. Valor: o estado (`completo`, `parcial`,
-    `estrutural` ou `AnalysisState`) ou um mapa
+    (objetivos e lacunas do FLUXO 3). Chave: `document_id`, `entity_id`
+    (de Capability, Contract ou qualquer âncora), `stable_key`, título da
+    âncora ou o NAMESPACE (teto de último recurso para documentos que não
+    resolvem obrigação nenhuma). Chaves que não casam com documento algum são
+    ignoradas sem erro. Valor: o estado (`completo`, `parcial`, `estrutural` ou
+    `AnalysisState`) ou um mapa
     `{"state": ..., "gaps": ["o que falta e em que pé está", ...]}`.
     Sem ele, o estado é DERIVADO das unidades — nunca presumido completo:
     documento sem nenhuma unidade com comportamento sustentado por evidência
     sai como `estrutural`, com título honesto e lacunas no corpo.
+
+    Duas regras duras do achado bloqueante nº2 (2ª auditoria):
+
+    - documento sem NENHUMA unidade behavioral nunca sai `completo`, nem quando
+      a investigação declarou completude (a declaração é rebaixada e a lacuna
+      explica por quê);
+    - documento de contrato/dependência herda o PIOR estado das capacidades que
+      o expõem/consomem — capacidade `parcial` e contrato `completo` no mesmo
+      conjunto deixou de ser representável.
     """
     scope = RevisionScope(repo, revision_id)
     namespaces = [namespace] if namespace else _all_namespaces(repo)
@@ -320,7 +344,58 @@ class _PlanContext:
     skipped: list[SkippedItem]
     investigation: Mapping[str, Any] = field(default_factory=dict)
     catalog: dict[str, SemanticUnit] = field(default_factory=dict)
+    #: `entity_id`/`document_id` → estado de análise já PUBLICADO nesta execução.
+    #: Capacidades são planejadas antes dos contratos (`plan`), então o contrato
+    #: sempre encontra aqui o estado da capacidade que o sustenta.
+    analysis_by_key: dict[str, AnalysisState] = field(default_factory=dict)
     _belonging: dict[str, Belonging] = field(default_factory=dict)
+
+    def record_analysis(self, doc_id: str, anchor: Entity, state: AnalysisState) -> None:
+        """Registra o estado do documento montado, por documento E por âncora."""
+        for key in (doc_id, anchor.entity_id, anchor.stable_key):
+            if key:
+                self.analysis_by_key[key] = state
+
+    def analysis_of(self, entity: Entity) -> AnalysisState:
+        """Estado da análise de uma entidade que SUSTENTA outro documento.
+
+        Ordem: o que já foi montado nesta execução → o que a investigação
+        declarou → `estrutural`. O último caso não é chute: entidade sem
+        documento montado e sem estado declarado não tem comportamento
+        publicado nenhum nesta revisão.
+        """
+        for key in (entity.entity_id, entity.stable_key):
+            if key and key in self.analysis_by_key:
+                return self.analysis_by_key[key]
+        declared, _ = self.declared_analysis(
+            document_id(self.namespace, DocKind.CAPACIDADE, entity.entity_id), entity
+        )
+        if declared is not None:
+            return declared
+        return AnalysisState.ESTRUTURAL
+
+    def namespace_analysis(self) -> AnalysisState | None:
+        """Estado declarado para o NAMESPACE inteiro, quando informado.
+
+        É o teto de último recurso do documento que não resolve nenhuma
+        obrigação: `investigation_states={"acme/pagamentos": "parcial"}`.
+        """
+        raw = self.investigation.get(self.namespace)
+        if raw is None:
+            return None
+        if isinstance(raw, Mapping):
+            raw = raw.get("state") or raw.get("estado")
+        if raw is None:
+            return None
+        if isinstance(raw, AnalysisState):
+            return raw
+        try:
+            return AnalysisState(str(raw).strip().lower())
+        except ValueError:
+            raise PublishingError(
+                f"estado de investigação {raw!r} do namespace {self.namespace!r} não é um "
+                f"AnalysisState válido ({', '.join(s.value for s in AnalysisState)})"
+            ) from None
 
     def declared_analysis(
         self, doc_id: str, anchor: Entity
@@ -463,6 +538,10 @@ def _plan_contracts(ctx: _PlanContext) -> list[KnowledgeDocument]:
                 anchor=contract,
                 members=(),
                 title=f"{contract.title}: interface, condições e falhas",
+                # A completude do contrato é herdada das capacidades que o
+                # expõem/consomem (achado nº2): `peers` já traz as pontas
+                # tipadas resolvidas pelas relações da revisão.
+                inherit_from=peers,
             )
         )
     return out
@@ -564,6 +643,7 @@ def _assemble(
     members: Sequence[Entity],
     title: str,
     impacted_ids: set[str] | None = None,
+    inherit_from: Sequence[Entity] = (),
 ) -> list[KnowledgeDocument]:
     """Monta um documento e devolve `[]` quando ele não deve ser publicado.
 
@@ -618,9 +698,15 @@ def _assemble(
     # nunca antes. Documento sem nenhuma unidade behavioral não sai com o
     # título que promete regra, fluxo e falha.
     declared_state, declared_gaps = ctx.declared_analysis(doc_id, anchor)
+    inherited_state, inherited_reason = _inherited_analysis(ctx, doc_kind, inherit_from)
     analysis_state, analysis_gaps = analysis_summary(
-        linked, declared_state=declared_state, declared_gaps=declared_gaps
+        linked,
+        declared_state=declared_state,
+        declared_gaps=declared_gaps,
+        inherited_state=inherited_state,
+        inherited_reason=inherited_reason,
     )
+    ctx.record_analysis(doc_id, anchor, analysis_state)
     doc_title = honest_title(doc_kind, anchor.title, title, analysis_state)
     summary = _summary_for(
         doc_kind, anchor, len(linked), impacted_ids or set(), analysis_state
@@ -647,6 +733,58 @@ def _assemble(
         ctx.skip(doc_id, "document", doc_title, "; ".join(problems))
         return []
     return [doc]
+
+
+def _inherited_analysis(
+    ctx: _PlanContext, doc_kind: DocKind, related: Sequence[Entity]
+) -> tuple[AnalysisState | None, str]:
+    """TETO do estado da análise vindo das obrigações que sustentam o documento.
+
+    Regra do achado bloqueante nº2: um documento de contrato/dependência não
+    pode sair `completo` enquanto a capacidade que o expõe ou consome está
+    `parcial` — as duas páginas descrevem a MESMA investigação e sair com
+    rótulos diferentes é a contradição que a auditoria encontrou.
+
+    Ordem de resolução:
+
+    1. PIOR estado entre as capacidades relacionadas por relação tipada da
+       revisão (`consumes`/`publishes`/`contains`/`implements`/`depends_on`…);
+    2. sem capacidade resolvível, o estado declarado para o NAMESPACE em
+       `investigation_states`, quando houver;
+    3. sem nada disso, teto `parcial`: sem obrigação resolvível não há como
+       AFIRMAR completude — mas também não se declara `estrutural` um documento
+       que publica regra com evidência, porque isso seria a mentira simétrica.
+
+    Devolve `(None, "")` para espécies que não herdam.
+    """
+    if doc_kind not in INHERITING_DOC_KINDS:
+        return None, ""
+    sustaining = [e for e in related if e.entity_type in SUSTAINING_ENTITY_TYPES]
+    if sustaining:
+        states = {e.entity_id: ctx.analysis_of(e) for e in sustaining}
+        worst = worst_analysis_state(states.values())
+        if worst is None:  # pragma: no cover - `sustaining` não vazio garante estado
+            return None, ""
+        names = ", ".join(
+            sorted(e.title for e in sustaining if states[e.entity_id] is worst)
+        )
+        return worst, (
+            "A completude deste documento está limitada pelo estado da análise da capacidade "
+            f"que o sustenta ({names}): {ANALYSIS_STATE_LABEL[worst]}. Contrato e capacidade "
+            "descrevem a mesma investigação e não podem sair com rótulos diferentes."
+        )
+    ns_state = ctx.namespace_analysis()
+    if ns_state is not None:
+        return ns_state, (
+            "Nenhuma capacidade relacionada foi resolvida nesta revisão para este contrato; o "
+            f"estado herdado é o declarado para o namespace {ctx.namespace}: "
+            f"{ANALYSIS_STATE_LABEL[ns_state]}."
+        )
+    return AnalysisState.PARCIAL, (
+        "Nenhuma capacidade que exponha ou consuma este contrato foi resolvida nesta revisão: "
+        "não há obrigação conhecida contra a qual verificar a completude, então o documento não "
+        "pode ser declarado completo."
+    )
 
 
 def _context_of(
@@ -837,8 +975,10 @@ def _document_sort_key(doc: KnowledgeDocument) -> tuple[str, str, str]:
 __all__ = [
     "CAPABILITY_MEMBER_TYPES",
     "DEFAULT_CONSUMERS",
+    "INHERITING_DOC_KINDS",
     "INITIATIVE_MEMBER_ORDER",
     "MAX_UNITS_PER_DOCUMENT",
+    "SUSTAINING_ENTITY_TYPES",
     "PublicationPlan",
     "SkippedItem",
     "assert_single_system",

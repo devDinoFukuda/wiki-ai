@@ -41,6 +41,21 @@ Invariantes em código, não em prosa
    `InvestigationObjective.evaluate()` a partir do contrato preenchido pelo
    resultado; o `state` que o worker declarou só é honrado quando ele PIORA o
    estado (`blocked`).
+7. **A frase inteira vale pelo componente MAIS FRACO.** Uma frase condicional
+   tem condição *e* consequência; aprovar a condição e gravar a frase toda como
+   sustentada é o achado nº1 da 2ª auditoria ("total > 1000 é aprovado com HTTP
+   200" virava `supported` porque `total > 1000` existe no código que devolve
+   409). `_consequence_of` extrai a consequência, `_consequence_guard` exige que
+   ela seja confirmada MECANICAMENTE no trecho, e rebaixa (`inferred`) ou
+   contradiz (`disputed`) a frase inteira quando não é.
+8. **Integração é ESCOPADA.** `integrate` exige `objectives`/`objective_ids` e
+   descarta (em `IntegrationReport.descartados`) resultado de objetivo fora do
+   escopo ou cujas entradas não pertencem ao snapshot corrente. Dois repositórios
+   no mesmo store deixaram de se contaminar: sem escopo, `collect_results`
+   devolvia toda tarefa `done` do runtime.db, inclusive as do outro repositório.
+9. **Fato nunca aponta entidade de outro namespace.** `_capability_subject` e
+   `_write_claim` conferem o namespace da entidade ANTES de gravar; citação cujo
+   caminho não existe no snapshot corrente rejeita o claim com motivo.
 
 O que este módulo NÃO faz
 -------------------------
@@ -59,7 +74,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from analysis.investigation import (
@@ -81,6 +96,8 @@ from analysis.verification import (
     VerificationError,
     apply_inconsistencies,
     check_consistency,
+    check_location,
+    extract_effects,
     reread_obligations,
     verification_summary,
     verify_claim,
@@ -88,6 +105,7 @@ from analysis.verification import (
 from runtime import tasks as rt_tasks
 
 from . import evidence as ev_mod
+from . import identity as id_mod
 from .models import (
     ApprovalState,
     ContentKind,
@@ -230,6 +248,59 @@ _TEXT_RAISE = re.compile(
     re.IGNORECASE,
 )
 _EXC_NAME = re.compile(r"\b([A-Z]\w*(?:Error|Exception|Fault))\b")
+
+#: Verbos que abrem a CONSEQUÊNCIA de uma frase (o "então" do "se ... então").
+#: Chaves em minúsculas SEM acento (o texto é dobrado por `_accent_fold` antes
+#: da busca, porque o worker escreve tanto "é aprovado" quanto "e aprovado").
+#: Valor: `(efeito observável que confirmaria a consequência, polaridade)`.
+#: A polaridade só serve para DESCREVER divergência: consequência positiva
+#: ("aprovado") contra trecho que levanta exceção nomeada é contradição.
+_CONSEQUENCE_VERBS: Mapping[str, tuple[str, str]] = {
+    "devolve": ("return", "neutral"), "devolvem": ("return", "neutral"),
+    "devolver": ("return", "neutral"), "devolvido": ("return", "neutral"),
+    "retorna": ("return", "neutral"), "retornam": ("return", "neutral"),
+    "retornar": ("return", "neutral"), "retornado": ("return", "neutral"),
+    "responde": ("return", "neutral"), "responde com": ("return", "neutral"),
+    "return": ("return", "neutral"), "returns": ("return", "neutral"),
+    "aprova": ("return", "positive"), "aprovado": ("return", "positive"),
+    "aprovada": ("return", "positive"), "aceito": ("return", "positive"),
+    "aceita": ("return", "positive"), "autoriza": ("return", "positive"),
+    "autorizado": ("return", "positive"), "permitido": ("return", "positive"),
+    "rejeita": ("raise", "negative"), "rejeitado": ("raise", "negative"),
+    "rejeitada": ("raise", "negative"), "recusa": ("raise", "negative"),
+    "recusado": ("raise", "negative"), "nega": ("raise", "negative"),
+    "negado": ("raise", "negative"), "bloqueia": ("raise", "negative"),
+    "bloqueado": ("raise", "negative"), "impede": ("raise", "negative"),
+    "falha": ("raise", "negative"), "cancelado": ("state", "negative"),
+    "lanca": ("raise", "negative"), "lança": ("raise", "negative"),
+    "levanta": ("raise", "negative"), "dispara": ("raise", "negative"),
+    "raise": ("raise", "negative"), "raises": ("raise", "negative"),
+    "throw": ("raise", "negative"), "throws": ("raise", "negative"),
+    "notifica": ("publish", "neutral"), "notificar": ("publish", "neutral"),
+    "avisa": ("publish", "neutral"), "envia": ("publish", "neutral"),
+    "publica": ("publish", "neutral"), "emite": ("publish", "neutral"),
+    "grava": ("write", "neutral"), "salva": ("write", "neutral"),
+    "persiste": ("write", "neutral"), "registra": ("write", "neutral"),
+    "atualiza": ("write", "neutral"),
+    "vira": ("state", "neutral"), "muda para": ("state", "neutral"),
+    "passa a": ("state", "neutral"), "torna-se": ("state", "neutral"),
+    "fica": ("state", "neutral"), "marcado como": ("state", "neutral"),
+}
+_CONSEQUENCE_VERB_RE = re.compile(
+    r"(?<![A-Za-z0-9_])("
+    + "|".join(re.escape(v) for v in sorted(_CONSEQUENCE_VERBS, key=len, reverse=True))
+    + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+#: Código de status (HTTP e afins) citado na consequência. Literal mecânico por
+#: excelência: ou o número está no trecho, ou não está.
+_STATUS_CODE = re.compile(r"(?<![\w.])([1-5]\d{2})(?![\w.])")
+_STATUS_WORD = re.compile(r"\b(?:HTTP|status|c[oó]digo|code)\b\s*[:=]?\s*(\d{3})\b", re.IGNORECASE)
+#: Nome de estado citado (`APROVADO`, `PENDING_REVIEW`) ou literal entre aspas.
+_STATE_TOKEN = re.compile(r"(?<![\w])([A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)*)(?![\w])")
+_QUOTED = re.compile(r"'([^']{1,60})'|\"([^\"]{1,60})\"")
+#: Fim da cláusula de consequência: outra oração começa.
+_CLAUSE_END = re.compile(r"\s+(?:exceto|salvo|a menos que|caso contrario|porem|mas)\b|[;.]")
 _NAMED_PREFIX = re.compile(r"^\s*([^:\n]{3,80}?)\s*:\s*(\S.*)$", re.DOTALL)
 _BULLET = re.compile(r"^\s*(?:[-*•—]|\d+[.)])\s*")
 _ASSERT_LINE = re.compile(r"\b(assert|expect|should|it\(|test)", re.IGNORECASE)
@@ -276,6 +347,17 @@ class AcceptedResult:
         )
 
 
+def _expected_hash_for(
+    expected: str | Mapping[str, str] | None, objective_id: str
+) -> str:
+    """Hash de entradas esperado para ESTE objetivo (str única ou mapa)."""
+    if expected is None:
+        return ""
+    if isinstance(expected, Mapping):
+        return str(expected.get(objective_id) or "")
+    return str(expected)
+
+
 def _worker_of(task: rt_tasks.Task) -> str:
     """Quem afirmou, a partir da configuração da tarefa.
 
@@ -296,6 +378,7 @@ def collect_results(
     objective_ids: Sequence[str] | None = None,
     *,
     latest_only: bool = True,
+    expected_input_versions_hash: str | Mapping[str, str] | None = None,
 ) -> list[AcceptedResult]:
     """Resultados aceitos em `runtime.db`, prontos para integração.
 
@@ -306,7 +389,19 @@ def collect_results(
     - `termination_reason` de recusa (`rejected:*`, `submit:*`), mesmo que a
       linha tenha resultado antigo de outra tentativa;
     - tarefa sem `result_json` (A01 já impede `done` sem resultado);
-    - tarefa cuja última tentativa terminou `rejected`.
+    - tarefa cuja última tentativa terminou `rejected`;
+    - `objective_id` fora de `objective_ids`, quando dado;
+    - `input_versions_hash` diferente do esperado, quando dado.
+
+    `objective_ids` é opcional AQUI (a função também serve para inspeção), mas
+    `integrate` o exige: um `runtime.db` guarda as tarefas de TODOS os
+    repositórios já analisados no mesmo store, e integrar sem escopo foi o que
+    fez a integração do repositório B processar o objetivo do repositório A
+    (achado nº5).
+
+    `expected_input_versions_hash` aceita um hash único ou um mapa
+    `objective_id -> hash`: resultado que descreve OUTRA versão das entradas
+    descreve outro código, e reintegrá-lo grava conhecimento vencido.
 
     `latest_only` mantém apenas a tarefa mais recente por `objective_id`:
     `create_task` nunca ATUALIZA linha existente — código mudado gera tarefa
@@ -341,6 +436,9 @@ def collect_results(
         if not objective_id:
             continue
         if wanted is not None and objective_id not in wanted:
+            continue
+        expected = _expected_hash_for(expected_input_versions_hash, objective_id)
+        if expected and expected != task.input_versions_hash:
             continue
         accepted.append(
             AcceptedResult(
@@ -496,46 +594,320 @@ def _split_statements(text: str) -> list[str]:
     return out
 
 
-def _derive_statement_fields(text: str, campo: str) -> dict[str, Any]:
-    """Campos mecânicos EXTRAÍDOS do enunciado, quando ele já é estruturado.
+def _accent_fold(text: str) -> str:
+    """Remove diacríticos PRESERVANDO o comprimento em caracteres.
 
-    Deliberadamente conservador. Só duas formas são extraídas: a comparação
-    (`total > 1000`) e a exceção nomeada (`raise ConflictError`). Derivar
-    também o consequente ("→ 409") como literal soaria mais completo e seria
-    pior: `check_support` exige que TODA checagem aplicável passe, então um
-    literal adivinhado que caia fora da faixa citada rebaixaria um predicado
-    genuinamente sustentado. Consequente não extraído continua registrado no
-    `value` do fato e visível na consulta.
+    NFKD decompõe `é` em `e` + combining; descartar só os combining devolve uma
+    string com o mesmo número de caracteres para o português corrente, então os
+    offsets do casamento no texto dobrado indexam o texto ORIGINAL. É o que
+    permite detectar o verbo em "é aprovado" e recortar a cláusula no original.
+    """
+    folded = "".join(
+        c for c in unicodedata.normalize("NFKD", text or "") if not unicodedata.combining(c)
+    )
+    return folded if len(folded) == len(text or "") else (text or "")
+
+
+@dataclass(frozen=True)
+class _Consequence:
+    """A parte da frase que diz O QUE ACONTECE — o "então" do "se ... então".
+
+    `literals` são os valores mecanicamente confrontáveis com o trecho (código
+    de status, nome de estado, literal citado). `effect_kind` é o efeito que
+    confirmaria a consequência quando ela não traz literal nenhum. `verifiable`
+    é falso quando a consequência existe mas não produziu NADA mecânico — o
+    caso em que o claim inteiro não pode sair `supported`.
+    """
+
+    text: str
+    verb: str
+    effect_kind: str
+    polarity: str
+    literals: tuple[str, ...] = ()
+    exception: str | None = None
+
+    @property
+    def verifiable(self) -> bool:
+        return bool(self.literals or self.exception or self.effect_kind in _MECHANICAL_EFFECTS)
+
+
+#: Efeitos que `analysis.verification.extract_effects` sabe observar no trecho.
+#: `state` fica de fora: "vira aprovado" sem literal não tem forma mecânica.
+_MECHANICAL_EFFECTS: frozenset[str] = frozenset({"return", "raise", "publish", "write"})
+
+
+def _consequence_of(statement: str, start: int = 0) -> _Consequence | None:
+    """Consequência declarada no enunciado, a partir de `start` (§achado nº1).
+
+    `start` é o fim da CONDIÇÃO já extraída: procurar o verbo depois dela evita
+    confundir o operando da comparação com o valor da consequência.
+    """
+    text = statement or ""
+    folded = _accent_fold(text)
+    match = _CONSEQUENCE_VERB_RE.search(folded, start)
+    if match is None and start <= 0:
+        # Sem verbo de consequência E sem condição antes: a frase inteira é uma
+        # afirmação só. Colher "literais" dela seria inventar consequência onde
+        # o enunciado não declara nenhuma — e inventar checagem que PASSA é pior
+        # que não checar (promoveria claim hoje `unresolved` a `supported`).
+        return None
+    clause_start = match.start() if match else start
+    end_match = _CLAUSE_END.search(folded, clause_start + (len(match.group(1)) if match else 0))
+    clause = text[clause_start : end_match.start() if end_match else len(text)]
+    if not clause.strip():
+        return None
+
+    literals: list[str] = []
+    for m in _STATUS_WORD.finditer(clause):
+        literals.append(m.group(1))
+    for m in _STATUS_CODE.finditer(clause):
+        if m.group(1) not in literals:
+            literals.append(m.group(1))
+    for m in _QUOTED.finditer(clause):
+        value = m.group(1) or m.group(2) or ""
+        if value and value not in literals:
+            literals.append(value)
+
+    exception = None
+    raised = _TEXT_RAISE.search(clause)
+    if raised:
+        exception = raised.group(1)
+    else:
+        named = _EXC_NAME.search(clause)
+        if named:
+            exception = named.group(1)
+
+    if match is None:
+        # Sem verbo: só é consequência se houver valor mecânico solto depois da
+        # condição ("Se total > 1000, HTTP 409").
+        if not literals and exception is None:
+            return None
+        return _Consequence(
+            text=_norm_ws(clause), verb="", effect_kind="", polarity="neutral",
+            literals=tuple(literals), exception=exception,
+        )
+
+    verb = _accent_fold(match.group(1)).lower()
+    effect_kind, polarity = _CONSEQUENCE_VERBS.get(verb, ("", "neutral"))
+    if effect_kind == "state" and not literals:
+        for m in _STATE_TOKEN.finditer(clause):
+            if m.group(1) not in literals:
+                literals.append(m.group(1))
+    return _Consequence(
+        text=_norm_ws(clause),
+        verb=verb,
+        effect_kind=effect_kind,
+        polarity=polarity,
+        literals=tuple(literals),
+        exception=exception,
+    )
+
+
+def _statement_parse(text: str, campo: str = "") -> tuple[dict[str, Any], _Consequence | None]:
+    """Enunciado -> (campos mecânicos, consequência). Nunca para na 1ª extração.
+
+    A versão anterior RETORNAVA na comparação e a consequência ficava fora do
+    claim: `check_support` aprovava `total > 1000`, e `_write_claim` gravava a
+    FRASE INTEIRA ("... é aprovado com HTTP 200") como sustentada, contra um
+    trecho que devolve 409. Aqui condição, consequência e exceção são derivadas
+    juntas — e a consequência volta ao chamador para que a regra de sustentação
+    (`_consequence_guard`) possa julgar a frase pelo componente mais fraco.
     """
     statement = _norm_ws(text)
     if not statement:
-        return {}
+        return {}, None
 
+    fields: dict[str, Any] = {}
+    end = 0
     match = _TEXT_CMP_SYMBOLIC.search(statement)
     if match:
         comparator = match.group(2)
-        return {
-            "condition": match.group(1),
-            "comparator": "==" if comparator == "=" else comparator,
-            "value": match.group(3),
-        }
+        fields["condition"] = match.group(1)
+        fields["comparator"] = "==" if comparator == "=" else comparator
+        fields["value"] = match.group(3)
+        end = match.end()
+    else:
+        worded = _TEXT_CMP_WORDS.search(statement)
+        if worded:
+            fields["condition"] = worded.group(1)
+            fields["comparator"] = _WORD_COMPARATOR[worded.group(2).lower()]
+            fields["value"] = worded.group(3)
+            end = worded.end()
 
-    worded = _TEXT_CMP_WORDS.search(statement)
-    if worded:
-        return {
-            "condition": worded.group(1),
-            "comparator": _WORD_COMPARATOR[worded.group(2).lower()],
-            "value": worded.group(3),
-        }
+    consequence = _consequence_of(statement, end)
+    if consequence is not None:
+        # `literals` é a forma mecânica da consequência que NÃO presume a
+        # gramática do efeito: "devolve 409" contra `raise ConflictError(409)`
+        # continua sustentado (o valor está lá), enquanto "aprovado com HTTP
+        # 200" contra o mesmo trecho falha — que é exatamente o achado nº1.
+        # `effect` NÃO é derivado por isto: `_check_effect` exigiria um `return`
+        # no trecho e rebaixaria o primeiro caso, verdadeiro. O efeito é
+        # confrontado em `_consequence_confirmed`, com `extract_effects`.
+        if consequence.literals:
+            fields["literals"] = list(consequence.literals)
+        if consequence.exception:
+            fields["exception"] = consequence.exception
 
-    raised = _TEXT_RAISE.search(statement)
-    if raised:
-        return {"exception": raised.group(1)}
-    if campo == "falhas":
-        named = _EXC_NAME.search(statement)
-        if named:
-            return {"exception": named.group(1)}
-    return {}
+    if "exception" not in fields:
+        raised = _TEXT_RAISE.search(statement)
+        if raised:
+            fields["exception"] = raised.group(1)
+        elif campo == "falhas":
+            named = _EXC_NAME.search(statement)
+            if named:
+                fields["exception"] = named.group(1)
+    return fields, consequence
+
+
+def _derive_statement_fields(text: str, campo: str) -> dict[str, Any]:
+    """Campos mecânicos EXTRAÍDOS do enunciado (condição + consequência)."""
+    return _statement_parse(text, campo)[0]
+
+
+# --------------------------------------------------------------------------
+# Regra de sustentação da FRASE INTEIRA (achado nº1 da 2ª auditoria)
+# --------------------------------------------------------------------------
+
+def _literal_in(text: str, snippet: str) -> bool:
+    """Mesma semântica de `verification._check_literals`: substring normalizada."""
+    if not text:
+        return False
+    if text in (snippet or ""):
+        return True
+    if _norm_ws(text) and _norm_ws(text) in _norm_ws(snippet):
+        return True
+    collapsed = re.sub(r"\s+", "", snippet or "")
+    compact = re.sub(r"\s+", "", text)
+    return bool(compact) and compact in collapsed
+
+
+def _consequence_confirmed(cons: _Consequence, verdict: Verdict) -> bool:
+    """A consequência aparece MECANICAMENTE em alguma citação que resolveu?
+
+    Literal presente basta e é deliberado: "devolve 409" contra
+    `raise ConflictError(409)` continua sustentado — o valor afirmado ESTÁ no
+    trecho, e exigir a forma `return` reprovaria uma afirmação verdadeira. O que
+    não passa é o valor AUSENTE ("HTTP 200" contra o mesmo trecho).
+    """
+    if not cons.verifiable:
+        return False
+    for loc in verdict.locations:
+        if not loc.ok:
+            continue
+        if cons.literals and not all(_literal_in(lit, loc.snippet) for lit in cons.literals):
+            continue
+        if cons.exception:
+            effects = extract_effects(loc.snippet, loc.path)
+            leaf = cons.exception.rsplit(".", 1)[-1]
+            if not any(r.rsplit(".", 1)[-1] == leaf for r in effects.raises if r):
+                continue
+        if not cons.literals and not cons.exception:
+            effects = extract_effects(loc.snippet, loc.path)
+            observed = {
+                "return": effects.returns,
+                "raise": effects.raises,
+                "publish": tuple(effects.publishes),
+                "write": tuple(effects.writes),
+            }.get(cons.effect_kind, ())
+            if not observed:
+                continue
+        return True
+    return False
+
+
+def _contrary_consequence(cons: _Consequence, verdict: Verdict) -> str:
+    """O trecho mostra consequência CONTRÁRIA à afirmada? Devolve a divergência.
+
+    Duas formas mecânicas, ambas do achado nº1: código de status afirmado que
+    não é nenhum dos códigos do trecho, e consequência de aprovação/retorno
+    contra trecho que só levanta exceção nomeada.
+    """
+    codes = {lit for lit in cons.literals if _STATUS_CODE.fullmatch(lit or "")}
+    for loc in verdict.locations:
+        if not loc.ok:
+            continue
+        if codes:
+            found = {m.group(1) for m in _STATUS_CODE.finditer(loc.snippet or "")}
+            if found and not (codes & found):
+                return (
+                    f"afirmado código {', '.join(sorted(codes))}; o trecho em {loc.span} usa "
+                    f"{', '.join(sorted(found))}"
+                )
+        if cons.polarity == "positive":
+            effects = extract_effects(loc.snippet, loc.path)
+            named = sorted({r for r in effects.raises if r})
+            if named and effects.raises_all_named:
+                return (
+                    f"consequência afirmada é de aprovação/retorno; o trecho em {loc.span} "
+                    f"levanta {', '.join(named)}"
+                )
+    return ""
+
+
+def _consequence_guard(claim: Claim, verdict: Verdict) -> tuple[Verdict, str]:
+    """Veredito da frase INTEIRA + o escopo efetivamente sustentado (achado nº1).
+
+    Reprodução da auditoria: código `if total > 1000: raise Conflict(409)`,
+    worker devolve "Quando total > 1000, o pedido é aprovado com HTTP 200".
+    `check_support` aprovava a comparação — que existe mesmo — e a frase inteira
+    era gravada `supported/implemented`. Aqui a frase só continua sustentada se
+    a CONSEQUÊNCIA também for confirmada no trecho; se o trecho mostra a
+    consequência contrária, o claim vira `disputed`; se a consequência não é
+    mecanicamente verificável, cai para `inferred`. Nunca promove nada.
+    """
+    consequence = _statement_parse(claim.statement)[1]
+    if consequence is None:
+        return verdict, ""
+    if _consequence_confirmed(consequence, verdict):
+        return verdict, "frase completa: condição e consequência confirmadas no trecho"
+
+    contrary = _contrary_consequence(consequence, verdict)
+    if contrary:
+        reasons = verdict.reasons + (
+            f"consequência afirmada ({consequence.text!r}) CONTRADITA pelo trecho: {contrary}",
+            "a frase vale pelo componente mais fraco: condição sustentada não sustenta "
+            "consequência divergente (achado nº1)",
+        )
+        return (
+            replace(
+                verdict,
+                epistemic=EpistemicStatus.DISPUTED,
+                reasons=reasons,
+                support_recorded_by=None,
+                external_behavior_supported=False,
+                insufficient=False,
+            ),
+            f"nenhum: o trecho mostra consequência contrária ({contrary})",
+        )
+
+    motivo = (
+        f"consequência afirmada ({consequence.text!r}) não confirmada mecanicamente no trecho"
+        if consequence.verifiable
+        else (
+            f"consequência afirmada ({consequence.text!r}) não é derivável em campo mecânico "
+            "(sem literal, efeito ou exceção a confrontar)"
+        )
+    )
+    escopo = f"apenas a condição — {motivo}"
+    if verdict.epistemic is not EpistemicStatus.SUPPORTED:
+        return verdict, escopo
+    reasons = verdict.reasons + (
+        motivo,
+        "claim rebaixado a inferred: a condição sozinha não sustenta a frase inteira "
+        "(achado nº1)",
+    )
+    return (
+        replace(
+            verdict,
+            epistemic=EpistemicStatus.INFERRED,
+            reasons=reasons,
+            nature=None,
+            support_recorded_by=None,
+            external_behavior_supported=False,
+            insufficient=not consequence.verifiable,
+        ),
+        escopo,
+    )
 
 
 def _structured_fields(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -795,7 +1167,13 @@ def _objective_of(
     if isinstance(objective, InvestigationObjective):
         return objective
     if isinstance(objective, Mapping) and objective.get("objective_id"):
-        return InvestigationObjective.from_dict(objective)
+        try:
+            return InvestigationObjective.from_dict(objective)
+        except Exception:
+            # Payload parcial (o `objective_json` da tarefa nem sempre traz o
+            # pacote inteiro): cai para o objetivo mínimo em vez de derrubar a
+            # integração dos demais objetivos.
+            pass
     return InvestigationObjective(
         objective_id=objective_id or str(output.get("objective_id") or "objetivo"),
         kind="capability",
@@ -809,19 +1187,116 @@ def _objective_of(
 # --------------------------------------------------------------------------
 
 
+def _reading_satisfied_entries(output: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Campo opcional `reading_satisfied` do resultado, normalizado.
+
+    É DADO, não comando: cada item diz qual obrigação o worker afirma ter
+    cumprido e com que evidência. Nada aqui fecha obrigação por si — quem fecha
+    é `_satisfy_readings`, e só depois de resolver a evidência no snapshot.
+    """
+    raw = output.get("reading_satisfied")
+    if isinstance(raw, Mapping):
+        raw = [raw]
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, Mapping):
+            out.append(dict(item))
+        elif isinstance(item, str) and item.strip():
+            out.append({"need_id": item.strip()})
+    return out
+
+
+def _satisfy_readings(
+    data: dict[str, Any], output: Mapping[str, Any], snapshot: Snapshot | None
+) -> list[dict[str, Any]]:
+    """Fecha as obrigações de leitura que o resultado EVIDENCIOU (achado nº3).
+
+    Declaração não fecha nada: cada `evidence_refs` vira `ClaimEvidence` e passa
+    por `check_location` contra o snapshot — localizador que não resolve (ou
+    cujo `snippet_hash` não bate) deixa a obrigação ABERTA, e ela continua em
+    `unmet_obligations()`. É a mesma porta que o resto do módulo usa para
+    evidência; um worker não fecha obrigação escrevendo que leu.
+    """
+    entries = _reading_satisfied_entries(output)
+    needs = data.get("reading_needs")
+    if not entries or not isinstance(needs, list):
+        return []
+
+    fechadas: list[dict[str, Any]] = []
+    for entry in entries:
+        need_id = _norm_ws(entry.get("need_id"))
+        target = _norm_ws(entry.get("target"))
+        alvo = [
+            n
+            for n in needs
+            if isinstance(n, Mapping)
+            and not n.get("satisfied")
+            and not (n.get("waived_reason") or "")
+            and (
+                (need_id and str(n.get("need_id") or "") == need_id)
+                or (not need_id and target and _norm_ws(n.get("target")) == target)
+            )
+        ]
+        if not alvo:
+            continue
+        spans: list[str] = []
+        motivos: list[str] = []
+        for raw in _evidence_dicts(entry) or ([entry] if entry.get("path") else []):
+            citation = _claim_evidence(raw)
+            if citation is None:
+                motivos.append("evidência sem localizador utilizável (path + faixa de linhas)")
+                continue
+            if snapshot is None:
+                motivos.append("sem snapshot para resolver a evidência")
+                continue
+            loc = check_location(citation, snapshot)
+            if loc.ok:
+                spans.append(loc.span)
+            else:
+                motivos.append(f"{citation.span}: {loc.reason}")
+        registro = {
+            "need_id": need_id or str(alvo[0].get("need_id") or ""),
+            "target": target or _norm_ws(alvo[0].get("target")),
+            "satisfeita": bool(spans),
+            "evidencia": spans,
+            "motivo": "; ".join(motivos[:3]),
+        }
+        if spans:
+            nota = "leitura satisfeita com evidência resolvida no snapshot: " + ", ".join(spans)
+            for need in alvo:
+                need["satisfied"] = True
+                need["satisfied_note"] = nota
+        else:
+            registro["motivo"] = (
+                registro["motivo"]
+                or "reading_satisfied sem evidence_refs: declaração não fecha obrigação"
+            )
+        fechadas.append(registro)
+    return fechadas
+
+
 def _objective_after_result(
-    objective: InvestigationObjective, output: Mapping[str, Any]
-) -> InvestigationObjective:
+    objective: InvestigationObjective,
+    output: Mapping[str, Any],
+    snapshot: Snapshot | None = None,
+) -> tuple[InvestigationObjective, list[dict[str, Any]]]:
     """Objetivo do PLANO + o que o resultado preencheu, sem promoção indevida.
 
     O `state` declarado pelo worker só entra quando PIORA o estado (`blocked`):
     o estado final vem sempre de `evaluate()`, que exige `unmet_obligations()`
     vazio para `complete`. É por isso que um worker não consegue fechar um
     objetivo declarando-o fechado.
+
+    `reading_satisfied` (achado nº3) é o único caminho pelo qual o resultado
+    fecha obrigação de leitura — e só quando a evidência resolve no snapshot.
+    Devolve também o registro do que foi (e do que não foi) fechado.
     """
     data = objective.to_dict()
     contract = {name: _merged_field(objective, output, name).to_dict() for name in CONTRACT_FIELDS}
     data["contract"] = contract
+    leituras = _satisfy_readings(data, output, snapshot)
     matrix = output.get("matrix")
     if isinstance(matrix, Mapping) and matrix:
         data["matrix"] = dict(matrix)
@@ -832,9 +1307,9 @@ def _objective_after_result(
         # Nunca reafirmar `complete` vindo do payload: recalcula do zero.
         data["state"] = ObjectiveState.PARTIAL.value
     try:
-        return InvestigationObjective.from_dict(data)
+        return InvestigationObjective.from_dict(data), leituras
     except Exception:
-        return objective
+        return objective, leituras
 
 
 def _lacunas_of(
@@ -911,6 +1386,11 @@ class FactWrite:
     changed: bool
     evidence_refs: tuple[str, ...] = ()
     entity_id: str | None = None
+    #: Que PARTE da frase o veredito sustenta. Vazio quando a frase não tem
+    #: consequência separável; preenchido quando só a condição ficou de pé
+    #: (achado nº1) — o `value` gravado continua sendo a frase inteira, e é este
+    #: campo que diz por que ela não é `supported`.
+    escopo_sustentado: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -924,6 +1404,7 @@ class FactWrite:
             "changed": self.changed,
             "evidence_refs": list(self.evidence_refs),
             "entity_id": self.entity_id,
+            "escopo_sustentado": self.escopo_sustentado,
         }
 
 
@@ -942,6 +1423,13 @@ class ObjectiveOutcome:
     entidades: list[dict[str, Any]] = field(default_factory=list)
     relacoes: list[dict[str, Any]] = field(default_factory=list)
     bloqueios: list[str] = field(default_factory=list)
+    #: Claims que NÃO viraram fato por incoerência de escopo (achado nº5):
+    #: citação para caminho fora do snapshot corrente, sujeito de outro
+    #: namespace. Cada item traz `claim_id` e `motivo`.
+    rejeitados: list[dict[str, Any]] = field(default_factory=list)
+    #: Obrigações de leitura fechadas por `reading_satisfied` COM evidência
+    #: resolvida (achado nº3).
+    leituras_satisfeitas: list[dict[str, Any]] = field(default_factory=list)
     task_id: str = ""
     execution_id: str | None = None
     integration_key: str = ""
@@ -970,6 +1458,8 @@ class ObjectiveOutcome:
             "entidades": list(self.entidades),
             "relacoes": list(self.relacoes),
             "bloqueios": list(self.bloqueios),
+            "rejeitados": list(self.rejeitados),
+            "leituras_satisfeitas": list(self.leituras_satisfeitas),
             "fatos": [f.to_dict() for f in self.fatos],
         }
 
@@ -984,6 +1474,11 @@ class IntegrationReport:
     reread_obligations: list[dict[str, Any]] = field(default_factory=list)
     verificacao: dict[str, Any] = field(default_factory=dict)
     bloqueios: list[str] = field(default_factory=list)
+    #: Resultados aceitos pelo coordenador que esta integração NÃO processou,
+    #: com o motivo (achado nº5): objetivo fora do escopo pedido, ou entradas
+    #: que não são as do snapshot corrente. Descarte silencioso seria o mesmo
+    #: erro com outra aparência.
+    descartados: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def fatos_gravados(self) -> int:
@@ -998,6 +1493,7 @@ class IntegrationReport:
             "reread_obligations": list(self.reread_obligations),
             "verificacao": dict(self.verificacao),
             "bloqueios": list(self.bloqueios),
+            "descartados": list(self.descartados),
         }
 
 
@@ -1085,8 +1581,24 @@ class _SourceVersions:
         self.files = snapshot.file_map()
         self.cache: dict[str, str | None] = {}
 
+    @staticmethod
+    def normalize(path: str) -> str:
+        return (path or "").replace("\\", "/").strip("/")
+
+    def in_snapshot(self, path: str) -> bool:
+        """O caminho pertence ao snapshot corrente? (achado nº5)
+
+        Citação para arquivo que não está aqui é citação de OUTRO escopo — o
+        outro repositório do mesmo store, ou uma árvore anterior.
+        """
+        return self.normalize(path) in self.files
+
+    def sha_of(self, path: str) -> str:
+        entry = self.files.get(self.normalize(path))
+        return str(getattr(entry, "sha256", "") or "") if entry is not None else ""
+
     def get(self, path: str) -> str | None:
-        norm = (path or "").replace("\\", "/").strip("/")
+        norm = self.normalize(path)
         if norm in self.cache:
             return self.cache[norm]
         entry = self.files.get(norm)
@@ -1113,30 +1625,73 @@ def integrate(
     capability_entity_map: Mapping[str, str] | None = None,
     results: Sequence[AcceptedResult] | None = None,
     objective_ids: Sequence[str] | None = None,
+    expected_input_versions_hash: str | Mapping[str, str] | None = None,
     reason: str = "integração de resultados de investigação",
     create_missing_capability: bool = True,
 ) -> IntegrationReport:
     """Resultados aceitos -> fatos verificados, numa ÚNICA revisão atômica.
+
+    ESCOPO É OBRIGATÓRIO (achado nº5). `objectives` (ou `objective_ids`) define
+    o conjunto que esta integração pode gravar; resultado de objetivo fora dele
+    vai para `IntegrationReport.descartados` com motivo, e nada é escrito por
+    ele. Sem escopo declarado, a integração inteira é bloqueada: um `runtime.db`
+    compartilhado guarda tarefas de todos os repositórios já analisados, e
+    `collect_results` sem filtro devolvia as do repositório vizinho — foi assim
+    que a integração do repositório B recriou a regra do A no namespace do B.
+
+    Também é descartado o resultado cujas ENTRADAS não são as do snapshot
+    corrente: `expected_input_versions_hash` quando o chamador o conhece, e, em
+    todo caso, os `source_version_ids` (`caminho@sha256`) declarados na tarefa,
+    conferidos arquivo a arquivo contra `snapshot.file_map()`.
 
     `capability_entity_map` (capability_id -> entity_id) é parâmetro, e não
     consulta ao `wk`: quem chama já resolveu a identidade da capacidade e este
     módulo não deve reimplementar aquela decisão. Sem entrada no mapa, tenta-se
     o próprio `capability_id` como `entity_id` (é a convenção que
     `wk._write_structural_knowledge` usa ao gravar `EntityDraft(entity_id=
-    cap.capability_id)`), e só então cria-se a Capability que falta.
+    cap.capability_id)`), e só então cria-se a Capability que falta — sempre
+    conferindo que a entidade reutilizada é DESTE namespace.
 
     A revisão é uma só de propósito: ou todos os fatos desta integração entram
     com a mesma proveniência, ou nenhum entra (§4.2).
     """
-    accepted = list(results) if results is not None else collect_results(
-        task_store, objective_ids
-    )
-    index = _objectives_index(objectives)
     report = IntegrationReport()
+    index = _objectives_index(objectives)
+    scope = _scope_of(objectives, objective_ids)
+    if not scope:
+        report.bloqueios.append(
+            "integração sem escopo: `objectives` (ou `objective_ids`) é obrigatório — "
+            "sem ele, resultados de OUTRO repositório no mesmo runtime.db seriam gravados "
+            "neste namespace (achado nº5). Nada foi integrado."
+        )
+        return report
+
+    versions = _SourceVersions(repo, namespace, snapshot)
+    # Coleta SEM filtro e descarta aqui: o filtro dentro de `collect_results`
+    # deixaria o descarte invisível, e "não integrei o resultado do outro
+    # repositório" é informação, não silêncio (achado nº5).
+    collected = list(results) if results is not None else collect_results(task_store)
+    accepted: list[AcceptedResult] = []
+    for result in collected:
+        motivo = _out_of_scope_reason(result, scope, versions, expected_input_versions_hash)
+        if motivo:
+            report.descartados.append(
+                {
+                    "objective_id": result.objective_id,
+                    "task_id": result.task_id,
+                    "capability_id": result.capability_id,
+                    "input_versions_hash": result.input_versions_hash,
+                    "motivo": motivo,
+                }
+            )
+            continue
+        accepted.append(result)
+
     if not accepted:
         report.bloqueios.append(
             "nenhum resultado aceito em runtime.db (tarefas done de investigação/verificação "
-            "com resultado): nada a integrar"
+            "com resultado) dentro do escopo pedido: nada a integrar"
+            + (f"; {len(report.descartados)} resultado(s) descartado(s)" if report.descartados else "")
         )
         return report
 
@@ -1146,27 +1701,44 @@ def integrate(
         base = index.get(result.objective_id)
         if base is None:
             base = _objective_of(result.objective_payload or None, result.output, result.objective_id)
-        objective = _objective_after_result(base, result.output)
+        objective, leituras = _objective_after_result(base, result.output, snapshot)
         claims = results_to_claims(result, objective)
         verdicts = [verify_claim(c, snapshot, extraction) for c in claims]
         inconsistencies: list[Inconsistency] = check_consistency(claims, verdicts)
         verdicts = apply_inconsistencies(verdicts, inconsistencies)
+        by_id = {c.claim_id: c for c in claims}
+        # Achado nº1: a frase inteira é reavaliada pelo componente mais fraco
+        # ANTES do resumo e da gravação, para que relatório e banco contem a
+        # mesma história.
+        guarded: list[Verdict] = []
+        escopos: dict[str, str] = {}
+        for verdict in verdicts:
+            claim = by_id.get(verdict.claim_id)
+            if claim is None:
+                guarded.append(verdict)
+                continue
+            adjusted, escopo = _consequence_guard(claim, verdict)
+            guarded.append(adjusted)
+            if escopo:
+                escopos[verdict.claim_id] = escopo
+        verdicts = guarded
         all_verdicts.extend(verdicts)
         prepared.append(
             {
                 "result": result,
                 "objective": objective,
-                "claims": {c.claim_id: c for c in claims},
+                "claims": by_id,
                 "ordered_claims": claims,
                 "verdicts": verdicts,
                 "inconsistencies": inconsistencies,
+                "escopos": escopos,
+                "leituras": leituras,
             }
         )
 
     report.verificacao = verification_summary(all_verdicts)
     report.reread_obligations = _reread_with_objective(prepared)
 
-    versions = _SourceVersions(repo, namespace, snapshot)
     with repo.revision(author=INTEGRATOR, reason=reason) as rev:
         for item in prepared:
             report.objetivos.append(
@@ -1182,11 +1754,75 @@ def integrate(
                     inconsistencies=item["inconsistencies"],
                     capability_entity_map=capability_entity_map or {},
                     create_missing_capability=create_missing_capability,
+                    escopos=item["escopos"],
+                    leituras=item["leituras"],
                 )
             )
         report.revisao = rev.revision_id
         report.mudancas = rev.change_count
     return report
+
+
+def _scope_of(
+    objectives: Iterable[Any] | None, objective_ids: Sequence[str] | None
+) -> set[str]:
+    """Ids que esta integração pode gravar.
+
+    Lê o `objective_id` do objeto BRUTO (e não só do índice reconstruído) de
+    propósito: um objetivo que `InvestigationObjective.from_dict` recuse ainda
+    delimita escopo — perder o id ali alargaria silenciosamente o filtro.
+    """
+    ids: set[str] = set()
+    for raw in objectives or ():
+        oid = getattr(raw, "objective_id", None)
+        if oid is None and isinstance(raw, Mapping):
+            oid = raw.get("objective_id")
+        if oid:
+            ids.add(str(oid))
+    ids.update(str(o) for o in (objective_ids or ()) if str(o))
+    return ids
+
+
+def _out_of_scope_reason(
+    result: AcceptedResult,
+    scope: set[str],
+    versions: "_SourceVersions",
+    expected: str | Mapping[str, str] | None,
+) -> str:
+    """Por que este resultado NÃO pertence a esta integração (ou ``""``)."""
+    if result.objective_id not in scope:
+        return (
+            f"objective_id {result.objective_id!r} fora do escopo desta integração "
+            f"({len(scope)} objetivo(s)): resultado de outro conjunto/repositório"
+        )
+    want = _expected_hash_for(expected, result.objective_id)
+    if want and want != result.input_versions_hash:
+        return (
+            f"input_versions_hash {result.input_versions_hash[:12]!r} difere do esperado "
+            f"{want[:12]!r}: o resultado descreve outra versão das entradas"
+        )
+    declared = result.input_versions.get("source_version_ids")
+    entries = (
+        [str(s) for s in declared]
+        if isinstance(declared, Sequence) and not isinstance(declared, (str, bytes))
+        else []
+    )
+    foreign: list[str] = []
+    for entry in entries:
+        path, sep, sha = entry.rpartition("@")
+        if not sep:
+            path, sha = entry, ""
+        if not versions.in_snapshot(path):
+            foreign.append(f"{path} (fora do snapshot atual)")
+        elif sha and versions.sha_of(path) != sha:
+            foreign.append(f"{path} (sha divergente do snapshot atual)")
+    if foreign:
+        return (
+            "entradas declaradas pela tarefa não pertencem ao snapshot corrente: "
+            + "; ".join(foreign[:3])
+            + (f" (+{len(foreign) - 3})" if len(foreign) > 3 else "")
+        )
+    return ""
 
 
 def _objectives_index(objectives: Iterable[Any] | None) -> dict[str, InvestigationObjective]:
@@ -1215,6 +1851,39 @@ def _reread_with_objective(prepared: Sequence[Mapping[str, Any]]) -> list[dict[s
     return out
 
 
+def _entity_namespace(repo: Any, entity_id: str) -> str | None:
+    """Namespace da entidade, ou `None` quando ela não existe/não é legível.
+
+    `repository.entity_exists` responde só "existe" — e existir em OUTRO
+    namespace foi o que permitiu, com dois repositórios no mesmo store, um fato
+    do namespace B apontar a entidade do A (achado nº5).
+    """
+    getter = getattr(repo, "get_entity", None)
+    if getter is None:
+        return None
+    try:
+        entity = getter(entity_id, lifecycle=None)
+    except TypeError:
+        try:
+            entity = getter(entity_id)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    return getattr(entity, "namespace", None)
+
+
+def _same_namespace(repo: Any, entity_id: str, namespace: str) -> bool:
+    """A entidade EXISTENTE pertence a este namespace?"""
+    found = _entity_namespace(repo, entity_id)
+    if found is None:
+        return False
+    try:
+        return id_mod.normalize_namespace(found) == id_mod.normalize_namespace(namespace)
+    except KnowledgeError:
+        return False
+
+
 def _capability_subject(
     rev: Any,
     repo: Any,
@@ -1229,16 +1898,34 @@ def _capability_subject(
     Só cria a Capability quando ela NÃO existe: recriar com título próprio
     geraria uma revisão de entidade a cada integração sobre uma base que
     `wk analyze` já povoou — idempotência aparente é pior que nenhuma.
+
+    Toda entidade REUTILIZADA passa por `_same_namespace`: prender os fatos
+    desta integração a uma entidade de outro namespace é exatamente o cruzamento
+    que o achado nº5 descreve, e existir não é pertencer.
     """
     mapped = str(capability_entity_map.get(objective.capability_id) or "").strip()
     if mapped:
         if repo.entity_exists(mapped):
-            return mapped
+            if _same_namespace(repo, mapped, namespace):
+                return mapped
+            outcome.bloqueios.append(
+                f"capability_entity_map aponta para entidade {mapped!r} do namespace "
+                f"{_entity_namespace(repo, mapped)!r}, não de {namespace!r}: recusada "
+                "(fato deste namespace não aponta entidade de outro)"
+            )
+        else:
+            outcome.bloqueios.append(
+                f"capability_entity_map aponta para entidade inexistente: {mapped!r}"
+            )
+    existing = bool(objective.capability_id) and repo.entity_exists(objective.capability_id)
+    if existing:
+        if _same_namespace(repo, objective.capability_id, namespace):
+            return objective.capability_id
         outcome.bloqueios.append(
-            f"capability_entity_map aponta para entidade inexistente: {mapped!r}"
+            f"capacidade {objective.capability_id!r} já existe no namespace "
+            f"{_entity_namespace(repo, objective.capability_id)!r}: este objetivo não é "
+            f"de {namespace!r} ou o id colide — nova identidade será derivada do namespace"
         )
-    if objective.capability_id and repo.entity_exists(objective.capability_id):
-        return objective.capability_id
     if not create_missing:
         outcome.bloqueios.append(
             f"capacidade {objective.capability_id!r} sem entidade em knowledge.db: "
@@ -1253,7 +1940,10 @@ def _capability_subject(
             entity_type=EntityType.CAPABILITY,
             stable_key=stable_key,
             title=objective.name or objective.capability_id or objective.objective_id,
-            entity_id=objective.capability_id or None,
+            # `entity_id` explícito SÓ quando ninguém mais o reivindicou: reusar
+            # o id de uma entidade de outro namespace seria `IdentityConflict`
+            # (e, sem a checagem, seria contaminação silenciosa).
+            entity_id=(objective.capability_id or None) if not existing else None,
             attributes={"objective_id": objective.objective_id, "origem": "integracao"},
         )
     )
@@ -1273,27 +1963,43 @@ def _rule_entity(
     evidence_ids: Sequence[str],
     verdict: Verdict,
     outcome: ObjectiveOutcome,
+    statement: str = "",
 ) -> str:
     """`BusinessRule`/`Flow` nomeada, com `implements` para a capacidade.
 
     Identidade determinística por `capability + assunto` (`stable_key`), então
     a mesma regra reafirmada em outra execução revisita a MESMA entidade em vez
     de criar uma homônima.
+
+    Quando o nome (ou o enunciado) traz um id explícito do corpus — `RN-023`,
+    `CAP-007` —, esse id vira ALIAS canônico (achado nº4). A `stable_key` é
+    derivada (`businessrule:<capability>:rn-023`) e a ingestão resolve pela
+    chave LITERAL "RN-023": sem o alias, os dois lados nunca se encontram e a
+    mesma regra existe duas vezes. Com ele, `repository.put_entity` chama
+    `identity.resolve_identity`, que casa pelo alias e REUSA a entidade.
     """
     entity_type = RULE_ENTITY_TYPE.get(campo, EntityType.BUSINESS_RULE)
     stable_key = f"{entity_type.value.lower()}:{objective.capability_id or objective.objective_id}:{_slug(subject_name)}"
+    aliases = id_mod.explicit_id_aliases(subject_name, statement)
     write = rev.put_entity(
         EntityDraft(
             namespace=namespace,
             entity_type=entity_type,
             stable_key=stable_key,
             title=subject_name,
+            aliases=aliases,
             attributes={"campo": campo, "objective_id": objective.objective_id},
             evidence_refs=tuple(evidence_ids),
         )
     )
     outcome.entidades.append(
-        {"entity_id": write.target_id, "tipo": entity_type.value, "novo": write.changed, "titulo": subject_name}
+        {
+            "entity_id": write.target_id,
+            "tipo": entity_type.value,
+            "novo": write.changed,
+            "titulo": subject_name,
+            "aliases": [a.alias for a in aliases],
+        }
     )
 
     supported = verdict.epistemic is EpistemicStatus.SUPPORTED and bool(evidence_ids)
@@ -1397,6 +2103,8 @@ def _write_objective(
     inconsistencies: Sequence[Inconsistency],
     capability_entity_map: Mapping[str, str],
     create_missing_capability: bool,
+    escopos: Mapping[str, str] | None = None,
+    leituras: Sequence[Mapping[str, Any]] = (),
 ) -> ObjectiveOutcome:
     """Grava os fatos de UM objetivo e recalcula seu estado (§6.6)."""
     state = objective.evaluate()
@@ -1408,6 +2116,7 @@ def _write_objective(
         unmet=objective.unmet_obligations(),
         lacunas=_lacunas_of(objective, result.output, verdicts, claims),
         inconsistencias=[i.as_dict() for i in inconsistencies],
+        leituras_satisfeitas=[dict(l) for l in leituras],
         task_id=result.task_id,
         execution_id=result.execution_id,
         integration_key=result.integration_key,
@@ -1434,6 +2143,7 @@ def _write_objective(
             verdict=verdict,
             capability_subject=capability_subject,
             outcome=outcome,
+            escopo_sustentado=(escopos or {}).get(claim.claim_id, ""),
         )
     return outcome
 
@@ -1470,9 +2180,28 @@ def _write_claim(
     verdict: Verdict,
     capability_subject: str,
     outcome: ObjectiveOutcome,
+    escopo_sustentado: str = "",
 ) -> None:
     """Um claim verificado -> um fato, com o `epistemic` do VEREDITO."""
     campo = claim.scope.rsplit(":", 1)[-1] if ":" in claim.scope else ""
+
+    # Achado nº5: citação para arquivo que não está no snapshot corrente é prova
+    # de OUTRO escopo (o repositório vizinho no mesmo store, ou uma árvore
+    # anterior). Gravar o fato aqui apontaria conhecimento deste namespace para
+    # evidência que ele não pode reabrir. Claim SEM citação continua virando
+    # fato `unresolved` — ausência de prova é lacuna declarada (invariante 4);
+    # prova de fora do escopo é incoerência, e incoerência é recusada.
+    if claim.evidence_refs and not any(
+        versions.in_snapshot(ref.path) for ref in claim.evidence_refs
+    ):
+        motivo = (
+            "todas as citações apontam para fora do snapshot desta integração: "
+            + ", ".join(sorted({ref.path for ref in claim.evidence_refs}))[:200]
+        )
+        outcome.rejeitados.append({"claim_id": claim.claim_id, "campo": campo, "motivo": motivo})
+        outcome.bloqueios.append(f"{claim.claim_id}: {motivo}")
+        return
+
     evidence_ids, source_version_id = _record_evidence(
         rev, namespace, versions, verdict, claim.symbol
     )
@@ -1483,7 +2212,7 @@ def _write_claim(
     if subject_name and campo in RULE_ENTITY_TYPE:
         entity_id = _rule_entity(
             rev, namespace, objective, campo, subject_name, capability_subject,
-            evidence_ids, verdict, outcome,
+            evidence_ids, verdict, outcome, claim.statement,
         )
         subject_id = entity_id
 
@@ -1491,6 +2220,11 @@ def _write_claim(
     # fora do snapshot, localizador irrecuperável) é rebaixado AQUI:
     # `repository._check_support` recusaria depois, e recusar tarde derrubaria
     # a revisão inteira em vez de registrar o que se sabe.
+    #
+    # O `value` gravado é a frase INTEIRA (é ela que a consulta e a publicação
+    # mostram), e por isso o `epistemic` já chega aqui julgado pelo componente
+    # mais fraco: `_consequence_guard` rebaixou/contradisse antes. Gravar a
+    # frase toda com o `epistemic` da condição isolada é o achado nº1.
     supported = verdict.epistemic is EpistemicStatus.SUPPORTED and bool(evidence_ids)
     epistemic = (
         verdict.epistemic
@@ -1540,6 +2274,7 @@ def _write_claim(
             changed=write.changed,
             evidence_refs=tuple(evidence_ids),
             entity_id=entity_id,
+            escopo_sustentado=escopo_sustentado,
         )
     )
 

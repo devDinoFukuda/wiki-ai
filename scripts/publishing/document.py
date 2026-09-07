@@ -115,12 +115,16 @@ class ContentGrade(str, enum.Enum):
     sustentada — é o caso que produziu Word intitulado "regras, fluxo, falhas e
     contratos" com nada além de `implemented = true` e uma lista de relações.
 
-    - `behavioral`: existe ao menos um `Statement` de condição, comportamento
-      ou exceção COM evidência própria (`evidence_ids`). Sem evidência a frase
-      é afirmação não sustentada (§5.4), e sustentar título que promete regra
-      em afirmação não sustentada é o mesmo defeito com outra roupa.
-    - `structural`: tem conteúdo, mas só identidade/relações — ou frases de
-      comportamento sem nenhuma evidência ligada, ou apenas lacunas e
+    - `behavioral`: existe ao menos um `Statement` que passa nas TRÊS provas de
+      `is_behavioral_statement()` — predicado comportamental (não estrutural),
+      conteúdo com condição E efeito reais, e evidência própria
+      (`evidence_ids`). Presença de evidência sozinha NÃO basta: `implemented =
+      true` tem evidência executável e mesmo assim não diz o que o sistema faz
+      sob que condição — foi exatamente esse atalho que produziu o achado
+      bloqueante nº2 da 2ª auditoria (capacidade `parcial` e contrato
+      `completo` no MESMO conjunto).
+    - `structural`: tem conteúdo, mas só identidade/relações/flags — ou frases
+      de comportamento sem nenhuma evidência ligada, ou apenas lacunas e
       limitações. Publicável, desde que o rótulo não prometa comportamento.
     - `empty`: nem statements nem relações.
     """
@@ -158,6 +162,45 @@ ANALYSIS_STATE_LABEL: dict[AnalysisState, str] = {
         "documento descreve estrutura, identidade e relações"
     ),
 }
+
+#: Rótulo usado quando NENHUM `Statement` do documento é behavioral pela regra
+#: de `is_behavioral_statement()`. A frase de completude ("todas as unidades
+#: publicadas têm condição, comportamento ou exceção sustentada") é proibida
+#: aqui: o único fato pode ser `implemented = true`, que é estrutura com
+#: evidência, não comportamento (achado bloqueante nº2 da 2ª auditoria).
+NO_BEHAVIOR_ANALYSIS_LABEL: str = (
+    "apenas estrutura e contratos confirmados; comportamento não analisado nesta revisão "
+    "(nenhuma condição, comportamento ou exceção com conteúdo real sustentado por evidência)"
+)
+
+#: Severidade do estado da análise — menor é PIOR. Usada para herdar o PIOR
+#: estado entre obrigações que sustentam um documento (planner) e para nunca
+#: elevar um estado por herança.
+ANALYSIS_SEVERITY: dict[AnalysisState, int] = {
+    AnalysisState.ESTRUTURAL: 0,
+    AnalysisState.PARCIAL: 1,
+    AnalysisState.COMPLETO: 2,
+}
+
+
+def worst_analysis_state(states: Iterable[AnalysisState]) -> AnalysisState | None:
+    """PIOR estado entre os informados (`None` quando não há nenhum)."""
+    found = [s for s in states if s is not None]
+    if not found:
+        return None
+    return min(found, key=lambda s: ANALYSIS_SEVERITY[s])
+
+
+def analysis_state_label(state: AnalysisState, has_behavior: bool = True) -> str:
+    """Rótulo humano do estado — honesto quanto ao que sustenta a afirmação.
+
+    Sem nenhum `Statement` behavioral, NENHUM estado pode afirmar "condição,
+    comportamento ou exceção sustentada": o texto passa a dizer o que de fato
+    existe (estrutura e contratos) e que comportamento não foi analisado.
+    """
+    if not has_behavior:
+        return NO_BEHAVIOR_ANALYSIS_LABEL
+    return ANALYSIS_STATE_LABEL[state]
 
 #: Título da seção de lacunas do DOCUMENTO (nível de documento, distinta da
 #: seção de lacunas por unidade). Compartilhado por markdown/word/validate para
@@ -789,10 +832,29 @@ class SemanticUnit:
             if st.evidence_ids
         )
 
+    def behavioral_statements(self) -> tuple[Statement, ...]:
+        """Statements que REALMENTE descrevem comportamento (`is_behavioral_statement`).
+
+        Subconjunto estrito de `sustained_statements()`: além de evidência,
+        exige predicado comportamental e conteúdo com condição e efeito. A
+        diferença entre os dois conjuntos é exatamente o achado bloqueante nº2
+        — `implemented = true` está no primeiro e nunca no segundo.
+        """
+        return tuple(
+            st
+            for st in (self.conditions + self.behavior + self.exceptions)
+            if is_behavioral_statement(st)
+        )
+
+    def structural_statements(self) -> tuple[Statement, ...]:
+        """Statements com evidência que, ainda assim, só afirmam estrutura."""
+        behavioral = {id(st) for st in self.behavioral_statements()}
+        return tuple(st for st in self.statements() if id(st) not in behavioral)
+
     @property
     def content_grade(self) -> ContentGrade:
         """Espécie de conteúdo desta unidade (ver `ContentGrade`)."""
-        if self.sustained_statements():
+        if self.behavioral_statements():
             return ContentGrade.BEHAVIORAL
         if self.statements() or self.relations:
             return ContentGrade.STRUCTURAL
@@ -839,8 +901,9 @@ class SemanticUnit:
         return (
             f"unidade {self.unit_id} ({self.title!r}) é {self.content_grade.value} num documento "
             f"{doc_kind.value if doc_kind else ''} que promete comportamento: não há condição, "
-            "comportamento ou exceção sustentada por evidência, e nenhuma lacuna foi declarada "
-            "dizendo o que falta e em que pé está a investigação"
+            "comportamento ou exceção com conteúdo real (condição e efeito) sustentada por "
+            "evidência, e nenhuma lacuna foi declarada dizendo o que falta e em que pé está a "
+            "investigação"
         )
 
 
@@ -926,12 +989,22 @@ class KnowledgeDocument:
         promete e o corpo ainda não responde."""
         return tuple(u for u in self.own_units() if not u.is_behavioral())
 
+    def has_behavioral_statement(self) -> bool:
+        """Existe ≥1 `Statement` behavioral pela regra de `is_behavioral_statement`?"""
+        return any(u.behavioral_statements() for u in self.own_units())
+
     def derived_analysis_state(self) -> AnalysisState:
-        """Estado da análise deduzido do conteúdo, sem depender de declaração."""
+        """Estado da análise deduzido do conteúdo, sem depender de declaração.
+
+        REGRA DURA do achado nº2: nenhum documento sai `completo` se nenhuma
+        unidade sua é behavioral. Antes bastava um `Statement` com evidência —
+        `implemented = true` satisfazia isso e o contrato saía `completo` ao
+        lado de uma capacidade `parcial`, sobre o mesmo conjunto.
+        """
         own = self.own_units()
         if not own:
             return AnalysisState.ESTRUTURAL
-        if not self.behavioral_units():
+        if not self.behavioral_units() or not self.has_behavioral_statement():
             return AnalysisState.ESTRUTURAL
         if self.unevaluated_units():
             return AnalysisState.PARCIAL
@@ -939,8 +1012,19 @@ class KnowledgeDocument:
 
     def effective_analysis_state(self) -> AnalysisState:
         """O declarado quando existe; o derivado quando não (nunca "presumido
-        completo": presumir completude é o defeito que se está corrigindo)."""
-        return self.analysis_state or self.derived_analysis_state()
+        completo": presumir completude é o defeito que se está corrigindo).
+
+        A declaração VENCE, com um teto: `completo` declarado sem nenhuma
+        unidade behavioral é rebaixado para o derivado. Quem investigou pode
+        dizer que parou no meio; não pode declarar completude que o corpo do
+        documento não sustenta.
+        """
+        declared = self.analysis_state
+        if declared is None:
+            return self.derived_analysis_state()
+        if declared is AnalysisState.COMPLETO and not self.behavioral_units():
+            return self.derived_analysis_state()
+        return declared
 
     def title_promises_behavior(self) -> bool:
         return promises_behavior(self.title)
@@ -985,6 +1069,13 @@ class KnowledgeDocument:
                     f"analysis_state {self.analysis_state.value} e não publica nenhuma lacuna "
                     "dizendo o que falta e em que pé está a investigação"
                 )
+
+        if self.analysis_state is AnalysisState.COMPLETO and not behavioral:
+            problems.append(
+                "documento declara analysis_state completo sem NENHUMA unidade behavioral: o "
+                "que está publicado é estrutura (existência, identidade, relações) com "
+                "evidência, não condição, comportamento ou exceção"
+            )
 
         if self.analysis_state is AnalysisState.COMPLETO and unevaluated:
             missing = [u for u in unevaluated if not u.declares_gaps()]
@@ -1116,6 +1207,8 @@ def analysis_summary(
     declared_state: AnalysisState | None = None,
     declared_gaps: Sequence[str] = (),
     investigation_note: str = "",
+    inherited_state: AnalysisState | None = None,
+    inherited_reason: str = "",
 ) -> tuple[AnalysisState, tuple[str, ...]]:
     """Estado da análise + bloco de lacunas, derivados das próprias unidades.
 
@@ -1126,35 +1219,64 @@ def analysis_summary(
     com outro nome.
 
     `declared_state`/`declared_gaps` vêm de quem conduziu a investigação e
-    sempre vencem a derivação: quem investigou sabe se parou no meio.
+    vencem a derivação com UM teto: `completo` declarado sem nenhuma unidade
+    behavioral é rebaixado (achado bloqueante nº2 — quem investigou pode dizer
+    que parou no meio, não pode declarar completude que o corpo não sustenta).
+
+    `inherited_state`/`inherited_reason` são o TETO vindo das obrigações que
+    sustentam o documento (um contrato não é mais completo do que a capacidade
+    que o expõe). Herança só REBAIXA: nunca eleva um estado derivado.
     """
     own = [u for u in units if u.is_publishable() and not u.shared_context]
     behavioral = [u for u in own if u.is_behavioral()]
     unevaluated = [u for u in own if not u.is_behavioral()]
+    has_behavior = bool(behavioral)
 
+    downgraded_declared = False
     if declared_state is not None:
         state = declared_state
-    elif not own or not behavioral:
+        if state is AnalysisState.COMPLETO and not has_behavior:
+            state = AnalysisState.ESTRUTURAL
+            downgraded_declared = True
+    elif not own or not has_behavior:
         state = AnalysisState.ESTRUTURAL
     elif unevaluated:
         state = AnalysisState.PARCIAL
     else:
         state = AnalysisState.COMPLETO
 
+    inherited_applied = False
+    if inherited_state is not None and (
+        ANALYSIS_SEVERITY[inherited_state] < ANALYSIS_SEVERITY[state]
+    ):
+        state = inherited_state
+        inherited_applied = True
+
     if state is AnalysisState.COMPLETO and not declared_gaps:
         return state, ()
 
     lines: list[str] = [assert_no_placeholder(g, "lacuna declarada") for g in declared_gaps]
+    if downgraded_declared:
+        lines.append(
+            "A investigação declarou análise completa, mas nenhuma unidade deste documento tem "
+            "condição, comportamento ou exceção com conteúdo real sustentado por evidência: o "
+            "único conteúdo evidenciado é estrutural (existência, identidade, relações). O estado "
+            "publicado foi rebaixado para estrutural."
+        )
+    if inherited_applied and inherited_reason:
+        lines.append(assert_no_placeholder(inherited_reason, "herança do estado da análise"))
     if state is AnalysisState.ESTRUTURAL and not lines:
         lines.append(
-            "Nenhuma unidade deste documento tem condição, comportamento ou exceção sustentada "
-            "por evidência nesta revisão: o que está publicado é estrutura, identidade e "
-            "relações. Regra, fluxo e falha permanecem por investigar."
+            "Nenhuma unidade deste documento tem condição, comportamento ou exceção com "
+            "conteúdo real sustentado por evidência nesta revisão: o que está publicado é "
+            "estrutura, identidade e relações — inclusive quando o fato tem evidência, como "
+            "uma marca de existência. Regra, fluxo e falha permanecem por investigar."
         )
     for unit in unevaluated:
         lines.append(
-            f"{unit.title} (unidade {unit.unit_id}): sem condição, comportamento ou exceção "
-            "sustentada por evidência nesta revisão; avaliação de comportamento pendente."
+            f"{unit.title} (unidade {unit.unit_id}): sem condição, comportamento ou exceção com "
+            "conteúdo real (condição e efeito) sustentado por evidência nesta revisão; o que há "
+            "é estrutura. Avaliação de comportamento pendente."
         )
     for unit in own:
         for gap in unit.gaps:
@@ -1165,9 +1287,12 @@ def analysis_summary(
     if investigation_note:
         lines.append(assert_no_placeholder(investigation_note, "estado da investigação"))
     else:
+        # A frase de completude só pode afirmar "condição, comportamento ou
+        # exceção sustentada" quando existe ≥1 unidade behavioral pela regra
+        # nova; senão o texto diz o que de fato há (achado nº2).
         lines.append(
             "Estado da investigação nesta revisão: "
-            + ANALYSIS_STATE_LABEL[state]
+            + analysis_state_label(state, has_behavior)
             + "."
         )
     return state, tuple(dict.fromkeys(lines))
@@ -1289,6 +1414,370 @@ EXCEPTION_PREDICATES: frozenset[str] = frozenset(
 LIMITATION_PREDICATES: frozenset[str] = frozenset(
     {"limitation", "boundary", "assumption", "limitacao", "fronteira", "premissa"}
 )
+
+
+# --------------------------------------------------------------------------
+# Estrutural × comportamental por PREDICADO (achado bloqueante nº2, 2ª auditoria)
+# --------------------------------------------------------------------------
+#
+# O defeito corrigido aqui: a classificação anterior chamava de "behavioral"
+# qualquer condição/comportamento/exceção que TIVESSE evidência. O fato
+# `implemented = true` emitido pelo `wk code` tem evidência executável real
+# (`FactDraft(predicate="implemented", value="true", evidence_refs=(ev_id,))`)
+# e ainda assim não carrega 404/422/409, condição nenhuma e mudança de estado
+# nenhuma. Resultado auditado: capacidade saiu `parcial` e o contrato que ela
+# sustenta saiu `completo` no mesmo conjunto.
+#
+# A separação passa a ser por PREDICADO, não por presença de evidência.
+
+#: Predicados ESTRUTURAIS: respondem "existe / como se chama / do que participa",
+#: nunca "o que acontece sob que condição". Um `Statement` cujo predicado cai
+#: aqui NUNCA é behavioral — COM ou SEM evidência.
+STRUCTURAL_PREDICATES: frozenset[str] = frozenset(
+    {
+        # flag de existência/implementação (o caso do achado nº2)
+        "implemented",
+        "implementado",
+        "implementada",
+        "is_implemented",
+        "exists",
+        "existe",
+        "present",
+        "presente",
+        "enabled",
+        "habilitado",
+        "active",
+        "ativo",
+        "deployed",
+        "publicado",
+        # identidade e nomenclatura
+        "name",
+        "nome",
+        "title",
+        "titulo",
+        "identity",
+        "identidade",
+        "kind",
+        "tipo",
+        "type",
+        "framework",
+        "language",
+        "linguagem",
+        "path",
+        "caminho",
+        "module",
+        "modulo",
+        "package",
+        "pacote",
+        "qualname",
+        "symbol",
+        "simbolo",
+        "stable_key",
+        "alias",
+        "line",
+        "linha",
+        "signature",
+        "assinatura",
+        "version",
+        "versao",
+        "owner",
+        "dono",
+        "repo",
+        "repositorio",
+        "url",
+        "endpoint",
+        "rota",
+        "route",
+        "entrypoint",
+        "entrypoint_kind",
+        # espelho de relação: a aresta já é publicada COMO relação; repeti-la
+        # como fato não acrescenta comportamento nenhum
+        "contains",
+        "contem",
+        "calls",
+        "chama",
+        "called_by",
+        "chamado_por",
+        "reads",
+        "le",
+        "writes",
+        "grava_em",
+        "publishes",
+        "consumes",
+        "consome",
+        "depends_on",
+        "depende_de",
+        "belongs_to",
+        "pertence_a",
+        "part_of",
+        "faz_parte_de",
+        "implements",
+        "implementa",
+        "uses",
+        "usa",
+        # investigação: identidade, gatilho declarado e dependências são MAPA
+        "investigacao.identidade",
+        "investigacao.gatilho",
+        "investigacao.dependencias",
+        "investigacao.entradas",
+        "investigacao.saidas",
+        "investigacao.escopo",
+    }
+)
+
+#: Folha estrutural de predicado QUALIFICADO (`<algo>.<folha>`): `capability.
+#: implemented`, `contract.implemented`, `investigacao.gatilho` etc. Só vale
+#: para predicado com ponto — `gatilho` sozinho continua sendo condição
+#: (`CONDITION_PREDICATES`) e é filtrado pelo conteúdo, não pelo nome.
+STRUCTURAL_PREDICATE_LEAVES: frozenset[str] = frozenset(
+    {
+        "implemented",
+        "implementado",
+        "implementada",
+        "exists",
+        "existe",
+        "identidade",
+        "identity",
+        "gatilho",
+        "trigger",
+        "dependencias",
+        "dependencies",
+        "entradas",
+        "saidas",
+        "inputs",
+        "outputs",
+        "escopo",
+        "scope",
+        "nome",
+        "name",
+        "titulo",
+        "title",
+        "tipo",
+        "kind",
+        "type",
+        "path",
+        "caminho",
+        "rota",
+        "route",
+        "url",
+        "versao",
+        "version",
+    }
+)
+
+#: Termos que tornam um predicado COMPORTAMENTAL: decisão, persistência,
+#: falha, sucesso, borda, regra. Casamento por token OU por subcadeia (termos
+#: com 5+ caracteres), para pegar `behavior_on_timeout`, `persistencia_pedido`,
+#: `regra_de_rejeicao`.
+BEHAVIORAL_PREDICATE_TERMS: frozenset[str] = frozenset(
+    {
+        # regra e comportamento
+        "rule", "regra", "regras", "behavior", "behaviour", "comportamento",
+        "policy", "politica", "criterio", "criteria", "invariant", "invariante",
+        # decisão
+        "decision", "decisao", "decide", "decides", "escolhe", "seleciona",
+        "authorization", "autorizacao", "permission", "permissao", "auth",
+        # persistência e efeito
+        "persist", "persiste", "persistencia", "grava", "gravacao", "save",
+        "salva", "store", "armazena", "commit", "rollback", "transacao",
+        "transaction", "escrita", "atualiza", "atualizacao",
+        # falha, exceção, borda
+        "fail", "fails", "falha", "falhas", "failure", "error", "erro",
+        "exception", "excecao", "edge", "edge_case", "borda", "timeout",
+        "retry", "reintento", "degradacao", "fallback",
+        # sucesso e resposta
+        "success", "sucesso", "accept", "aceita", "reject", "rejeita",
+        "recusa", "deny", "nega", "block", "bloqueia", "status", "response",
+        "resposta", "returns", "retorna", "result", "resultado",
+        # condição, fluxo e limite
+        "condition", "condicao", "precondition", "trigger", "when",
+        "applies_when", "consequence", "consequencia", "effect", "efeito",
+        "partial_effect", "efeito_parcial", "validation", "validacao",
+        "valida", "constraint", "restricao", "limit", "limite", "threshold",
+        "limiar", "quota", "cota", "rate", "flow", "fluxo", "step", "etapa",
+        "transition", "transicao", "state_machine", "idempot", "concorrencia",
+        "concurrency", "lock",
+    }
+)
+
+#: Valores que são FLAG booleana: nunca carregam condição nem efeito, então
+#: nunca sustentam comportamento (o `true` de `implemented = true`).
+BOOLEAN_FLAG_VALUES: frozenset[str] = frozenset(
+    {"true", "false", "sim", "nao", "yes", "no", "1", "0", "verdadeiro", "falso", "on", "off"}
+)
+
+#: CONDIÇÃO real no conteúdo: comparador, conectivo condicional ou limiar.
+_CONDITION_MARKER_RE = re.compile(
+    r"(?:>=|<=|!=|<>|==|≠|≥|≤|>|<)"
+    r"|\b(?:se|quando|caso|sempre que|somente se|apenas se|apenas quando|enquanto|"
+    r"apos|antes de|desde que|a partir de|acima de|abaixo de|maior que|menor que|"
+    r"igual a|diferente de|excede|exceder|ultrapassa|se e somente se|"
+    r"if|when|unless|while|whenever|after|before|above|below|greater than|"
+    r"less than|exceeds|only if)\b",
+    re.I,
+)
+
+#: EFEITO/EXCEÇÃO real no conteúdo: consequência, mudança de estado, código de
+#: falha. Sem efeito, uma condição isolada ainda não diz o que o sistema faz.
+_EFFECT_MARKER_RE = re.compile(
+    r"(?:->|=>|→|⇒)"
+    r"|\b(?:entao|retorna|retornar|devolve|responde|resposta|grava|gravar|persiste|"
+    r"persistir|salva|salvar|registra|armazena|envia|publica|emite|rejeita|recusa|"
+    r"nega|bloqueia|aborta|cancela|falha|lanca|levanta|propaga|aplica|atualiza|"
+    r"cria|remove|exclui|marca|define|resulta|impede|interrompe|ignora|descarta|"
+    r"then|returns|responds|writes|saves|persists|stores|sends|publishes|emits|"
+    r"rejects|denies|blocks|aborts|fails|raises|throws|applies|updates|creates|"
+    r"deletes|results|skips)\b"
+    r"|\b[45]\d{2}\b"
+    r"|\b(?:erro|error|excecao|exception|timeout|rollback|http)\b",
+    re.I,
+)
+
+# Fallback local dos tokens críticos D12 — usado só se `publishing.validate`
+# não puder ser importado. As duas pontas precisam concordar, por isso a
+# primeira escolha é SEMPRE `validate.critical_tokens`.
+_FB_COMPARATOR_RE = re.compile(r"(?:>=|<=|!=|<>|==|≠|≥|≤|>|<|=)")
+_FB_NEGATION_RE = re.compile(
+    r"\b(n[ãa]o|nunca|jamais|sem|nenhum(?:a|as|os)?|exceto|salvo|inexistente|ausente|"
+    r"not|never|no|neither)\b",
+    re.I,
+)
+_FB_NUMBER_RE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:%|ms|s|seg|segundos?|min|minutos?|h|horas?|d|dias?|"
+    r"kb|mb|gb|tb|req/s|rps)?\b",
+    re.I,
+)
+_FB_STATE_RE = re.compile(
+    r"\b(implementad[oa]s?|implemented|propost[oa]s?|proposed|hist[óo]ric[oa]s?|"
+    r"historical|n[ãa]o[- ]resolvid[oa]s?|unresolved|bloquead[oa]s?)\b",
+    re.I,
+)
+
+_CRITICAL_TOKENS_FN: Any = None
+
+
+def _fallback_critical_tokens(value: str) -> list[str]:
+    text = re.sub(r"\s+", " ", (value or "")).strip()
+    tokens: list[str] = []
+    tokens.extend(m.group(0) for m in _FB_COMPARATOR_RE.finditer(text))
+    tokens.extend(m.group(0) for m in _FB_NEGATION_RE.finditer(text))
+    tokens.extend(re.sub(r"\s+", " ", m.group(0)).strip() for m in _FB_NUMBER_RE.finditer(text))
+    tokens.extend(m.group(0) for m in _FB_STATE_RE.finditer(text))
+    return list(dict.fromkeys(t for t in tokens if t))
+
+
+def critical_tokens_of(value: str) -> list[str]:
+    """Tokens críticos D12 do valor — `validate.critical_tokens` quando existe.
+
+    Import PREGUIÇOSO de propósito: `validate` importa `markdown`, que importa
+    este módulo. Resolvido só na primeira chamada, quando `document` já está
+    completamente carregado, o ciclo não existe.
+    """
+    global _CRITICAL_TOKENS_FN
+    if _CRITICAL_TOKENS_FN is None:
+        fn = None
+        for mod_path in ("publishing.validate", "validate"):
+            try:
+                mod = __import__(mod_path, fromlist=["critical_tokens"])
+                fn = getattr(mod, "critical_tokens", None)
+            except Exception:  # pragma: no cover - ambiente sem o módulo irmão
+                fn = None
+            if fn is not None:
+                break
+        _CRITICAL_TOKENS_FN = fn or _fallback_critical_tokens
+    return list(_CRITICAL_TOKENS_FN(value or ""))
+
+
+def is_boolean_flag(value: str) -> bool:
+    """O valor é uma flag booleana pura (`true`, `sim`, `0`)?"""
+    return normalize_title(value) in BOOLEAN_FLAG_VALUES
+
+
+def normalize_predicate(predicate: str) -> str:
+    """Forma comparável do predicado.
+
+    Sem acento, minúsculo, espaço/hífen colapsados em `_` (`depends on`,
+    `depends-on` e `depends_on` são o MESMO predicado) e o ponto preservado,
+    porque é ele que separa o qualificador da folha em `capability.implemented`.
+    """
+    stripped = unicodedata.normalize("NFKD", (predicate or "").strip())
+    ascii_form = "".join(c for c in stripped if not unicodedata.combining(c))
+    return re.sub(r"[\s\-]+", "_", ascii_form.lower()).strip("_. ")
+
+
+def is_structural_predicate(predicate: str) -> bool:
+    """O predicado descreve ESTRUTURA (existência, identidade, aresta)?
+
+    Nunca depende de evidência: `implemented = true` com evidência executável
+    continua sendo estrutura. É esta função que impede um fato estrutural de
+    sustentar a frase "condição, comportamento ou exceção sustentada".
+    """
+    pred = normalize_predicate(predicate)
+    if not pred:
+        return True
+    if pred in STRUCTURAL_PREDICATES:
+        return True
+    if "." in pred:
+        leaf = pred.rsplit(".", 1)[-1].strip("_ ")
+        if leaf in STRUCTURAL_PREDICATE_LEAVES:
+            return True
+    return False
+
+
+def is_behavioral_predicate(predicate: str) -> bool:
+    """O predicado promete decisão, persistência, falha, sucesso, borda ou regra?
+
+    Lista POSITIVA de propósito: predicado desconhecido conta como estrutura,
+    porque o erro conservador (deixar de chamar de comportamento algo que era)
+    publica um documento honesto a menos, e o erro oposto publica um documento
+    que mente. Ampliar `BEHAVIORAL_PREDICATE_TERMS` é aditivo.
+    """
+    pred = normalize_predicate(predicate)
+    if not pred or is_structural_predicate(predicate):
+        return False
+    if pred in CONDITION_PREDICATES or pred in EXCEPTION_PREDICATES:
+        return True
+    tokens = [t for t in _WORD_SPLIT_RE.split(pred.replace(".", " ")) if t]
+    if any(t in BEHAVIORAL_PREDICATE_TERMS for t in tokens):
+        return True
+    long_terms = [t for t in BEHAVIORAL_PREDICATE_TERMS if len(t) >= 5]
+    return any(term in tok for tok in tokens for term in long_terms)
+
+
+def has_behavioral_content(value: str) -> bool:
+    """O CONTEÚDO carrega condição/comparador E efeito/exceção reais?
+
+    Exige as duas metades: condição sem efeito não diz o que acontece, efeito
+    sem condição nem quantidade é slogan. Flag booleana é recusada antes de
+    tudo — `true` nunca foi resposta para "o que o sistema faz".
+    """
+    text = normalize_title(value)
+    if not text or is_boolean_flag(value):
+        return False
+    condition = bool(_CONDITION_MARKER_RE.search(text))
+    if not condition:
+        # Tokens críticos D12 (negação, número com unidade, nome de estado)
+        # também qualificam a condição — `=` sozinho, não: é o comparador de
+        # atribuição de `implemented = true`.
+        condition = any(tok.strip() not in ("", "=") for tok in critical_tokens_of(value))
+    return condition and bool(_EFFECT_MARKER_RE.search(text))
+
+
+def is_behavioral_statement(statement: "Statement") -> bool:
+    """As TRÊS provas do achado nº2, na ordem em que barram mais cedo.
+
+    1. predicado NÃO estrutural e reconhecidamente comportamental;
+    2. conteúdo com condição/comparador E efeito/exceção real;
+    3. evidência própria no `Statement` (não na unidade: evidência que sustenta
+       uma relação não sustenta uma regra).
+    """
+    if is_structural_predicate(statement.predicate):
+        return False
+    if not is_behavioral_predicate(statement.predicate):
+        return False
+    if not has_behavioral_content(statement.value):
+        return False
+    return bool(statement.evidence_ids)
 
 
 def fact_state(fact: Fact) -> UnitState:
@@ -1729,10 +2218,25 @@ __all__ = [
     "ALLOWED_ANCHORS",
     "ALL_LIFECYCLE",
     "ANALYSIS_GAPS_TITLE",
+    "ANALYSIS_SEVERITY",
     "ANALYSIS_STATE_LABEL",
     "AnalysisState",
+    "BEHAVIORAL_PREDICATE_TERMS",
     "BEHAVIOR_PROMISE_TERMS",
     "BEHAVIOR_REQUIRED_KINDS",
+    "BOOLEAN_FLAG_VALUES",
+    "NO_BEHAVIOR_ANALYSIS_LABEL",
+    "STRUCTURAL_PREDICATES",
+    "STRUCTURAL_PREDICATE_LEAVES",
+    "analysis_state_label",
+    "critical_tokens_of",
+    "has_behavioral_content",
+    "is_behavioral_predicate",
+    "is_behavioral_statement",
+    "is_boolean_flag",
+    "is_structural_predicate",
+    "normalize_predicate",
+    "worst_analysis_state",
     "Belonging",
     "CONDITION_PREDICATES",
     "ContentGrade",

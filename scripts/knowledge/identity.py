@@ -11,12 +11,19 @@ Três regras que existem em código, não em documentação:
    por `confirm_rename` (A06: similaridade isolada não confirma vínculo).
 3. Ids determinísticos são o que torna reingestão idêntica idempotente: o
    mesmo insumo recalcula o mesmo id e cai no upsert, sem duplicar identidade.
+4. Id explícito do corpus (`RN-023`, `CAP-007`) citado no nome/texto de uma
+   entidade vira ALIAS canônico (`explicit_id_aliases`) e é resolvível pela
+   chave LITERAL (`find_by_alias`). Sem isso, quem cria a regra deriva
+   `stable_key = businessrule:<capacidade>:rn-023` e quem a cita procura por
+   "RN-023": os dois lados nunca se encontram e a mesma regra passa a existir
+   duas vezes (achado nº4 da 2ª auditoria externa).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -32,6 +39,132 @@ from .models import (
 )
 
 _ID_LEN = 32
+
+
+# --------------------------------------------------------------------------
+# Ids explícitos do corpus (RN-023, CAP-007, ...) como ALIAS canônico
+# --------------------------------------------------------------------------
+
+#: Prefixos de id explícito reconhecidos no corpus. Reimplementação LOCAL e
+#: mínima do vocabulário de `ingestion.extract`: `knowledge` não importa
+#: `ingestion` (a dependência é a inversa), e duplicar a CONSTANTE é o preço de
+#: manter a camada de identidade sem depender da camada de ingestão.
+EXPLICIT_ID_PREFIXES: tuple[str, ...] = (
+    "INI", "DEC", "ADR", "RF", "REF", "RN", "BR", "CAP", "US", "HU", "STY",
+    "RQ", "REQ", "RNF", "DEF", "BUG", "SYS", "CMP", "CTR", "ENT", "FLW",
+)
+
+#: Duas alternativas, de propósito: prefixo CONHECIDO aceita separador ausente
+#: ou solto (`RN-023`, `RN 23`, `rn.23`); prefixo desconhecido exige hífen E
+#: maiúsculas, para que uma palavra comum não vire id.
+EXPLICIT_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?P<known>"
+    + "|".join(sorted(EXPLICIT_ID_PREFIXES, key=len, reverse=True))
+    + r")[\s._-]?(?P<knum>\d{1,6})"
+    r"|(?P<other>[A-Z]{2,6})-(?P<onum>\d{1,6}))(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+#: Origem do alias criado a partir de um id explícito do texto. `metadata_id` é
+#: a origem do §5.2 para "id declarado na própria fonte" — e é uma origem que
+#: CONFIRMA identidade em renomeação, que é exatamente o estatuto de `RN-023`:
+#: o texto trouxe o id, ninguém o inferiu por semelhança.
+EXPLICIT_ID_ALIAS_ORIGIN: AliasOrigin = AliasOrigin.METADATA_ID
+
+
+def parse_explicit_ids(text: str) -> tuple[str, ...]:
+    """Ids explícitos citados em `text`, na forma canônica ``PRE-NNN``.
+
+    Determinístico e sem fuzzy: só casa o padrão de id, normaliza o número para
+    3 dígitos (``RN 23`` e ``RN-023`` são o MESMO id) e preserva a ordem sem
+    repetir. Prefixo desconhecido em minúsculas é palavra comum, não id.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in EXPLICIT_ID_RE.finditer(text or ""):
+        if m.group("known"):
+            prefix_raw, number = m.group("known"), m.group("knum")
+        else:
+            prefix_raw, number = m.group("other"), m.group("onum")
+        prefix = prefix_raw.upper()
+        if m.group("other") and prefix != prefix_raw:
+            continue
+        canonical = f"{prefix}-{number.zfill(3) if len(number) < 3 else number}"
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        out.append(canonical)
+    return tuple(out)
+
+
+def explicit_id_aliases(*texts: str) -> tuple[Alias, ...]:
+    """Aliases canônicos para os ids explícitos citados nos textos dados.
+
+    É o que faz `RN-023` no NOME de uma regra virar chave de resolução: sem o
+    alias, quem cita a regra pela chave literal (`ingestion`) não encontra a
+    entidade, porque a `stable_key` derivada carrega capacidade e slug.
+    """
+    out: list[Alias] = []
+    seen: set[str] = set()
+    for text in texts:
+        for value in parse_explicit_ids(text or ""):
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(Alias(alias=value, origin=EXPLICIT_ID_ALIAS_ORIGIN))
+    return tuple(out)
+
+
+def _connection_of(target: Any) -> sqlite3.Connection:
+    """Aceita `Repository` (que expõe `.conn`) ou a conexão crua."""
+    conn = getattr(target, "conn", target)
+    if not hasattr(conn, "execute"):
+        raise IdentityConflict(
+            f"esperado sqlite3.Connection ou Repository, recebido {type(target).__name__}"
+        )
+    return conn
+
+
+def find_by_alias(
+    target: Any,
+    namespace: str,
+    alias: str,
+    entity_type: EntityType | None = None,
+) -> str | None:
+    """`entity_id` cujo ALIAS EXATO é `alias`, dentro do namespace.
+
+    Lookup determinístico: casamento exato de string na coluna `alias`, nunca
+    aproximação — `parse_explicit_ids` é quem normaliza a forma citada antes,
+    se o chamador quiser (`RN 23` -> `RN-023`).
+
+    Ambiguidade é REPORTADA, não resolvida: dois `entity_id` distintos com o
+    mesmo alias no mesmo namespace levantam `IdentityConflict`, porque escolher
+    um deles seria fundir identidades por chute (§5.2).
+    """
+    key = (alias or "").strip()
+    if not key:
+        return None
+    ns = normalize_namespace(namespace)
+    conn = _connection_of(target)
+    sql = (
+        "SELECT DISTINCT a.entity_id FROM entity_aliases a "
+        "JOIN entities e ON e.entity_id = a.entity_id "
+        "WHERE a.namespace=? AND a.alias=?"
+    )
+    params: list[Any] = [ns, key]
+    if entity_type is not None:
+        sql += " AND e.entity_type=?"
+        params.append(entity_type.value)
+    rows = conn.execute(sql, params).fetchall()
+    if not rows:
+        return None
+    ids = sorted({row[0] for row in rows})
+    if len(ids) > 1:
+        raise IdentityConflict(
+            f"alias {key!r} em {ns!r} aponta para {len(ids)} entidades ({', '.join(ids)}): "
+            "ambiguidade de identidade não é resolvida por escolha arbitrária (§5.2)"
+        )
+    return ids[0]
 
 
 def normalize_namespace(namespace: str) -> str:
