@@ -169,6 +169,187 @@ EXPLICIT_ID_RE = re.compile(
 )
 
 
+class MentionPolarity(str, Enum):
+    """Como o texto trata a relação implícita NESTA menção a um id (R3).
+
+    Não é atributo do candidato inteiro: é por ID CITADO, porque o mesmo
+    bloco pode afirmar uma relação com um id e negar outra ("RF-042 refina
+    DEC-017, mas nao altera RN-023"). É esta polaridade — nunca só o par de
+    tipos das entidades — que `correlate.py` usa para decidir se grava
+    `refines`/`proposes_change_to`/`derived_from`/`implements` como
+    sustentado, como candidata, ou se nem os grava (achado bloqueante nº3 da
+    auditoria externa: "RF-042 nao refina DEC-017" virava `refines
+    supported`, porque a decisão olhava só Refinement->Decision).
+    """
+
+    AFFIRMED = "affirmed"
+    NEGATED = "negated"
+    NEUTRAL = "neutral"
+
+
+#: Nega o predicado de relação mais próximo. Acento-insensível: casadas
+#: contra `accent_fold`, então "não"/"nao" já são a mesma entrada. Lista
+#: literal (mesmo espírito de `MARKER_RULES`: sem stemmer, sem score) —
+#: "descarta"/"rejeita"/"revoga" são, por si só, verbos de negação de
+#: vínculo, não precisam de "não" junto.
+_NEGATION_CUES: tuple[str, ...] = (
+    r"\bnao se aplica\b",
+    r"\bnao\b",
+    r"\bnunca\b",
+    r"\bjamais\b",
+    r"\bdeixa de\b",
+    r"\bsem relacao\b",
+    r"\bdescarta\b",
+    r"\brejeita\b",
+    r"\brevoga\b",
+)
+_NEGATION_RE = re.compile("|".join(_NEGATION_CUES))
+
+#: Comparação/citação: cita a outra entidade só para contraste, não afirma
+#: vínculo. Vira, no máximo, candidata — nunca `supported` (§8.2.7).
+_COMPARISON_CUES: tuple[str, ...] = (
+    r"\bdiferente de\b",
+    r"\bao contrario de\b",
+    r"\bcomo em\b",
+)
+_COMPARISON_RE = re.compile("|".join(_COMPARISON_CUES))
+
+#: Predicados AFIRMATIVOS explícitos de relação. Mesma lista fechada citada
+#: pela regra (R3): "refina", "detalha", "implementa", "altera", "decorre
+#: de", com as conjugações correntes. Não cobre toda a morfologia do
+#: português — é heurística de vocabulário fechado, documentada como
+#: limitação, não análise sintática.
+_AFFIRM_PREDICATE_CUES: tuple[str, ...] = (
+    r"\brefina\b",
+    r"\brefinar\b",
+    r"\brefinam\b",
+    r"\brefinou\b",
+    r"\brefinaram\b",
+    r"\bdetalha\b",
+    r"\bdetalhar\b",
+    r"\bdetalham\b",
+    r"\bdetalhou\b",
+    r"\bdetalharam\b",
+    r"\bimplementa\b",
+    r"\bimplementar\b",
+    r"\bimplementam\b",
+    r"\bimplementou\b",
+    r"\bimplementaram\b",
+    r"\baltera\b",
+    r"\balterar\b",
+    r"\balteram\b",
+    r"\balterou\b",
+    r"\balteraram\b",
+    r"\bdecorre de\b",
+    r"\bdecorrer de\b",
+    r"\bdecorrem de\b",
+    r"\bdecorreu de\b",
+)
+_AFFIRM_PREDICATE_RE = re.compile("|".join(_AFFIRM_PREDICATE_CUES))
+
+#: Janela, em tokens, para considerar uma pista "ligada" ao id/predicado.
+#: N=6 cobre "nao [advérbio] refina a decisao DEC-017" com folga sem
+#: atravessar para a frase seguinte. É heurística de janela — não análise
+#: sintática — e fica documentada como limitação conhecida (§ entrega R3).
+POLARITY_WINDOW_TOKENS = 6
+
+
+def _tokens_between(folded: str, start: int, end: int) -> int:
+    """Quantos tokens existem estritamente entre dois offsets de `folded`."""
+    if end <= start:
+        return 0
+    return len(_WORD.findall(folded[start:end]))
+
+
+def _nearest_gap(cue_re: re.Pattern[str], folded: str, span: tuple[int, int]) -> int | None:
+    """Menor distância (em tokens) entre `span` e alguma ocorrência de `cue_re`.
+
+    `None` quando a pista não ocorre em `folded`. Sobreposição com `span`
+    conta como distância zero.
+    """
+    start, end = span
+    best: int | None = None
+    for m in cue_re.finditer(folded):
+        if m.end() <= start:
+            gap = _tokens_between(folded, m.end(), start)
+        elif m.start() >= end:
+            gap = _tokens_between(folded, end, m.start())
+        else:
+            gap = 0
+        if best is None or gap < best:
+            best = gap
+    return best
+
+
+def _nearest_match(
+    cue_re: re.Pattern[str], folded: str, span: tuple[int, int]
+) -> tuple[int, int, int] | None:
+    """`(gap, start, end)` do casamento de `cue_re` mais próximo de `span`."""
+    start, end = span
+    best: tuple[int, int, int] | None = None
+    for m in cue_re.finditer(folded):
+        if m.end() <= start:
+            gap = _tokens_between(folded, m.end(), start)
+        elif m.start() >= end:
+            gap = _tokens_between(folded, end, m.start())
+        else:
+            gap = 0
+        if best is None or gap < best[0]:
+            best = (gap, m.start(), m.end())
+    return best
+
+
+def _negation_immediately_before(cue_re: re.Pattern[str], folded: str, before_pos: int) -> bool:
+    """Alguma ocorrência de `cue_re` termina a até `POLARITY_WINDOW_TOKENS`
+    tokens ANTES de `before_pos`? R3 é literal: "janela de N tokens ANTES do
+    verbo/ID" — só olha para trás, nunca para a frente.
+    """
+    for m in cue_re.finditer(folded):
+        if m.end() > before_pos:
+            continue
+        if _tokens_between(folded, m.end(), before_pos) <= POLARITY_WINDOW_TOKENS:
+            return True
+    return False
+
+
+def _mention_polarity_at(folded: str, span: tuple[int, int]) -> MentionPolarity:
+    """Polaridade da menção a um id no trecho `span` de `folded` (§ R3).
+
+    Duas perguntas em sequência, cada uma ancorada no lugar certo:
+
+    1. Existe um predicado AFIRMATIVO explícito perto do id? Se sim, a
+       negação relevante é a que precede ESSE PREDICADO — não a que fica
+       mais perto do id em distância bruta. É o que faz "RF-042 nao refina a
+       decisao DEC-017" negar a menção a DEC-017 mesmo "refina" (a palavra
+       afirmativa) estando mais perto de DEC-017 do que "nao": a negação está
+       ligada ao verbo, o verbo é que rege o id, não o contrário. Sem
+       predicado nas proximidades (ex.: "RF-042 revoga DEC-017", onde
+       "revoga" já É a negação, sem verbo afirmativo por perto), a âncora
+       cai no próprio id.
+    2. Sem negação, uma comparação/citação perto do id (antes ou depois)
+       rebaixa a menção a `neutral` — aqui sim a distância é do PRÓPRIO id,
+       porque comparação tipicamente substitui o verbo em vez de modificá-lo
+       ("RF-042, diferente de DEC-017, ...").
+
+    Sem nenhuma pista, a menção fica `affirmed`: é o comportamento de menção
+    simples que já sustentava os cenários normativos de §8.3 antes desta
+    regra existir, e não há motivo para uma citação sem marcador virar
+    candidata.
+    """
+    id_start, _id_end = span
+    predicate = _nearest_match(_AFFIRM_PREDICATE_RE, folded, span)
+    anchor = predicate[1] if predicate is not None and predicate[0] <= POLARITY_WINDOW_TOKENS else id_start
+
+    if _negation_immediately_before(_NEGATION_RE, folded, anchor):
+        return MentionPolarity.NEGATED
+
+    comparison_gap = _nearest_gap(_COMPARISON_RE, folded, span)
+    if comparison_gap is not None and comparison_gap <= POLARITY_WINDOW_TOKENS:
+        return MentionPolarity.NEUTRAL
+
+    return MentionPolarity.AFFIRMED
+
+
 @dataclass(frozen=True)
 class ExplicitId:
     """Um id citado no texto, já normalizado para a forma canônica ``PRE-NNN``.
@@ -176,6 +357,10 @@ class ExplicitId:
     `entity_type` é `None` quando o prefixo não está em `ID_PREFIX_TYPES`:
     reconhecer o id sem saber o que ele é vale mais do que descartá-lo, porque
     permite pedir a decisão material em vez de perder a referência.
+
+    `mention_polarity` é da MENÇÃO, não da entidade: a mesma `ExplicitId`
+    (mesmo `value`) citada em dois blocos diferentes pode ter polaridades
+    diferentes — cada ocorrência carrega a sua (§ R3).
     """
 
     raw: str
@@ -183,6 +368,7 @@ class ExplicitId:
     prefix: str
     number: str
     entity_type: EntityType | None
+    mention_polarity: MentionPolarity = MentionPolarity.AFFIRMED
 
     @property
     def known(self) -> bool:
@@ -190,10 +376,21 @@ class ExplicitId:
 
 
 def parse_explicit_ids(text: str) -> tuple[ExplicitId, ...]:
-    """Extrai ids explícitos preservando a ordem e sem repetir o mesmo id."""
+    """Extrai ids explícitos preservando a ordem e sem repetir o mesmo id.
+
+    A polaridade de cada menção é calculada sobre `accent_fold(text)`, mas os
+    OFFSETS vêm do casamento no texto original: `accent_fold` (NFKD + remoção
+    de combining marks) preserva 1:1 o comprimento de caractere para o
+    português corrente (á/é/í/ó/ú/ã/õ/ç viram 1 caractere cada), então a
+    mesma posição indexa os dois. Isso evita ter que re-casar
+    `EXPLICIT_ID_RE` sobre o texto dobrado, que quebraria a regra de
+    prefixo-desconhecido-exige-maiúscula (ela depende do texto ORIGINAL).
+    """
+    raw_text = text or ""
+    folded_full = accent_fold(raw_text)
     out: list[ExplicitId] = []
     seen: set[str] = set()
-    for m in EXPLICIT_ID_RE.finditer(text or ""):
+    for m in EXPLICIT_ID_RE.finditer(raw_text):
         if m.group("known"):
             prefix_raw, number = m.group("known"), m.group("knum")
         else:
@@ -213,6 +410,7 @@ def parse_explicit_ids(text: str) -> tuple[ExplicitId, ...]:
                 prefix=prefix,
                 number=number,
                 entity_type=ID_PREFIX_TYPES.get(prefix),
+                mention_polarity=_mention_polarity_at(folded_full, (m.start(), m.end())),
             )
         )
     return tuple(out)

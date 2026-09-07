@@ -20,6 +20,7 @@ import contextlib
 import dataclasses
 import hashlib
 import html
+import inspect
 import io
 import json
 import os
@@ -5325,6 +5326,210 @@ def _write_structural_knowledge(store_root: str, namespace: str, snapshot, capab
         repo.close()
 
 
+# -- achado nº1: resultado aceito -> fato verificado -> publicação ------------
+#
+# `_write_structural_knowledge` grava o que a EXTRAÇÃO estabeleceu e nada mais:
+# nenhuma linha dele lê `tasks.result_json`. Por isso um resultado aceito pelo
+# coordenador morria em `runtime.db` — a tarefa ficava `done`, e a regra que ela
+# descobriu não existia em `knowledge.db`, logo não existia na publicação.
+#
+# O bloco abaixo é a fiação que faltava, na ordem exigida por
+# `knowledge.integrate`: revisão estrutural -> integração (revisão PRÓPRIA,
+# posterior) -> publicação DA REVISÃO PÓS-INTEGRAÇÃO. Publicar a revisão
+# estrutural depois de integrar publicaria o estado anterior aos fatos.
+
+#: Estado do objetivo (§6.6) -> `AnalysisState` do documento (§10.2). `blocked`
+#: vira `estrutural`, não `parcial`: objetivo bloqueado não teve comportamento
+#: avaliado nesta revisão, e "parcial" prometeria uma análise que não houve.
+_OBJECTIVE_ANALYSIS_STATE = {
+    "complete": "completo",
+    "partial": "parcial",
+    "blocked": "estrutural",
+}
+
+#: Último `IntegrationReport` serializado, em `store/.analysis/`. `runtime.db`
+#: sabe o estado da TAREFA (`done`), nunca o do OBJETIVO depois de verificado —
+#: só o relatório de integração tem `state`/`unmet`/`lacunas` recalculados, e é
+#: dele que `wk status` lê os objetivos por estado (achado nº6a).
+_INTEGRATION_FILE = "last_integration.json"
+
+
+def _last_integration_path(store_root: str) -> str:
+    return os.path.join(_analysis_dir(store_root), _INTEGRATION_FILE)
+
+
+def _save_last_integration(store_root: str, namespace: str, report: dict) -> None:
+    _write_atomic(
+        _last_integration_path(store_root),
+        json.dumps(
+            {"namespace": namespace, "gravado_em": _utc_now(), "integracao": report},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+    )
+
+
+def _load_last_integration(store_root: str) -> dict:
+    path = _last_integration_path(store_root)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _integration_states(report: dict) -> dict:
+    """`IntegrationReport.to_dict()` -> `investigation_states` do planner.
+
+    Chave: `capability_id` (que é o `entity_id` da Capability, pela convenção de
+    `_write_structural_knowledge`), o `subject_id` efetivamente usado e o
+    `objective_id` — `planner.plan` procura por `document_id`/`entity_id`/
+    `stable_key`/título e simplesmente ignora a chave que não casar.
+
+    Sem isto o `analysis_state` publicado é DERIVADO das unidades; com isto ele
+    é o estado que a integração RECALCULOU, com as lacunas reais no corpo do
+    documento (achado nº6).
+    """
+    states: dict = {}
+    for obj in report.get("objetivos") or ():
+        if not isinstance(obj, dict):
+            continue
+        state = _OBJECTIVE_ANALYSIS_STATE.get(str(obj.get("state") or ""))
+        if state is None:
+            continue
+        gaps = [
+            str(l.get("detalhe") or "").strip()
+            for l in (obj.get("lacunas") or ())
+            if isinstance(l, dict)
+        ]
+        gaps += [str(u).strip() for u in (obj.get("unmet") or ())]
+        entry = {"state": state, "gaps": [g for g in dict.fromkeys(gaps) if g][:20]}
+        for key in (obj.get("capability_id"), obj.get("subject_id"), obj.get("objective_id")):
+            if key:
+                states[str(key)] = entry
+    return states
+
+
+def _integration_summary(report: dict) -> dict:
+    """Resumo do relatório para o JSON dos comandos (contrato do achado nº1)."""
+    por_estado = {"complete": 0, "partial": 0, "blocked": 0}
+    supported = disputed = unresolved = lacunas = 0
+    for obj in report.get("objetivos") or ():
+        if not isinstance(obj, dict):
+            continue
+        estado = str(obj.get("state") or "")
+        if estado in por_estado:
+            por_estado[estado] += 1
+        supported += int(obj.get("supported") or 0)
+        disputed += int(obj.get("disputed") or 0)
+        unresolved += int(obj.get("unresolved") or 0)
+        lacunas += len(obj.get("lacunas") or ())
+    return {
+        "revisao": report.get("revisao"),
+        "mudancas": int(report.get("mudancas") or 0),
+        "objetivos_por_estado": por_estado,
+        "fatos": {"supported": supported, "disputed": disputed, "unresolved": unresolved},
+        "fatos_gravados": int(report.get("fatos_gravados") or 0),
+        "lacunas_totais": lacunas,
+        "reread_obligations": len(report.get("reread_obligations") or ()),
+        "bloqueios": list(report.get("bloqueios") or ()),
+    }
+
+
+def _integrate_results(
+    store_root: str,
+    namespace: str,
+    task_store,
+    snapshot,
+    extraction,
+    objectives,
+    capability_map,
+    *,
+    reason: str,
+) -> tuple[dict, dict, str | None]:
+    """`knowledge.integrate.integrate` -> `(resumo, investigation_states, revisão)`.
+
+    `capability_entity_map` é `{capability_id: capability_id}` porque é
+    exatamente a convenção com que `_write_structural_knowledge` grava a
+    Capability (`EntityDraft(entity_id=cap.capability_id)`); quem chama já
+    resolveu essa identidade, e `knowledge.integrate` não a reimplementa.
+
+    Falha aqui NUNCA derruba o comando nem desfaz a revisão estrutural já
+    gravada: vira `bloqueios` no resumo, e a publicação segue com a revisão que
+    existir.
+    """
+    from knowledge import integrate as kg_integrate
+    from knowledge.repository import Repository
+
+    cap_map = {
+        c.capability_id: c.capability_id
+        for c in getattr(capability_map, "capabilities", ()) or ()
+    }
+    repo = Repository.open(_knowledge_db_path(store_root))
+    try:
+        report = kg_integrate.integrate(
+            repo,
+            task_store,
+            snapshot,
+            extraction,
+            namespace,
+            objectives=objectives,
+            capability_entity_map=cap_map,
+            reason=reason,
+        )
+        data = report.to_dict()
+    except Exception as exc:
+        data = {
+            "revisao": None,
+            "objetivos": [],
+            "bloqueios": [f"{type(exc).__name__}: {exc}"],
+        }
+    finally:
+        repo.close()
+
+    _save_last_integration(store_root, namespace, data)
+    return _integration_summary(data), _integration_states(data), data.get("revisao")
+
+
+def _status_geral(
+    *,
+    objetivos_por_estado: dict | None = None,
+    decisoes_pendentes: int = 0,
+    publicacao_bloqueada: bool = False,
+    revisao_nova: bool = False,
+    bloqueios_execucao: int = 0,
+    erro_material: bool = False,
+) -> tuple[str, int]:
+    """`status_geral` + exit code do comando (achado nº6a).
+
+    Três estados, e o exit code deriva SÓ deles:
+
+    | status | quando | exit |
+    |---|---|---|
+    | `bloqueado` | erro material, ou publicação bloqueada SEM revisão nova (nada de útil saiu) | 2 |
+    | | (`revisao_nova` é revisão COM mudança: reexecutar sobre árvore inalterada abre revisão idempotente de 0 mudanças, que não é resultado útil nenhum) | |
+    | `parcial` | objetivo `partial`/`blocked`, decisão pendente, bloqueio de execução (despacho/integração) ou publicação bloqueada COM revisão gravada | 0 |
+    | `completo` | nada pendente | 0 |
+
+    `parcial` sai com 0 DE PROPÓSITO: houve resultado útil (revisão gravada), e
+    o que falta está explícito no JSON — falhar aqui obrigaria o operador a
+    tratar progresso parcial como erro. O inverso também é deliberado:
+    `completo` só quando NADA ficou em aberto, para que o silêncio do exit 0
+    não seja confundido com análise concluída.
+    """
+    estados = objetivos_por_estado or {}
+    parciais = int(estados.get("partial") or 0) + int(estados.get("blocked") or 0)
+    if erro_material or (publicacao_bloqueada and not revisao_nova):
+        return "bloqueado", 2
+    if parciais or decisoes_pendentes or publicacao_bloqueada or bloqueios_execucao:
+        return "parcial", 0
+    return "completo", 0
+
+
 #: Publicação local (`store/publicacoes/`): raiz relativa ao store, fixa —
 #: `wk analyze`/`wk update`/`wk ingest` (W8-T8.2) publicam sempre aqui, com o
 #: pipeline REAL de W6 (`publishing.planner`+`publishing.release`, renderers
@@ -5334,26 +5539,110 @@ def _write_structural_knowledge(store_root: str, namespace: str, snapshot, capab
 _PUBLICACOES_DIRNAME = "publicacoes"
 
 
-def _publish_local(store_root: str, namespace: str, revision_id: str | None) -> dict:
-    """Publica localmente a revisão `revision_id` (Markdown+Word+manifest.json).
+def _knowledge_namespaces(repo) -> list:
+    """Namespaces com entidade em `knowledge.db` — a mesma consulta que
+    `planner._all_namespaces` faz, usada só pelo caminho de compatibilidade
+    abaixo (quando `plan` não aceitar `namespace=None`)."""
+    rows = repo.conn.execute(
+        "SELECT DISTINCT namespace FROM entities ORDER BY namespace"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _plan_union(repo, revision_id: str, investigation_states: dict | None):
+    """Plano da UNIÃO de TODOS os namespaces vigentes (achado nº5).
+
+    O manifesto ativo é ÚNICO por store: `release.publish_revision` promove um
+    `manifest.json` que descreve tudo o que está publicado. Planejar só o
+    namespace da execução corrente fazia a publicação seguinte apagar do
+    manifesto os documentos do outro universo — `wk ingest` (namespace `wiki`)
+    derrubava os documentos de código publicados por `wk analyze`
+    (`code/<repo>`), e vice-versa.
+
+    Caminho normal: `plan(namespace=None)`, que o planner já suporta e que
+    mantém os namespaces isolados entre si (cada travessia parte das entidades
+    do próprio namespace). Caminho de compatibilidade (assinatura antiga, sem
+    `namespace=None`): um plano POR namespace, compostos num único
+    `PublicationPlan` — mesma revisão, documentos concatenados.
+    """
+    from publishing.planner import PublicationPlan
+    from publishing.planner import plan as pub_plan
+
+    params = inspect.signature(pub_plan).parameters
+    kwargs: dict = {}
+    if "investigation_states" in params and investigation_states:
+        kwargs["investigation_states"] = dict(investigation_states)
+
+    if "namespace" in params:
+        try:
+            return pub_plan(repo, revision_id, namespace=None, **kwargs)
+        except TypeError:
+            pass  # assinatura não aceita `None`: compõe abaixo
+
+    namespaces = _knowledge_namespaces(repo)
+    documents: list = []
+    catalog: dict = {}
+    skipped: list = []
+    warnings: list = []
+    consumers: tuple = ()
+    for ns in namespaces:
+        part = pub_plan(repo, revision_id, namespace=ns, **kwargs)
+        documents.extend(part.documents)
+        for unit in part.catalog_units:
+            catalog.setdefault(unit.unit_id, unit)
+        skipped.extend(part.skipped)
+        warnings.extend(part.warnings)
+        consumers = consumers or tuple(part.consumers)
+    return PublicationPlan(
+        revision_id=revision_id,
+        namespace=",".join(namespaces),
+        documents=tuple(documents),
+        catalog_units=tuple(catalog[k] for k in sorted(catalog)),
+        skipped=tuple(skipped),
+        consumers=consumers,
+        warnings=tuple(warnings),
+    )
+
+
+def _publish_local(
+    store_root: str,
+    namespace: str,
+    revision_id: str | None,
+    investigation_states: dict | None = None,
+) -> dict:
+    """Publica a revisão `revision_id` (Markdown+Word+manifest.json), com o
+    manifesto cobrindo TODOS os namespaces vigentes (achado nº5).
+
+    `namespace` continua no retorno como o namespace de ORIGEM da execução (o
+    que foi gravado agora), mas não recorta mais a publicação: o que vai para o
+    manifesto é a união (ver `_plan_union`). `namespaces_publicados[]` diz
+    exatamente quais universos entraram.
+
+    `investigation_states` (achado nº6) chega do `IntegrationReport` e faz o
+    `analysis_state` de cada documento ser o estado RECALCULADO do objetivo, em
+    vez do derivado das unidades.
 
     Falha de publicação NUNCA desfaz a revisão de conhecimento já gravada em
     `knowledge.db` — `release.publish_revision` já garante isso (§10.6/F09:
     staging isolado, promoção só se tudo validar; revisão anterior de
     publicação continua ativa/servível). Aqui só reportamos o resultado como
-    `bloqueios`; o chamador (`cmd_analyze`/`cmd_update`/`cmd_ingest`) sempre
-    retorna 0 mesmo com bloqueio de publicação — a revisão de conhecimento em
-    si já terminou com sucesso antes desta função ser chamada.
+    `bloqueios`; quem chama decide o `status_geral` a partir deles.
 
     `revision_id=None` (nada foi gravado nesta execução) não tenta publicar.
     """
     rel_root = _PUBLICACOES_DIRNAME
     if not revision_id:
-        return {"revisao": None, "bloqueios": ["nenhuma revisão nova para publicar"]}
+        return {
+            "revisao": None,
+            "namespaces_publicados": [],
+            "bloqueios": ["nenhuma revisão nova para publicar"],
+        }
 
     out_root = os.path.join(store_root, _PUBLICACOES_DIRNAME)
     publicacoes = {
         "revisao": revision_id,
+        "namespace_origem": namespace,
+        "namespaces_publicados": [],
         "markdown": f"{rel_root}/markdown",
         "word": f"{rel_root}/word",
         "manifesto": f"{rel_root}/manifest.json",
@@ -5363,7 +5652,6 @@ def _publish_local(store_root: str, namespace: str, revision_id: str | None) -> 
         from publishing import markdown as pub_markdown
         from publishing import release as pub_release
         from publishing import word as pub_word
-        from publishing.planner import plan as pub_plan
 
         class _Renderers:
             markdown = pub_markdown
@@ -5371,7 +5659,11 @@ def _publish_local(store_root: str, namespace: str, revision_id: str | None) -> 
 
         repo = Repository.open(_knowledge_db_path(store_root))
         try:
-            plan_obj = pub_plan(repo, revision_id, namespace=namespace)
+            plan_obj = _plan_union(repo, revision_id, investigation_states)
+            publicacoes["namespaces_publicados"] = sorted(
+                {d.namespace for d in plan_obj.documents if getattr(d, "namespace", None)}
+            )
+            publicacoes["documentos"] = len(plan_obj.documents)
             result = pub_release.publish_revision(
                 plan_obj, out_root, _Renderers(), revision_id=revision_id,
             )
@@ -5446,19 +5738,41 @@ def cmd_analyze(a) -> int:
 
         reason = f"wk analyze --repo {repo_abs}" + (f" --topic {topic}" if topic else "")
         kg_summary = _write_structural_knowledge(store_root, namespace, snapshot, capability_map, extraction, reason)
-        publicacoes = _publish_local(store_root, namespace, kg_summary.get("revision_id"))
+
+        # Achado nº1: DEPOIS da revisão estrutural e ANTES de publicar. O que o
+        # worker afirmou é confrontado com o snapshot e vira fato; a publicação
+        # usa a revisão PÓS-integração (`integ_revisao`), senão sairia o estado
+        # anterior aos fatos que acabaram de ser gravados.
+        integracao, investigation_states, integ_revisao = _integrate_results(
+            store_root, namespace, store, snapshot, extraction, objectives, capability_map,
+            reason=f"integração de resultados — {reason}",
+        )
+        revisao_publicada = integ_revisao or kg_summary.get("revision_id")
+        publicacoes = _publish_local(
+            store_root, namespace, revisao_publicada, investigation_states
+        )
 
         current_oids = sorted({str(o.get("objective_id")) for o in objective_dicts if o.get("objective_id")})
         profile_all[_repo_key(repo_abs)] = {
             "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
-            "last_snapshot_id": snapshot.snapshot_id, "last_revision_id": kg_summary.get("revision_id"),
+            "last_snapshot_id": snapshot.snapshot_id, "last_revision_id": revisao_publicada,
             "current_objective_ids": current_oids, "updated_at": _utc_now(),
         }
         _save_analysis_profile(store_root, profile_all)
 
+        status, exit_code = _status_geral(
+            objetivos_por_estado=integracao.get("objetivos_por_estado"),
+            publicacao_bloqueada=bool(publicacoes.get("bloqueios")),
+            revisao_nova=bool(revisao_publicada) and bool(
+                int(kg_summary.get("mudancas") or 0) + int(integracao.get("mudancas") or 0)
+            ),
+            bloqueios_execucao=len(bloqueios) + len(integracao.get("bloqueios") or ()),
+        )
         out = {
+            "status_geral": status,
             "capacidades_analisadas": capacidades_analisadas,
             "revisao": kg_summary,
+            "integracao": integracao,
             "publicacoes": publicacoes,
             "resultados": resultados,
             "lacunas": _lacunas_from_objectives(objectives),
@@ -5475,7 +5789,7 @@ def cmd_analyze(a) -> int:
                 "estrutural já concluída não precisa ser refeita"
             )
         print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0
+        return exit_code
     finally:
         store.close()
 
@@ -5609,28 +5923,48 @@ def cmd_update(a) -> int:
         finally:
             repo_kg.close()
 
+        # Mesma fiação do `wk analyze` (achado nº1): integrar antes de publicar,
+        # e publicar a revisão pós-integração.
+        integracao, investigation_states, integ_revisao = _integrate_results(
+            store_root, namespace, store, new_snapshot, extraction, objectives, capability_map,
+            reason=f"integração de resultados — {reason}",
+        )
+        revisao_publicada = integ_revisao or kg_summary.get("revision_id")
+
         # Republica só quando houve mudança (§7.1/W8): esta função inteira só
         # roda dentro do ramo `mudou=True` — o `if new_snapshot.snapshot_id ==
         # old_snapshot.snapshot_id` acima já retorna sem chegar aqui quando
         # não há delta, então `wk update` sem mudança nunca republica.
-        publicacoes = _publish_local(store_root, namespace, kg_summary.get("revision_id"))
+        publicacoes = _publish_local(
+            store_root, namespace, revisao_publicada, investigation_states
+        )
 
         _save_snapshot_manifest(store_root, new_snapshot)
         profile_all[_repo_key(repo_abs)] = {
             "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
-            "last_snapshot_id": new_snapshot.snapshot_id, "last_revision_id": kg_summary.get("revision_id"),
+            "last_snapshot_id": new_snapshot.snapshot_id, "last_revision_id": revisao_publicada,
             "current_objective_ids": sorted(current_oids), "updated_at": _utc_now(),
         }
         _save_analysis_profile(store_root, profile_all)
 
+        status, exit_code = _status_geral(
+            objetivos_por_estado=integracao.get("objetivos_por_estado"),
+            publicacao_bloqueada=bool(publicacoes.get("bloqueios")),
+            revisao_nova=bool(revisao_publicada) and bool(
+                int(kg_summary.get("mudancas") or 0) + int(integracao.get("mudancas") or 0)
+            ),
+            bloqueios_execucao=len(bloqueios) + len(integracao.get("bloqueios") or ()),
+        )
         out = {
             "mudou": True,
+            "status_geral": status,
             "delta": {"adicionados": delta["added"], "removidos": delta["removed"], "alterados": delta["changed"]},
             "objetivos_invalidados": objetivos_invalidados,
             "objetivos_obsoletos": objetivos_obsoletos,
             "conhecimento_invalidado": conhecimento_invalidado,
             "capacidades_analisadas": capacidades_analisadas,
             "revisao": kg_summary,
+            "integracao": integracao,
             "publicacoes": publicacoes,
             "resultados": resultados,
             "lacunas": _lacunas_from_objectives(objectives),
@@ -5641,7 +5975,7 @@ def cmd_update(a) -> int:
             },
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0
+        return exit_code
     finally:
         store.close()
 
@@ -5711,6 +6045,32 @@ def cmd_status(a) -> int:
             finally:
                 repo_kg.close()
 
+        # Achado nº6a: estado da TAREFA não é estado do OBJETIVO. `runtime.db`
+        # diz `done`; se o objetivo ficou `partial` porque uma obrigação segue
+        # em aberto, quem sabe disso é o último `IntegrationReport` — daí ler
+        # `store/.analysis/last_integration.json` em vez de deduzir da tarefa.
+        integ = (_load_last_integration(store_root).get("integracao") or {})
+        objetivos_por_estado = {"complete": 0, "partial": 0, "blocked": 0}
+        objetivos_pendentes = []
+        for obj in integ.get("objetivos") or ():
+            if not isinstance(obj, dict):
+                continue
+            oid = str(obj.get("objective_id") or "")
+            if current_oids is not None and oid and oid not in current_oids:
+                continue
+            estado = str(obj.get("state") or "")
+            if estado in objetivos_por_estado:
+                objetivos_por_estado[estado] += 1
+            unmet_obj = [str(u) for u in (obj.get("unmet") or ())]
+            if estado != "complete" or unmet_obj:
+                objetivos_pendentes.append({
+                    "objective_id": oid,
+                    "capability_id": obj.get("capability_id"),
+                    "estado": estado,
+                    "unmet": unmet_obj,
+                    "lacunas": len(obj.get("lacunas") or ()),
+                })
+
         out = {
             "repo": repo_abs,
             "escopo_efetivo": {
@@ -5718,6 +6078,13 @@ def cmd_status(a) -> int:
                 "namespace": prior.get("namespace"), "scope": prior.get("scope"),
             },
             "ultimo_snapshot": prior.get("last_snapshot_id"),
+            "objetivos_por_estado": objetivos_por_estado,
+            "objetivos_pendentes": objetivos_pendentes,
+            "integracao": {
+                "revisao": integ.get("revisao"),
+                "fatos_gravados": integ.get("fatos_gravados"),
+                "bloqueios": list(integ.get("bloqueios") or ()),
+            } if integ else None,
             "tarefas_por_estado": por_estado,
             "tarefas_total_historico": len(store.all_tasks()),
             "capacidades_obsoletas": capacidades_obsoletas,
@@ -5749,6 +6116,10 @@ def cmd_resume(a) -> int:
     from runtime import recovery as rt_recovery
     from runtime import tasks as rt_tasks
 
+    namespace = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
+    scope = prior.get("scope")
+
+    snap = None
     resolver = None
     if prior.get("last_snapshot_id"):
         snap = _load_snapshot_manifest(store_root, prior["last_snapshot_id"])
@@ -5759,9 +6130,69 @@ def cmd_resume(a) -> int:
     try:
         resume_plan = rt_recovery.resume(store)
         resultados, bloqueios = _dispatch_objectives(store, engine_name, resolver=resolver)
-        out = {"retomada": resume_plan.summary(), "resultados": resultados, "bloqueios": bloqueios}
+
+        # Achado nº6b: retomar não é só despachar. Sem o MESMO pós-processamento
+        # do `wk analyze`, o resultado que esta retomada acabou de aceitar
+        # ficaria em `runtime.db` — a tarefa `done` e o fato inexistente em
+        # `knowledge.db`, exatamente o buraco do achado nº1 reaberto pela porta
+        # de trás. Por isso: integrar -> `investigation_states` -> republicar.
+        integracao: dict = {}
+        publicacoes: dict = {}
+        revisao_publicada = None
+        if snap is None:
+            bloqueios = list(bloqueios) + [{
+                "tipo": "snapshot_ausente",
+                "detalhe": (
+                    f"manifesto do snapshot {prior.get('last_snapshot_id')!r} não encontrado em "
+                    f"{_snapshots_dir(store_root)}"
+                ),
+                "impacto": "resultados não puderam ser integrados nem publicados nesta retomada",
+                "acao": f"rode `wk analyze --repo {repo_abs}` para recriar o manifesto",
+            }]
+        else:
+            try:
+                _snapshot, _inventory, extraction, capability_map, objectives = _analyze_pipeline(
+                    repo_abs, scope, namespace, precaptured=snap
+                )
+            except Exception as exc:
+                extraction = capability_map = objectives = None
+                bloqueios = list(bloqueios) + [{
+                    "tipo": "extracao_indisponivel",
+                    "detalhe": f"{type(exc).__name__}: {exc}",
+                    "impacto": "resultados não puderam ser confrontados com o código nesta retomada",
+                }]
+            if objectives is not None:
+                integracao, investigation_states, revisao_publicada = _integrate_results(
+                    store_root, namespace, store, snap, extraction, objectives, capability_map,
+                    reason=f"integração de resultados — wk resume --repo {repo_abs}",
+                )
+                revisao_publicada = revisao_publicada or prior.get("last_revision_id")
+                publicacoes = _publish_local(
+                    store_root, namespace, revisao_publicada, investigation_states
+                )
+                if integracao.get("revisao"):
+                    profile_all[_repo_key(repo_abs)] = {
+                        **prior, "last_revision_id": integracao["revisao"],
+                        "updated_at": _utc_now(),
+                    }
+                    _save_analysis_profile(store_root, profile_all)
+
+        status, exit_code = _status_geral(
+            objetivos_por_estado=integracao.get("objetivos_por_estado"),
+            publicacao_bloqueada=bool(publicacoes.get("bloqueios")),
+            revisao_nova=bool(integracao.get("revisao")) and bool(integracao.get("mudancas")),
+            bloqueios_execucao=len(bloqueios) + len(integracao.get("bloqueios") or ()),
+        )
+        out = {
+            "status_geral": status,
+            "retomada": resume_plan.summary(),
+            "resultados": resultados,
+            "integracao": integracao,
+            "publicacoes": publicacoes,
+            "bloqueios": bloqueios,
+        }
         print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0
+        return exit_code
     finally:
         store.close()
 
@@ -6053,13 +6484,34 @@ def cmd_ingest(a) -> int:
     # foi correlacionado/gravado acima.
     publicacoes = None
     if revisoes:
-        publicacoes = _publish_local(store_root, namespace, revisoes[-1])
+        # Achado nº5: o manifesto publicado aqui é a UNIÃO dos namespaces —
+        # ingerir uma iniciativa não pode apagar do manifesto os documentos de
+        # código publicados por `wk analyze` (namespaces distintos, manifesto
+        # único). Achado nº6: o `analysis_state` dos documentos de código vem do
+        # último `IntegrationReport` deste store, não é reinventado aqui.
+        investigation_states = _integration_states(
+            _load_last_integration(store_root).get("integracao") or {}
+        )
+        publicacoes = _publish_local(
+            store_root, namespace, revisoes[-1], investigation_states
+        )
         if publicacoes.get("bloqueios"):
             avisos.append(
                 "publicacao_com_bloqueio: " + "; ".join(publicacoes["bloqueios"])
             )
 
+    # Achado nº6a: `ok_count > 0` sozinho não distingue "tudo entrou" de "entrou
+    # metade". `bloqueado` (exit 2) é reservado a nenhum resultado útil: nenhuma
+    # fonte ok, ou publicação bloqueada sem revisão nova.
+    status, exit_code = _status_geral(
+        decisoes_pendentes=pending_count,
+        publicacao_bloqueada=bool((publicacoes or {}).get("bloqueios")),
+        revisao_nova=bool(revisoes),
+        bloqueios_execucao=fail_count,
+        erro_material=(ok_count == 0),
+    )
     out = {
+        "status_geral": status,
         "fontes": fontes,
         "revisoes": revisoes,
         "unidades_afetadas": sorted(unidades_afetadas),
@@ -6068,7 +6520,7 @@ def cmd_ingest(a) -> int:
     if publicacoes is not None:
         out["publicacoes"] = publicacoes
     print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 0 if ok_count > 0 else 1
+    return exit_code
 
 
 # ---------- W8: migrate (corpus legado -> knowledge.db; §16.1) ----------

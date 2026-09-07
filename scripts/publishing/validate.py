@@ -69,7 +69,12 @@ _MD_ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|>])")
 #: Mesma regra de `document.PLACEHOLDER_RE` (colchete SEM espaço interno, como
 #: `list[int]`, é sintaxe técnica legítima e não é acusado).
 _FALLBACK_PLACEHOLDER_RE = re.compile(r"\[\s*(?:\]|\.{2,}\]|…\]|[^\[\]]*\s[^\[\]]*\])")
-_PLACEHOLDER_WORDS_RE = re.compile(r"\b(todo|fixme|preencher|a definir|tbd)\b", re.I)
+# Marcadores ingleses (TODO/FIXME/TBD) so contam como placeholder em CAIXA ALTA:
+# "todo" minusculo e palavra comum em PT-BR ("todo agrupamento") e nao pode
+# bloquear publicacao. Expressoes PT seguem case-insensitive.
+_PLACEHOLDER_WORDS_RE = re.compile(
+    r"\b(?:TODO|FIXME|TBD)\b|\b[aA] [dD]efinir\b|\b[pP]reencher\b"
+)
 
 # D12 — tokens críticos que não podem se perder na renderização.
 _TOK_COMPARATOR_RE = re.compile(r"(?:>=|<=|!=|<>|==|≠|≥|≤|>|<|=)")
@@ -588,6 +593,255 @@ def validate_semantics(document, rendered_md_text, docx_bytes):
 
 
 # ---------------------------------------------------------------------------
+# validate_sufficiency — o modelo é SUFICIENTE para o que o título promete?
+# ---------------------------------------------------------------------------
+#
+# `validate_semantics` confere FIDELIDADE (modelo → Markdown/Word: o que está
+# no modelo chegou igual nas duas saídas). Isso não diz nada sobre o modelo ser
+# suficiente: um documento cujo único conteúdo é `implemented = true` e uma
+# lista de relações é renderizado com fidelidade perfeita e publicado sob o
+# título "regras, fluxo, falhas e contratos". Era o achado bloqueante nº2 — 40
+# células de matriz sem avaliação passando pela publicação.
+#
+# Este portão fecha a lacuna no eixo que faltava: o que o rótulo promete existe
+# no corpo, ou a falta está declarada como lacuna e visível no conteúdo
+# RENDERIZADO (não só no modelo).
+
+#: Título da seção de lacunas por unidade (renderizada por `markdown.render_unit`).
+UNIT_GAPS_TITLE = "Lacunas e pontos não resolvidos"
+
+_FALLBACK_ANALYSIS_GAPS_TITLE = "Lacunas da análise nesta revisão"
+
+
+def _doc_attr(document, *names, default=None):
+    """Leitura tolerante que NÃO chama método sem argumento (ao contrário de
+    `_word._get`): `sufficiency_problems`/`is_publishable` são resolvidos aqui
+    de propósito, um a um, com o argumento certo."""
+    if document is None:
+        return default
+    for name in names:
+        if isinstance(document, dict):
+            val = document.get(name)
+        else:
+            val = getattr(document, name, None)
+        if val not in (None, "", [], {}, ()):
+            return val
+    return default
+
+
+def analysis_gaps_title():
+    """Título canônico da seção de lacunas do documento (o mesmo que os
+    renderizadores escrevem) — sem duplicar a constante."""
+    mod = _word._document_module()
+    return getattr(mod, "ANALYSIS_GAPS_TITLE", _FALLBACK_ANALYSIS_GAPS_TITLE) if mod else (
+        _FALLBACK_ANALYSIS_GAPS_TITLE
+    )
+
+
+def promises_behavior(text):
+    """O rótulo promete comportamento? Usa `document.promises_behavior` quando
+    disponível — as duas pontas precisam concordar sobre o que é promessa."""
+    mod = _word._document_module()
+    checker = getattr(mod, "promises_behavior", None) if mod is not None else None
+    if callable(checker):
+        return bool(checker(text or ""))
+    folded = _fold(text)
+    return any(
+        term in re.split(r"[^a-z0-9]+", folded)
+        for term in ("regra", "regras", "fluxo", "fluxos", "falha", "falhas",
+                     "comportamento", "excecao", "excecoes", "condicao", "condicoes")
+    )
+
+
+def unit_is_behavioral(unit):
+    """A unidade tem condição/comportamento/exceção sustentada por evidência?
+
+    Prefere `SemanticUnit.content_grade`; o fallback duck-typed repete a MESMA
+    regra para modelo em dict (a fidelidade entre as duas é o que impede o
+    validador de aceitar o que o construtor recusa).
+    """
+    grade = getattr(unit, "content_grade", None)
+    if grade is not None:
+        return _word._norm_ws(grade) == "behavioral"
+    for group in ("conditions", "behavior", "exceptions"):
+        for st in _word._as_list(_word._get(unit, group, default=[])):
+            if _word._as_list(_word._get(st, "evidence_ids", "evidence_refs", default=[])):
+                return True
+    return False
+
+
+def unit_declares_gaps(unit):
+    return bool(_word._as_list(_word._get(unit, "gaps", default=[])))
+
+
+def _own_units(document):
+    """Unidades publicáveis que são conteúdo próprio (sem mini-contexto)."""
+    return [
+        u
+        for u in _word.publishable_units(document)
+        if _word._get(u, "shared_context", default=False) is not True
+    ]
+
+
+def _analysis_state_of(document):
+    """Estado da análise DECLARADO (string) — vazio quando não declarado."""
+    return _word._norm_ws(_doc_attr(document, "analysis_state", "estado_analise", default=""))
+
+
+def _declared_gaps_of(document):
+    return [
+        _word._norm_ws(g)
+        for g in _word._as_list(_doc_attr(document, "analysis_gaps", "lacunas", default=[]))
+        if _word._norm_ws(g)
+    ]
+
+
+def _sufficiency_problems(document):
+    """Motivos de bloqueio do documento.
+
+    Delega a `KnowledgeDocument.sufficiency_problems()` quando o modelo é o
+    real — regra em UM lugar só; o fallback abaixo existe para documento
+    duck-typed (dict) e aplica as mesmas três regras.
+    """
+    native = getattr(document, "sufficiency_problems", None)
+    if callable(native):
+        try:
+            return [str(p) for p in native()]
+        except TypeError:  # pragma: no cover - assinatura estranha vira fallback
+            pass
+
+    title = _word._norm_ws(_word._get(document, "title", "titulo", default=""))
+    state = _analysis_state_of(document)
+    own = _own_units(document)
+    behavioral = [u for u in own if unit_is_behavioral(u)]
+    unevaluated = [u for u in own if not unit_is_behavioral(u)]
+    gaps_declared = bool(_declared_gaps_of(document)) or any(unit_declares_gaps(u) for u in own)
+    problems = []
+
+    if promises_behavior(title) and not behavioral:
+        if state in ("", "completo"):
+            problems.append(
+                f"título {title!r} promete comportamento e nenhuma unidade tem "
+                "condição/comportamento/exceção sustentada por evidência; o documento não declara "
+                "analysis_state diferente de completo"
+            )
+        elif not gaps_declared:
+            problems.append(
+                f"título {title!r} promete comportamento, o documento declara analysis_state "
+                f"{state} e não publica nenhuma lacuna dizendo o que falta"
+            )
+    if state == "completo" and unevaluated:
+        missing = [u for u in unevaluated if not unit_declares_gaps(u)]
+        if missing:
+            problems.append(
+                "documento declara analysis_state completo, mas "
+                f"{len(missing)} unidade(s) não têm comportamento avaliado nem lacuna declarada: "
+                + ", ".join(_word._norm_ws(_word._get(u, "unit_id", default="")) for u in missing)
+            )
+    if state in ("parcial", "estrutural") and not gaps_declared:
+        problems.append(
+            f"estado da análise é {state} e nenhuma lacuna está publicada: o leitor não tem como "
+            "distinguir ausência de comportamento de ausência de análise"
+        )
+    return problems
+
+
+def validate_sufficiency(plan, staging_root=None):
+    """O modelo responde ao que o rótulo promete? (achado bloqueante nº2)
+
+    Por documento do plano:
+      - título que promete comportamento exige ≥1 unidade behavioral OU
+        `analysis_state` explícito ≠ `completo` com lacunas declaradas;
+      - `analysis_state = completo` com unidade sem comportamento avaliado e
+        sem lacuna → completude falsa, bloqueio;
+      - documento de espécie que exige comportamento (capacidade, contrato,
+        evolução) sem nenhuma unidade behavioral e sem lacuna → bloqueio;
+      - conferência no conteúdo RENDERIZADO: quando `analysis_state` ≠
+        `completo`, a seção de lacunas precisa existir de fato no Markdown
+        publicado — declarar lacuna no modelo e não renderizá-la deixaria o
+        leitor exatamente onde estava.
+
+    `staging_root` é aceito (e ignorado) para casar com a assinatura do
+    Protocol `release.Validators`, pela mesma razão das funções `*_staged`.
+    """
+    report = Report("sufficiency")
+    documents = _word.plan_documents(plan)
+    report.details["documents"] = len(documents)
+    if not documents:
+        return report.error("plano sem documento: não há suficiência a verificar")
+
+    estrutural, parcial, completo = [], [], []
+
+    for doc in documents:
+        doc_id = _word._norm_ws(_word._get(doc, "document_id", "id", default=""))
+        title = _word._norm_ws(_word._get(doc, "title", "titulo", default=""))
+        state = _analysis_state_of(doc)
+        own = _own_units(doc)
+        behavioral = [u for u in own if unit_is_behavioral(u)]
+        unevaluated = [u for u in own if not unit_is_behavioral(u)]
+
+        for problem in _sufficiency_problems(doc):
+            report.error(f"documento {doc_id} ({title!r}): {problem}",
+                         document_id=doc_id, analysis_state=state)
+
+        # Conferência por conteúdo RENDERIZADO (§10.5: o que o consumidor recebe).
+        if state and state != "completo":
+            md_text = _markdown.render(doc)
+            variants = markdown_variants(md_text)
+            has_doc_gaps = _contains(variants, analysis_gaps_title())
+            has_unit_gaps = _contains(variants, UNIT_GAPS_TITLE)
+            if not (has_doc_gaps or has_unit_gaps):
+                report.error(
+                    f"documento {doc_id} ({title!r}): analysis_state {state} sem seção de lacunas "
+                    "no Markdown publicado (§10.3: lacuna declarada precisa chegar ao leitor)",
+                    document_id=doc_id,
+                )
+            if not _contains(variants, state):
+                report.error(
+                    f"documento {doc_id}: estado da análise {state!r} ausente do corpo do Markdown",
+                    document_id=doc_id,
+                )
+
+        # "Análise parcial" sem dizer ONDE é a mesma opacidade com outro nome:
+        # cada unidade sem comportamento avaliado precisa estar nomeada em
+        # alguma lacuna — no bloco próprio da unidade ou no bloco do documento.
+        # É o que impede 40 células não avaliadas de sumirem atrás de uma
+        # ressalva genérica.
+        declared_text = normalize_space(" ".join(_declared_gaps_of(doc)))
+        for unit in unevaluated:
+            uid = _word._norm_ws(_word._get(unit, "unit_id", default=""))
+            unit_title = _word._norm_ws(_word._get(unit, "title", "titulo", default=""))
+            if unit_declares_gaps(unit):
+                continue
+            named = bool(uid and uid in declared_text) or (
+                bool(unit_title) and _contains((declared_text,), unit_title)
+            )
+            if named:
+                report.warn(
+                    f"unidade {uid} publicada sem condição, comportamento ou exceção sustentada "
+                    f"por evidência no documento {doc_id} ({title!r}); a lacuna está declarada",
+                    unit_id=uid, document_id=doc_id,
+                )
+                continue
+            report.error(
+                f"documento {doc_id} ({title!r}): unidade {uid} ({unit_title!r}) não tem "
+                "comportamento avaliado e não é nomeada em nenhuma lacuna declarada — a falta "
+                "some atrás de uma ressalva genérica",
+                unit_id=uid, document_id=doc_id,
+            )
+
+        bucket = estrutural if not behavioral else (parcial if unevaluated else completo)
+        bucket.append(doc_id)
+
+    report.details.update({
+        "documents_estruturais": estrutural,
+        "documents_parciais": parcial,
+        "documents_completos": completo,
+    })
+    return report
+
+
+# ---------------------------------------------------------------------------
 # validate_equivalence
 # ---------------------------------------------------------------------------
 
@@ -786,6 +1040,7 @@ def validate_revision(plan, md_manifest, md_texts):
     reports = []
     word_manifest = _word.render_manifest_word(plan)
     reports.append(validate_equivalence(md_manifest, word_manifest, plan))
+    reports.append(validate_sufficiency(plan))
 
     for doc in _word.plan_documents(plan):
         doc_id = _word._norm_ws(_word._get(doc, "document_id", "id", default=""))
@@ -846,12 +1101,25 @@ def validate_equivalence_staged(plan, staging_root):
 def validate_semantics_staged(plan, staging_root):
     """`Validators.validate_semantics(plan, staging_root)` — fidelidade
     semântica (D02/D05/D08/D09/D12/D13/D14) de cada documento do plano,
-    agregada num único `Report`."""
+    agregada num único `Report`.
+
+    Agrega TAMBÉM `validate_sufficiency` de propósito: `release._run_validators`
+    percorre uma tupla FIXA de três nomes (`validate_equivalence`,
+    `validate_semantics`, `validate_docx_structure`) — um quarto método em
+    `StagedValidators` seria simplesmente nunca chamado, e o portão novo não
+    bloquearia publicação nenhuma. `release.py` não é editável neste escopo, e
+    o par natural é este: fidelidade e suficiência respondem à mesma pergunta
+    ("o que chega ao consumidor corresponde ao que se afirma?") em dois eixos.
+    Os erros continuam distinguíveis pelo prefixo `[sufficiency]` que
+    `merge_reports` aplica, e o portão continua chamável isoladamente por
+    `StagedValidators.validate_sufficiency`.
+    """
     reports = []
     for doc in _word.plan_documents(plan):
         md_text = _markdown.render(doc)
         docx_bytes = _word.render(doc)
         reports.append(validate_semantics(doc, md_text, docx_bytes))
+    reports.append(validate_sufficiency(plan, staging_root))
     return merge_reports("semantics", reports)
 
 
@@ -878,3 +1146,8 @@ class StagedValidators:
     validate_equivalence = staticmethod(validate_equivalence_staged)
     validate_semantics = staticmethod(validate_semantics_staged)
     validate_docx_structure = staticmethod(validate_docx_structure_staged)
+    #: Portão de suficiência (achado bloqueante nº2). Chamável isoladamente e
+    #: JÁ agregado dentro de `validate_semantics` — `release._run_validators`
+    #: só percorre os três nomes acima, então é por dentro de `semantics` que
+    #: este portão efetivamente bloqueia uma publicação.
+    validate_sufficiency = staticmethod(validate_sufficiency)

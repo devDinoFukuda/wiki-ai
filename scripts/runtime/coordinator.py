@@ -513,8 +513,31 @@ def _build_package(
 
 
 def _references(package: Any) -> Any:
+    """Referências enviadas ao executor: o PACOTE COMPLETO, quando montado.
+
+    Achado ALTO nº4 (auditoria externa): mandar só `package.refs` deixa
+    `ref_id`/`part_id` órfãos no worker — os trechos (`package.parts`) que o
+    context builder montou nunca chegavam a `executor.submit`. `references`
+    é opaco ao protocolo `AgentExecutor` (só o adapter concreto interpreta o
+    formato — ver `executors/base.AgentExecutor.submit`), então o pacote
+    inteiro (`objective_id` + `refs` + `parts` + limites, via
+    `Package.to_json()`) viaja como o ÚNICO item de uma sequência — mantém a
+    assinatura `Sequence[Any]` do protocolo sem reinterpretar o parâmetro.
+
+    O teto de orçamento (F05) já foi aplicado pelo context builder
+    (`context.build_package`/`_fit_to_budget`); esta função NÃO trunca nada
+    de novo — só encaminha o que já veio pronto.
+
+    Compatibilidade: sem pacote montado (tarefa sem contexto — vizinho
+    ausente ou objetivo sem evidence_refs), devolve `()`, como antes.
+    """
     if package is None:
         return ()
+    to_json = getattr(package, "to_json", None)
+    if callable(to_json):
+        return (to_json(),)
+    # Defensivo: objeto sem `to_json` (ex.: stub de teste) cai para o
+    # comportamento anterior em vez de quebrar o despacho.
     return getattr(package, "refs", ())
 
 

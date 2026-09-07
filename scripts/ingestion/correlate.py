@@ -85,6 +85,7 @@ from .extract import (
     CandidateKind,
     ExplicitId,
     ExtractionCandidates,
+    MentionPolarity,
     accent_fold,
     assert_no_implemented,
     normalize_tokens,
@@ -1274,12 +1275,16 @@ def correlate(
                     rev, repo, ns, initiative_id, resolved, all_candidates, svid, evidence_by_id, derived
                 )
             )
-            written, mentions_only = _write_subject_links(
-                rev, repo, ns, subject_ref, resolved, all_candidates, svid, evidence_by_id, derived
+            written, mentions_only, negation_facts = _write_subject_links(
+                rev, repo, ns, subject_ref, resolved, all_candidates, svid, sid, evidence_by_id, derived
             )
             confirmed.extend(written)
             for note in mentions_only:
                 diagnostics.append(note)
+            if negation_facts:
+                # §R3: a negação declarada fica consultável pelo MESMO canal
+                # que os demais fatos — não só num diagnóstico de texto.
+                result.facts_written = result.facts_written + tuple(negation_facts)
             candidate_edges.extend(
                 _write_candidate_edges(
                     rev, repo, ns, source_entity.target_id, suggestions, svid, evidence_of_block, derived
@@ -1821,6 +1826,141 @@ def _write_belongs_to(
     return out
 
 
+#: Escopo fixo das arestas de §8.3 (sujeito -> referência citada). Repetido
+#: aqui como constante porque `_dispute_relation_on_negation` precisa montar
+#: o MESMO `relation_id` que `_write_subject_links` já usou para achar a
+#: aresta afirmativa a contestar — duplicar o literal seria o tipo de
+#: divergência silenciosa que quebra a busca por `identity.relation_id`.
+_SUBJECT_LINK_SCOPE = "document-ingestion"
+
+
+def _mention_polarities(candidates: Sequence[Candidate], value: str) -> tuple[MentionPolarity, ...]:
+    """Polaridade de cada menção ao id `value` nos candidatos dados (§ R3)."""
+    return tuple(
+        i.mention_polarity for c in candidates for i in c.explicit_ids if i.value == value
+    )
+
+
+def _combined_polarity(polarities: Sequence[MentionPolarity]) -> MentionPolarity:
+    """Combina polaridades de várias menções ao MESMO id no MESMO documento.
+
+    Prioridade conservadora — nunca a favor de `supported`: uma negação em
+    qualquer menção pesa mais que uma afirmação em outra (documento
+    internamente inconsistente não deveria gravar a relação como sustentada
+    de qualquer forma); neutra pesa mais que afirmada pelo mesmo motivo.
+    Sem nenhuma menção, o default é `affirmed` (compatibilidade com chamadas
+    sem grupo de candidatos).
+    """
+    if not polarities:
+        return MentionPolarity.AFFIRMED
+    if MentionPolarity.NEGATED in polarities:
+        return MentionPolarity.NEGATED
+    if MentionPolarity.NEUTRAL in polarities:
+        return MentionPolarity.NEUTRAL
+    return MentionPolarity.AFFIRMED
+
+
+def _write_declared_negation(
+    rev: Any,
+    repo: Any,
+    ns: str,
+    subject_entity_id: str,
+    relation_type: RelationType,
+    ref: ResolvedRef,
+    group: Sequence[Candidate],
+    svid: str,
+    source_id: str,
+    refs: Sequence[str],
+    derived: DerivedInfo,
+) -> str | None:
+    """Fato consultável de negação declarada (§ R3, achado bloqueante nº3).
+
+    "RF-042 nao refina a decisao DEC-017" NUNCA cria `RF-042 refines
+    DEC-017` — é exatamente o contrário do que a fonte afirma. Mas a negação
+    em si é informação: fica gravada como fato `declared_not_<relacao>`,
+    consultável, com a evidência do bloco que a afirma. `scope=ref.entity_id`
+    torna o fato estável por par (sujeito, predicado, alvo): reingestão da
+    mesma negação apenas acumula evidência, não duplica.
+    """
+    if not refs:
+        return None
+    value = " ".join(c.text for c in group).strip() or (
+        f"{subject_entity_id} nao {relation_type.value} {ref.entity_id} "
+        f"(fonte {source_id}, id citado {ref.identifier.value})"
+    )
+    epistemic = _agent_gate(EpistemicStatus.SUPPORTED, derived)
+    draft = FactDraft(
+        namespace=ns,
+        subject_id=subject_entity_id,
+        predicate=f"declared_not_{relation_type.value}",
+        value=value,
+        scope=ref.entity_id or "",
+        nature=FactNature.OBSERVED,
+        epistemic_status=epistemic,
+        lifecycle_status=LifecycleStatus.CURRENT,
+        asserted_by=ASSERTED_BY,
+        evidence_refs=tuple(refs),
+        source_version_id=svid,
+        support_recorded_by=(SUPPORT_RECORDED_BY if epistemic is EpistemicStatus.SUPPORTED else None),
+    )
+    written = rev.put_fact(draft)
+    return written.target_id
+
+
+def _dispute_relation_on_negation(
+    rev: Any,
+    repo: Any,
+    ns: str,
+    subject_entity_id: str,
+    relation_type: RelationType,
+    ref: ResolvedRef,
+    svid: str,
+    refs: Sequence[str],
+    derived: DerivedInfo,
+) -> WrittenRelation | None:
+    """Negação chegando sobre uma relação já `supported` de OUTRA fonte vira
+    `disputed`, com evidência dos dois lados (§8.2.8 aplicado a relações: o
+    mesmo mecanismo que `_write_statement_fact` usa para fatos divergentes).
+
+    Nunca deleta a relação: ela continua existindo, só deixa de ser
+    incontestável — "o grafo nunca mostra o contrário da fonte" também vale
+    ao contrário, uma negação isolada não apaga o que outra fonte sustentou.
+    Uma fonte se contradizendo consigo mesma (`other == mine`) fica fora
+    deste mecanismo: §8.2.8 é sobre divergência ENTRE fontes.
+    """
+    if not refs:
+        return None
+    rid = identity.relation_id(
+        ns, subject_entity_id, relation_type.value, ref.entity_id or "", _SUBJECT_LINK_SCOPE
+    )
+    prev = repo.get_relation(rid, lifecycle=ALL_LIFECYCLE)
+    if prev is None or prev.epistemic_status is not EpistemicStatus.SUPPORTED:
+        return None
+    other = _source_entity_of_version(repo, ns, prev.source_version_id)
+    mine = _source_entity_of_version(repo, ns, svid)
+    if other is not None and mine is not None and other == mine:
+        return None
+    combined_refs = tuple(dict.fromkeys(tuple(prev.evidence_refs) + tuple(refs)))
+    return _put_relation(
+        rev,
+        repo,
+        ns,
+        subject_entity_id,
+        relation_type,
+        ref.entity_id or "",
+        scope=_SUBJECT_LINK_SCOPE,
+        epistemic=EpistemicStatus.DISPUTED,
+        lifecycle=prev.lifecycle_status,
+        svid=svid,
+        evidence_refs=combined_refs,
+        derived=derived,
+        attributes={
+            "basis": "negação declarada sobre relação sustentada (§R3)",
+            "external_id": ref.identifier.value,
+        },
+    )
+
+
 def _write_subject_links(
     rev: Any,
     repo: Any,
@@ -1829,20 +1969,37 @@ def _write_subject_links(
     resolved: Mapping[str, ResolvedRef],
     candidates: Sequence[Candidate],
     svid: str,
+    source_id: str,
     evidence_by_id: Mapping[str, Sequence[str]],
     derived: DerivedInfo,
-) -> tuple[list[WrittenRelation], list[str]]:
-    """Arestas do sujeito do documento para o que ele referencia (§8.3).
+) -> tuple[list[WrittenRelation], list[str], list[str]]:
+    """Arestas do sujeito do documento para o que ele referencia (§8.3, § R3).
 
     Produz `RF-042 refines DEC-017` e `RF-042 proposes_change_to RN-023`, e
     devolve como MENÇÕES (segundo elemento) as citações técnicas sem marcador
     de alteração — registradas, não transformadas em aresta confirmada.
+
+    A decisão NÃO é mais só o par de tipos das entidades (esse era o achado
+    bloqueante nº3: "RF-042 nao refina DEC-017" virava `refines supported`
+    porque só o par Refinement->Decision era olhado). Agora o par de tipos
+    decide o TIPO de relação (`_relation_type_for`), e a polaridade da menção
+    (§ R3, `extract.MentionPolarity`) decide o que fazer com ela:
+
+    - `affirmed`: comportamento de sempre — aresta `supported`.
+    - `neutral` (comparação/citação, ex. "diferente de"): aresta CANDIDATA,
+      `epistemic=inferred` com `attributes.candidate_only=True` — nunca
+      `supported` (§8.2.7).
+    - `negated`: a aresta afirmativa NÃO é criada; grava-se um fato
+      `declared_not_<relacao>` consultável, e se já existir aresta
+      `supported` de outra fonte para o mesmo par, ela vira `disputed` com
+      evidência dos dois lados (nunca é apagada).
     """
     if subject is None or not subject.resolved or subject.entity_type is None:
-        return [], []
+        return [], [], []
 
     out: list[WrittenRelation] = []
     notes: list[str] = []
+    negation_facts: list[str] = []
     for ref in resolved.values():
         if not ref.resolved or ref.entity_id == subject.entity_id or ref.entity_type is None:
             continue
@@ -1860,6 +2017,27 @@ def _write_subject_links(
                 "proposta de mudança (§8.2.7)"
             )
             continue
+
+        polarity = _combined_polarity(_mention_polarities(mentioning, ref.identifier.value))
+        refs = tuple(evidence_by_id.get(ref.identifier.value, ()))
+
+        if polarity is MentionPolarity.NEGATED:
+            fact_id = _write_declared_negation(
+                rev, repo, ns, subject.entity_id or "", rtype, ref, mentioning, svid, source_id, refs, derived
+            )
+            if fact_id:
+                negation_facts.append(fact_id)
+                notes.append(
+                    f"negação declarada: {subject.entity_id} nao {rtype.value} "
+                    f"{ref.entity_id} (fato {fact_id}, §R3) — aresta afirmativa NÃO criada"
+                )
+            disputed_edge = _dispute_relation_on_negation(
+                rev, repo, ns, subject.entity_id or "", rtype, ref, svid, refs, derived
+            )
+            if disputed_edge:
+                out.append(disputed_edge)
+            continue
+
         # Aqui a autoridade é o SUJEITO: uma aresta que sai de um refinamento
         # proposto é proposta (§5.5: relação extraída de proposta conserva a
         # natureza de proposta).
@@ -1868,6 +2046,17 @@ def _write_subject_links(
         )
         if rtype is RelationType.PROPOSES_CHANGE_TO:
             lifecycle = LifecycleStatus.PROPOSED  # §8.3: proposta de alteração é proposta
+
+        attributes: dict[str, Any] = {"basis": "referência explícita", "external_id": ref.identifier.value}
+        if polarity is MentionPolarity.NEUTRAL:
+            # Comparação/citação (§ R3): candidata explícita, nunca supported,
+            # mesmo que a fonte tenha evidência — a evidência sustenta a
+            # CITAÇÃO, não o vínculo (§8.2.7).
+            epistemic = EpistemicStatus.INFERRED
+            attributes["candidate_only"] = True
+        else:
+            epistemic = EpistemicStatus.SUPPORTED
+
         edge = _put_relation(
             rev,
             repo,
@@ -1875,14 +2064,14 @@ def _write_subject_links(
             subject.entity_id or "",
             rtype,
             ref.entity_id or "",
-            scope="document-ingestion",
-            epistemic=EpistemicStatus.SUPPORTED,
+            scope=_SUBJECT_LINK_SCOPE,
+            epistemic=epistemic,
             lifecycle=lifecycle,
             svid=svid,
-            evidence_refs=tuple(evidence_by_id.get(ref.identifier.value, ())),
+            evidence_refs=refs,
             derived=derived,
-            attributes={"basis": "referência explícita", "external_id": ref.identifier.value},
+            attributes=attributes,
         )
         if edge:
             out.append(edge)
-    return out, notes
+    return out, notes, negation_facts

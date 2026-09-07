@@ -106,6 +106,74 @@ class UnitState(str, enum.Enum):
     UNRESOLVED = "unresolved"
 
 
+class ContentGrade(str, enum.Enum):
+    """ESPÉCIE de conteúdo que a unidade carrega — não o estado dela.
+
+    `UnitState` responde "em que vigência isto está"; `ContentGrade` responde
+    "isto chega a descrever comportamento?". São eixos independentes: uma
+    unidade `implemented` pode não ter uma única condição/comportamento/exceção
+    sustentada — é o caso que produziu Word intitulado "regras, fluxo, falhas e
+    contratos" com nada além de `implemented = true` e uma lista de relações.
+
+    - `behavioral`: existe ao menos um `Statement` de condição, comportamento
+      ou exceção COM evidência própria (`evidence_ids`). Sem evidência a frase
+      é afirmação não sustentada (§5.4), e sustentar título que promete regra
+      em afirmação não sustentada é o mesmo defeito com outra roupa.
+    - `structural`: tem conteúdo, mas só identidade/relações — ou frases de
+      comportamento sem nenhuma evidência ligada, ou apenas lacunas e
+      limitações. Publicável, desde que o rótulo não prometa comportamento.
+    - `empty`: nem statements nem relações.
+    """
+
+    BEHAVIORAL = "behavioral"
+    STRUCTURAL = "structural"
+    EMPTY = "empty"
+
+
+class AnalysisState(str, enum.Enum):
+    """Quanto da análise de COMPORTAMENTO foi feita no documento.
+
+    Publicado no corpo do documento (Markdown e Word) para que o leitor saiba,
+    sem abrir outra fonte, se a ausência de uma regra significa "não existe" ou
+    "ainda não foi investigado" (§5.3: ausência examinada ≠ ausência global).
+    """
+
+    COMPLETO = "completo"
+    PARCIAL = "parcial"
+    ESTRUTURAL = "estrutural"
+
+
+#: Rótulo humano do estado da análise — MESMO texto nos dois renderizadores.
+ANALYSIS_STATE_LABEL: dict[AnalysisState, str] = {
+    AnalysisState.COMPLETO: (
+        "completo: todas as unidades publicadas têm condição, comportamento ou exceção "
+        "sustentada por evidência"
+    ),
+    AnalysisState.PARCIAL: (
+        "parcial: parte das unidades publicadas ainda não tem comportamento avaliado nesta "
+        "revisão"
+    ),
+    AnalysisState.ESTRUTURAL: (
+        "estrutural: nenhuma unidade publicada tem comportamento avaliado nesta revisão; o "
+        "documento descreve estrutura, identidade e relações"
+    ),
+}
+
+#: Título da seção de lacunas do DOCUMENTO (nível de documento, distinta da
+#: seção de lacunas por unidade). Compartilhado por markdown/word/validate para
+#: que a checagem "a seção existe mesmo no corpo" procure o mesmo texto que o
+#: renderizador escreve.
+ANALYSIS_GAPS_TITLE = "Lacunas da análise nesta revisão"
+
+#: Tipos de documento cujo contrato de leitura é comportamento: quem abre um
+#: documento de capacidade, de contrato ou de evolução está perguntando "o que
+#: o sistema faz", não "o que existe". Estrutura pura aqui só é publicável com
+#: lacuna declarada.
+BEHAVIOR_REQUIRED_KINDS: frozenset[DocKind] = frozenset(
+    {DocKind.CAPACIDADE, DocKind.CONTRATO_DEPENDENCIA, DocKind.EVOLUCAO}
+)
+
+
 #: `Repository.neighbors` NÃO aceita `lifecycle=None` (só `facts_for_subject`
 #: e `get_entity` aceitam). Publicação precisa enxergar proposta, histórico e
 #: substituído para poder ROTULÁ-LOS — filtrar só `current` esconderia
@@ -242,6 +310,46 @@ def is_generic_title(text: str) -> bool:
     if _NUMERIC_TITLE_RE.match(norm):
         return True
     return False
+
+
+#: Palavras que, num título ou subtítulo, PROMETEM comportamento ao leitor.
+#: Um documento intitulado "regras, fluxo, falhas e contratos" assume dívida:
+#: quem o abre espera condição, comportamento e exceção, não uma lista de
+#: relações. Esta lista é o que torna a promessa verificável em código.
+BEHAVIOR_PROMISE_TERMS: frozenset[str] = frozenset(
+    {
+        "regra",
+        "regras",
+        "fluxo",
+        "fluxos",
+        "falha",
+        "falhas",
+        "comportamento",
+        "comportamentos",
+        "excecao",
+        "excecoes",
+        "condicao",
+        "condicoes",
+        "politica",
+        "politicas",
+        "validacao",
+        "validacoes",
+        "criterio",
+        "criterios",
+    }
+)
+
+_WORD_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def promises_behavior(text: str) -> bool:
+    """O rótulo promete comportamento (regra, fluxo, falha, exceção, condição)?
+
+    Comparação por PALAVRA sobre a forma normalizada — "contratos" sozinho não
+    promete comportamento (contrato é estrutura), "regras" promete.
+    """
+    words = {w for w in _WORD_SPLIT_RE.split(normalize_title(text)) if w}
+    return bool(words & BEHAVIOR_PROMISE_TERMS)
 
 
 def assert_specific_title(text: str, where: str) -> str:
@@ -665,21 +773,74 @@ class SemanticUnit:
     def evidence_ids(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(e.evidence_id for e in self.evidence))
 
-    def is_publishable(self) -> bool:
+    # -------------------------------------------------- espécie de conteúdo
+
+    def sustained_statements(self) -> tuple[Statement, ...]:
+        """Condição/comportamento/exceção COM evidência própria.
+
+        `limitations` e `gaps` ficam de fora de propósito: limitação e lacuna
+        descrevem o que NÃO se sabe; elas nunca respondem "o que o sistema
+        faz". Evidência é exigida no próprio `Statement` (não na unidade):
+        evidência que sustenta uma relação não sustenta uma regra.
+        """
+        return tuple(
+            st
+            for st in (self.conditions + self.behavior + self.exceptions)
+            if st.evidence_ids
+        )
+
+    @property
+    def content_grade(self) -> ContentGrade:
+        """Espécie de conteúdo desta unidade (ver `ContentGrade`)."""
+        if self.sustained_statements():
+            return ContentGrade.BEHAVIORAL
+        if self.statements() or self.relations:
+            return ContentGrade.STRUCTURAL
+        return ContentGrade.EMPTY
+
+    def is_behavioral(self) -> bool:
+        return self.content_grade is ContentGrade.BEHAVIORAL
+
+    def declares_gaps(self) -> bool:
+        """Há bloco explícito de lacuna (o que falta e em que pé está)?"""
+        return bool(self.gaps)
+
+    def is_publishable(self, doc_kind: "DocKind | None" = None) -> bool:
         """Tem resposta, ou só carimbo de pertencimento? (§10.2)
 
         Título, pertencimento, escopo e versão são MOLDURA. Uma unidade que só
         tem moldura não responde nada quando recuperada isolada e, publicada,
         vira ruído que compete na busca com a unidade que responde.
-        """
-        return bool(self.behavior or self.exceptions or self.gaps or self.relations)
 
-    def unpublishable_reason(self) -> str:
-        if self.is_publishable():
+        `doc_kind` opcional acrescenta a SUFICIÊNCIA por espécie de conteúdo:
+        num documento cujo contrato de leitura é comportamento
+        (`BEHAVIOR_REQUIRED_KINDS`), unidade apenas estrutural só é publicável
+        quando declara lacuna — sem lacuna declarada ela seria publicada como
+        se fosse a resposta, e é exatamente esse silêncio que fez 40 células
+        sem avaliação passarem por conteúdo. Sem `doc_kind` a resposta é a
+        histórica: unidade estrutural continua publicável (o rótulo é que não
+        pode prometer comportamento).
+        """
+        if not (self.behavior or self.exceptions or self.gaps or self.relations):
+            return False
+        if doc_kind is not None and doc_kind in BEHAVIOR_REQUIRED_KINDS:
+            if self.content_grade is not ContentGrade.BEHAVIORAL and not self.declares_gaps():
+                return False
+        return True
+
+    def unpublishable_reason(self, doc_kind: "DocKind | None" = None) -> str:
+        if self.is_publishable(doc_kind):
             return ""
+        if not (self.behavior or self.exceptions or self.gaps or self.relations):
+            return (
+                f"unidade {self.unit_id} ({self.title!r}) sem conteúdo útil: só título e "
+                "pertencimento, sem comportamento, exceção, lacuna ou relação (§10.2)"
+            )
         return (
-            f"unidade {self.unit_id} ({self.title!r}) sem conteúdo útil: só título e "
-            "pertencimento, sem comportamento, exceção, lacuna ou relação (§10.2)"
+            f"unidade {self.unit_id} ({self.title!r}) é {self.content_grade.value} num documento "
+            f"{doc_kind.value if doc_kind else ''} que promete comportamento: não há condição, "
+            "comportamento ou exceção sustentada por evidência, e nenhuma lacuna foi declarada "
+            "dizendo o que falta e em que pé está a investigação"
         )
 
 
@@ -701,11 +862,21 @@ class KnowledgeDocument:
     anchor_entity_id: str
     anchor_entity_type: EntityType
     summary: str = ""
+    #: Quanto da análise de comportamento foi feita. `None` = não declarado —
+    #: campo ADITIVO: documento antigo continua construível sem informá-lo, e
+    #: `effective_analysis_state()` deriva o valor das próprias unidades.
+    analysis_state: AnalysisState | None = None
+    #: Bloco de lacunas do DOCUMENTO: o que falta e em que pé está a
+    #: investigação, em texto publicável. Vazio só é honesto quando o estado da
+    #: análise é `completo`.
+    analysis_gaps: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         assert_specific_title(self.title, f"documento {self.document_id}")
         assert_no_placeholder(self.title, f"título do documento {self.document_id}")
         assert_no_placeholder(self.summary, f"resumo do documento {self.document_id}")
+        for gap in self.analysis_gaps:
+            assert_no_placeholder(gap, f"lacuna declarada do documento {self.document_id}")
         allowed = ALLOWED_ANCHORS[self.doc_kind]
         if self.anchor_entity_type not in allowed:
             raise InvalidDocumentGrouping(
@@ -736,6 +907,107 @@ class KnowledgeDocument:
 
     def publishable_units(self) -> tuple[SemanticUnit, ...]:
         return tuple(u for u in self.units if u.is_publishable())
+
+    # ------------------------------------------------- suficiência (R2/§10.2)
+
+    def own_units(self) -> tuple[SemanticUnit, ...]:
+        """Unidades publicáveis que são conteúdo PRÓPRIO deste documento.
+
+        Mini-contexto fica de fora: ele é contexto repetido de outro assunto e
+        nunca poderia responder pelo comportamento prometido no título.
+        """
+        return tuple(u for u in self.units if u.is_publishable() and not u.shared_context)
+
+    def behavioral_units(self) -> tuple[SemanticUnit, ...]:
+        return tuple(u for u in self.own_units() if u.is_behavioral())
+
+    def unevaluated_units(self) -> tuple[SemanticUnit, ...]:
+        """Unidades próprias sem comportamento sustentado — o que o título
+        promete e o corpo ainda não responde."""
+        return tuple(u for u in self.own_units() if not u.is_behavioral())
+
+    def derived_analysis_state(self) -> AnalysisState:
+        """Estado da análise deduzido do conteúdo, sem depender de declaração."""
+        own = self.own_units()
+        if not own:
+            return AnalysisState.ESTRUTURAL
+        if not self.behavioral_units():
+            return AnalysisState.ESTRUTURAL
+        if self.unevaluated_units():
+            return AnalysisState.PARCIAL
+        return AnalysisState.COMPLETO
+
+    def effective_analysis_state(self) -> AnalysisState:
+        """O declarado quando existe; o derivado quando não (nunca "presumido
+        completo": presumir completude é o defeito que se está corrigindo)."""
+        return self.analysis_state or self.derived_analysis_state()
+
+    def title_promises_behavior(self) -> bool:
+        return promises_behavior(self.title)
+
+    def requires_behavior(self) -> bool:
+        """O contrato de leitura deste documento é comportamento?"""
+        return self.doc_kind in BEHAVIOR_REQUIRED_KINDS or self.title_promises_behavior()
+
+    def declares_gaps(self) -> bool:
+        """Lacuna visível: no bloco do documento OU no bloco de alguma unidade."""
+        return bool(self.analysis_gaps) or any(u.declares_gaps() for u in self.units)
+
+    def sufficiency_problems(self) -> tuple[str, ...]:
+        """Motivos pelos quais este documento NÃO pode ser publicado como está.
+
+        Regra executável do achado bloqueante nº2 (Word "regras, fluxo, falhas
+        e contratos" com só `implemented = true` estrutural):
+
+        1. título promete comportamento e nenhuma unidade é behavioral →
+           só passa com `analysis_state` declarado ≠ `completo` E lacuna visível;
+        2. `analysis_state = completo` declarado com unidade sem comportamento
+           avaliado e sem lacuna → completude falsa;
+        3. documento de espécie que exige comportamento, sem nenhuma unidade
+           behavioral e sem lacuna nenhuma → matriz não avaliada publicada como
+           se fosse resposta.
+        """
+        problems: list[str] = []
+        state = self.effective_analysis_state()
+        behavioral = self.behavioral_units()
+        unevaluated = self.unevaluated_units()
+
+        if self.title_promises_behavior() and not behavioral:
+            if self.analysis_state is None or self.analysis_state is AnalysisState.COMPLETO:
+                problems.append(
+                    f"título {self.title!r} promete comportamento (regra, fluxo, falha, exceção ou "
+                    "condição) e nenhuma unidade tem condição/comportamento/exceção sustentada por "
+                    "evidência; o documento não declara analysis_state diferente de completo"
+                )
+            elif not self.declares_gaps():
+                problems.append(
+                    f"título {self.title!r} promete comportamento, o documento declara "
+                    f"analysis_state {self.analysis_state.value} e não publica nenhuma lacuna "
+                    "dizendo o que falta e em que pé está a investigação"
+                )
+
+        if self.analysis_state is AnalysisState.COMPLETO and unevaluated:
+            missing = [u for u in unevaluated if not u.declares_gaps()]
+            if missing:
+                problems.append(
+                    "documento declara analysis_state completo, mas "
+                    f"{len(missing)} unidade(s) não têm comportamento avaliado nem lacuna "
+                    "declarada: " + ", ".join(u.unit_id for u in missing)
+                )
+
+        if self.doc_kind in BEHAVIOR_REQUIRED_KINDS and not behavioral and not self.declares_gaps():
+            problems.append(
+                f"documento {self.doc_kind.value} sem nenhuma unidade behavioral e sem lacuna "
+                "declarada: estrutura e identidade publicadas no lugar da resposta que a espécie "
+                "documental promete (§10.2)"
+            )
+
+        if state is not AnalysisState.COMPLETO and not self.declares_gaps():
+            problems.append(
+                f"estado da análise é {state.value} e nenhuma lacuna está publicada no corpo: o "
+                "leitor não tem como distinguir ausência de comportamento de ausência de análise"
+            )
+        return tuple(dict.fromkeys(problems))
 
     def assert_publishable(self) -> "KnowledgeDocument":
         """Guarda explícita para quem promove a revisão (§10.6).
@@ -820,7 +1092,10 @@ class KnowledgeDocument:
                     continue
                 units.append(unit)
         units = link_cross_state(units)
-        doc_title = title or f"{anchor.title} — {DOC_TITLE_SUFFIX[doc_kind]}"
+        state, gaps = analysis_summary(units)
+        doc_title = honest_title(
+            doc_kind, anchor.title, title or f"{anchor.title} — {DOC_TITLE_SUFFIX[doc_kind]}", state
+        )
         return cls(
             document_id=document_id(namespace, doc_kind, anchor_entity_id, discriminator),
             title=doc_title,
@@ -831,7 +1106,71 @@ class KnowledgeDocument:
             anchor_entity_id=anchor_entity_id,
             anchor_entity_type=anchor.entity_type,
             summary=summary,
+            analysis_state=state,
+            analysis_gaps=gaps,
         )
+
+
+def analysis_summary(
+    units: Sequence[SemanticUnit],
+    declared_state: AnalysisState | None = None,
+    declared_gaps: Sequence[str] = (),
+    investigation_note: str = "",
+) -> tuple[AnalysisState, tuple[str, ...]]:
+    """Estado da análise + bloco de lacunas, derivados das próprias unidades.
+
+    Uma única fonte para `planner.plan` e para `KnowledgeDocument.from_revision`:
+    o texto das lacunas nomeia CADA unidade sem comportamento avaliado, com o
+    identificador, para que o leitor saiba exatamente qual célula da matriz
+    ficou por avaliar — "análise parcial" sem dizer onde é a mesma opacidade
+    com outro nome.
+
+    `declared_state`/`declared_gaps` vêm de quem conduziu a investigação e
+    sempre vencem a derivação: quem investigou sabe se parou no meio.
+    """
+    own = [u for u in units if u.is_publishable() and not u.shared_context]
+    behavioral = [u for u in own if u.is_behavioral()]
+    unevaluated = [u for u in own if not u.is_behavioral()]
+
+    if declared_state is not None:
+        state = declared_state
+    elif not own or not behavioral:
+        state = AnalysisState.ESTRUTURAL
+    elif unevaluated:
+        state = AnalysisState.PARCIAL
+    else:
+        state = AnalysisState.COMPLETO
+
+    if state is AnalysisState.COMPLETO and not declared_gaps:
+        return state, ()
+
+    lines: list[str] = [assert_no_placeholder(g, "lacuna declarada") for g in declared_gaps]
+    if state is AnalysisState.ESTRUTURAL and not lines:
+        lines.append(
+            "Nenhuma unidade deste documento tem condição, comportamento ou exceção sustentada "
+            "por evidência nesta revisão: o que está publicado é estrutura, identidade e "
+            "relações. Regra, fluxo e falha permanecem por investigar."
+        )
+    for unit in unevaluated:
+        lines.append(
+            f"{unit.title} (unidade {unit.unit_id}): sem condição, comportamento ou exceção "
+            "sustentada por evidência nesta revisão; avaliação de comportamento pendente."
+        )
+    for unit in own:
+        for gap in unit.gaps:
+            lines.append(
+                f"{unit.title} (unidade {unit.unit_id}): ponto não resolvido registrado no fato "
+                f"{gap.fact_id}."
+            )
+    if investigation_note:
+        lines.append(assert_no_placeholder(investigation_note, "estado da investigação"))
+    else:
+        lines.append(
+            "Estado da investigação nesta revisão: "
+            + ANALYSIS_STATE_LABEL[state]
+            + "."
+        )
+    return state, tuple(dict.fromkeys(lines))
 
 
 #: Sufixo de título por tipo de documento — específico o bastante para D02/D09
@@ -843,6 +1182,36 @@ DOC_TITLE_SUFFIX: dict[DocKind, str] = {
     DocKind.INICIATIVA: "iniciativa, decisões e refinamentos",
     DocKind.EVOLUCAO: "estado atual e mudança proposta",
 }
+
+#: Sufixo HONESTO quando a análise de comportamento não foi feita: descreve o
+#: que o documento realmente tem (estrutura, identidade, contratos) e diz, no
+#: próprio título, que a parte comportamental está pendente. Nenhum destes
+#: sufixos contém palavra de `BEHAVIOR_PROMISE_TERMS` — a promessa some do
+#: título junto com o conteúdo que a sustentaria.
+STRUCTURAL_TITLE_SUFFIX: dict[DocKind, str] = {
+    DocKind.VISAO_SISTEMA: "estrutura do sistema (análise comportamental pendente)",
+    DocKind.CAPACIDADE: "estrutura e contratos (análise comportamental pendente)",
+    DocKind.CONTRATO_DEPENDENCIA: "interface e dependências (análise comportamental pendente)",
+    DocKind.INICIATIVA: "cadeia declarada (análise comportamental pendente)",
+    DocKind.EVOLUCAO: "estrutura e proposta registrada (análise comportamental pendente)",
+}
+
+
+def honest_title(
+    doc_kind: DocKind, anchor_title: str, proposed_title: str, state: AnalysisState
+) -> str:
+    """Título que não promete o que o corpo não entrega.
+
+    Só reescreve no caso indefensável: análise `estrutural` (zero unidade com
+    comportamento sustentado) sob título que promete regra/fluxo/falha. Estado
+    `parcial` mantém o título — há comportamento publicado — e a extensão do
+    que falta é dita no bloco de lacunas, não no título.
+    """
+    if state is not AnalysisState.ESTRUTURAL:
+        return proposed_title
+    if not promises_behavior(proposed_title):
+        return proposed_title
+    return f"{anchor_title}: {STRUCTURAL_TITLE_SUFFIX[doc_kind]}"
 
 
 # --------------------------------------------------------------------------
@@ -1359,11 +1728,21 @@ def _skip(skipped: list[tuple[str, str]] | None, target: str, reason: str) -> No
 __all__ = [
     "ALLOWED_ANCHORS",
     "ALL_LIFECYCLE",
+    "ANALYSIS_GAPS_TITLE",
+    "ANALYSIS_STATE_LABEL",
+    "AnalysisState",
+    "BEHAVIOR_PROMISE_TERMS",
+    "BEHAVIOR_REQUIRED_KINDS",
     "Belonging",
     "CONDITION_PREDICATES",
+    "ContentGrade",
     "CrossRef",
     "DOC_TITLE_SUFFIX",
     "DocKind",
+    "STRUCTURAL_TITLE_SUFFIX",
+    "analysis_summary",
+    "honest_title",
+    "promises_behavior",
     "EXCEPTION_PREDICATES",
     "EmptyDocument",
     "EvidenceRef",

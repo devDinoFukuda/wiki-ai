@@ -27,7 +27,7 @@ Só stdlib + `knowledge`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from knowledge.models import (
     Entity,
@@ -38,6 +38,7 @@ from knowledge.models import (
 
 from .document import (
     ALL_LIFECYCLE,
+    AnalysisState,
     Belonging,
     DocKind,
     InvalidDocumentGrouping,
@@ -45,8 +46,10 @@ from .document import (
     PublishingError,
     RevisionScope,
     SemanticUnit,
+    analysis_summary,
     context_unit,
     document_id,
+    honest_title,
     link_cross_state,
     resolve_belonging,
     units_for_entity,
@@ -172,6 +175,15 @@ class PublicationPlan:
             "by_kind": {
                 k.value: sum(1 for d in self.documents if d.doc_kind is k) for k in DocKind
             },
+            # Aditivo: quantos documentos saem com análise completa, parcial ou
+            # só estrutural — quem lê o plano vê a suficiência antes de abrir
+            # qualquer arquivo.
+            "by_analysis_state": {
+                s.value: sum(
+                    1 for d in self.documents if d.effective_analysis_state() is s
+                )
+                for s in AnalysisState
+            },
         }
 
 
@@ -185,12 +197,22 @@ def plan(
     revision_id: str,
     namespace: str | None = None,
     consumers: Sequence[str] = DEFAULT_CONSUMERS,
+    investigation_states: Mapping[str, Any] | None = None,
 ) -> PublicationPlan:
     """Planeja a publicação de uma revisão (§10.2), de forma determinística.
 
     `namespace=None` planeja todos os namespaces presentes em `knowledge.db`;
     namespaces continuam isolados (§5.2), cada entidade só encontra vizinhos
     do próprio namespace porque a travessia parte das entidades dele.
+
+    `investigation_states` é OPCIONAL e vem de quem conduziu a investigação
+    (objetivos e lacunas do FLUXO 3). Chave: `document_id`, `entity_id`,
+    `stable_key` ou título da âncora. Valor: o estado (`completo`, `parcial`,
+    `estrutural` ou `AnalysisState`) ou um mapa
+    `{"state": ..., "gaps": ["o que falta e em que pé está", ...]}`.
+    Sem ele, o estado é DERIVADO das unidades — nunca presumido completo:
+    documento sem nenhuma unidade com comportamento sustentado por evidência
+    sai como `estrutural`, com título honesto e lacunas no corpo.
     """
     scope = RevisionScope(repo, revision_id)
     namespaces = [namespace] if namespace else _all_namespaces(repo)
@@ -198,9 +220,16 @@ def plan(
     catalog: dict[str, SemanticUnit] = {}
     skipped: list[SkippedItem] = []
     warnings: list[str] = []
+    investigation = dict(investigation_states or {})
 
     for ns in namespaces:
-        ctx = _PlanContext(repo=repo, namespace=ns, scope=scope, skipped=skipped)
+        ctx = _PlanContext(
+            repo=repo,
+            namespace=ns,
+            scope=scope,
+            skipped=skipped,
+            investigation=investigation,
+        )
         docs = (
             _plan_systems(ctx)
             + _plan_capabilities(ctx)
@@ -237,6 +266,12 @@ def plan(
                 SkippedItem(doc.document_id, "document", doc.title, str(exc))
             )
             continue
+        if doc.effective_analysis_state() is AnalysisState.ESTRUTURAL:
+            warnings.append(
+                f"documento {doc.document_id} ({doc.title!r}) sai como análise estrutural: "
+                "nenhuma unidade tem condição, comportamento ou exceção sustentada por evidência "
+                "nesta revisão; título e resumo foram ajustados e as lacunas estão no corpo"
+            )
         if len(doc.units) > MAX_UNITS_PER_DOCUMENT:
             warnings.append(
                 f"documento {doc.document_id} ({doc.title!r}) tem {len(doc.units)} unidades, "
@@ -283,8 +318,46 @@ class _PlanContext:
     namespace: str
     scope: RevisionScope
     skipped: list[SkippedItem]
+    investigation: Mapping[str, Any] = field(default_factory=dict)
     catalog: dict[str, SemanticUnit] = field(default_factory=dict)
     _belonging: dict[str, Belonging] = field(default_factory=dict)
+
+    def declared_analysis(
+        self, doc_id: str, anchor: Entity
+    ) -> tuple[AnalysisState | None, tuple[str, ...]]:
+        """Estado e lacunas informados pela investigação, se houver.
+
+        Procura por `document_id`, `entity_id`, `stable_key` e título — quem
+        conduz a investigação conhece a entidade pelo código de negócio
+        ("CAP-023"), não pelo hash do documento.
+        """
+        raw = None
+        for key in (doc_id, anchor.entity_id, anchor.stable_key, anchor.title):
+            if key and key in self.investigation:
+                raw = self.investigation[key]
+                break
+        if raw is None:
+            return None, ()
+        if isinstance(raw, Mapping):
+            state_val = raw.get("state") or raw.get("estado")
+            gaps = tuple(
+                str(g).strip()
+                for g in (raw.get("gaps") or raw.get("lacunas") or ())
+                if str(g).strip()
+            )
+        else:
+            state_val, gaps = raw, ()
+        if state_val is None:
+            return None, gaps
+        if isinstance(state_val, AnalysisState):
+            return state_val, gaps
+        try:
+            return AnalysisState(str(state_val).strip().lower()), gaps
+        except ValueError:
+            raise PublishingError(
+                f"estado de investigação {state_val!r} não é um AnalysisState válido "
+                f"({', '.join(s.value for s in AnalysisState)})"
+            ) from None
 
     def entities(self, entity_type: EntityType) -> list[Entity]:
         found = [
@@ -538,17 +611,41 @@ def _assemble(
         return []
 
     linked = link_cross_state(units)
+    doc_id = document_id(ctx.namespace, doc_kind, anchor.entity_id)
+
+    # Suficiência ANTES do título (achado bloqueante nº2): o rótulo do
+    # documento é decidido depois de saber que espécie de conteúdo existe,
+    # nunca antes. Documento sem nenhuma unidade behavioral não sai com o
+    # título que promete regra, fluxo e falha.
+    declared_state, declared_gaps = ctx.declared_analysis(doc_id, anchor)
+    analysis_state, analysis_gaps = analysis_summary(
+        linked, declared_state=declared_state, declared_gaps=declared_gaps
+    )
+    doc_title = honest_title(doc_kind, anchor.title, title, analysis_state)
+    summary = _summary_for(
+        doc_kind, anchor, len(linked), impacted_ids or set(), analysis_state
+    )
+
     doc = KnowledgeDocument(
-        document_id=document_id(ctx.namespace, doc_kind, anchor.entity_id),
-        title=title,
+        document_id=doc_id,
+        title=doc_title,
         doc_kind=doc_kind,
         units=tuple(linked),
         revision_id=ctx.scope.revision_id,
         namespace=ctx.namespace,
         anchor_entity_id=anchor.entity_id,
         anchor_entity_type=anchor.entity_type,
-        summary=_summary_for(doc_kind, anchor, len(linked), impacted_ids or set()),
+        summary=summary,
+        analysis_state=analysis_state,
+        analysis_gaps=analysis_gaps,
     )
+    # Rede de segurança: nenhum caminho deste módulo pode produzir documento
+    # que prometa comportamento sem nenhuma unidade behavioral. Se acontecer, o
+    # documento fica de fora COM motivo, em vez de ser publicado mentindo.
+    problems = doc.sufficiency_problems()
+    if problems and not doc.behavioral_units() and doc.title_promises_behavior():
+        ctx.skip(doc_id, "document", doc_title, "; ".join(problems))
+        return []
     return [doc]
 
 
@@ -576,8 +673,40 @@ def _context_of(
 
 
 def _summary_for(
-    doc_kind: DocKind, anchor: Entity, unit_count: int, impacted: set[str]
+    doc_kind: DocKind,
+    anchor: Entity,
+    unit_count: int,
+    impacted: set[str],
+    analysis_state: AnalysisState | None = None,
 ) -> str:
+    if analysis_state is AnalysisState.ESTRUTURAL:
+        # O subtítulo acompanha o título: prometer "regras, fluxo, falhas e
+        # contratos" no resumo enquanto o título já foi corrigido apenas move a
+        # promessa falsa de lugar.
+        base = {
+            DocKind.VISAO_SISTEMA: (
+                f"Estrutura, fronteiras e relações de {anchor.title} nesta revisão."
+            ),
+            DocKind.CAPACIDADE: (
+                f"Estrutura, identidade e contratos de {anchor.title} nesta revisão."
+            ),
+            DocKind.CONTRATO_DEPENDENCIA: (
+                f"Interface, consumidores e provedores de {anchor.title} nesta revisão."
+            ),
+            DocKind.INICIATIVA: (
+                f"Cadeia declarada de {anchor.title}: artefatos, decisões e vínculos registrados."
+            ),
+            DocKind.EVOLUCAO: (
+                f"Estrutura de {anchor.title} e a proposta registrada nesta revisão."
+            ),
+        }[doc_kind]
+        base += (
+            " Nenhum comportamento foi avaliado nesta revisão; as lacunas estão declaradas no "
+            "corpo do documento."
+        )
+        if impacted:
+            base += f" Entidades de sistema impactadas nesta revisão: {len(impacted)}."
+        return base
     base = {
         DocKind.VISAO_SISTEMA: (
             f"Escopo, capacidades e fronteiras de {anchor.title} nesta revisão."

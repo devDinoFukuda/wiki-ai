@@ -587,6 +587,12 @@ class PythonExtractor(CodeExtractor):
                 )
             )
 
+        # 2b) Decoradores de framework web/job/evento (achado nº7 da auditoria
+        # externa): `@app.post(...)` é FastAPI/Flask válido e não passava por
+        # nenhum dos ramos acima — a função ficava sem Entrypoint, a
+        # capacidade não era descoberta e o objetivo virava órfão.
+        out.extend(self._web_entrypoints(parsed, path))
+
         # 3) API pública do pacote
         exported = _dunder_all(tree)
         is_package_member = "." in parsed.module or _posix(path).endswith("__init__.py")
@@ -614,6 +620,130 @@ class PythonExtractor(CodeExtractor):
                     resolution="syntactic",
                 )
             )
+        return out
+
+    def _web_entrypoints(self, parsed: "_ParsedModule", path: str) -> list[Entrypoint]:
+        """Entradas HTTP/job/evento por decorador (achado nº7 da auditoria externa).
+
+        `@app.post("/orders/{id}/approve")` é FastAPI válido sem `__all__` e
+        sem guarda `__main__`: nenhum dos dois ramos acima o alcança. O
+        adaptador não instancia `app` para confirmar que é mesmo uma
+        `FastAPI`/`APIRouter`/`Flask`/`Blueprint` — isso exigiria executar o
+        código, fora do que `ast` permite (§6.2) — por isso todo item aqui sai
+        com `resolution="heuristic"`: o decorador é sintaticamente real, mas
+        "isto é uma rota HTTP" é inferência sobre a forma da chamada, nunca
+        resolução de tipo. Item 4 do achado: isso é permitido para
+        `Entrypoint` (ao contrário de `Reference.resolved`, que
+        `__post_init__` recusa sob `resolution="heuristic"` — §6.2, §5.5).
+        """
+        hints = _module_import_hints(parsed.tree)
+        framework = _http_framework(hints)
+        out: list[Entrypoint] = []
+        for node, qualname in _iter_defs_qualified(parsed.tree.body, parsed.module):
+            for dec in node.decorator_list:
+                call, func = _decorator_call_and_func(dec)
+                dec_line = dec.lineno
+                dec_end = getattr(dec, "end_lineno", dec_line) or dec_line
+
+                http = _match_http_decorator(func)
+                if http is not None:
+                    verb, obj_name = http
+                    if verb == "route":
+                        methods = _route_methods(call) or ["GET"]
+                        route = _route_literal_path(call)
+                        label = "/".join(methods)
+                    elif verb == "websocket":
+                        methods = ["WS"]
+                        route = _route_literal_path(call)
+                        label = "WS"
+                    else:
+                        methods = [verb.upper()]
+                        route = _route_literal_path(call)
+                        label = verb.upper()
+                    dynamic = route == "<dinâmica>"
+                    out.append(
+                        Entrypoint(
+                            kind="http",
+                            name=f"{label} {route}",
+                            path=path,
+                            line=dec_line,
+                            line_end=dec_end,
+                            framework=framework,
+                            symbol=qualname,
+                            language=self.language,
+                            resolution="heuristic",
+                            detail=(
+                                f"decorador `@{obj_name or '<expr>'}.{verb}(...)` sobre `{node.name}`; "
+                                "framework inferido pelos imports do módulo, não por resolução de tipo"
+                            ),
+                            extra={
+                                "http_method": ",".join(methods),
+                                "route": route,
+                                "receiver": obj_name or "",
+                                "dynamic_route": dynamic,
+                            },
+                        )
+                    )
+                    if dynamic:
+                        self.add_diagnostic(
+                            Diagnostic(
+                                level="info",
+                                code="python_dynamic_http_route",
+                                message=(
+                                    f"rota de `{node.name}` não é literal string: primeiro argumento de "
+                                    f"`@{obj_name or '<expr>'}.{verb}(...)` é uma expressão, não `ast.Constant`"
+                                ),
+                                scope_examined=f"decorador em {path}:{dec_line}",
+                                path=path,
+                                paths=(path,),
+                                language=self.language,
+                                impact=(
+                                    "rota citada como `<dinâmica>` no Entrypoint; o path exato só existe "
+                                    "em tempo de execução"
+                                ),
+                            )
+                        )
+                    continue
+
+                if _is_job_decorator(func):
+                    out.append(
+                        Entrypoint(
+                            kind="job",
+                            name=node.name,
+                            path=path,
+                            line=dec_line,
+                            line_end=dec_end,
+                            framework="celery",
+                            symbol=qualname,
+                            language=self.language,
+                            resolution="heuristic",
+                            detail=f"decorador de tarefa assíncrona (`{_safe_unparse(func)}`) sobre `{node.name}`",
+                            extra={"decorator": _safe_unparse(func)},
+                        )
+                    )
+                    continue
+
+                if _is_event_decorator(func):
+                    event_name = _first_str_arg(call) if call is not None else None
+                    out.append(
+                        Entrypoint(
+                            kind="event",
+                            name=event_name or f"{node.name}:on_event",
+                            path=path,
+                            line=dec_line,
+                            line_end=dec_end,
+                            framework=framework,
+                            symbol=qualname,
+                            language=self.language,
+                            resolution="heuristic",
+                            detail=(
+                                f"`on_event({event_name!r})` sobre `{node.name}`"
+                                if event_name
+                                else f"`on_event(...)` sobre `{node.name}` com evento não literal"
+                            ),
+                            extra={"event": event_name or "<dinâmica>"},
+                        )
+                    )
         return out
 
     def configuration(self, path: str, content: str) -> list[ConfigItem]:
@@ -917,6 +1047,136 @@ def _first_str_arg(call: ast.Call) -> str | None:
         if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
             return kw.value.value
     return None
+
+
+#: Verbos HTTP diretos (`@app.get(...)`) — achado nº7.
+_HTTP_VERBS = ("get", "post", "put", "delete", "patch", "head", "options")
+#: Formas HTTP que não são verbo direto: `route` (Flask, métodos por kwarg) e
+#: `websocket` (FastAPI/Starlette).
+_HTTP_EXTRA_VERBS = ("route", "websocket")
+
+
+def _iter_defs_qualified(body: list[ast.stmt], prefix: str) -> Iterable[tuple[ast.AST, str]]:
+    """Percorre `FunctionDef`/`AsyncFunctionDef` com o mesmo qualname que
+    `_collect_symbols` atribuiria (§6.2) — é o que faz `ep.symbol` bater
+    exatamente com o `Symbol` já emitido, inclusive para métodos de classe.
+    """
+    for node in body:
+        if isinstance(node, _DEF_NODES):
+            qual = f"{prefix}.{node.name}"
+            yield node, qual
+            yield from _iter_defs_qualified(node.body, qual)
+        elif isinstance(node, ast.ClassDef):
+            qual = f"{prefix}.{node.name}"
+            yield from _iter_defs_qualified(node.body, qual)
+
+
+def _decorator_call_and_func(dec: ast.AST) -> tuple[ast.Call | None, ast.AST]:
+    """`(chamada_ou_None, alvo_do_decorador)`.
+
+    `@app.post("/x")` chega como `ast.Call`; `@shared_task` sem parênteses
+    chega como o próprio `Name`/`Attribute`. Separar os dois evita duplicar a
+    checagem de forma em cada decorador reconhecido.
+    """
+    if isinstance(dec, ast.Call):
+        return dec, dec.func
+    return None, dec
+
+
+def _decorator_object_name(func_value: ast.AST) -> str | None:
+    """Nome do objeto imediatamente antes do verbo.
+
+    Item 5 do achado: `@api.v1.router.get` tem cadeia `api.v1.router`; o
+    último segmento (`router`) é o que importa para nomear o receptor —
+    resolver `api.v1.router` por completo exigiria o mesmo tipo de inferência
+    de tipo que o restante do módulo recusa fazer sem parser semântico.
+    """
+    if isinstance(func_value, ast.Attribute):
+        return func_value.attr
+    if isinstance(func_value, ast.Name):
+        return func_value.id
+    return None
+
+
+def _match_http_decorator(func: ast.AST) -> tuple[str, str | None] | None:
+    """`(verbo, nome_do_objeto)` se `func` for `<obj>.<verbo>`, senão `None`."""
+    if not isinstance(func, ast.Attribute):
+        return None
+    verb = func.attr
+    if verb not in _HTTP_VERBS and verb not in _HTTP_EXTRA_VERBS:
+        return None
+    return verb, _decorator_object_name(func.value)
+
+
+def _route_literal_path(call: ast.Call | None) -> str:
+    """1º argumento posicional literal, ou `path=`/`rule=` literal; senão `"<dinâmica>"`."""
+    if call is None:
+        return "<dinâmica>"
+    for arg in call.args:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        break
+    for kw in call.keywords:
+        if kw.arg in ("path", "rule") and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+            return kw.value.value
+    return "<dinâmica>"
+
+
+def _route_methods(call: ast.Call | None) -> list[str] | None:
+    """Lista de `methods=[...]` quando literal (Flask `@app.route`); senão `None`."""
+    if call is None:
+        return None
+    for kw in call.keywords:
+        if kw.arg == "methods":
+            value = _literal(kw.value)
+            if isinstance(value, (list, tuple, set)):
+                return [str(m).upper() for m in value]
+    return None
+
+
+def _is_job_decorator(func: ast.AST) -> bool:
+    """`@task`, `@shared_task` (bare) ou `@celery.task`/`@app.task` (atributo)."""
+    if isinstance(func, ast.Name):
+        return func.id in ("task", "shared_task")
+    if isinstance(func, ast.Attribute):
+        dotted = _dotted(func)
+        if dotted is None:
+            return False
+        parts = dotted.split(".")
+        return len(parts) >= 2 and parts[-1] == "task" and parts[-2] in ("celery", "app")
+    return False
+
+
+def _is_event_decorator(func: ast.AST) -> bool:
+    """`@app.on_event(...)` / `@router.on_event(...)` (FastAPI/Starlette)."""
+    return isinstance(func, ast.Attribute) and func.attr == "on_event"
+
+
+def _module_import_hints(tree: ast.Module) -> set[str]:
+    """Nomes (minúsculos) de módulos e símbolos importados — só para a
+    heurística de framework declarada no achado nº7 (item 1): decidir
+    `fastapi-like` vs `flask-like` vs `http-decorator` pelos imports visíveis
+    no módulo, nunca por resolução de tipo.
+    """
+    hints: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                hints.add(alias.name.split(".")[0].lower())
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                hints.add(node.module.split(".")[0].lower())
+            for alias in node.names:
+                hints.add(alias.name.lower())
+    return hints
+
+
+def _http_framework(hints: set[str]) -> str:
+    if "fastapi" in hints or "apirouter" in hints or "starlette" in hints:
+        return "fastapi-like"
+    if "flask" in hints or "blueprint" in hints:
+        return "flask-like"
+    return "http-decorator"
 
 
 def _dunder_all(tree: ast.Module) -> set[str] | None:

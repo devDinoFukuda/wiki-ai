@@ -36,7 +36,10 @@ from typing import Any, Sequence
 from knowledge.models import EpistemicStatus, LifecycleStatus
 
 from .document import (
+    ANALYSIS_GAPS_TITLE,
+    ANALYSIS_STATE_LABEL,
     STATE_LABEL,
+    AnalysisState,
     DocKind,
     EvidenceRef,
     KnowledgeDocument,
@@ -137,13 +140,48 @@ def render(document: KnowledgeDocument) -> str:
     lines.append(f"- Revisão de conhecimento: {document.revision_id}")
     lines.append(f"- Identificador do documento: {document.document_id}")
     lines.append(f"- Unidades publicadas: {len(document.publishable_units())}")
+    lines.extend(_analysis_state_lines(document))
     lines.append("")
+    lines.extend(_analysis_gaps_lines(document))
 
     for unit in document.units:
         if not unit.is_publishable():
             continue
         lines.extend(render_unit(unit))
     return NEWLINE.join(lines).rstrip() + NEWLINE
+
+
+def _analysis_state_value(document: KnowledgeDocument) -> str:
+    """Valor textual do estado da análise — vazio quando não declarado."""
+    state = getattr(document, "analysis_state", None)
+    if isinstance(state, AnalysisState):
+        return state.value
+    return str(state) if state else ""
+
+
+def _analysis_state_lines(document: KnowledgeDocument) -> list[str]:
+    """Estado da análise no CORPO do documento (mesmo espírito de D05).
+
+    Sem esta linha, ausência de regra e ausência de investigação são
+    indistinguíveis para quem lê — foi assim que um Word com só `implemented =
+    true` passou por documento de regras.
+    """
+    state = getattr(document, "analysis_state", None) or None
+    if state is None:
+        return []
+    label = ANALYSIS_STATE_LABEL.get(state, str(getattr(state, "value", state)))
+    return [f"- Estado da análise de comportamento: {label}"]
+
+
+def _analysis_gaps_lines(document: KnowledgeDocument) -> list[str]:
+    """Bloco de lacunas do documento: o que falta e em que pé está."""
+    gaps = tuple(getattr(document, "analysis_gaps", ()) or ())
+    if not gaps:
+        return []
+    out = [f"## {ANALYSIS_GAPS_TITLE}", ""]
+    out.extend(f"- {gap}" for gap in gaps)
+    out.append("")
+    return out
 
 
 def render_unit(unit: SemanticUnit) -> list[str]:
@@ -411,6 +449,11 @@ def render_manifest_envelope(plan: Any) -> dict[str, Any]:
             "fact_ids": list(doc.fact_ids()),
             "relation_ids": list(doc.relation_ids()),
             "states": list(doc.states()),
+            # Aditivo (§10.5): a suficiência do documento viaja no manifesto,
+            # para o consumidor não precisar abrir o arquivo para saber se a
+            # análise de comportamento foi feita.
+            "analysis_state": _analysis_state_value(doc),
+            "analysis_gaps": list(getattr(doc, "analysis_gaps", ()) or ()),
         }
 
     return {

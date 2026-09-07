@@ -697,9 +697,18 @@ def _default_validators() -> Any:
 
 def _run_validators(validators: Any, plan: PlanLike, staging_root: str):
     reports = []
-    for name in ("validate_equivalence", "validate_semantics", "validate_docx_structure"):
+    for name in (
+        "validate_equivalence",
+        "validate_semantics",
+        "validate_docx_structure",
+        "validate_sufficiency",
+    ):
         fn = getattr(validators, name, None)
         if fn is None:
+            if name == "validate_sufficiency":
+                # gate opcional: validador customizado antigo sem esse método
+                # continua aceito; a suficiência então corre por conta dele.
+                continue
             reports.append(Report(ok=False, bloqueios=[f"validators.{name} ausente"]))
             continue
         try:

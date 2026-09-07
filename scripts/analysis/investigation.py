@@ -1237,7 +1237,7 @@ def _prefill_contract(
                 + (" …" if len(cap.entrypoints) > 8 else "")
                 + f". Módulos tocados: {', '.join(cap.modules[:8]) or '(nenhum resolvido)'}"
                 + f". Agrupamento: {cap.grouping_basis.value}."
-                " Nome de NEGÓCIO não é dedutível de código e permanece a definir."
+                " Nome de NEGÓCIO não é dedutível de código (lacuna registrada; requer fonte de negócio)."
             ),
             ident_ev,
         )

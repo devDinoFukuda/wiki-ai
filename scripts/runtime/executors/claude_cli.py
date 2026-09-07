@@ -12,7 +12,12 @@ Python fake no lugar do binário `claude` real (ver bloco `__main__`), porque
 a validação aqui NUNCA invoca a engine de verdade.
 
 `submit()`:
-- monta o prompt do pacote (objective+references+schema em JSON);
+- monta o prompt do pacote: um JSON (task_id+objective+references+schema)
+  seguido, quando o pacote enviado em `references` traz `parts` (trechos de
+  código montados pelo context builder), de uma seção "EVIDÊNCIAS" com cada
+  parte — localizador `path:linhas` + conteúdo — na ordem do pacote (achado
+  ALTO nº4 da auditoria: sem isso o worker via `ref_id`/`part_id` sem o
+  trecho correspondente);
 - gera `execution_id="claude-cli:<uuid4>"` ANTES do fork e registra (F07);
 - inicia `subprocess.Popen([...,"-p", prompt, "--output-format", "json"])`
   de forma assíncrona — sem `shell=True`, cwd isolado em `tempfile.mkdtemp`,
@@ -74,6 +79,61 @@ def _as_command(binary_path: BinaryPath) -> List[str]:
     if isinstance(binary_path, str):
         return [binary_path]
     return list(binary_path)
+
+
+# --------------------------------------------------------------------------
+# Achado ALTO nº4 (auditoria externa) — as `parts` do pacote (trechos de
+# código montados pelo context builder) precisam chegar ao prompt do
+# worker, não só as `refs`. `runtime.coordinator._references` manda o
+# Package inteiro (`to_json()`: objective_id+refs+parts+limites) como o
+# único item de `references`; aqui só se LÊ `parts` de dentro dele — nada é
+# re-truncado (o teto F05 já foi aplicado pelo context builder).
+# --------------------------------------------------------------------------
+
+
+def _extract_parts(references: Optional[Sequence[Any]]) -> List[Mapping[str, Any]]:
+    """Extrai `parts` do pacote completo enviado em `references`, se houver.
+
+    Compatibilidade: `references` sem pacote montado (lista de refs "crua",
+    vazia, ou `None`) devolve lista vazia — igual ao comportamento anterior
+    a este pacote passar a viajar inteiro.
+    """
+    if not references:
+        return []
+    parts: List[Mapping[str, Any]] = []
+    for item in references:
+        if isinstance(item, Mapping) and isinstance(item.get("parts"), (list, tuple)):
+            parts.extend(p for p in item["parts"] if isinstance(p, Mapping))
+    return parts
+
+
+def _format_locator(part: Mapping[str, Any]) -> str:
+    """`path:linha_inicial-linha_final`, com o `locator` do resolvedor anexado
+    quando presente (commit/outro identificador — formato do vizinho)."""
+    path = part.get("path", "")
+    start = part.get("line_start", "")
+    end = part.get("line_end", "")
+    locator_str = f"{path}:{start}-{end}"
+    extra = part.get("locator")
+    if extra:
+        locator_str += " " + json.dumps(extra, ensure_ascii=False, sort_keys=True)
+    return locator_str
+
+
+def _format_evidence_section(parts: Sequence[Mapping[str, Any]]) -> str:
+    """Seção "EVIDÊNCIAS" do prompt: cada `part`, na ordem do pacote, com seu
+    localizador (path:linhas) seguido do conteúdo (`snippet`).
+
+    Sem esta seção o worker recebia (via `refs`) `ref_id`/`part_id` sem o
+    trecho correspondente — exatamente o achado ALTO nº4 da auditoria.
+    """
+    if not parts:
+        return ""
+    blocks = ["EVIDÊNCIAS:"]
+    for part in parts:
+        blocks.append(f"--- {_format_locator(part)} ---")
+        blocks.append(str(part.get("snippet", "")))
+    return "\n".join(blocks)
 
 
 class ClaudeCliExecutor(BaseExecutor):
@@ -183,13 +243,21 @@ class ClaudeCliExecutor(BaseExecutor):
         validated_policy = self._validate_policy(policy)
         timeout_s = _coerce_timeout(validated_policy.get("timeout_s"), self._default_timeout_s)
 
+        refs_list = list(references) if references is not None else []
         payload = {
             "task_id": task_id,
             "objective": objective,
-            "references": list(references) if references is not None else [],
+            "references": refs_list,
             "schema": schema,
         }
         prompt = json.dumps(payload, ensure_ascii=False)
+        # Achado ALTO nº4: as `parts` (trechos de código) do pacote precisam
+        # chegar ao prompt de verdade, não só sobreviver dentro do JSON de
+        # `references` — por isso ganham seção própria, explícita, anexada
+        # ao prompt (path:linhas + conteúdo, na ordem do pacote).
+        evidence_section = _format_evidence_section(_extract_parts(refs_list))
+        if evidence_section:
+            prompt = f"{prompt}\n\n{evidence_section}"
 
         execution_id = self._new_execution_id()  # emitido ANTES do fork (F07)
         record = ExecutionRecord(

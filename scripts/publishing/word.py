@@ -108,6 +108,11 @@ L_LIMITS = "Limitações que alterariam a resposta"
 L_DIAGRAM = "Representação textual do diagrama"
 L_BLOCKED = "Unidade bloqueada"
 L_UNITS_INDEX = "Unidades deste documento"
+L_ANALYSIS_STATE = "Estado da análise de comportamento"
+#: Título da seção de lacunas do documento. A lista canônica está em
+#: `document.ANALYSIS_GAPS_TITLE`; aqui fica o mesmo texto como queda, pelo
+#: mesmo motivo de `_FALLBACK_GENERIC_TITLES` (word.py roda sem o vizinho).
+L_ANALYSIS_GAPS = "Lacunas da análise nesta revisão"
 
 #: D15 — a mesma advertência do Markdown: localizador de fonte não é endereço
 #: navegável, e o Copilot não deve tratá-lo como link.
@@ -902,6 +907,35 @@ def _dedupe_anchors(rendered):
     return rendered
 
 
+def _analysis_state_label(value):
+    """Rótulo humano do estado da análise, com o mapa canônico de `document`."""
+    mod = _document_module()
+    labels = getattr(mod, "ANALYSIS_STATE_LABEL", None) if mod is not None else None
+    enum_cls = getattr(mod, "AnalysisState", None) if mod is not None else None
+    if labels and enum_cls is not None:
+        try:
+            return labels[enum_cls(value)]
+        except (ValueError, KeyError):
+            return value
+    return value
+
+
+def _analysis_blocks(document):
+    """Estado da análise + lacunas do documento (achado bloqueante nº2)."""
+    blocks = []
+    state = _norm_ws(_get(document, "analysis_state", default=""))
+    if state:
+        blocks.append(_labeled(L_ANALYSIS_STATE, _analysis_state_label(state)))
+    gaps = [_text_of(g) for g in _as_list(_get(document, "analysis_gaps", default=[]))]
+    gaps = [g for g in gaps if g]
+    if gaps:
+        mod = _document_module()
+        title = getattr(mod, "ANALYSIS_GAPS_TITLE", L_ANALYSIS_GAPS) if mod else L_ANALYSIS_GAPS
+        blocks.append(_heading(title, 2))
+        blocks.extend(_bullet(gap) for gap in gaps)
+    return blocks
+
+
 def _document_header_blocks(document, rendered):
     """Heading1, contexto do documento e índice de unidades (D02/D05/D09/D11).
 
@@ -932,6 +966,11 @@ def _document_header_blocks(document, rendered):
     summary = _norm_ws(_get(document, "summary", default=""))
     if summary and not is_boilerplate(summary):
         blocks.append(_text_para(summary))
+
+    # Suficiência no CORPO do Word: estado da análise e, quando ela não está
+    # completa, o bloco de lacunas. Sem isto, um documento estrutural chega ao
+    # leitor indistinguível de um documento de regras.
+    blocks.extend(_analysis_blocks(document))
 
     if rendered:
         blocks.append(_heading(L_UNITS_INDEX, 2))
