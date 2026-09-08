@@ -45,6 +45,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -110,6 +111,20 @@ def canonical_json(value: Any) -> str:
         ensure_ascii=False,
         default=str,
     )
+
+
+def _loads(raw: Any) -> dict[str, Any]:
+    """JSON de coluna -> dicionário. Linha corrompida vira `{}`, nunca exceção.
+
+    Motivo: estas colunas são CONTADORES operacionais (orçamento consumido,
+    último pacote). Uma linha ilegível não pode derrubar a abertura do banco —
+    ela vira "sem informação", e o teto de rodadas continua valendo.
+    """
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def sha256_hex(text: str) -> str:
@@ -257,6 +272,15 @@ CREATE TABLE IF NOT EXISTS attempts (
     error_detail TEXT NOT NULL DEFAULT '',
     -- hash do erro: mesmo hash duas vezes => blocked (§7.4, sem laço infinito)
     error_hash   TEXT NOT NULL DEFAULT '',
+    -- spec §10.4.2 item 7: proveniência de execução POR TENTATIVA (agente,
+    -- versão do adaptador, transporte, binding, host, modelo). `model: null`
+    -- é indisponibilidade registrada, nunca inferência pelo nome do host.
+    binding_id       TEXT NOT NULL DEFAULT '',
+    lease_id         TEXT NOT NULL DEFAULT '',
+    provenance_json  TEXT NOT NULL DEFAULT '{}',
+    -- hash do envelope de resultado aceito: receber o MESMO resultado duas
+    -- vezes é no-op (§10.4.4), e é este valor que identifica a duplicata.
+    result_hash      TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (task_id, attempt_no),
     CHECK (outcome IN ('running','succeeded','failed','rejected','cancelled'))
 );
@@ -294,6 +318,38 @@ CREATE INDEX IF NOT EXISTS ix_leases_exp     ON leases(expires_at);
 CREATE INDEX IF NOT EXISTS ix_attempts_task  ON attempts(task_id, attempt_no);
 CREATE INDEX IF NOT EXISTS ix_attempts_hash  ON attempts(task_id, error_hash);
 CREATE INDEX IF NOT EXISTS ix_effects_state  ON effects_runtime(state, registered_at);
+
+-- ------------------------------------------------- estado consolidado (§7.1)
+-- Uma linha por (repo_id, objective_id, input_revision): a chave AUTORITATIVA
+-- do §7.1. O progresso deixa de ser reconstruído da última tarefa; cada
+-- resultado aceito é um delta aplicado sobre esta linha (ver `runtime.state`).
+CREATE TABLE IF NOT EXISTS objective_state (
+    repo_id        TEXT NOT NULL,
+    objective_id   TEXT NOT NULL,
+    input_revision TEXT NOT NULL,
+    state_json     TEXT NOT NULL,
+    stop_reason    TEXT NOT NULL DEFAULT '',
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY (repo_id, objective_id, input_revision)
+);
+
+-- --------------------------------------------------- cadeia por objetivo (§7.3)
+-- `max_rounds` aqui é o TETO TOTAL DA CADEIA, não um crédito por invocação:
+-- reiniciar o processo (ou rodar `wk resume` de novo) NÃO zera `rounds_used`.
+-- `last_package_hash` é o que impede repetir o mesmo pacote de necessidades.
+CREATE TABLE IF NOT EXISTS objective_chains (
+    objective_id      TEXT PRIMARY KEY,
+    max_rounds        INTEGER,
+    rounds_used       INTEGER NOT NULL DEFAULT 0,
+    budget_json       TEXT NOT NULL DEFAULT '{}',
+    consumed_json     TEXT NOT NULL DEFAULT '{}',
+    stop_reason       TEXT NOT NULL DEFAULT '',
+    last_package_hash TEXT NOT NULL DEFAULT '',
+    last_progress_json TEXT NOT NULL DEFAULT '{}',
+    updated_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_state_objective ON objective_state(objective_id);
 """
 
 TABLES = (
@@ -304,7 +360,101 @@ TABLES = (
     "attempts",
     "effects_runtime",
     "policies",
+    "objective_state",
+    "objective_chains",
 )
+
+
+#: Colunas ADITIVAS (nullable/com default) que bancos criados antes da
+#: proveniência por tentativa não possuem. `CREATE TABLE IF NOT EXISTS` nunca
+#: altera uma tabela existente, então elas são acrescentadas por
+#: `_ensure_columns`. Aditivo e com default ⇒ compatível nos dois sentidos:
+#: código antigo ignora a coluna nova, código novo lê o default. Por isso a
+#: `SCHEMA_VERSION` não muda — não há migração destrutiva a declarar.
+ADDITIVE_COLUMNS = {
+    "attempts": (
+        ("binding_id", "TEXT NOT NULL DEFAULT ''"),
+        ("lease_id", "TEXT NOT NULL DEFAULT ''"),
+        ("provenance_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("result_hash", "TEXT NOT NULL DEFAULT ''"),
+    ),
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> list[str]:
+    """Acrescenta as colunas aditivas ausentes. Devolve as que foram criadas."""
+    added: list[str] = []
+    for table, columns in ADDITIVE_COLUMNS.items():
+        existing = {
+            str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if not existing:
+            continue
+        for name, decl in columns:
+            if name in existing:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            except sqlite3.OperationalError as exc:
+                # Dois processos abrindo o MESMO `runtime.db` ao mesmo tempo
+                # leem `PRAGMA table_info` antes de qualquer um dos dois
+                # escrever: os dois decidem acrescentar a coluna, e o segundo
+                # recebe "duplicate column name". O objetivo do passo (a
+                # coluna existir) foi atingido pelo outro processo — logo é
+                # sucesso, não falha de abertura do banco. Qualquer outro
+                # `OperationalError` continua subindo.
+                if "duplicate column" not in str(exc).lower():
+                    raise
+                continue
+            added.append(f"{table}.{name}")
+    return added
+
+
+def _register_initial_version(conn: sqlite3.Connection, now: str) -> int:
+    """Registra a versão inicial em `schema_version` e devolve a instalada.
+
+    LEITURA e ESCRITA sob o MESMO `BEGIN IMMEDIATE`, e `INSERT OR IGNORE`.
+    Sem isso, duas conexões abrindo o MESMO `runtime.db` ao mesmo tempo liam
+    ambas `MAX(version) IS NULL` e ambas tentavam inserir: a segunda morria com
+    `IntegrityError: UNIQUE constraint failed: schema_version.version` — na
+    ABERTURA, antes de qualquer trabalho. `IMMEDIATE` serializa a decisão e o
+    `OR IGNORE` torna a inserção idempotente mesmo se a corrida escapar.
+
+    Fast-path SEM LOCK: schema já instalado é o caso comum (toda abertura de
+    conexão, inclusive `wk status`, passa por aqui). Ler `MAX(version)` antes
+    resolve esse caso sem `BEGIN IMMEDIATE` — abrir transação de ESCRITA para
+    não escrever nada fazia toda leitura disputar o lock de escrita do banco.
+    Só a instalação (versão ausente) entra na transação, e a leitura é refeita
+    lá dentro: a decisão continua serializada — mesma disciplina do
+    `_ensure_wal`.
+    """
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    instalada = row[0] if row else None
+    if instalada is not None:
+        return int(instalada)
+    externa = conn.in_transaction
+    if not externa:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        installed = row[0] if row else None
+        if installed is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at, note) "
+                "VALUES (?,?,?)",
+                (SCHEMA_VERSION, now, "initial"),
+            )
+            # Relê: quem perdeu a corrida enxerga a versão do vencedor, não a
+            # sua — a versão efetiva é sempre a que está no disco.
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            installed = (row[0] if row else None) or SCHEMA_VERSION
+    except BaseException:
+        if not externa:
+            conn.execute("ROLLBACK")
+        raise
+    if not externa:
+        conn.execute("COMMIT")
+    return int(installed)
 
 
 def apply_schema(conn: sqlite3.Connection, now: str) -> int:
@@ -314,14 +464,8 @@ def apply_schema(conn: sqlite3.Connection, now: str) -> int:
     mesma regra de `knowledge.schema.apply_schema`.
     """
     conn.executescript(DDL)
-    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    installed = row[0] if row else None
-    if installed is None:
-        conn.execute(
-            "INSERT INTO schema_version(version, applied_at, note) VALUES (?,?,?)",
-            (SCHEMA_VERSION, now, "initial"),
-        )
-        return SCHEMA_VERSION
+    _ensure_columns(conn)
+    installed = _register_initial_version(conn, now)
     if int(installed) != SCHEMA_VERSION:
         raise SchemaVersionMismatch(
             f"runtime.db está na versão {installed}; este código suporta "
@@ -343,12 +487,50 @@ def connect(path: str, now: str | None = None, busy_timeout_ms: int = 5000) -> s
         os.makedirs(directory, exist_ok=True)
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # `busy_timeout` ANTES de tudo. `PRAGMA journal_mode=WAL` pega lock de
+    # escrita, e `apply_schema` escreve (DDL + colunas aditivas): com o timeout
+    # configurado depois, dois processos abrindo o MESMO runtime.db ao mesmo
+    # tempo davam "database is locked" na abertura — sem retentativa nenhuma,
+    # porque o padrão do SQLite é falhar na hora. Configurado primeiro, o
+    # segundo processo espera o primeiro terminar, que é o comportamento que o
+    # resto do módulo já assume (`immediate()`/`BEGIN IMMEDIATE`).
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    _ensure_wal(conn, busy_timeout_ms)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
     apply_schema(conn, now or utc_now())
     return conn
+
+
+def _ensure_wal(conn: sqlite3.Connection, busy_timeout_ms: int) -> str:
+    """Garante `journal_mode=WAL`, tolerando abertura concorrente.
+
+    `PRAGMA journal_mode=WAL` precisa de lock exclusivo e, ao contrário de uma
+    escrita comum, NÃO passa pelo `busy_timeout` em todas as builds do SQLite:
+    dois processos abrindo o mesmo `runtime.db` ao mesmo tempo faziam o segundo
+    morrer com "database is locked" — na ABERTURA, antes de qualquer trabalho.
+
+    Duas saídas, ambas corretas: o modo já é WAL (o outro processo acabou de
+    configurá-lo, e não há nada a fazer) ou vale a pena tentar de novo por um
+    instante. Só depois de esgotar a janela o erro sobe — e aí é problema real
+    de acesso ao arquivo, não corrida de inicialização.
+    """
+    deadline = time.monotonic() + max(0.1, busy_timeout_ms / 1000.0)
+    ultimo: sqlite3.OperationalError | None = None
+    while True:
+        modo = str((conn.execute("PRAGMA journal_mode").fetchone() or [""])[0]).lower()
+        if modo == "wal":
+            return modo
+        try:
+            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            return str((row or [""])[0]).lower()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            ultimo = exc
+            if time.monotonic() >= deadline:
+                raise ultimo
+            time.sleep(0.01)
 
 
 # --------------------------------------------------------------------------
@@ -380,6 +562,12 @@ class Attempt:
     error_class: str
     error_detail: str
     error_hash: str
+    #: Binding vigente na tentativa e proveniência do agente (§10.4.2 item 7).
+    binding_id: str = ""
+    lease_id: str = ""
+    provenance: dict[str, Any] = field(default_factory=dict)
+    #: Hash do resultado aceito — base da idempotência de duplicata.
+    result_hash: str = ""
 
 
 @dataclass
@@ -786,9 +974,16 @@ class TaskStore:
         lease_id: str,
         execution_id: str | None = None,
         *,
+        binding_id: str = "",
+        provenance: Mapping[str, Any] | None = None,
         now: str | None = None,
     ) -> Attempt:
         """Registra a tentativa com o `execution_id` DEVOLVIDO PELO EXECUTOR (F07).
+
+        `binding_id`/`provenance` gravam, POR TENTATIVA, qual agente executou
+        (§10.4.2 item 7): trocar de binding depois não reescreve a história —
+        cada tentativa continua apontando o binding que a produziu, e é assim
+        que um resultado tardio do binding anterior é reconhecido como tardio.
 
         É esta linha que transforma "execução conhecida" em fato verificável:
         `attempt_for_execution` só encontra o que passou por aqui, então um
@@ -808,17 +1003,38 @@ class TaskStore:
                 (task_id,),
             ).fetchone()
             attempt_no = int(row["n"])
+            provenance_json = canonical_json(dict(provenance or {}))
             conn.execute(
-                "INSERT INTO attempts(task_id, attempt_no, execution_id, started_at, outcome) "
-                "VALUES (?,?,?,?,?)",
-                (task_id, attempt_no, execution_id, moment, AttemptOutcome.RUNNING.value),
+                "INSERT INTO attempts(task_id, attempt_no, execution_id, started_at, outcome, "
+                "binding_id, lease_id, provenance_json) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    task_id,
+                    attempt_no,
+                    execution_id,
+                    moment,
+                    AttemptOutcome.RUNNING.value,
+                    str(binding_id or ""),
+                    str(lease_id or ""),
+                    provenance_json,
+                ),
             )
             conn.execute(
                 "UPDATE tasks SET attempt_count=attempt_count+1, updated_at=? WHERE task_id=?",
                 (moment, task_id),
             )
             return Attempt(
-                task_id, attempt_no, execution_id, moment, None, AttemptOutcome.RUNNING, "", "", ""
+                task_id,
+                attempt_no,
+                execution_id,
+                moment,
+                None,
+                AttemptOutcome.RUNNING,
+                "",
+                "",
+                "",
+                binding_id=str(binding_id or ""),
+                lease_id=str(lease_id or ""),
+                provenance=dict(provenance or {}),
             )
 
     def attempt_for_execution(self, execution_id: str) -> Attempt | None:
@@ -834,6 +1050,32 @@ class TaskStore:
             for r in self.conn.execute(
                 "SELECT * FROM attempts WHERE task_id=? ORDER BY attempt_no", (task_id,)
             )
+        ]
+
+    def provenance_for_execution(self, execution_id: str) -> dict[str, Any] | None:
+        """Proveniência gravada na tentativa que originou `execution_id` (§10.4.2 item 7).
+
+        `None` quando a execução é desconhecida — nunca um dicionário vazio
+        indistinguível de "agente que não informou nada".
+        """
+        attempt = self.attempt_for_execution(execution_id)
+        if attempt is None:
+            return None
+        return dict(attempt.provenance)
+
+    def execution_provenance(self, task_id: str) -> list[dict[str, Any]]:
+        """Proveniência por tentativa da tarefa, em ordem — histórico recuperável."""
+        return [
+            {
+                "attempt_no": a.attempt_no,
+                "execution_id": a.execution_id,
+                "binding_id": a.binding_id,
+                "lease_id": a.lease_id,
+                "outcome": a.outcome.value,
+                "result_hash": a.result_hash,
+                "agent_provenance": dict(a.provenance),
+            }
+            for a in self.attempts(task_id)
         ]
 
     def same_error_count(self, task_id: str, err_hash: str) -> int:
@@ -858,6 +1100,7 @@ class TaskStore:
         error_class: str = "",
         error_detail: str = "",
         error_hash: str = "",
+        result_hash: str = "",
         release: bool = True,
         now: str | None = None,
     ) -> Task:
@@ -890,13 +1133,14 @@ class TaskStore:
             if arow is not None:
                 conn.execute(
                     "UPDATE attempts SET ended_at=?, outcome=?, error_class=?, error_detail=?, "
-                    "error_hash=? WHERE task_id=? AND attempt_no=?",
+                    "error_hash=?, result_hash=? WHERE task_id=? AND attempt_no=?",
                     (
                         moment,
                         outcome.value,
                         error_class,
                         error_detail,
                         error_hash,
+                        result_hash,
                         task_id,
                         int(arow["attempt_no"]),
                     ),
@@ -943,6 +1187,201 @@ class TaskStore:
             )
 
     # -- efeitos -----------------------------------------------------------
+    # -- cadeia de continuação: rodadas e orçamento persistidos (§7.3) ------
+
+    def chain_status(self, objective_id: str) -> dict[str, Any]:
+        """Situação da CADEIA de continuação deste objetivo.
+
+        `{objective_id, rounds_used, max_rounds, budget, consumed,
+        stop_reason, last_package_hash, last_progress, rounds_left}`.
+
+        `rounds_used` nunca regride e nunca zera por nova invocação: é o
+        máximo entre o contador persistido e a maior rodada de continuação já
+        CRIADA para o objetivo (`continuation_rounds`). Os dois existem porque
+        o segundo cobre bancos anteriores a esta tabela — sem ele, um
+        `runtime.db` já em uso ganharia crédito novo na primeira execução do
+        código novo, que é exatamente o que o §7.3 proíbe.
+
+        `max_rounds` ausente cai no teto global de `policies`
+        (`get_max_continuation_rounds`, default 3): a cadeia só tem teto
+        próprio depois de `set_chain_limits`.
+        """
+        oid = str(objective_id or "")
+        row = self.conn.execute(
+            "SELECT max_rounds, rounds_used, budget_json, consumed_json, stop_reason, "
+            "last_package_hash, last_progress_json FROM objective_chains WHERE objective_id=?",
+            (oid,),
+        ).fetchone()
+        global_limit = get_max_continuation_rounds(self)
+        historic = continuation_rounds(self, oid) if oid else 0
+        if row is None:
+            return {
+                "objective_id": oid,
+                "rounds_used": historic,
+                "max_rounds": global_limit,
+                "budget": {},
+                "consumed": {},
+                "stop_reason": "",
+                "last_package_hash": "",
+                "last_progress": {},
+                "rounds_left": max(0, global_limit - historic),
+            }
+        declared = row["max_rounds"]
+        max_rounds = global_limit if declared is None else max(0, int(declared))
+        rounds_used = max(int(row["rounds_used"] or 0), historic)
+        return {
+            "objective_id": oid,
+            "rounds_used": rounds_used,
+            "max_rounds": max_rounds,
+            "budget": _loads(row["budget_json"]),
+            "consumed": _loads(row["consumed_json"]),
+            "stop_reason": str(row["stop_reason"] or ""),
+            "last_package_hash": str(row["last_package_hash"] or ""),
+            "last_progress": _loads(row["last_progress_json"]),
+            "rounds_left": max(0, max_rounds - rounds_used),
+        }
+
+    def set_chain_limits(
+        self,
+        objective_id: str,
+        *,
+        max_rounds: int | None = None,
+        budget: Mapping[str, Any] | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Define o TETO TOTAL da cadeia e/ou o orçamento. Devolve `chain_status`.
+
+        Semântica exigida pelo §7.3: `--max-rounds N` é o teto DAQUELA CADEIA,
+        não um crédito novo. Ampliar de 3 para 6 depois de consumir 3 permite
+        mais 3 justamente porque `rounds_used` continua valendo 3 — este método
+        NUNCA mexe em `rounds_used`.
+
+        `max_rounds=None` mantém o teto vigente; `budget=None` mantém o
+        orçamento vigente. Reduzir o teto abaixo do já consumido é permitido e
+        significa "pare agora": `rounds_left` vira 0.
+        """
+        oid = str(objective_id or "")
+        if not oid:
+            raise RuntimeStoreError("set_chain_limits exige objective_id")
+        moment = now or utc_now()
+        with self.immediate() as conn:
+            conn.execute(
+                "INSERT INTO objective_chains(objective_id, max_rounds, rounds_used, "
+                "budget_json, consumed_json, updated_at) VALUES (?,?,0,?,'{}',?) "
+                "ON CONFLICT(objective_id) DO NOTHING",
+                (oid, None if max_rounds is None else max(0, int(max_rounds)),
+                 canonical_json(dict(budget or {})), moment),
+            )
+            if max_rounds is not None:
+                conn.execute(
+                    "UPDATE objective_chains SET max_rounds=?, updated_at=? WHERE objective_id=?",
+                    (max(0, int(max_rounds)), moment, oid),
+                )
+            if budget is not None:
+                conn.execute(
+                    "UPDATE objective_chains SET budget_json=?, updated_at=? WHERE objective_id=?",
+                    (canonical_json(dict(budget)), moment, oid),
+                )
+        return self.chain_status(oid)
+
+    def record_chain_round(
+        self,
+        objective_id: str,
+        *,
+        package_hash: str = "",
+        progress: Mapping[str, Any] | None = None,
+        usage: Mapping[str, Any] | None = None,
+        counts_round: bool = True,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Fecha uma rodada da cadeia: contador, pacote despachado e consumo.
+
+        `counts_round=False` é o caso do §7.3 "não contar tarefa-base nem
+        recusa de executor como rodada": o consumo e o pacote são registrados,
+        o CONTADOR não avança. Sem esse parâmetro, uma engine indisponível
+        gastaria o teto do operador sem ter lido uma linha de código.
+        """
+        oid = str(objective_id or "")
+        if not oid:
+            raise RuntimeStoreError("record_chain_round exige objective_id")
+        moment = now or utc_now()
+        # M1: LEITURA, CÁLCULO e GRAVAÇÃO acontecem sob o MESMO
+        # `BEGIN IMMEDIATE`. Com a leitura fora da transação, duas rodadas
+        # concorrentes liam o mesmo `rounds_used` e a segunda gravava o mesmo
+        # valor da primeira: uma rodada sumia do contador e o teto do §7.3
+        # deixava de valer. `IMMEDIATE` pega o lock de escrita ANTES de ler —
+        # mesmo padrão de `acquire_lease`.
+        with self.immediate() as conn:
+            status = self.chain_status(oid)
+            # O CONTADOR avança sobre o valor PERSISTIDO, não sobre
+            # `status["rounds_used"]` (que já é o máximo com a rodada
+            # histórica). Somar sobre o máximo contava a mesma rodada duas
+            # vezes quando a tarefa de continuação acabara de ser criada: o
+            # histórico já a via, e o `+1` a somava de novo — o teto do
+            # operador caía pela metade.
+            row = conn.execute(
+                "SELECT rounds_used FROM objective_chains WHERE objective_id=?", (oid,)
+            ).fetchone()
+            persisted = int((row["rounds_used"] if row is not None else 0) or 0)
+            consumed = dict(status["consumed"])
+            if usage:
+                consumed["calls"] = int(consumed.get("calls") or 0) + 1
+                for key, value in dict(usage).items():
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    consumed[str(key)] = (consumed.get(str(key)) or 0) + value
+            rounds_used = max(persisted + (1 if counts_round else 0), status["rounds_used"])
+            conn.execute(
+                "INSERT INTO objective_chains(objective_id, max_rounds, rounds_used, "
+                "budget_json, consumed_json, stop_reason, last_package_hash, "
+                "last_progress_json, updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(objective_id) DO UPDATE SET rounds_used=excluded.rounds_used, "
+                "consumed_json=excluded.consumed_json, "
+                "last_package_hash=excluded.last_package_hash, "
+                "last_progress_json=excluded.last_progress_json, "
+                "updated_at=excluded.updated_at",
+                (
+                    oid,
+                    None,
+                    rounds_used,
+                    canonical_json(status["budget"]),
+                    canonical_json(consumed),
+                    status["stop_reason"],
+                    str(package_hash or status["last_package_hash"]),
+                    canonical_json(dict(progress or status["last_progress"])),
+                    moment,
+                ),
+            )
+        return self.chain_status(oid)
+
+    def set_chain_stop(
+        self, objective_id: str, reason: str, *, now: str | None = None
+    ) -> dict[str, Any]:
+        """Persiste o motivo de parada canônico da cadeia (§7.3).
+
+        Vocabulário fechado, validado em `runtime.state.STOP_REASONS`: um
+        motivo livre não diz ao operador qual das sete condutas do §7.3 se
+        aplica. `reason=""` limpa (a cadeia voltou a andar).
+        """
+        from . import state as S  # import tardio: `state` importa nada de `tasks`
+
+        oid = str(objective_id or "")
+        if not oid:
+            raise RuntimeStoreError("set_chain_stop exige objective_id")
+        if reason and reason not in S.STOP_REASONS:
+            raise RuntimeStoreError(
+                f"motivo de parada {reason!r} fora do vocabulário do §7.3: {list(S.STOP_REASONS)}"
+            )
+        moment = now or utc_now()
+        with self.immediate() as conn:
+            conn.execute(
+                "INSERT INTO objective_chains(objective_id, rounds_used, stop_reason, updated_at) "
+                "VALUES (?,0,?,?) ON CONFLICT(objective_id) DO UPDATE SET "
+                "stop_reason=excluded.stop_reason, updated_at=excluded.updated_at",
+                (oid, str(reason or ""), moment),
+            )
+        return self.chain_status(oid)
+
     def register_effect(
         self, effect_id: str, *, task_id: str | None = None, now: str | None = None
     ) -> str:
@@ -1300,6 +1739,16 @@ def create_continuation_tasks(
 
 
 def _attempt(row: sqlite3.Row) -> Attempt:
+    keys = set(row.keys())
+
+    def _get(name: str, default: Any = "") -> Any:
+        return row[name] if name in keys else default
+
+    raw_provenance = _get("provenance_json", "{}") or "{}"
+    try:
+        provenance = json.loads(raw_provenance)
+    except (TypeError, ValueError):
+        provenance = {}
     return Attempt(
         task_id=row["task_id"],
         attempt_no=int(row["attempt_no"]),
@@ -1310,6 +1759,10 @@ def _attempt(row: sqlite3.Row) -> Attempt:
         error_class=row["error_class"],
         error_detail=row["error_detail"],
         error_hash=row["error_hash"],
+        binding_id=str(_get("binding_id", "") or ""),
+        lease_id=str(_get("lease_id", "") or ""),
+        provenance=provenance if isinstance(provenance, dict) else {},
+        result_hash=str(_get("result_hash", "") or ""),
     )
 
 
@@ -1334,6 +1787,7 @@ __all__ = [
     "TaskState",
     "TaskStore",
     "UnknownTask",
+    "ADDITIVE_COLUMNS",
     "apply_schema",
     "canonical_json",
     "connect",

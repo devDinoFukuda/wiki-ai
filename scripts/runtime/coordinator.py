@@ -39,7 +39,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from . import agents as A
+from . import envelopes as E
 from . import recovery as R
+from . import state as S
 from . import tasks as T
 
 # --------------------------------------------------------------------------
@@ -90,6 +93,42 @@ class RejectionReason(str, enum.Enum):
     SCHEMA_INVALID = "rejected:schema_invalid"
     #: Campo que mudaria orçamento, ferramentas, permissões, destino ou aprovação.
     CONTROL_FIELD = "rejected:control_field"
+    #: spec §10.4.4 — envelope de outra versão de protocolo.
+    PROTOCOL_DIVERGENCE = "rejected:protocol_divergence"
+    #: Envelope declara outra tentativa da mesma tarefa.
+    ATTEMPT_MISMATCH = "rejected:attempt_mismatch"
+    #: Envelope declara outro objetivo.
+    OBJECTIVE_MISMATCH = "rejected:objective_mismatch"
+    #: `context_hash` diferente do contexto que foi de fato enviado.
+    CONTEXT_INVALID = "rejected:context_invalid"
+    #: Resultado tardio de um binding que não é mais o vigente.
+    BINDING_DIVERGENCE = "rejected:binding_divergence"
+    #: Lease expirado ou invalidado (`agent connect --cancel-active`).
+    LEASE_INVALID = "rejected:lease_invalid"
+    #: Tentativa cancelada: resultado tardio não altera estado.
+    ATTEMPT_CANCELLED = "rejected:attempt_cancelled"
+    #: Texto do host não adaptável a resultado válido (nunca `done` vazio).
+    UNPARSEABLE = "rejected:unparseable"
+
+
+#: Códigos de `envelopes.EnvelopeError` → motivo de recusa do coordenador.
+#: A tradução existe porque a VALIDAÇÃO de envelope tem uma implementação só
+#: (`runtime.envelopes`); aqui só se decide a política de erro do §7.4.
+ENVELOPE_REJECTIONS: Mapping[str, RejectionReason] = {
+    E.R_PROTOCOL: RejectionReason.PROTOCOL_DIVERGENCE,
+    E.R_TASK: RejectionReason.TASK_MISMATCH,
+    E.R_EXECUTION: RejectionReason.EXECUTION_MISMATCH,
+    E.R_ATTEMPT: RejectionReason.ATTEMPT_MISMATCH,
+    E.R_OBJECTIVE: RejectionReason.OBJECTIVE_MISMATCH,
+    E.R_INPUT: RejectionReason.INPUT_DIVERGENCE,
+    E.R_CONTEXT: RejectionReason.CONTEXT_INVALID,
+    E.R_BINDING: RejectionReason.BINDING_DIVERGENCE,
+    E.R_LEASE: RejectionReason.LEASE_INVALID,
+    E.R_CANCELLED: RejectionReason.ATTEMPT_CANCELLED,
+    E.R_MALFORMED: RejectionReason.MALFORMED,
+    E.R_SCHEMA: RejectionReason.SCHEMA_INVALID,
+    E.R_UNPARSEABLE: RejectionReason.UNPARSEABLE,
+}
 
 
 #: §13.1 — "payload não pode mudar orçamento, ferramentas, permissões ou estado
@@ -246,6 +285,76 @@ class Acceptance:
     output: dict[str, Any] | None = None
     reason: RejectionReason | None = None
     detail: str = ""
+    #: `True` quando o MESMO resultado (mesmo `execution_id` + mesmo hash) já
+    #: havia sido aceito: aceitar de novo é no-op, não regravação (§10.4.4).
+    duplicate: bool = False
+    #: Envelope validado (identidades + proveniência). `None` em recusa.
+    result: E.ResultEnvelope | None = None
+
+    @property
+    def result_hash(self) -> str:
+        return self.result.result_hash if self.result is not None else ""
+
+
+def envelope_for_task(
+    task: T.Task,
+    *,
+    execution_id: str = "",
+    attempt_id: str = "",
+    lease_id: str = "",
+    context_hash: str = "",
+    accumulated_state: Mapping[str, Any] | None = None,
+    evidence: Sequence[Any] = (),
+    reading_needs: Sequence[Mapping[str, Any]] = (),
+    schema: "ResultSchema" = None,  # type: ignore[assignment]
+    policy: Mapping[str, Any] | None = None,
+    deadline: str | None = None,
+) -> E.TaskEnvelope:
+    """`Task` + estado acumulado → envelope de tarefa do §10.4.4.
+
+    É o ÚNICO construtor de envelope de tarefa do runtime: o despacho real
+    (`run`) e a sonda (`doctor --probe-agent`, via adaptador) usam o mesmo
+    formato, então validar um resultado de sonda e validar um resultado de
+    produção é literalmente o mesmo código.
+    """
+    objective = dict(task.objective or {})
+    needs = list(reading_needs) or [
+        n for n in objective.get("reading_needs", []) if isinstance(n, Mapping)
+    ]
+    return E.TaskEnvelope(
+        task_id=task.task_id,
+        objective_id=str(objective.get("objective_id") or objective.get("id") or ""),
+        input_revision=task.input_versions_hash,
+        context_hash=context_hash,
+        objective=objective,
+        accumulated_state=dict(accumulated_state or {}),
+        reading_needs=tuple(dict(n) for n in needs),
+        evidence=tuple(evidence),
+        result_schema=(schema or DEFAULT_SCHEMA).to_dict(),
+        budget=dict(task.budget or {}),
+        deadline=deadline,
+        lease_id=lease_id,
+        attempt_id=attempt_id,
+        execution_id=execution_id,
+        vendor={"policy": dict(policy or {})},
+    )
+
+
+def _input_revision_matcher(task: T.Task) -> Callable[[Any], bool]:
+    """Compara a revisão declarada com o snapshot da tarefa por HASH ou valor.
+
+    Um adaptador legado devolve `input_versions` (o dicionário); o envelope de
+    protocolo devolve `input_revision` (o hash). Os dois casam contra o MESMO
+    `input_versions_hash` — sem isso, "revisão errada é rejeitada" dependeria
+    do formato do adaptador.
+    """
+
+    def matches(declared: Any) -> bool:
+        if str(declared) == task.input_versions_hash:
+            return True
+        return T.input_versions_hash(declared) == task.input_versions_hash
+
+    return matches
 
 
 def accept_result(
@@ -254,19 +363,28 @@ def accept_result(
     execution_id: str,
     envelope: Any,
     schema: ResultSchema = DEFAULT_SCHEMA,
+    *,
+    task_envelope: E.TaskEnvelope | None = None,
+    binding_id: str | None = None,
+    lease_valid: bool | None = None,
+    bindings: Any = None,
 ) -> Acceptance:
-    """Valida o envelope `{execution_id, output}` antes de qualquer gravação.
+    """ÚNICA porta de aceitação de resultado do runtime (F07 + spec §10.4.4).
 
-    Ordem das checagens — identidade da execução ANTES de schema, de propósito:
-    resultado de execução desconhecida não merece nem ser lido como dado.
+    Ordem das checagens — identidade e autorização ANTES de schema, de
+    propósito: resultado de execução desconhecida não merece nem ser lido.
 
     1. `execution_id` precisa existir em `attempts` E pertencer a ESTA tarefa.
-       `attempts.execution_id` só é gravado por `start_attempt`, com o valor que
-       `executor.submit` devolveu — logo, um id inventado pelo worker nunca casa.
-    2. O envelope não pode declarar outra execução nem outra tarefa.
-    3. A revisão de input declarada precisa bater com `input_versions_hash` da
-       tarefa (aceite "revisão errada é rejeitada").
-    4. A saída passa pelo schema fechado (§13.1).
+       `attempts.execution_id` só é gravado por `start_attempt`, com o valor
+       que o adaptador devolveu — um id inventado pelo worker nunca casa.
+    2. Tentativa cancelada e lease expirado/invalidado recusam ANTES de ler o
+       conteúdo (spec §10.4.4/§10.4.6: invalidação de lease impede resultado
+       tardio de alterar o estado, mesmo sem cancelamento físico).
+    3. `envelopes.validate_result` checa protocolo, identidades,
+       `input_revision`, `context_hash` e `binding_id` — implementação única,
+       compartilhada com a sonda do `probe`.
+    4. Resultado idêntico já aceito ⇒ no-op idempotente (`duplicate=True`).
+    5. A saída (`claims`) passa pelo schema fechado (§13.1).
     """
     attempt = store.attempt_for_execution(execution_id)
     if attempt is None:
@@ -281,50 +399,56 @@ def accept_result(
             reason=RejectionReason.TASK_MISMATCH,
             detail=f"execução {execution_id!r} pertence à tarefa {attempt.task_id!r}",
         )
-    if not isinstance(envelope, Mapping):
-        return Acceptance(
-            False,
-            reason=RejectionReason.MALFORMED,
-            detail=f"envelope não é objeto: {type(envelope).__name__}",
-        )
 
-    declared_exec = envelope.get("execution_id")
-    if declared_exec is not None and declared_exec != execution_id:
+    env = task_envelope or envelope_for_task(
+        task,
+        execution_id=execution_id,
+        attempt_id=str(attempt.attempt_no),
+        lease_id=attempt.lease_id,
+        schema=schema,
+    )
+    if env.execution_id and env.execution_id != execution_id:
         return Acceptance(
             False,
             reason=RejectionReason.EXECUTION_MISMATCH,
             detail=(
-                f"envelope declara execução {declared_exec!r}; a integração emitiu "
-                f"{execution_id!r}"
+                f"envelope de tarefa aponta execução {env.execution_id!r}; "
+                f"resultado chegou por {execution_id!r}"
             ),
         )
-    declared_task = envelope.get("task_id")
-    if declared_task is not None and declared_task != task.task_id:
+    env = env.with_execution_id(execution_id)
+
+    expected_binding = binding_id if binding_id is not None else (attempt.binding_id or None)
+    if lease_valid is None:
+        lease_valid = _lease_still_valid(store, task, attempt, bindings)
+
+    try:
+        validated = E.validate_result(
+            envelope,
+            env,
+            binding_id=expected_binding,
+            lease_valid=bool(lease_valid),
+            attempt_cancelled=attempt.outcome is T.AttemptOutcome.CANCELLED,
+            input_revision_matches=_input_revision_matcher(task),
+        )
+    except E.EnvelopeError as exc:
         return Acceptance(
             False,
-            reason=RejectionReason.TASK_MISMATCH,
-            detail=f"envelope declara tarefa {declared_task!r}; esperada {task.task_id!r}",
+            reason=ENVELOPE_REJECTIONS.get(exc.reason, RejectionReason.MALFORMED),
+            detail=exc.detail,
         )
 
-    for key in ("input_versions", "input_revision"):
-        declared_inputs = envelope.get(key)
-        if declared_inputs is None:
-            continue
-        if T.input_versions_hash(declared_inputs) != task.input_versions_hash:
-            return Acceptance(
-                False,
-                reason=RejectionReason.INPUT_DIVERGENCE,
-                detail=(
-                    f"resultado descreve {key} fora do snapshot da tarefa "
-                    f"({task.input_versions_hash[:12]})"
-                ),
-            )
-
-    output = envelope.get("output", None)
-    if output is None:
+    if attempt.result_hash and attempt.result_hash == validated.result_hash:
+        # Mesma execução, mesmo conteúdo: já foi aplicado. No-op.
         return Acceptance(
-            False, reason=RejectionReason.MALFORMED, detail="envelope sem campo 'output'"
+            True,
+            output=dict(task.result or validated.output()),
+            duplicate=True,
+            result=validated,
+            detail="resultado idêntico já aceito para esta execução",
         )
+
+    output = validated.output()
     problems = schema.validate(output)
     if problems:
         reason = next(
@@ -334,7 +458,29 @@ def accept_result(
         return Acceptance(
             False, reason=reason, detail="; ".join(detail for _, detail in problems)
         )
-    return Acceptance(True, output=dict(output))
+    return Acceptance(True, output=dict(output), result=validated)
+
+
+def _lease_still_valid(
+    store: T.TaskStore, task: T.Task, attempt: T.Attempt, bindings: Any = None
+) -> bool:
+    """O lease da tentativa continua vigente?
+
+    Duas fontes, ambas verificáveis: o lease da TAREFA em `runtime.db` (expira
+    sozinho quando o worker morre) e, quando existe `BindingStore`, o lease do
+    BINDING (invalidado por `agent connect --cancel-active`). Qualquer uma
+    negando derruba o resultado tardio.
+    """
+    if attempt.lease_id:
+        current = store.lease_of(task.task_id)
+        if current is not None and current.lease_id != attempt.lease_id:
+            return False
+        if current is not None and current.expired(T.utc_now()):
+            return False
+        checker = getattr(bindings, "lease_valid", None)
+        if callable(checker) and not checker(attempt.lease_id):
+            return False
+    return True
 
 
 #: Mapeia recusa → classe de erro do §7.4. Recusa de identidade (execução
@@ -349,6 +495,19 @@ REJECTION_TO_ERROR_CLASS: Mapping[RejectionReason, R.ErrorClass] = {
     RejectionReason.MALFORMED: R.ErrorClass.SCHEMA_INVALID,
     RejectionReason.SCHEMA_INVALID: R.ErrorClass.SCHEMA_INVALID,
     RejectionReason.CONTROL_FIELD: R.ErrorClass.SCHEMA_INVALID,
+    # spec §10.4.4 — recusas de protocolo/autorização. Nenhuma delas se
+    # corrige reenviando o MESMO envelope: divergência de protocolo, binding,
+    # contexto ou identidade é contradição; lease invalidado e tentativa
+    # cancelada também (o dono do trabalho mudou, não o formato da resposta).
+    RejectionReason.PROTOCOL_DIVERGENCE: R.ErrorClass.CONTRADICTORY,
+    RejectionReason.ATTEMPT_MISMATCH: R.ErrorClass.CONTRADICTORY,
+    RejectionReason.OBJECTIVE_MISMATCH: R.ErrorClass.CONTRADICTORY,
+    RejectionReason.CONTEXT_INVALID: R.ErrorClass.CONTRADICTORY,
+    RejectionReason.BINDING_DIVERGENCE: R.ErrorClass.CONTRADICTORY,
+    RejectionReason.LEASE_INVALID: R.ErrorClass.CONTRADICTORY,
+    RejectionReason.ATTEMPT_CANCELLED: R.ErrorClass.CONTRADICTORY,
+    # Texto não parseável É corrigível com erros objetivos na reenvio.
+    RejectionReason.UNPARSEABLE: R.ErrorClass.SCHEMA_INVALID,
 }
 
 
@@ -525,6 +684,8 @@ def plan_continuations(
     budget: Mapping[str, Any] | None = None,
     max_rounds: int | None = None,
     engine_capabilities: Mapping[str, Any] | None = None,
+    progress: Mapping[str, Any] | None = None,
+    chain_guard: bool = True,
     now: str | None = None,
 ) -> dict[str, list[Any]]:
     """Cria tarefas de continuação para objetivos `partial` com pendência concreta.
@@ -579,7 +740,9 @@ def plan_continuations(
                 {
                     "motivo": (
                         "engine sem capacidade de aprofundamento (deepening=False); "
-                        "continuações exigem engine com leitura (ex.: claude-cli)"
+                        "continuações exigem agente com capacidade de "
+                        "aprofundamento (deepening); conecte um agente com essa "
+                        "capacidade (`wk agent list` mostra as capacidades)"
                     )
                 }
             ],
@@ -642,9 +805,27 @@ def plan_continuations(
                 {
                     "objective_id": objective_id,
                     "motivo": f"round {round_no} excede o máximo de {limit} rodadas de continuação",
+                    "stop_reason": S.STOP_BUDGET_EXHAUSTED,
                 }
             )
             continue
+
+        # -- teto TOTAL da cadeia, orçamento e progresso (§7.3) -------------
+        # Estas guardas são o que separa "mais uma rodada" de "mais uma
+        # invocação com crédito novo". `chain_guard=False` existe só para quem
+        # planeja fora de uma cadeia (inspeção/teste de unidade da criação).
+        if chain_guard:
+            recusa = _chain_refusal(
+                store,
+                objective_id,
+                needs,
+                declared_max_rounds=max_rounds,
+                progress=progress,
+                now=now,
+            )
+            if recusa is not None:
+                recusadas.append(recusa)
+                continue
 
         # Onda11-T2a: `parent_result` vem do resultado ACEITO da tarefa-mãe
         # (já carregado acima), a menos que o outcome traga um resumo
@@ -668,11 +849,146 @@ def plan_continuations(
         )
         if task_ids:
             criadas.extend(task_ids)
+            if chain_guard:
+                # A rodada só CONTA aqui: tarefa realmente criada. Recusa de
+                # executor e tarefa-base não passam por este ponto (§7.3).
+                store.record_chain_round(
+                    objective_id,
+                    package_hash=S.needs_package_hash(needs),
+                    progress=_progress_dict(progress, objective_id),
+                    counts_round=True,
+                    now=now,
+                )
+                store.set_chain_stop(objective_id, "", now=now)
         else:  # defensivo: teto/needs já checados acima, mas nunca confiar 2x
             recusadas.append(
                 {"objective_id": objective_id, "motivo": "create_continuation_tasks recusou"}
             )
     return {"criadas": criadas, "recusadas": recusadas}
+
+
+def _progress_dict(progress: Any, objective_id: str) -> dict[str, Any]:
+    """Progresso da rodada anterior DESTE objetivo, em forma de dicionário.
+
+    Aceita `S.Progress`, o dicionário dele, um mapa `objective_id -> progresso`
+    ou `None` (nada informado). Um `bool` também é aceito porque quem só sabe
+    "houve/não houve progresso" (um chamador antigo) ainda precisa conseguir
+    dizê-lo sem montar a estrutura inteira.
+    """
+    if progress is None:
+        return {}
+    if isinstance(progress, S.Progress):
+        return progress.to_dict()
+    if isinstance(progress, bool):
+        return {"has_progress": progress}
+    if isinstance(progress, Mapping):
+        if objective_id and objective_id in progress:
+            return _progress_dict(progress[objective_id], "")
+        if "has_progress" in progress or "obligations_closed" in progress:
+            return dict(progress)
+    return {}
+
+
+def _obligation_diagnostic(needs: Sequence[Mapping[str, Any]]) -> str:
+    """Obrigação e alvo concretos da rodada que não avançou (§7.3).
+
+    "Nenhum progresso" sem dizer QUAL obrigação e QUAL alvo é o diagnóstico
+    inútil que o §7.3 proíbe: o operador precisa saber onde a cadeia parou
+    para decidir (fornecer informação, escolher identidade, ampliar orçamento).
+    """
+    for need in needs:
+        if not isinstance(need, Mapping):
+            continue
+        alvo = str(need.get("target") or need.get("alvo") or "").strip()
+        if not alvo:
+            continue
+        tipo = str(need.get("kind") or need.get("tipo") or "leitura").strip()
+        motivo = str(need.get("motivo") or need.get("reason") or "").strip()
+        detalhe = f"obrigação {tipo!r} sobre {alvo!r}"
+        return f"{detalhe} ({motivo})" if motivo else detalhe
+    return "nenhuma obrigação com alvo concreto"
+
+
+def _chain_refusal(
+    store: T.TaskStore,
+    objective_id: str,
+    needs: Sequence[Mapping[str, Any]],
+    *,
+    declared_max_rounds: int | None,
+    progress: Any,
+    now: str | None,
+) -> dict[str, Any] | None:
+    """Recusa de cadeia (ou `None` para "pode continuar").
+
+    Três condições materiais do §7.3, nesta ordem:
+
+    1. **teto total da cadeia** — `rounds_used` é persistido e não zera por
+       nova invocação; `--max-rounds N` é o teto DAQUELA cadeia. Motivo
+       canônico `budget_exhausted`.
+    2. **orçamento consumido** — teto declarado em `set_chain_limits` já
+       atingido. Mesmo motivo canônico, detalhe diferente (consumo x teto).
+    3. **ausência de progresso** — a rodada anterior não encerrou obrigação,
+       não aceitou evidência nova e não resolveu conflito, OU o pacote de
+       necessidades seria byte-a-byte o mesmo já despachado. Motivo canônico
+       `no_progress`, sempre com a obrigação e o alvo no diagnóstico.
+
+    Toda recusa PERSISTE o motivo (`set_chain_stop`): a próxima invocação —
+    inclusive depois de reiniciar o processo — lê o mesmo diagnóstico.
+    """
+    status = store.chain_status(objective_id)
+    limit = status["max_rounds"] if declared_max_rounds is None else max(0, int(declared_max_rounds))
+    if status["rounds_used"] >= limit:
+        store.set_chain_stop(objective_id, S.STOP_BUDGET_EXHAUSTED, now=now)
+        return {
+            "objective_id": objective_id,
+            "motivo": (
+                f"cadeia excede o teto total: {status['rounds_used']} de {limit} rodadas já "
+                "consumidas nesta cadeia (o teto é da CADEIA, não da invocação); "
+                f"amplie com set_chain_limits(objective_id={objective_id!r}, max_rounds=N)"
+            ),
+            "stop_reason": S.STOP_BUDGET_EXHAUSTED,
+            "chain": status,
+        }
+
+    esgotado, detalhe = S.budget_exhausted(status["budget"], status["consumed"])
+    if esgotado:
+        store.set_chain_stop(objective_id, S.STOP_BUDGET_EXHAUSTED, now=now)
+        return {
+            "objective_id": objective_id,
+            "motivo": f"orçamento da cadeia esgotado ({detalhe}); estado preservado",
+            "stop_reason": S.STOP_BUDGET_EXHAUSTED,
+            "chain": status,
+        }
+
+    anterior = _progress_dict(progress, objective_id) or status["last_progress"]
+    ja_rodou = bool(status["rounds_used"]) or bool(status["last_package_hash"])
+    if ja_rodou and anterior and not anterior.get("has_progress", False):
+        store.set_chain_stop(objective_id, S.STOP_NO_PROGRESS, now=now)
+        return {
+            "objective_id": objective_id,
+            "motivo": (
+                "rodada anterior sem progresso semântico (nenhuma obrigação encerrada, "
+                "evidência nova aceita ou conflito resolvido): "
+                + _obligation_diagnostic(needs)
+            ),
+            "stop_reason": S.STOP_NO_PROGRESS,
+            "chain": status,
+        }
+
+    package_hash = S.needs_package_hash(needs)
+    if package_hash and package_hash == status["last_package_hash"]:
+        store.set_chain_stop(objective_id, S.STOP_NO_PROGRESS, now=now)
+        return {
+            "objective_id": objective_id,
+            "motivo": (
+                "pacote de necessidades idêntico ao já despachado "
+                f"({package_hash[:12]}): repetir o mesmo pacote é proibido — "
+                + _obligation_diagnostic(needs)
+            ),
+            "stop_reason": S.STOP_NO_PROGRESS,
+            "chain": status,
+        }
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -770,18 +1086,72 @@ def _check_dispatch(executor: Any) -> dict[str, Any]:
     caps_fn = getattr(executor, "capabilities", None)
     caps = dict(caps_fn()) if callable(caps_fn) else {}
     if caps.get("dispatch") is False:
+        # §7.3, "executor indisponível": preservar progresso E indicar correção
+        # CONCRETA. A engine já sabe por que não despacha (binário fora do
+        # PATH, host não autenticado); descartar esse `reason` obrigava o
+        # operador a adivinhar qual das causas era a dele.
+        motivo = str(caps.get("reason") or "").strip()
         raise DispatchUnavailable(
-            "engine declarou ausência de despacho em capabilities(); "
-            "configure a integração antes de executar análise"
+            "engine declarou ausência de despacho em capabilities()"
+            + (f": {motivo}" if motivo else "")
+            + "; configure a integração antes de executar análise"
         )
     return caps
 
 
+def _open_binding_lease(
+    bindings: Any, lease: T.Lease, binding: A.AgentBinding, task: T.Task
+) -> None:
+    """Registra o lease da tarefa no `BindingStore`, quando existe um.
+
+    Sem `BindingStore` (chamada legada da CLI) não há o que registrar: a
+    validade do lease continua sendo decidida pelo `runtime.db`.
+    """
+    opener = getattr(bindings, "open_lease", None)
+    if not callable(opener):
+        return
+    repo = str((task.input_versions or {}).get("repo_id") or "") or None
+    opener(
+        lease.lease_id,
+        binding_id=binding.binding_id,
+        repo=repo,
+        task_id=task.task_id,
+    )
+
+
+def _close_binding_lease(bindings: Any, lease_id: str, reason: str) -> None:
+    closer = getattr(bindings, "close_lease", None)
+    if callable(closer):
+        closer(lease_id, reason=reason)
+
+
+def bind_executor(executor: Any) -> tuple[Any, A.AgentBinding, dict[str, Any]]:
+    """Executor já construído → (adaptador, binding, capacidades).
+
+    Ponte de compatibilidade do §10.4: `run(store, executor=...)` continua
+    existindo, mas o laço NÃO fala mais com executores — só com adaptadores.
+    Assim `wk.cli._dispatch_objectives` e os testes atuais seguem funcionando
+    sobre a MESMA rota do despacho por binding.
+    """
+    caps = _check_dispatch(executor)
+    from .executors.agent_adapters import LegacyExecutorAdapter
+
+    adapter = LegacyExecutorAdapter(executor)
+    try:
+        binding = adapter.bind()
+    except A.HandshakeFailed as exc:
+        raise DispatchUnavailable(str(exc)) from exc
+    return adapter, binding, caps
+
+
 def run(
     store: T.TaskStore,
-    executor: Any,
+    executor: Any = None,
     context_builder: Callable[..., Any] | None = None,
     *,
+    adapter: Any = None,
+    binding: A.AgentBinding | None = None,
+    bindings: Any = None,
     max_concurrency: int = 2,
     policy: Mapping[str, Any] | None = None,
     schema: ResultSchema | Mapping[Any, ResultSchema] = DEFAULT_SCHEMA,
@@ -807,7 +1177,21 @@ def run(
     Nada aqui grava fato: o resultado aceito fica em `tasks.result_json`
     (§7.2, grafos separados).
     """
-    caps = _check_dispatch(executor)
+    if executor is not None:
+        adapter, binding, caps = bind_executor(executor)
+    elif adapter is None or binding is None:
+        raise DispatchUnavailable(
+            "run() exige um executor OU (adapter, binding) conectados; "
+            "sem binding não há despacho — e o núcleo não escolhe um agente sozinho"
+        )
+    else:
+        if not binding.connected:
+            raise DispatchUnavailable(
+                f"binding {binding.binding_id!r} de {binding.agent_id!r} não está conectado; "
+                "execute agent connect antes de despachar"
+            )
+        caps = binding.capabilities.to_executor_capabilities()
+    provenance = E.Provenance.from_binding(binding).to_dict()
     # `capabilities()` declara concorrência real (§7.3). Dois nomes são aceitos
     # porque o vocabulário do adapter é dele, não deste laço; o coordenador
     # nunca despacha ACIMA do que a engine declarou suportar.
@@ -819,6 +1203,9 @@ def run(
     policies = R.load_policies(store)
     report = RunReport()
     inflight: dict[str, tuple[T.Lease, str]] = {}
+    #: envelope de tarefa efetivamente submetido, por tarefa — é ele (e não o
+    #: payload do worker) que decide identidade, revisão e contexto no aceite.
+    submitted_envelopes: dict[str, E.TaskEnvelope] = {}
     #: quantas vezes seguidas cada execução respondeu estado não observável
     unobservable: dict[str, int] = {}
 
@@ -847,6 +1234,7 @@ def run(
         """
         err_hash = R.error_hash(error_class, detail)
         moment = now_fn()
+        _close_binding_lease(bindings, lease.lease_id, f"{termination_prefix}:{error_class.value}")
         if execution_id is None:
             store.start_attempt(task.task_id, lease.lease_id, None, now=moment)
         store.record_result(
@@ -899,6 +1287,7 @@ def run(
         for released in store.release_expired_leases(moment):
             if released in inflight:
                 inflight.pop(released, None)
+                submitted_envelopes.pop(released, None)
                 progressed = True
 
         # 2. despacho de tarefas prontas -----------------------------------
@@ -920,6 +1309,10 @@ def run(
                     )
                 except T.LeaseHeld:
                     continue  # outro coordenador pegou; não é erro
+                # §10.4.6: o lease da tarefa é TAMBÉM o lease do binding. Só
+                # assim `agent connect --cancel-active` invalida trabalho em
+                # voo — e `accept_result` reconhece o resultado tardio.
+                _open_binding_lease(bindings, lease, binding, task)
                 package, exc = _build_package(
                     context_builder, task.objective, task.budget, resolver
                 )
@@ -935,14 +1328,43 @@ def run(
                     )
                     progressed = True
                     continue
+                references = _references(package)
+                # §10.4.4 + §7.1: o envelope carrega objetivo, ESTADO
+                # ACUMULADO, obrigações de leitura, evidência montada,
+                # orçamento, lease e o hash do contexto efetivamente enviado.
+                # `context_hash` é calculado sobre o que VAI no envelope, não
+                # sobre uma promessa — é ele que o resultado precisa refletir.
+                # B1: montar o envelope também pode falhar (estado acumulado
+                # não serializável em `context_hash`, schema inválido). Sem a
+                # blindagem, a exceção escapava de `run()` com o lease ABERTO:
+                # a tarefa ficava presa até o TTL e o binding seguia ocupado.
                 try:
-                    execution_id = executor.submit(
-                        task.task_id,
-                        task.objective,
-                        _references(package),
-                        schema_for(task).to_dict(),
-                        dict(policy or {}),
+                    envelope = envelope_for_task(
+                        task,
+                        lease_id=lease.lease_id,
+                        attempt_id=str(task.attempt_count + 1),
+                        context_hash=E.context_hash(
+                            {"evidence": list(references), "state": task.result or {}}
+                        ),
+                        accumulated_state=dict(task.result or {}),
+                        evidence=references,
+                        schema=schema_for(task),
+                        policy=dict(policy or {}),
                     )
+                except Exception as exc:
+                    close_with_failure(
+                        task,
+                        lease,
+                        None,
+                        _classify_exception(exc),
+                        f"montagem do envelope falhou: {exc}",
+                        outcome=T.AttemptOutcome.FAILED,
+                        termination_prefix="envelope",
+                    )
+                    progressed = True
+                    continue
+                try:
+                    execution_id = adapter.submit(binding, envelope)
                 except Exception as exc:  # falha de despacho
                     close_with_failure(
                         task,
@@ -968,7 +1390,14 @@ def run(
                     progressed = True
                     continue
                 try:
-                    store.start_attempt(task.task_id, lease.lease_id, execution_id, now=moment)
+                    store.start_attempt(
+                        task.task_id,
+                        lease.lease_id,
+                        execution_id,
+                        binding_id=binding.binding_id,
+                        provenance=provenance,
+                        now=moment,
+                    )
                 except sqlite3.IntegrityError:
                     # `ux_attempts_exec` é UNIQUE: um executor que reemite um
                     # execution_id já usado não pode "herdar" a execução de
@@ -985,6 +1414,7 @@ def run(
                     progressed = True
                     continue
                 inflight[task.task_id] = (lease, execution_id)
+                submitted_envelopes[task.task_id] = envelope.with_execution_id(execution_id)
                 report.submitted += 1
                 progressed = True
 
@@ -999,15 +1429,16 @@ def run(
             task = store.get(task_id)
             moment = now_fn()
             try:
-                observed = executor.status(execution_id)
+                observed = adapter.poll(binding, execution_id)
             except Exception as exc:
                 inflight.pop(task_id, None)
+                submitted_envelopes.pop(task_id, None)
                 close_with_failure(
                     task,
                     lease,
                     execution_id,
                     _classify_exception(exc),
-                    f"status falhou: {exc}",
+                    f"poll falhou: {exc}",
                     outcome=T.AttemptOutcome.FAILED,
                     termination_prefix="status",
                 )
@@ -1017,7 +1448,25 @@ def run(
             if state in RUNNING_STATES:
                 unobservable.pop(execution_id, None)
                 # Batimento observado renova o lease: worker vivo não é despejado.
-                store.heartbeat(lease.lease_id, ttl_seconds=lease_ttl_seconds, now=moment)
+                # B1: se o store falhar no batimento, a exceção escapava de
+                # `run()` com o lease ABERTO — fecha-se a tentativa como falha
+                # transitória em vez de deixar tarefa e binding presos.
+                try:
+                    store.heartbeat(lease.lease_id, ttl_seconds=lease_ttl_seconds, now=moment)
+                except Exception as exc:
+                    inflight.pop(task_id, None)
+                    submitted_envelopes.pop(task_id, None)
+                    unobservable.pop(execution_id, None)
+                    close_with_failure(
+                        task,
+                        lease,
+                        execution_id,
+                        _classify_exception(exc),
+                        f"renovação do lease falhou: {exc}",
+                        outcome=T.AttemptOutcome.FAILED,
+                        termination_prefix="heartbeat",
+                    )
+                    progressed = True
                 continue
             if state not in SUCCESS_STATES and state not in FAILURE_STATES:
                 # `unknown` (ou vocabulário não reconhecido) NUNCA vira sucesso.
@@ -1026,7 +1475,24 @@ def run(
                 seen = unobservable.get(execution_id, 0) + 1
                 unobservable[execution_id] = seen
                 if seen <= unknown_state_limit:
-                    store.heartbeat(lease.lease_id, ttl_seconds=lease_ttl_seconds, now=moment)
+                    try:
+                        store.heartbeat(
+                            lease.lease_id, ttl_seconds=lease_ttl_seconds, now=moment
+                        )
+                    except Exception as exc:  # B1: idem — lease nunca fica aberto
+                        inflight.pop(task_id, None)
+                        submitted_envelopes.pop(task_id, None)
+                        unobservable.pop(execution_id, None)
+                        close_with_failure(
+                            task,
+                            lease,
+                            execution_id,
+                            _classify_exception(exc),
+                            f"renovação do lease falhou: {exc}",
+                            outcome=T.AttemptOutcome.FAILED,
+                            termination_prefix="heartbeat",
+                        )
+                        progressed = True
                     continue
                 inflight.pop(task_id, None)
                 unobservable.pop(execution_id, None)
@@ -1042,9 +1508,14 @@ def run(
                 )
                 continue
             inflight.pop(task_id, None)
+            sent = submitted_envelopes.pop(task_id, None)
             progressed = True
             if state in FAILURE_STATES:
-                detail = str((observed or {}).get("detail") or _failure_detail(executor, execution_id) or state)
+                detail = str(
+                    (observed or {}).get("detail")
+                    or (observed or {}).get("error")
+                    or state
+                )
                 close_with_failure(
                     task,
                     lease,
@@ -1055,21 +1526,34 @@ def run(
                     termination_prefix="execution",
                 )
                 continue
-            try:
-                envelope = executor.result(execution_id)
-            except Exception as exc:
+            envelope = (observed or {}).get("result")
+            if envelope is None:
                 close_with_failure(
                     task,
                     lease,
                     execution_id,
-                    _classify_exception(exc),
-                    f"result falhou: {exc}",
+                    R.ErrorClass.TRANSIENT,
+                    f"adaptador terminou sem resultado: {(observed or {}).get('error') or state}",
                     outcome=T.AttemptOutcome.FAILED,
                     termination_prefix="result",
                 )
                 continue
 
-            verdict = accept_result(store, task, execution_id, envelope, schema_for(task))
+            verdict = accept_result(
+                store,
+                task,
+                execution_id,
+                envelope,
+                schema_for(task),
+                task_envelope=sent,
+                binding_id=binding.binding_id,
+                bindings=bindings,
+            )
+            if verdict.duplicate:
+                # Mesma execução, mesmo conteúdo: nada é regravado (§10.4.4).
+                report.accepted += 1
+                report.done_tasks.append(task.task_id)
+                continue
             if not verdict.accepted:
                 assert verdict.reason is not None
                 report.rejected += 1
@@ -1095,8 +1579,10 @@ def run(
                 outcome=T.AttemptOutcome.SUCCEEDED,
                 result=verdict.output,
                 termination_reason="completed",
+                result_hash=verdict.result_hash,
                 now=now_fn(),
             )
+            _close_binding_lease(bindings, lease.lease_id, "resultado aceito")
             report.accepted += 1
             report.done_tasks.append(task.task_id)
 
@@ -1107,26 +1593,319 @@ def run(
     return report
 
 
-def _failure_detail(executor: Any, execution_id: str) -> str:
-    """Causa da falha declarada pela engine, quando `result()` a expõe.
+# --------------------------------------------------------------------------
+# Laço automático da cadeia (§7.3)
+# --------------------------------------------------------------------------
 
-    Execução terminada em falha costuma trazer o erro em `result()["error"]`
-    (é o contrato de `executors.base._result_dict`). Sem isso, o diagnóstico
-    diria apenas "failed" — e, pior, dois erros DIFERENTES teriam o mesmo
-    `error_hash`, bloqueando a tarefa por "erro idêntico" que não é idêntico.
+
+@dataclass
+class RoundReport:
+    """Uma rodada do laço automático: o que rodou, o que moveu, o que parou."""
+
+    round_no: int
+    #: `RunReport` do despacho desta rodada (`None` quando nem despachou).
+    run: RunReport | None = None
+    #: `objective_id` -> `Progress.to_dict()`
+    progress: dict[str, Any] = field(default_factory=dict)
+    outcomes: tuple[Mapping[str, Any], ...] = ()
+    planned: dict[str, Any] = field(default_factory=dict)
+    stop_reason: str = ""
+    detail: str = ""
+
+    @property
+    def has_progress(self) -> bool:
+        return any(bool(p.get("has_progress")) for p in self.progress.values())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "round": self.round_no,
+            "run": self.run.summary() if self.run is not None else None,
+            "progress": {k: dict(v) for k, v in self.progress.items()},
+            "has_progress": self.has_progress,
+            "planned": dict(self.planned),
+            "stop_reason": self.stop_reason,
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class ChainReport:
+    """Resultado do laço inteiro — o que `analyze`/`update`/`resume` publicam."""
+
+    objective_ids: tuple[str, ...] = ()
+    rounds: int = 0
+    stop_reason: str = ""
+    detail: str = ""
+    progress_by_round: list[dict[str, Any]] = field(default_factory=list)
+    round_reports: list[RoundReport] = field(default_factory=list)
+    #: `objective_id` -> `ConsolidatedState.to_dict()` ao fim do laço.
+    state: dict[str, Any] = field(default_factory=dict)
+    #: `objective_id` -> `TaskStore.chain_status(objective_id)`
+    chain: dict[str, Any] = field(default_factory=dict)
+    diagnostics: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "objective_ids": list(self.objective_ids),
+            "rounds": self.rounds,
+            "stop_reason": self.stop_reason,
+            "detail": self.detail,
+            "progress_by_round": [dict(p) for p in self.progress_by_round],
+            "rounds_detail": [r.to_dict() for r in self.round_reports],
+            "state": {k: dict(v) for k, v in self.state.items()},
+            "chain": {k: dict(v) for k, v in self.chain.items()},
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+def _outcome_state(outcome: Mapping[str, Any]) -> str:
+    return str(outcome.get("state") or "").strip().lower()
+
+
+def run_chain(
+    store: T.TaskStore,
+    *,
+    objective_ids: Sequence[str] | str,
+    input_versions: Mapping[str, Any],
+    outcomes_fn: Callable[[int], Sequence[Mapping[str, Any]]],
+    repo_id: str = "",
+    input_revision: str = "",
+    executor: Any = None,
+    adapter: Any = None,
+    binding: A.AgentBinding | None = None,
+    bindings: Any = None,
+    budget: Mapping[str, Any] | None = None,
+    max_rounds: int | None = None,
+    engine_capabilities: Mapping[str, Any] | None = None,
+    state_store: Any = None,
+    on_round: Callable[[RoundReport], None] | None = None,
+    max_loops: int = 32,
+    now_fn: Callable[[], str] = T.utc_now,
+    run_kwargs: Mapping[str, Any] | None = None,
+) -> ChainReport:
+    """Executa a cadeia INTEIRA numa invocação: planejar → despachar → aceitar → aplicar.
+
+    É o §7.3 em código: `analyze`, `update` e `resume` chamam esta função UMA
+    vez e ela repete as rodadas disponíveis até conclusão ou motivo material de
+    parada. O operador não roda `resume` por rodada.
+
+    Contrato dos parâmetros que a CLI precisa fornecer:
+
+    * `outcomes_fn(round_no)` — a integração da rodada. Devolve a lista de
+      outcomes por objetivo (o `IntegrationReport.to_dict()["objetivos"]` do
+      `knowledge.integrate`). É um *callback* porque este módulo não importa
+      `knowledge`: a fronteira runtime/knowledge continua valendo.
+    * `input_versions` — snapshot das entradas; `input_revision` cai para
+      `T.input_versions_hash(input_versions)` quando não informado, e é a
+      terceira parte da chave do estado consolidado (§7.1).
+    * `executor` OU `(adapter, binding)` — mesma regra de `run()`.
+
+    Parada, sempre com motivo canônico de `runtime.state`:
+
+    | Motivo                 | Quando                                             |
+    |------------------------|----------------------------------------------------|
+    | `completed`            | nenhum objetivo do escopo continua `partial`       |
+    | `executor_unavailable` | `run()` recusou o despacho — rodada NÃO é contada  |
+    | `budget_exhausted`     | teto da cadeia ou orçamento consumido              |
+    | `no_progress`          | rodada sem progresso, ou pacote idêntico ao anterior |
+    | `evidence_changed`     | alguma leitura satisfeita foi invalidada na rodada |
+    | `ambiguity`            | outcome declarou ambiguidade de identidade         |
+    | `interrupted`          | `KeyboardInterrupt` OU erro interno na rodada (outcome fora de contrato, falha do store) — estado da rodada já persistido |
+
+    Retomada idempotente: o estado é gravado A CADA rodada e cada delta é
+    identificado por `result_hash`. Reexecutar `run_chain` depois de uma
+    interrupção reaplica nada — `apply_result` devolve `duplicate=True` — e a
+    cadeia continua de onde parou, sem reiniciar conclusões válidas.
     """
-    try:
-        envelope = executor.result(execution_id)
-    except Exception:
-        return ""
-    if not isinstance(envelope, Mapping):
-        return ""
-    error = envelope.get("error")
-    if error is None:
-        return ""
-    if isinstance(error, Mapping):
-        return "; ".join(f"{k}={error[k]}" for k in sorted(error))
-    return str(error)
+    ids = (objective_ids,) if isinstance(objective_ids, str) else tuple(str(o) for o in objective_ids)
+    revision = str(input_revision or T.input_versions_hash(input_versions))
+    states = state_store if state_store is not None else S.StateStore.of(store)
+    report = ChainReport(objective_ids=ids)
+    extra = dict(run_kwargs or {})
+
+    # Teto e orçamento são da CADEIA: gravados uma vez, não a cada rodada.
+    for oid in ids:
+        if max_rounds is not None or budget is not None:
+            store.set_chain_limits(oid, max_rounds=max_rounds, budget=budget, now=now_fn())
+
+    current: dict[str, S.ConsolidatedState] = {
+        oid: states.load_or_new(repo_id, oid, revision, input_versions=input_versions)
+        for oid in ids
+    }
+
+    def _finish(reason: str, detail: str = "") -> ChainReport:
+        report.stop_reason = reason
+        report.detail = detail
+        for oid in ids:
+            # A1: a persistência da parada é BEST-EFFORT por objetivo. Se o
+            # store falhar aqui, o ChainReport ainda sai com `stop_reason` e
+            # com as rodadas já aplicadas — perder o relatório inteiro por
+            # causa de uma gravação era o pior dos dois resultados, porque o
+            # operador ficava sem saber sequer que rodadas rodaram.
+            try:
+                parado = S.with_stop_reason(current[oid], reason, now=now_fn())
+                current[oid] = states.save(parado, now=now_fn())
+                report.state[oid] = current[oid].to_dict()
+                store.set_chain_stop(oid, reason, now=now_fn())
+                report.chain[oid] = store.chain_status(oid)
+            except Exception as exc:  # noqa: BLE001 — diagnóstico, não silêncio
+                report.diagnostics.append(
+                    f"parada {reason!r} não persistida para {oid!r}: "
+                    f"{exc.__class__.__name__}: {exc}"
+                )
+        return report
+
+    def _register_round(round_report: RoundReport) -> None:
+        """Publica a rodada no relatório uma única vez (idempotente)."""
+        snapshot = round_report.to_dict()
+        if report.round_reports and report.round_reports[-1] is round_report:
+            report.progress_by_round[-1] = snapshot
+            return
+        report.round_reports.append(round_report)
+        report.progress_by_round.append(snapshot)
+        if on_round is not None:
+            on_round(round_report)
+
+    def _integrate_round(round_report: RoundReport) -> tuple[str, str] | None:
+        """Etapas 2–5 de uma rodada. `None` = a cadeia continua.
+
+        Isolada em função para que `run_chain` possa blindar o corpo inteiro
+        da rodada (A1) sem perder a legibilidade das etapas.
+        """
+        round_no_local = round_report.round_no
+        # -- 2. integração da rodada ---------------------------------------
+        outcomes = tuple(outcomes_fn(round_no_local) or ())
+        round_report.outcomes = outcomes
+
+        # -- 3. delta sobre o estado consolidado ---------------------------
+        reabertas: list[str] = []
+        ambiguidade = ""
+        for outcome in outcomes:
+            if not isinstance(outcome, Mapping):
+                raise CoordinatorError(
+                    f"outcomes_fn devolveu item fora de contrato na rodada "
+                    f"{round_no_local}: esperado Mapping, veio {type(outcome).__name__}"
+                )
+            oid = str(outcome.get("objective_id") or "")
+            if oid not in current:
+                continue
+            novo, progresso = states.apply(
+                current[oid], outcome, round_no=round_no_local, now=now_fn()
+            )
+            current[oid] = novo
+            round_report.progress[oid] = progresso.to_dict()
+            reabertas.extend(progresso.readings_reopened)
+            if str(outcome.get("ambiguidade") or outcome.get("ambiguity") or "").strip():
+                ambiguidade = str(outcome.get("ambiguidade") or outcome.get("ambiguity"))
+        for oid in ids:
+            report.state[oid] = current[oid].to_dict()
+        _register_round(round_report)
+
+        # -- 4. motivos materiais de parada --------------------------------
+        pendentes = [o for o in outcomes if _outcome_state(o) == "partial"]
+        if outcomes and not pendentes:
+            return (S.STOP_COMPLETED, "nenhum objetivo do escopo continua parcial")
+        if ambiguidade:
+            return (S.STOP_AMBIGUITY, ambiguidade)
+        if reabertas:
+            # "Evidência alterada: invalidar somente dependentes e replanejar"
+            # — a invalidação já aconteceu no delta; a decisão de replanejar é
+            # do chamador, com o estado que ele acaba de receber.
+            return (
+                S.STOP_EVIDENCE_CHANGED,
+                f"leituras reabertas por invalidação: {sorted(set(reabertas))}",
+            )
+
+        # -- 5. planejar a rodada seguinte ---------------------------------
+        planejado = plan_continuations(
+            store,
+            outcomes,
+            input_versions=input_versions,
+            budget=budget,
+            max_rounds=max_rounds,
+            engine_capabilities=engine_capabilities,
+            progress=round_report.progress,
+            now=now_fn(),
+        )
+        round_report.planned = planejado
+        report.progress_by_round[-1] = round_report.to_dict()
+        if not planejado.get("criadas"):
+            motivos = [dict(r) for r in planejado.get("recusadas") or ()]
+            reason = next(
+                (str(r["stop_reason"]) for r in motivos if r.get("stop_reason")),
+                S.STOP_NO_PROGRESS,
+            )
+            detalhe = "; ".join(str(r.get("motivo") or "") for r in motivos) or (
+                "nenhuma continuação disponível"
+            )
+            report.diagnostics.extend(str(r.get("motivo") or "") for r in motivos)
+            return (reason, detalhe)
+        return None
+
+    round_no = 0
+    while round_no < max_loops:
+        round_report = RoundReport(round_no=round_no)
+        # -- 1. despacho ---------------------------------------------------
+        try:
+            round_report.run = run(
+                store,
+                executor=executor,
+                adapter=adapter,
+                binding=binding,
+                bindings=bindings,
+                now_fn=now_fn,
+                **extra,
+            )
+        except DispatchUnavailable as exc:
+            # §7.3: "preservar progresso, indicar correção concreta e
+            # retomada". A rodada NÃO conta — o operador não perde crédito por
+            # uma engine ausente.
+            round_report.stop_reason = S.STOP_EXECUTOR_UNAVAILABLE
+            round_report.detail = str(exc)
+            report.round_reports.append(round_report)
+            report.progress_by_round.append(round_report.to_dict())
+            if on_round is not None:
+                on_round(round_report)
+            report.diagnostics.append(f"executor indisponível: {exc}")
+            return _finish(S.STOP_EXECUTOR_UNAVAILABLE, str(exc))
+        except KeyboardInterrupt:
+            return _finish(S.STOP_INTERRUPTED, "interrompido durante o despacho")
+
+        # -- 2 a 5: integração, delta, motivos e planejamento ---------------
+        # A1: o corpo da rodada é BLINDADO. Antes, um `outcome` fora de
+        # contrato (item não-Mapping vindo de `outcomes_fn`) ou uma falha do
+        # store dentro de `states.apply`/`plan_continuations` propagava a
+        # exceção para fora de `run_chain`: o ChainReport com as rodadas JÁ
+        # APLICADAS era descartado, nenhum `stop_reason` chegava ao disco e
+        # `_finish()` nunca rodava — a cadeia ficava sem parada registrada e o
+        # operador sem retomada. Agora qualquer erro vira parada canônica
+        # `interrupted` (mesmo vocabulário fechado do §7.3, já traduzido pela
+        # CLI), com `detail` e `diagnostics` nomeando a causa.
+        try:
+            veredito = _integrate_round(round_report)
+        except KeyboardInterrupt:
+            detalhe = "interrompido durante a integração"
+            round_report.stop_reason = S.STOP_INTERRUPTED
+            round_report.detail = detalhe
+            _register_round(round_report)
+            return _finish(S.STOP_INTERRUPTED, detalhe)
+        except Exception as exc:  # noqa: BLE001 — vira parada, não crash
+            detalhe = (
+                f"rodada {round_no} abortada por erro interno: "
+                f"{exc.__class__.__name__}: {exc}"
+            )
+            round_report.stop_reason = S.STOP_INTERRUPTED
+            round_report.detail = detalhe
+            _register_round(round_report)
+            report.diagnostics.append(detalhe)
+            return _finish(S.STOP_INTERRUPTED, detalhe)
+        if veredito is not None:
+            return _finish(*veredito)
+
+        report.rounds += 1
+        round_no += 1
+
+    return _finish(S.STOP_BUDGET_EXHAUSTED, f"laço atingiu max_loops={max_loops}")
 
 
 def _class_from_state(observed: Mapping[str, Any] | None) -> R.ErrorClass:
@@ -1142,6 +1921,12 @@ def _class_from_state(observed: Mapping[str, Any] | None) -> R.ErrorClass:
 
 __all__ = [
     "Acceptance",
+    "ChainReport",
+    "ENVELOPE_REJECTIONS",
+    "RoundReport",
+    "bind_executor",
+    "run_chain",
+    "envelope_for_task",
     "CONTROL_FIELDS",
     "CoordinatorError",
     "DEFAULT_SCHEMA",

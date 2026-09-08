@@ -100,7 +100,9 @@ def store_e_fonte(tmp_path):
 
 
 def _ingest_args(path, store, namespace):
-    return argparse.Namespace(path=path, initiative=None, phase=None, store=store, namespace=namespace)
+    return argparse.Namespace(
+        path=path, initiative=None, phase=None, store=store, namespace=namespace, json=True,
+    )
 
 
 def _run_ingest(a):
@@ -134,7 +136,7 @@ def test_cmd_ingest_aceita_namespace_legitimo_com_barras_normais(store_e_fonte):
     code, out, err = _run_ingest(_ingest_args(src, store, "code/C:/tmp/x"))
     assert code == 0
     assert err == ""
-    resultado = json.loads(out)
+    resultado = json.loads(out)["summary"]["detail"]
     assert resultado["fontes"][0]["status"] == "ingested"
 
 
@@ -170,7 +172,7 @@ def test_cmd_ingest_primeira_ingestao_nao_tem_campos_de_duplicata(store_e_fonte)
     store, src = store_e_fonte
     code, out, _ = _run_ingest(_ingest_args(src, store, "wiki"))
     assert code == 0
-    entry = json.loads(out)["fontes"][0]
+    entry = json.loads(out)["summary"]["detail"]["fontes"][0]
     assert "duplicada" not in entry
     assert "correlacao_reavaliada" not in entry
 
@@ -184,7 +186,7 @@ def test_cmd_ingest_reingestao_identica_avisa_e_marca_correlacao_nao_reavaliada(
 
     code2, out2, _ = _run_ingest(a)  # mesmo arquivo, mesmo namespace: bytes idênticos
     assert code2 == 0
-    resultado2 = json.loads(out2)
+    resultado2 = json.loads(out2)["summary"]["detail"]
 
     entry = resultado2["fontes"][0]
     assert entry["duplicada"] is True
@@ -209,6 +211,6 @@ def test_cmd_ingest_reingestao_nao_reporta_fontes_incompletas_como_avaliacao_nov
     a = _ingest_args(src, store, "wiki")
     _run_ingest(a)
     _, out2, _ = _run_ingest(a)
-    resultado2 = json.loads(out2)
+    resultado2 = json.loads(out2)["summary"]["detail"]
     assert resultado2["fontes_incompletas"] == 0
     assert resultado2["status_geral"] == "completo"

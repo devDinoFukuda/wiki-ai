@@ -228,5 +228,100 @@ class TestPublishRevisionFailover(unittest.TestCase):
         self.assertEqual(manifest.get("revision_id"), "rev1")
 
 
+class TestSkippedDocuments(unittest.TestCase):
+    """Achado (baixa) release.py `_render_all`: documento do plano com
+    `unit_ids` vazio precisa ficar rastreado (`ReleaseResult.skipped`),
+    distinguindo `skipped_all` (havia documentos no plano, todos pulados)
+    de `nothing_to_publish` (plano sem documento nenhum) — nunca os dois
+    indistinguíveis de um `ok=True` silencioso."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        if os.path.exists(self.tmpdir):
+            shutil.rmtree(self.tmpdir)
+
+    def _doc_sem_unidades(self, doc_id: str) -> KnowledgeDocument:
+        from knowledge.models import EntityType
+        return KnowledgeDocument(
+            document_id=doc_id, title=f"Documento sem unidades {doc_id}",
+            doc_kind=DocKind.CAPACIDADE, units=(),
+            revision_id="rev1", namespace="test",
+            anchor_entity_id=f"cap_{doc_id}", anchor_entity_type=EntityType.CAPABILITY,
+        )
+
+    def test_plano_com_2_docs_sem_unidades_e_skipped_all(self):
+        """2 documentos, ambos sem unidade -> skipped_all, não nothing_to_publish."""
+        doc1 = self._doc_sem_unidades("d1")
+        doc2 = self._doc_sem_unidades("d2")
+        plan = PublicationPlan(revision_id="rev1", namespace="test", documents=(doc1, doc2))
+
+        result = release.publish_revision(
+            plan, self.tmpdir, FakeRenderers(), FakeValidators(), revision_id="rev1",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.nothing_to_publish)
+        self.assertTrue(result.skipped_all)
+        self.assertEqual({s["doc_id"] for s in result.skipped}, {"d1", "d2"})
+        for item in result.skipped:
+            self.assertTrue(item["reason"])
+        # nada foi promovido: nenhum manifest.json novo em disco.
+        self.assertFalse(os.path.isfile(os.path.join(self.tmpdir, "manifest.json")))
+
+    def test_plano_vazio_e_nothing_to_publish(self):
+        """Plano SEM documento nenhum continua `nothing_to_publish`, sem `skipped`."""
+        plan = PublicationPlan(revision_id="rev1", namespace="test", documents=())
+
+        result = release.publish_revision(
+            plan, self.tmpdir, FakeRenderers(), FakeValidators(), revision_id="rev1",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.nothing_to_publish)
+        self.assertFalse(result.skipped_all)
+        self.assertEqual(result.skipped, ())
+
+    def test_misto_publica_validos_e_lista_skipped(self):
+        """1 doc com unidade + 1 sem: publica o válido, lista o pulado."""
+        from knowledge.models import EntityType, FactNature, EpistemicStatus, LifecycleStatus
+        st = Statement(
+            "f1", "behavior", "Conteúdo A", "s",
+            UnitState.IMPLEMENTED, FactNature.IMPLEMENTED,
+            EpistemicStatus.SUPPORTED, LifecycleStatus.CURRENT, "rev1"
+        )
+        unit = SemanticUnit(
+            unit_id="unit_a", title="Unidade A",
+            state=UnitState.IMPLEMENTED, subject="Teste",
+            subject_key="teste", belonging=Belonging(),
+            entity_id="ent_a", entity_type=EntityType.CAPABILITY,
+            namespace="test", revision_id="rev1",
+            behavior=(st,),
+        )
+        doc_com_unidade = KnowledgeDocument(
+            document_id="doc_a", title="Documento A",
+            doc_kind=DocKind.CAPACIDADE, units=(unit,),
+            revision_id="rev1", namespace="test",
+            anchor_entity_id="cap_a", anchor_entity_type=EntityType.CAPABILITY,
+        )
+        doc_sem_unidade = self._doc_sem_unidades("doc_b")
+        plan = PublicationPlan(
+            revision_id="rev1", namespace="test",
+            documents=(doc_com_unidade, doc_sem_unidade),
+        )
+
+        result = release.publish_revision(
+            plan, self.tmpdir, FakeRenderers(), FakeValidators(), revision_id="rev1",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.nothing_to_publish)
+        self.assertFalse(result.skipped_all)
+        self.assertEqual([s["doc_id"] for s in result.skipped], ["doc_b"])
+        self.assertIn("unit_a", result.manifest.documents)
+        self.assertTrue(os.path.isfile(os.path.join(self.tmpdir, "manifest.json")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -156,15 +156,22 @@ class ContinuationsTest(unittest.TestCase):
         result1 = C.plan_continuations(self.store, outcomes, input_versions=inputs)
         criadas_1 = result1["criadas"][0]
 
-        # Segunda chamada (repeticion)
+        # Segunda chamada (repeticion) com o MESMO pacote de necessidades.
         result2 = C.plan_continuations(self.store, outcomes, input_versions=inputs)
 
-        # Aceite: nao deve duplicar
+        # Aceite (§7.3): repetir o mesmo pacote nao cria nada E e recusado com
+        # motivo canonico `no_progress` — antes a chamada repetida devolvia a
+        # mesma tarefa (dedupe por effect_identity) sem dizer que a cadeia nao
+        # tinha avancado. Nao duplicar continua valendo (total_tasks == 2).
         self.assertEqual(
             result2["criadas"],
-            result1["criadas"],
-            "Chamada repetida nao deve duplicar tarefas"
+            [],
+            "Pacote identico ao ja despachado nao pode gerar nova continuacao"
         )
+        self.assertEqual(len(result2["recusadas"]), 1)
+        self.assertEqual(result2["recusadas"][0]["stop_reason"], "no_progress")
+        self.assertIn("idêntico ao já despachado", result2["recusadas"][0]["motivo"])
+        self.assertIn(criadas_1, result1["criadas"])
         total_tasks = len(self.store.all_tasks())
         # Original + 1 continuation = 2 total
         self.assertEqual(

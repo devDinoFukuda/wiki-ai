@@ -421,9 +421,23 @@ def collect_results(
     `objective_id -> hash`: resultado que descreve OUTRA versão das entradas
     descreve outro código, e reintegrá-lo grava conhecimento vencido.
 
-    `latest_only` mantém apenas a tarefa mais recente por `objective_id`:
-    `create_task` nunca ATUALIZA linha existente — código mudado gera tarefa
-    NOVA — e integrar as duas gravaria a versão velha por cima da nova.
+    `latest_only` mantém apenas a tarefa mais recente por `objective_id`.
+    ATENÇÃO (§7.1): isso NÃO é mais a fonte de verdade da integração. Manter só
+    o mais recente descartava a rodada A quando a rodada B chegava — o contrato
+    apurado por A desaparecia se B não o repetisse, que é exatamente o
+    "reconstruir progresso a partir da última tarefa" que o §7.1 proíbe.
+    `integrate()` passou a coletar com `latest_only=False` e a DOBRAR a cadeia
+    de resultados por objetivo (`results_by_objective`), aplicando cada um como
+    delta sobre o estado acumulado. O parâmetro continua existindo, com o mesmo
+    default, para quem usa esta função para INSPEÇÃO ("qual foi o último
+    resultado deste objetivo?"), que é um uso legítimo e diferente.
+
+    A preocupação original de `latest_only` (código mudado gera tarefa NOVA, e
+    integrar as duas gravaria a versão velha por cima) continua tratada, e por
+    um filtro mais preciso: `expected_input_versions_hash` e a conferência de
+    `source_version_ids` contra o snapshot descartam o que descreve OUTRA
+    revisão de entrada. Resultados da MESMA revisão são rodadas da mesma
+    cadeia — e devem somar, não competir.
     """
     wanted = {str(o) for o in objective_ids} if objective_ids is not None else None
     accepted: list[AcceptedResult] = []
@@ -496,6 +510,24 @@ def collect_results(
 # --------------------------------------------------------------------------
 # Resultado -> claims
 # --------------------------------------------------------------------------
+
+
+def results_by_objective(
+    results: Sequence[AcceptedResult],
+) -> dict[str, list[AcceptedResult]]:
+    """Resultados agrupados por objetivo, em ordem CRONOLÓGICA da cadeia.
+
+    A ordem é `(created_at, task_id)`: é ela que define o que é "A depois B".
+    O delta seguinte sempre se aplica sobre o anterior, e não o contrário —
+    sem ordem estável, o contrato consolidado dependeria da ordem de varredura
+    do SQLite.
+    """
+    grouped: dict[str, list[AcceptedResult]] = {}
+    for item in results:
+        grouped.setdefault(item.objective_id, []).append(item)
+    for chain in grouped.values():
+        chain.sort(key=lambda r: (r.created_at, r.task_id))
+    return grouped
 
 
 def _hash(text: str) -> str:
@@ -1660,10 +1692,60 @@ def _satisfy_readings(
     return fechadas
 
 
+def _seed_with_accumulated(
+    objective: InvestigationObjective, accumulated: Mapping[str, Any] | None
+) -> InvestigationObjective:
+    """Objetivo do índice + contrato JÁ APURADO em rodadas anteriores (§7.1).
+
+    Sem isto, cada integração partia do objetivo PRISTINO do plano: o campo que
+    a rodada A preencheu voltava a `pending` na rodada B, e o worker de B
+    recebia um contrato vazio — o §7.2 exige o contrário ("enviar o contrato
+    acumulado COM conteúdo").
+
+    `accumulated` é o `contract` do `runtime.state.ConsolidatedState` (nome do
+    campo -> `{content, evidence_refs, status, impacto}`). Conteúdo vazio nunca
+    sobrescreve conteúdo apurado; campo desconhecido do contrato é ignorado
+    (este módulo não inventa campo de contrato a partir de estado externo).
+    """
+    contract = dict((accumulated or {}).get("contract") or accumulated or {})
+    if not contract:
+        return objective
+    data = objective.to_dict()
+    campos = dict(data.get("contract") or {})
+    mudou = False
+    for name in CONTRACT_FIELDS:
+        incoming = contract.get(name)
+        if not isinstance(incoming, Mapping):
+            continue
+        conteudo = str(incoming.get("content") or "").strip()
+        if not conteudo:
+            continue
+        atual = dict(campos.get(name) or {"name": name, "label": CONTRACT_LABELS.get(name, "")})
+        if str(atual.get("content") or "").strip():
+            continue  # o índice já traz conteúdo: não sobrescrever
+        atual["name"] = name
+        atual.setdefault("label", CONTRACT_LABELS.get(name, ""))
+        atual["content"] = conteudo
+        atual["status"] = str(incoming.get("status") or ContractFieldStatus.FILLED.value)
+        refs = [d for d in (_as_evidence_ref_dict(r) for r in _evidence_dicts(incoming)) if d]
+        if refs:
+            atual["evidence_refs"] = refs
+        campos[name] = atual
+        mudou = True
+    if not mudou:
+        return objective
+    data["contract"] = campos
+    try:
+        return InvestigationObjective.from_dict(data)
+    except Exception:
+        return objective
+
+
 def _objective_after_result(
     objective: InvestigationObjective,
     output: Mapping[str, Any],
     snapshot: Snapshot | None = None,
+    accumulated: Mapping[str, Any] | None = None,
 ) -> tuple[InvestigationObjective, list[dict[str, Any]]]:
     """Objetivo do PLANO + o que o resultado preencheu, sem promoção indevida.
 
@@ -1676,6 +1758,7 @@ def _objective_after_result(
     fecha obrigação de leitura — e só quando a evidência resolve no snapshot.
     Devolve também o registro do que foi (e do que não foi) fechado.
     """
+    objective = _seed_with_accumulated(objective, accumulated)
     data = objective.to_dict()
     contract = {name: _merged_field(objective, output, name).to_dict() for name in CONTRACT_FIELDS}
     data["contract"] = contract
@@ -1693,6 +1776,31 @@ def _objective_after_result(
         return InvestigationObjective.from_dict(data), leituras
     except Exception:
         return objective, leituras
+
+
+def _objective_after_results(
+    objective: InvestigationObjective,
+    results: Sequence[AcceptedResult],
+    snapshot: Snapshot | None = None,
+    accumulated: Mapping[str, Any] | None = None,
+) -> tuple[InvestigationObjective, list[dict[str, Any]]]:
+    """Dobra a cadeia de resultados sobre o objetivo — A, depois B, resulta A+B.
+
+    Cada resultado é um DELTA sobre o objetivo que saiu do anterior (e não
+    sobre o objetivo pristino do plano). Consequência direta e testável (T06):
+    a rodada A fecha o campo `regra` e a rodada B fecha `impacto`; o objetivo
+    integrado tem os DOIS, e a obrigação de leitura fechada por A continua
+    fechada mesmo que B não a mencione — `_satisfy_readings` só marca
+    `satisfied=True`, nunca `False`.
+    """
+    leituras: list[dict[str, Any]] = []
+    atual = _seed_with_accumulated(objective, accumulated)
+    for result in results:
+        atual, fechadas = _objective_after_result(atual, result.output, snapshot)
+        leituras.extend(fechadas)
+    if not results:
+        atual, leituras = _objective_after_result(atual, {}, snapshot)
+    return atual, leituras
 
 
 def _lacunas_of(
@@ -1816,6 +1924,18 @@ class ObjectiveOutcome:
     task_id: str = ""
     execution_id: str | None = None
     integration_key: str = ""
+    #: Contrato CONSOLIDADO depois desta integração (nome do campo ->
+    #: `{content, status, evidence_refs, ...}`). É o "contrato acumulado com
+    #: conteúdo" que o §7.2 manda enviar ao worker da rodada seguinte — e é
+    #: também o delta que `runtime.state.apply_result` aplica sobre o estado.
+    #: Sem ele, quem monta a continuação teria de reabrir o índice do plano e
+    #: perderia justamente o que as rodadas anteriores apuraram.
+    contract_state: dict[str, Any] = field(default_factory=dict)
+    #: Obrigações de leitura AINDA ABERTAS, com alvo concreto — o formato que
+    #: `coordinator.plan_continuations` e `runtime.state` consomem.
+    reading_needs: list[dict[str, Any]] = field(default_factory=list)
+    #: `task_id` de TODAS as rodadas da cadeia que esta integração dobrou.
+    chain_task_ids: list[str] = field(default_factory=list)
 
     def _count(self, status: EpistemicStatus) -> int:
         return sum(1 for f in self.fatos if f.epistemic == status.value)
@@ -1843,6 +1963,9 @@ class ObjectiveOutcome:
             "bloqueios": list(self.bloqueios),
             "rejeitados": list(self.rejeitados),
             "leituras_satisfeitas": list(self.leituras_satisfeitas),
+            "contract_state": dict(self.contract_state),
+            "reading_needs": list(self.reading_needs),
+            "chain_task_ids": list(self.chain_task_ids),
             "fatos": [f.to_dict() for f in self.fatos],
         }
 
@@ -2009,6 +2132,7 @@ def integrate(
     results: Sequence[AcceptedResult] | None = None,
     objective_ids: Sequence[str] | None = None,
     expected_input_versions_hash: str | Mapping[str, str] | None = None,
+    accumulated_state: Mapping[str, Any] | None = None,
     reason: str = "integração de resultados de investigação",
     create_missing_capability: bool = True,
 ) -> IntegrationReport:
@@ -2053,7 +2177,12 @@ def integrate(
     # Coleta SEM filtro e descarta aqui: o filtro dentro de `collect_results`
     # deixaria o descarte invisível, e "não integrei o resultado do outro
     # repositório" é informação, não silêncio (achado nº5).
-    collected = list(results) if results is not None else collect_results(task_store)
+    # `latest_only=False` (§7.1): a cadeia INTEIRA de rodadas do objetivo, não
+    # só a última tarefa. Manter só a última era descartar o que a rodada
+    # anterior já tinha apurado.
+    collected = (
+        list(results) if results is not None else collect_results(task_store, latest_only=False)
+    )
     accepted: list[AcceptedResult] = []
     for result in collected:
         motivo = _out_of_scope_reason(result, scope, versions, expected_input_versions_hash)
@@ -2080,12 +2209,26 @@ def integrate(
 
     prepared: list[dict[str, Any]] = []
     all_verdicts: list[Verdict] = []
-    for result in accepted:
-        base = index.get(result.objective_id)
+    estado = dict(accumulated_state or {})
+    for objective_id, chain in sorted(results_by_objective(accepted).items()):
+        # O ÚLTIMO resultado da cadeia é quem assina a gravação (proveniência,
+        # task_id, execution_id): é a rodada corrente. O CONTEÚDO, porém, vem
+        # da cadeia inteira dobrada sobre o estado acumulado.
+        result = chain[-1]
+        base = index.get(objective_id)
         if base is None:
-            base = _objective_of(result.objective_payload or None, result.output, result.objective_id)
-        objective, leituras = _objective_after_result(base, result.output, snapshot)
-        claims = results_to_claims(result, objective)
+            base = _objective_of(result.objective_payload or None, result.output, objective_id)
+        objective, leituras = _objective_after_results(
+            base, chain, snapshot, estado.get(objective_id)
+        )
+        claims: list[Claim] = []
+        vistos: set[str] = set()
+        for rodada in chain:
+            for claim in results_to_claims(rodada, objective):
+                if claim.claim_id in vistos:
+                    continue
+                vistos.add(claim.claim_id)
+                claims.append(claim)
         verdicts = [verify_claim(c, snapshot, extraction) for c in claims]
         inconsistencies: list[Inconsistency] = check_consistency(claims, verdicts)
         verdicts = apply_inconsistencies(verdicts, inconsistencies)
@@ -2109,6 +2252,7 @@ def integrate(
         prepared.append(
             {
                 "result": result,
+                "chain": chain,
                 "objective": objective,
                 "claims": by_id,
                 "ordered_claims": claims,
@@ -2139,6 +2283,7 @@ def integrate(
                     create_missing_capability=create_missing_capability,
                     escopos=item["escopos"],
                     leituras=item["leituras"],
+                    chain=item.get("chain") or (),
                 )
             )
         report.revisao = rev.revision_id
@@ -2473,6 +2618,40 @@ def _verifies_relation(
     )
 
 
+def _contract_state_dict(objective: InvestigationObjective) -> dict[str, Any]:
+    """Contrato consolidado em forma serializável — só campos COM conteúdo.
+
+    Campo vazio não viaja: o §7.2 pede o contrato acumulado *com conteúdo*, e
+    mandar `{"regra": {"content": ""}}` é o mesmo "lista de IDs sem conteúdo"
+    que ele proíbe, só que com mais bytes.
+    """
+    out: dict[str, Any] = {}
+    for name in CONTRACT_FIELDS:
+        campo = objective.contract.get(name)
+        if campo is None:
+            continue
+        data = campo.to_dict()
+        if not str(data.get("content") or "").strip():
+            continue
+        out[name] = data
+    return out
+
+
+def _open_needs_dicts(objective: InvestigationObjective) -> list[dict[str, Any]]:
+    """Obrigações de leitura ainda abertas, com `target` resolvível.
+
+    Sem `target` a obrigação não é despachável (`plan_continuations` a recusa),
+    então mandá-la aqui só inflaria o relatório sem criar trabalho possível.
+    """
+    out: list[dict[str, Any]] = []
+    for need in objective.open_needs():
+        data = need.to_dict() if hasattr(need, "to_dict") else dict(need)
+        if not str(data.get("target") or "").strip():
+            continue
+        out.append(data)
+    return out
+
+
 def _write_objective(
     *,
     rev: Any,
@@ -2488,6 +2667,7 @@ def _write_objective(
     create_missing_capability: bool,
     escopos: Mapping[str, str] | None = None,
     leituras: Sequence[Mapping[str, Any]] = (),
+    chain: Sequence[AcceptedResult] = (),
 ) -> ObjectiveOutcome:
     """Grava os fatos de UM objetivo e recalcula seu estado (§6.6)."""
     state = objective.evaluate()
@@ -2503,6 +2683,9 @@ def _write_objective(
         task_id=result.task_id,
         execution_id=result.execution_id,
         integration_key=result.integration_key,
+        contract_state=_contract_state_dict(objective),
+        reading_needs=_open_needs_dicts(objective),
+        chain_task_ids=[r.task_id for r in chain] or [result.task_id],
     )
 
     capability_subject = _capability_subject(

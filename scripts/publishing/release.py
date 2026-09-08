@@ -321,6 +321,38 @@ class ReleaseResult:
     out_root: str
     manifest: Optional[Manifest]
     blocked_by: list = field(default_factory=list)
+    #: §10.3/S-remediação: "nada a publicar" (plano SEM NENHUM documento —
+    #: `plan.documents` vazio, nenhuma falha de renderização/validação)
+    #: NUNCA é um bloqueio real. `ok=True` aqui, `blocked_by` vazio,
+    #: `manifest` é o manifesto ATIVO preservado tal-e-qual (nada foi
+    #: promovido, nada foi tocado) — só este campo aditivo diferencia o
+    #: cenário de uma publicação que de fato promoveu 0 mudanças. Quem
+    #: chama decide como reportar isso (nunca como `bloqueios`/erro).
+    #:
+    #: DISTINTO de `skipped_all` (abaixo): `nothing_to_publish` só é
+    #: verdadeiro quando o PLANO em si não trouxe nenhum documento —
+    #: nunca quando havia documentos e todos foram pulados por falta de
+    #: unidades (`unit_ids` vazio), caso coberto por `skipped_all`.
+    nothing_to_publish: bool = False
+    #: Achado (baixa) §10.6/_render_all: documentos do plano com
+    #: `unit_ids` vazio eram pulados (`continue`) sem deixar rastro —
+    #: indistinguível de um plano legitimamente vazio quando TODOS os
+    #: documentos caíam nesse caso. `skipped` registra cada documento
+    #: pulado por esse motivo: `{"doc_id": str, "reason": str}`. Sempre
+    #: preenchido quando há pulos, INDEPENDENTE de `ok`/`blocked_by`
+    #: (inclusive quando a publicação falhou por outro motivo — os pulos
+    #: continuam informativos).
+    skipped: tuple = ()
+    #: `True` quando o plano TINHA documentos (`skipped` não-vazio) mas
+    #: NENHUM produziu `entries` publicáveis — todos caíram em `skipped`
+    #: e não houve nenhum `blocked_by`. Diferente de `nothing_to_publish`
+    #: (plano sem documento nenhum): aqui havia trabalho a fazer e ele foi
+    #: todo descartado por falta de unidades, o que NÃO pode virar sucesso
+    #: silencioso — `ok=True` continua (nada foi promovido, nada quebrou),
+    #: mas `skipped_all=True` é o sinal explícito para o chamador tratar
+    #: como publicação PARCIAL (CLI: `partial` + `pending` tipado), nunca
+    #: como "nada a publicar" comum.
+    skipped_all: bool = False
 
 
 PublicationResult = ReleaseResult
@@ -556,19 +588,24 @@ def _render_all(
     previous_manifest: Optional[Manifest],
 ):
     """Renderiza markdown/ e word/ de TODAS as unidades publicáveis do plano
-    dentro do staging. Retorna (entries, blockers) — `entries` só é
+    dentro do staging. Retorna (entries, blockers, skipped) — `entries` só é
     confiável quando `blockers` está vazio (senão pode estar parcial: o
-    chamador NUNCA promove um staging parcial, então isso é inofensivo)."""
+    chamador NUNCA promove um staging parcial, então isso é inofensivo).
+    `skipped` registra, com `doc_id`/motivo, todo documento pulado por não
+    ter nenhuma unidade (`unit_ids` vazio) — nunca descartado em silêncio
+    (achado baixa §10.6): `publish_revision` usa essa lista para distinguir
+    `skipped_all` de `nothing_to_publish`."""
     blockers: list = []
+    skipped: list = []
 
     try:
         md_manifest = dict(renderers.markdown.render_manifest(plan) or {})
     except Exception as exc:  # noqa: BLE001 - falha de um vizinho vira bloqueio, não crash
-        return {}, [f"markdown.render_manifest falhou: {exc!r}"]
+        return {}, [f"markdown.render_manifest falhou: {exc!r}"], []
     try:
         word_manifest = dict(renderers.word.render_manifest_word(plan) or {})
     except Exception as exc:  # noqa: BLE001
-        return {}, [f"word.render_manifest_word falhou: {exc!r}"]
+        return {}, [f"word.render_manifest_word falhou: {exc!r}"], []
 
     documents = list(_pick(plan, "documents", default=None) or [])
     entries: dict = {}
@@ -577,6 +614,7 @@ def _render_all(
         doc_id = str(_pick(document, "document_id", "id", default="") or "")
         unit_ids = _unit_ids_of(document)
         if not unit_ids:
+            skipped.append({"doc_id": doc_id, "reason": "documento sem unidades (unit_ids vazio)"})
             continue
 
         # §10.5 — equivalência markdown/word e bloqueio (F08/D14) checados
@@ -644,7 +682,7 @@ def _render_all(
                 content_hash=doc_hash,
             )
 
-    return entries, blockers
+    return entries, blockers, skipped
 
 
 def _coerce_report(result: Any, name: str) -> Report:
@@ -754,7 +792,7 @@ def publish_revision(
 
     staging_root = _staging_dir_for(out_root)
     try:
-        entries, blockers = _render_all(plan, staging_root, renderers, previous_manifest)
+        entries, blockers, skipped = _render_all(plan, staging_root, renderers, previous_manifest)
         if blockers:
             return ReleaseResult(
                 ok=False,
@@ -762,14 +800,38 @@ def publish_revision(
                 out_root=out_root,
                 manifest=previous_manifest,
                 blocked_by=blockers,
+                skipped=tuple(skipped),
             )
         if not entries:
+            if skipped:
+                # Achado (baixa) §10.6: plano TINHA documentos, mas TODOS
+                # foram pulados por falta de unidades (`unit_ids` vazio) —
+                # distinto de `nothing_to_publish` (plano sem documento
+                # nenhum). Nada é promovido, o manifesto ATIVO continua
+                # exatamente como estava; `skipped_all=True` é o sinal
+                # explícito para o chamador NÃO tratar isso como sucesso
+                # silencioso equivalente a "plano vazio".
+                return ReleaseResult(
+                    ok=True,
+                    revision_id=revision_id,
+                    out_root=out_root,
+                    manifest=previous_manifest,
+                    skipped=tuple(skipped),
+                    skipped_all=True,
+                )
+            # S-remediação/§10.3: plano SEM NENHUM documento (nenhuma falha
+            # de renderização/validação — `blockers` já teria retornado
+            # acima, e nenhum documento foi pulado — `skipped` também
+            # vazio) — "nada a publicar" nunca é bloqueio real. Nada é
+            # promovido, o manifesto ATIVO (`previous_manifest`) continua
+            # exatamente como estava; só `nothing_to_publish` diferencia
+            # este caminho de uma publicação bloqueada de fato.
             return ReleaseResult(
-                ok=False,
+                ok=True,
                 revision_id=revision_id,
                 out_root=out_root,
                 manifest=previous_manifest,
-                blocked_by=["plano não produziu nenhum documento publicável"],
+                nothing_to_publish=True,
             )
 
         reports = _run_validators(validators, plan, staging_root)
@@ -783,6 +845,7 @@ def publish_revision(
                 out_root=out_root,
                 manifest=previous_manifest,
                 blocked_by=failing_blockers,
+                skipped=tuple(skipped),
             )
 
         # Tudo ok => promoção atômica (§10.6: só agora, nunca antes).
@@ -812,7 +875,10 @@ def publish_revision(
         )
         _write_manifest_atomic(os.path.join(out_root, MANIFEST_FILENAME), manifest)
 
-        return ReleaseResult(ok=True, revision_id=revision_id, out_root=out_root, manifest=manifest)
+        return ReleaseResult(
+            ok=True, revision_id=revision_id, out_root=out_root, manifest=manifest,
+            skipped=tuple(skipped),
+        )
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
 

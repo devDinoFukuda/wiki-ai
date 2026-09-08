@@ -1,26 +1,30 @@
 """Onda10-D — fiação final da 2ª remediação de auditoria em `wk/cli.py`.
 
-Três costuras, e só o que é da COSTURA está aqui (a regra em si mora nos
+Duas costuras, e só o que é da COSTURA está aqui (a regra em si mora nos
 vizinhos, que esta onda não edita):
 
 * achado nº5 — escopo na integração: `objectives` correntes + o
   `expected_input_versions_hash` do snapshot corrente, e o descarte VISÍVEL do
   que ficou de fora (`integracao.descartados` / `integracao.rejeitados`);
-* achado nº3 — laço de continuação BOUNDED: uma rodada por invocação,
-  `input_versions` por escopo de objetivo, teto de rodadas respeitado, e a
-  tarefa de continuação executável pela engine `local`;
-* achado nº4 — `wk ingest` leva a sério `CorrelationResult.completa`.
+* achado nº3 — leituras satisfeitas/pendentes (o dado que `wk status` mostra).
 
 O que NÃO é reproduzido aqui: o ponta a ponta com `knowledge.integrate` e os
 renderizadores reais (mesma razão de `test_fix_r6`: falharia por mudança do
 vizinho, não por regressão desta fiação). A validação ponta a ponta foi feita
 fora do teste, com dois mini-repos num store único.
+
+A 3ª costura original (nº3 — laço de continuação BOUNDED por invocação,
+`_plan_continuation_round`/`_continuation_cycle`/`_unmet_needs_of`/
+`_proximo_passo_continuacao`/`_dispatch_disponivel`/`_EMPTY_CONTINUACAO`) foi
+REMOVIDA de `cli.py` numa limpeza de código morto posterior: o laço inteiro
+de continuação passou a rodar em `_run_investigation_chain` (§7.3, UMA
+chamada por invocação até conclusão ou motivo material de parada) — ver a
+tabela de destino teste-a-teste no lugar onde esses testes viviam (git log
+deste arquivo) e a suíte que os substitui, `scripts/wk/tests/
+test_run_chain_cli.py`.
 """
 
 from __future__ import annotations
-
-import os
-import tempfile
 
 from wk import cli
 
@@ -187,186 +191,39 @@ def test_leituras_de_relatorio_vazio_nao_explode():
 
 
 # --------------------------------------------------------------------------
-# nº3 — unmet_needs: o que vira (e o que não vira) tarefa de continuação
+# nº3 — unmet_needs / continuação por rodada: MECÂNICA ANTIGA REMOVIDA
+#
+# `_unmet_needs_of`/`_plan_continuation_round`/`_continuation_cycle`/
+# `_proximo_passo_continuacao`/`_dispatch_disponivel`/`_EMPTY_CONTINUACAO`
+# foram removidos de `cli.py` nesta limpeza de código morto: sem chamador de
+# produção desde que o laço de continuação inteiro (despacho -> integra ->
+# planeja -> repete) passou a rodar em `_run_investigation_chain`, UMA
+# chamada por invocação de `analyze`/`update`/`resume`, até conclusão ou
+# motivo material de parada (§7.3) — nunca mais uma rodada por invocação
+# desta CLI orquestrando `_plan_continuation_round` manualmente.
+#
+# Onde a MESMA garantia comportamental sobrevive, testada contra o alvo novo:
+#
+# | comportamento                                    | teste antigo (aqui, removido)                          | teste novo                                                                 |
+# |---------------------------------------------------|---------------------------------------------------------|-----------------------------------------------------------------------------|
+# | leituras abertas viram pedido de continuação       | test_unmet_needs_traz_leituras_abertas_com_alvo          | `knowledge.integrate` publica `reading_needs` nativamente no outcome; `_run_investigation_chain` espelha (ver `_outcomes_fn_for` em cli.py) — T06 (test_run_chain_cli.py) exercita ponta a ponta |
+# | leitura fechada sai da lista de pendências         | test_unmet_needs_desconta_o_que_a_integracao_fechou      | T06MultiRoundaTest (test_run_chain_cli.py): 2ª rodada não repete a 1ª leitura já satisfeita |
+# | objetivo sem alvo concreto não gera continuação    | test_unmet_needs_de_objetivo_sem_leitura_aberta_e_vazio  | NoProgressTest (test_run_chain_cli.py): sem alvo novo -> `stop_reason=no_progress`, nenhuma 2ª continuação |
+# | teto de rodadas respeitado, recusa com motivo      | test_plan_continuation_round_cria_uma_rodada_e_respeita_o_teto | MaxRoundsTest (test_run_chain_cli.py): `budget_exhausted`/`rounds_used` através de invocações |
+# | reaplicar não duplica tarefa                       | test_plan_continuation_round_reaplicado_nao_duplica      | NoProgressTest (test_run_chain_cli.py): "pacote idêntico não pode gerar 3ª tarefa" |
+# | objetivo `complete` não gera continuação           | test_objetivo_complete_nao_gera_continuacao              | `runtime.coordinator.run_chain`/`STOP_COMPLETED` — coberto em `runtime/tests/test_run_chain.py` (dono é `runtime`, não `cli.py`) |
+# | objetivo de outro repo é excluído do escopo        | test_objetivo_fora_do_plano_corrente_e_recusado_com_motivo | ESTRUTURAL agora: `_run_investigation_chain` chama `run_chain(objective_ids=[oid])` POR objetivo — um objetivo de outro escopo nunca entra no laço para começo de conversa (não precisa mais recusa explícita em tempo de planejamento) |
+# | bloqueio de despacho reconhecido (tipo)            | test_dispatch_disponivel_le_o_bloqueio_ja_emitido        | ExecutorUnavailableTest (test_run_chain_cli.py) exercita o mesmo vocabulário de bloqueio via `_connect_chain_binding` |
+# | próximo passo orienta `wk resume`/reconectar        | test_proximo_passo_orienta_*                             | `_chain_next_action`/`_chain_envelope` (cli.py) — ExecutorUnavailableTest.test_next_action_de_executor_indisponivel_e_concreto (test_run_chain_cli.py) |
+#
+# `_round_relatado_e_o_criado_agora_nao_o_historico` não tem equivalente: o
+# par `round`/`round_historico` era um conceito EXCLUSIVO do desenho antigo
+# (uma tarefa de continuação por invocação); o `chain_status`
+# (`rounds_used`/`max_rounds`/`stop_reason`) que o substitui é persistido
+# pelo PRÓPRIO `runtime.coordinator`/`runtime.tasks` (`TaskStore.
+# chain_status`), já coberto pelos testes de `runtime/tests/` e por
+# MaxRoundsTest aqui.
 # --------------------------------------------------------------------------
-
-
-def _objetivo_com_needs():
-    from analysis.investigation import (
-        ContractField,
-        CONTRACT_FIELDS,
-        CONTRACT_LABELS,
-        InvestigationObjective,
-        ObjectiveKind,
-        ReadingKind,
-        ReadingNeed,
-        ReadingTrigger,
-    )
-
-    return InvestigationObjective(
-        objective_id="obj_1",
-        kind=ObjectiveKind.CAPABILITY,
-        capability_id="cap1",
-        name="capacidade 1",
-        contract={n: ContractField(name=n, label=CONTRACT_LABELS[n]) for n in CONTRACT_FIELDS},
-        reading_needs=[
-            ReadingNeed(
-                need_id="n1", kind=ReadingKind.SYMBOL, target="app/a.py::f",
-                motivo="símbolo alcançado pela entrada", trigger=ReadingTrigger.UNRESOLVED_CALL,
-            ),
-            ReadingNeed(
-                need_id="n2", kind=ReadingKind.SYMBOL, target="app/b.py::g",
-                motivo="dependência declarada", trigger=ReadingTrigger.UNRESOLVED_CALL,
-            ),
-        ],
-    )
-
-
-def test_unmet_needs_traz_leituras_abertas_com_alvo():
-    needs = cli._unmet_needs_of(_objetivo_com_needs(), {})
-    assert [n["target"] for n in needs] == ["app/a.py::f", "app/b.py::g"]
-    assert all(n["motivo"] for n in needs)  # `plan_continuations` exige motivo rastreável
-
-
-def test_unmet_needs_desconta_o_que_a_integracao_fechou():
-    """Leitura fechada COM evidência resolvida sai da lista; a declarada e não
-    resolvida continua nela (senão a continuação nunca seria criada para ela)."""
-    outcome = {
-        "leituras_satisfeitas": [
-            {"need_id": "n1", "target": "app/a.py::f", "satisfeita": True},
-            {"need_id": "n2", "target": "app/b.py::g", "satisfeita": False, "motivo": "sem evidência"},
-        ]
-    }
-    needs = cli._unmet_needs_of(_objetivo_com_needs(), outcome)
-    assert [n["need_id"] for n in needs] == ["n2"]
-
-
-def test_unmet_needs_de_objetivo_sem_leitura_aberta_e_vazio():
-    """Sem alvo concreto não há o que investigar de novo — `plan_continuations`
-    recusa, e recusar é melhor que criar tarefa que repetiria o mesmo impasse."""
-    objetivo = _objetivo_com_needs()
-    for need in objetivo.reading_needs:
-        need.waive("fronteira explícita do escopo")
-    assert cli._unmet_needs_of(objetivo, {}) == []
-
-
-# --------------------------------------------------------------------------
-# nº3 — o laço é BOUNDED: uma rodada por invocação, teto respeitado
-# --------------------------------------------------------------------------
-
-
-def _store_com_tarefa(tmpdir: str, objective: dict, inputs: dict):
-    from runtime import tasks as rt_tasks
-
-    store = rt_tasks.TaskStore.open(os.path.join(tmpdir, "runtime.db"))
-    task = store.create_task(rt_tasks.TaskKind.INVESTIGATION, objective, inputs)
-    return store, task
-
-
-def test_plan_continuation_round_cria_uma_rodada_e_respeita_o_teto():
-    """Rodada N+1 a cada invocação; passado o teto, RECUSA com motivo — nunca
-    exceção, nunca laço."""
-    from runtime import tasks as rt_tasks
-
-    objetivo = _objetivo_com_needs()
-    inputs = {"snapshot_id": "scope:x", "source_version_ids": ["app/a.py@sha"]}
-    tmpdir = tempfile.mkdtemp()
-    try:
-        store, task = _store_com_tarefa(tmpdir, objetivo.to_dict(), inputs)
-        try:
-            rt_tasks.set_max_continuation_rounds(store, 2)
-            report = {"objetivos": [{"objective_id": "obj_1", "task_id": task.task_id, "state": "partial"}]}
-            objetivos_by_id = {"obj_1": objetivo}
-            inputs_by_objective = {"obj_1": inputs}
-
-            r1 = cli._plan_continuation_round(store, report, objetivos_by_id, inputs_by_objective)
-            assert len(r1["criadas"]) == 1 and r1["round"] == 1 and r1["max_rounds"] == 2
-
-            # a rodada seguinte parte da tarefa de continuação recém-criada
-            filha = r1["criadas"][0]
-            report2 = {"objetivos": [{"objective_id": "obj_1", "task_id": filha, "state": "partial"}]}
-            r2 = cli._plan_continuation_round(store, report2, objetivos_by_id, inputs_by_objective)
-            assert len(r2["criadas"]) == 1 and r2["round"] == 2
-
-            neta = r2["criadas"][0]
-            report3 = {"objetivos": [{"objective_id": "obj_1", "task_id": neta, "state": "partial"}]}
-            r3 = cli._plan_continuation_round(store, report3, objetivos_by_id, inputs_by_objective)
-            assert r3["criadas"] == []
-            assert "excede o máximo de 2" in r3["recusadas"][0]["motivo"]
-        finally:
-            store.close()
-    finally:
-        import shutil
-
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_plan_continuation_round_reaplicado_nao_duplica():
-    """Mesmo outcome, mesma tarefa-mãe -> mesma rodada -> `create_task` devolve
-    a tarefa que já existe (§7.2). É por isso que reexecutar o comando não
-    multiplica trabalho."""
-    objetivo = _objetivo_com_needs()
-    inputs = {"snapshot_id": "scope:x", "source_version_ids": []}
-    tmpdir = tempfile.mkdtemp()
-    try:
-        store, task = _store_com_tarefa(tmpdir, objetivo.to_dict(), inputs)
-        try:
-            report = {"objetivos": [{"objective_id": "obj_1", "task_id": task.task_id, "state": "partial"}]}
-            args = (store, report, {"obj_1": objetivo}, {"obj_1": inputs})
-            primeira = cli._plan_continuation_round(*args)
-            segunda = cli._plan_continuation_round(*args)
-            assert primeira["criadas"] == segunda["criadas"]
-        finally:
-            store.close()
-    finally:
-        import shutil
-
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_round_relatado_e_o_criado_agora_nao_o_historico():
-    """Depois de um `wk update`, as ENTRADAS mudaram: a tarefa-mãe é nova e a
-    cadeia de continuação recomeça em 1, mesmo que o objetivo já tenha chegado
-    à rodada 2 sobre a versão anterior do código. `round` diz o que foi criado
-    agora (quanto ainda cabe até o teto); `round_historico`, o maior já visto.
-    """
-    objetivo = _objetivo_com_needs()
-    tmpdir = tempfile.mkdtemp()
-    try:
-        inputs_v1 = {"snapshot_id": "scope:v1", "source_version_ids": ["app/a.py@sha1"]}
-        store, mae_v1 = _store_com_tarefa(tmpdir, objetivo.to_dict(), inputs_v1)
-        try:
-            r1 = cli._plan_continuation_round(
-                store,
-                {"objetivos": [{"objective_id": "obj_1", "task_id": mae_v1.task_id, "state": "partial"}]},
-                {"obj_1": objetivo}, {"obj_1": inputs_v1},
-            )
-            r2 = cli._plan_continuation_round(
-                store,
-                {"objetivos": [{"objective_id": "obj_1", "task_id": r1["criadas"][0], "state": "partial"}]},
-                {"obj_1": objetivo}, {"obj_1": inputs_v1},
-            )
-            assert r2["round"] == 2
-
-            # código mudou: tarefa-mãe NOVA, cadeia recomeça
-            inputs_v2 = {"snapshot_id": "scope:v2", "source_version_ids": ["app/a.py@sha2"]}
-            mae_v2 = store.create_task(
-                mae_v1.kind, objetivo.to_dict(), inputs_v2
-            )
-            store.refresh_states()
-            novo = cli._plan_continuation_round(
-                store,
-                {"objetivos": [{"objective_id": "obj_1", "task_id": mae_v2.task_id, "state": "partial"}]},
-                {"obj_1": objetivo}, {"obj_1": inputs_v2},
-            )
-            assert novo["round"] == 1
-            assert novo["round_historico"] == 2
-        finally:
-            store.close()
-    finally:
-        import shutil
-
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_reading_satisfied_do_worker_e_dado_aceito_pelo_schema_fechado():
@@ -391,86 +248,3 @@ def test_reading_satisfied_do_worker_e_dado_aceito_pelo_schema_fechado():
         ],
     }
     assert DEFAULT_SCHEMA.validate(saida) == []
-
-
-def test_objetivo_complete_nao_gera_continuacao():
-    objetivo = _objetivo_com_needs()
-    inputs = {"snapshot_id": "scope:x", "source_version_ids": []}
-    tmpdir = tempfile.mkdtemp()
-    try:
-        store, task = _store_com_tarefa(tmpdir, objetivo.to_dict(), inputs)
-        try:
-            report = {"objetivos": [{"objective_id": "obj_1", "task_id": task.task_id, "state": "complete"}]}
-            plano = cli._plan_continuation_round(store, report, {"obj_1": objetivo}, {"obj_1": inputs})
-            assert plano["criadas"] == [] and plano["recusadas"] == []
-        finally:
-            store.close()
-    finally:
-        import shutil
-
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_objetivo_fora_do_plano_corrente_e_recusado_com_motivo():
-    """Objetivo do repositório vizinho no mesmo `runtime.db` não ganha
-    continuação neste comando (achado nº5 aplicado ao laço do nº3)."""
-    objetivo = _objetivo_com_needs()
-    inputs = {"snapshot_id": "scope:x", "source_version_ids": []}
-    tmpdir = tempfile.mkdtemp()
-    try:
-        store, task = _store_com_tarefa(tmpdir, objetivo.to_dict(), inputs)
-        try:
-            report = {"objetivos": [{"objective_id": "obj_de_outro_repo", "task_id": task.task_id, "state": "partial"}]}
-            plano = cli._plan_continuation_round(store, report, {"obj_1": objetivo}, {"obj_1": inputs})
-            assert plano["criadas"] == []
-            assert "não pertence ao plano corrente" in plano["recusadas"][0]["motivo"]
-        finally:
-            store.close()
-    finally:
-        import shutil
-
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# --------------------------------------------------------------------------
-# nº3 — a tarefa de continuação PRECISA ser executável pela engine local
-#
-# SUPERSEDIDO pela Onda11-T2b (achado BLOQUEANTE #2/3ª auditoria): a engine
-# `local` deixou de "executar" tarefas de continuação sem ler nada — agora
-# ela nunca CHEGA a receber uma, porque `_plan_continuation_round` passa
-# `engine_capabilities=executor.capabilities()` a
-# `coordinator.plan_continuations`, que recusa CRIAR a tarefa quando
-# `capabilities()["deepening"]` é `False` (o caso de `local`). Os três testes
-# que viviam aqui (`test_engine_local_despacha_objetivo_de_continuacao`,
-# `test_worker_local_de_continuacao_nao_fecha_leitura_nem_regride_contrato`,
-# `test_resultado_do_worker_de_continuacao_passa_no_schema_fechado`)
-# exercitavam `_local_continuation_worker`/`_LocalEngineEnvelope`, removidos
-# em `cli.py` (ver comentário acima de `_build_executor`) — os testes que
-# cobrem o comportamento novo estão em `test_fix_onda11_t2b.py`.
-# --------------------------------------------------------------------------
-
-
-def test_dispatch_disponivel_le_o_bloqueio_ja_emitido():
-    assert cli._dispatch_disponivel([]) is True
-    assert cli._dispatch_disponivel([{"tipo": "dispatch_indisponivel"}]) is False
-    assert cli._dispatch_disponivel([{"tipo": "engine_desconhecida"}]) is False
-    assert cli._dispatch_disponivel([{"tipo": "snapshot_ausente"}]) is True
-
-
-def test_proximo_passo_orienta_wk_resume_quando_nao_ha_despacho():
-    """Sem despacho, a continuação fica `ready` e quem a executa é `wk resume`."""
-    texto = cli._proximo_passo_continuacao(
-        "/repo", {"round": 1, "max_rounds": 3, "criadas": ["t1"], "recusadas": []},
-        [{"tipo": "dispatch_indisponivel"}],
-    )
-    assert "wk resume" in texto and "ready" in texto
-
-
-def test_proximo_passo_explica_o_teto_quando_houve_recusa():
-    texto = cli._proximo_passo_continuacao(
-        "/repo",
-        {"round": 3, "max_rounds": 3, "criadas": [],
-         "recusadas": [{"objective_id": "obj_1", "motivo": "round 4 excede o máximo de 3 rodadas"}]},
-        [],
-    )
-    assert "decisão humana" in texto

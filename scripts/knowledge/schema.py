@@ -243,6 +243,52 @@ TABLES = (
 )
 
 
+def _register_initial_version(conn: sqlite3.Connection, now: str) -> int:
+    """Registra a versão inicial em `schema_version` e devolve a instalada.
+
+    LEITURA e ESCRITA sob o MESMO `BEGIN IMMEDIATE`, e `INSERT OR IGNORE`.
+    Sem isso, duas conexões abrindo o MESMO `knowledge.db` ao mesmo tempo liam
+    ambas `MAX(version) IS NULL` e ambas tentavam inserir: a segunda morria com
+    `IntegrityError: UNIQUE constraint failed: schema_version.version` — na
+    ABERTURA, antes de qualquer trabalho. `IMMEDIATE` serializa a decisão e o
+    `OR IGNORE` torna a inserção idempotente mesmo se a corrida escapar.
+
+    Fast-path SEM LOCK: schema já instalado é o caso comum (toda abertura de
+    conexão, inclusive `wk status`, passa por aqui). Ler `MAX(version)` antes
+    resolve esse caso sem `BEGIN IMMEDIATE` — abrir transação de ESCRITA para
+    não escrever nada fazia toda leitura disputar o lock de escrita do banco.
+    Só a instalação (versão ausente) entra na transação, e a leitura é refeita
+    lá dentro: a decisão continua serializada — mesma disciplina do
+    `_ensure_wal`.
+    """
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    instalada = row[0] if row else None
+    if instalada is not None:
+        return int(instalada)
+    externa = conn.in_transaction
+    if not externa:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        installed = row[0] if row else None
+        if installed is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at, note) "
+                "VALUES (?,?,?)",
+                (SCHEMA_VERSION, now, "initial"),
+            )
+            # Relê: quem perdeu a corrida enxerga a versão do vencedor.
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            installed = (row[0] if row else None) or SCHEMA_VERSION
+    except BaseException:
+        if not externa:
+            conn.execute("ROLLBACK")
+        raise
+    if not externa:
+        conn.execute("COMMIT")
+    return int(installed)
+
+
 def apply_schema(conn: sqlite3.Connection, now: str) -> int:
     """Cria o schema se ausente e valida a versão instalada.
 
@@ -251,14 +297,7 @@ def apply_schema(conn: sqlite3.Connection, now: str) -> int:
     abrir conexão.
     """
     conn.executescript(DDL)
-    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    installed = row[0] if row else None
-    if installed is None:
-        conn.execute(
-            "INSERT INTO schema_version(version, applied_at, note) VALUES (?,?,?)",
-            (SCHEMA_VERSION, now, "initial"),
-        )
-        return SCHEMA_VERSION
+    installed = _register_initial_version(conn, now)
     if int(installed) != SCHEMA_VERSION:
         raise SchemaVersionMismatch(
             f"knowledge.db está na versão {installed}; este código suporta "

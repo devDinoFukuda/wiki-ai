@@ -585,8 +585,8 @@ class Fix5PyzFreshnessTests(unittest.TestCase):
         try:
             code, _out, err = _run(["store", "init", store])
             self.assertEqual(code, 0, err)
-            code, out, err = _run(["doctor", "--store", store, "--engine", "claude-code"])
-            data = json.loads(out)
+            code, out, err = _run(["doctor", "--store", store, "--engine", "claude-code", "--json"])
+            data = json.loads(out)["summary"]["detail"]
             self.assertIn("pyz", data["wk"])
             self.assertFalse(data["wk"]["pyz"]["fonte_disponivel"])
         finally:

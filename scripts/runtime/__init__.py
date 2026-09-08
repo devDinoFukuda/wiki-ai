@@ -12,6 +12,7 @@ Divisão do pacote
 | `tasks.py`      | `runtime.db`: tarefas, dependências, leases, tentativas, efeitos, idempotência |
 | `coordinator.py`| Laço determinístico: planejar → agendar → submeter → validar → gravar |
 | `recovery.py`   | Classes de erro, políticas persistidas, retomada (`resume`)    |
+| `state.py`      | Estado consolidado por `(repo_id, objective_id, input_revision)`, delta e invariante de leituras (§7.1) |
 | `context.py`    | (vizinho, NÃO deste dono) montagem e orçamento de pacotes      |
 | `executors/`    | (vizinho, NÃO deste dono) adapters reais de engine             |
 
@@ -46,4 +47,4 @@ Só stdlib; pode ler `knowledge`/`analysis` por contrato. Sem `wk`/`codescan`/`s
 
 from __future__ import annotations
 
-__all__ = ["tasks", "coordinator", "recovery"]
+__all__ = ["tasks", "coordinator", "recovery", "state"]

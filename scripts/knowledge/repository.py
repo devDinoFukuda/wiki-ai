@@ -30,6 +30,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
@@ -96,7 +97,38 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect(path: str, now: str | None = None) -> sqlite3.Connection:
+def _ensure_wal(conn: sqlite3.Connection, busy_timeout_ms: int) -> str:
+    """Garante `journal_mode=WAL`, tolerando abertura concorrente.
+
+    `PRAGMA journal_mode=WAL` precisa de lock exclusivo e, ao contrário de uma
+    escrita comum, NÃO passa pelo `busy_timeout` em todas as builds do SQLite:
+    duas aberturas simultâneas do mesmo `knowledge.db` faziam a segunda morrer
+    com "database is locked" — na ABERTURA, antes de qualquer trabalho. Se o
+    modo já é WAL, o outro processo acabou de configurá-lo e não há nada a
+    fazer; senão vale retentar dentro da janela. Só depois de esgotá-la o erro
+    sobe — aí é problema real de acesso ao arquivo, não corrida.
+    """
+    deadline = time.monotonic() + max(0.1, busy_timeout_ms / 1000.0)
+    ultimo: sqlite3.OperationalError | None = None
+    while True:
+        modo = str((conn.execute("PRAGMA journal_mode").fetchone() or [""])[0]).lower()
+        if modo == "wal":
+            return modo
+        try:
+            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            return str((row or [""])[0]).lower()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            ultimo = exc
+            if time.monotonic() >= deadline:
+                raise ultimo
+            time.sleep(0.01)
+
+
+def connect(
+    path: str, now: str | None = None, busy_timeout_ms: int = 5000
+) -> sqlite3.Connection:
     """Abre `knowledge.db` com WAL, `foreign_keys` ON e schema validado.
 
     `isolation_level=None` desliga o gerenciamento implícito de transação do
@@ -109,7 +141,13 @@ def connect(path: str, now: str | None = None) -> sqlite3.Connection:
         os.makedirs(directory, exist_ok=True)
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # `busy_timeout` ANTES de tudo: `PRAGMA journal_mode=WAL` e o
+    # `BEGIN IMMEDIATE` de `apply_schema` pegam lock de escrita. Sem o timeout
+    # configurado primeiro, duas aberturas simultâneas do MESMO `knowledge.db`
+    # davam "database is locked" na abertura, sem retentativa — o padrão do
+    # SQLite é falhar na hora.
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    _ensure_wal(conn, busy_timeout_ms)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=FULL")
     apply_schema(conn, now or utc_now())

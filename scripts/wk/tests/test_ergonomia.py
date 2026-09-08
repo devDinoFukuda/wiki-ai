@@ -126,10 +126,12 @@ class DoctorTests(unittest.TestCase):
 
         code, out, err = _run(
             ["doctor", "--store", self.store, "--repo", self.repo,
-             "--engine", "claude-code", "--base", self.base]
+             "--engine", "claude-code", "--base", self.base, "--json"]
         )
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        # §10.2/§10.3: `doctor --json` é o envelope comum; os campos antigos
+        # (testados abaixo) sobrevivem tal-e-qual dentro de `summary.detail`.
+        data = json.loads(out)["summary"]["detail"]
         for key in ("shell", "python", "wk", "store", "repo", "engine",
                     "bloqueios", "proximo_passo"):
             self.assertIn(key, data)
@@ -140,9 +142,9 @@ class DoctorTests(unittest.TestCase):
 
     def test_doctor_store_inexistente_bloqueia_e_indica_criacao(self):
         missing = os.path.join(self.base, "nao-existe-store")
-        code, out, err = _run(["doctor", "--store", missing])
+        code, out, err = _run(["doctor", "--store", missing, "--json"])
         self.assertNotEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self.assertFalse(data["store"]["existe"])
         self.assertIn("store", data["bloqueios"])
         self.assertIn("wk store init", data["proximo_passo"])
@@ -152,16 +154,18 @@ class DoctorTests(unittest.TestCase):
         original_msystem = os.environ.pop("MSYSTEM", None)
         try:
             with mock.patch.dict(os.environ, {"PSModulePath": "C:\\fake\\ps\\modules"}):
-                code, out, _err = _run(["doctor", "--store", self.store])
+                code, out, _err = _run(["doctor", "--store", self.store, "--json"])
         finally:
             if original_shell is not None:
                 os.environ["SHELL"] = original_shell
             if original_msystem is not None:
                 os.environ["MSYSTEM"] = original_msystem
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self.assertTrue(data["shell"]["powershell_provavel"])
         self.assertTrue(any("bash -c" in a for a in data["shell"]["avisos"]))
-        self.assertIn(code, (0, 1))  # powershell não é, por si só, um bloqueio
+        # §10.3: `succeeded`/`noop` -> 0, `blocked` -> 2 (era 1); powershell
+        # não é, por si só, um bloqueio.
+        self.assertIn(code, (0, 2))
 
 
 class CheckConfigPermissoesTests(unittest.TestCase):
@@ -192,10 +196,10 @@ class DoctorEngineInvalidaTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
 
         code, out, err = _run(
-            ["doctor", "--store", store, "--engine", "claude", "--base", base]
+            ["doctor", "--store", store, "--engine", "claude", "--base", base, "--json"]
         )
         self.assertNotEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self.assertIn("engine", data["bloqueios"])
         self.assertIn("erro", data["engine"])
         self.assertEqual(
@@ -223,10 +227,10 @@ class DoctorEngineInvalidaTests(unittest.TestCase):
 
         code, out, err = _run(
             ["doctor", "--store", store, "--repo", repo,
-             "--engine", "claude-code", "--base", base]
+             "--engine", "claude-code", "--base", base, "--json"]
         )
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self.assertEqual(data["bloqueios"], [])
 
 
@@ -254,9 +258,9 @@ class DoctorInvarianteExitBloqueiosTests(unittest.TestCase):
         base1 = tempfile.mkdtemp(prefix="wk_doctor_matrix_base1_")
         self.addCleanup(shutil.rmtree, base1, ignore_errors=True)
         code, out, err = _run(
-            ["doctor", "--store", os.path.join(base1, "nao-existe"), "--base", base1]
+            ["doctor", "--store", os.path.join(base1, "nao-existe"), "--base", base1, "--json"]
         )
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self._assert_invariante(code, data, err, "store_inexistente")
         self.assertIn("store", data["bloqueios"])
 
@@ -266,9 +270,9 @@ class DoctorInvarianteExitBloqueiosTests(unittest.TestCase):
         store2 = self._make_store()
         code, out, err = _run(
             ["doctor", "--store", store2,
-             "--repo", os.path.join(base2, "nao-existe-repo"), "--base", base2]
+             "--repo", os.path.join(base2, "nao-existe-repo"), "--base", base2, "--json"]
         )
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self._assert_invariante(code, data, err, "repo_inexistente")
         self.assertIn("repo", data["bloqueios"])
 
@@ -277,9 +281,9 @@ class DoctorInvarianteExitBloqueiosTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, base3, ignore_errors=True)
         store3 = self._make_store()
         code, out, err = _run(
-            ["doctor", "--store", store3, "--engine", "claude", "--base", base3]
+            ["doctor", "--store", store3, "--engine", "claude", "--base", base3, "--json"]
         )
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self._assert_invariante(code, data, err, "engine_invalida")
         self.assertIn("engine", data["bloqueios"])
 
@@ -295,9 +299,9 @@ class DoctorInvarianteExitBloqueiosTests(unittest.TestCase):
         )
         code, out, err = _run(
             ["doctor", "--store", store4, "--repo", repo4,
-             "--engine", "claude-code", "--base", base4]
+             "--engine", "claude-code", "--base", base4, "--json"]
         )
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self._assert_invariante(code, data, err, "tudo_ok")
         self.assertEqual(data["bloqueios"], [])
 
@@ -379,9 +383,9 @@ class PermissaoFormatoHonestidadeTests(unittest.TestCase):
 
         code, out, err = _run(
             ["doctor", "--store", store, "--repo", repo,
-             "--engine", "devin", "--base", base]
+             "--engine", "devin", "--base", base, "--json"]
         )
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         # o arquivo best-effort foi escrito corretamente (não deve travar por
         # si só), mas isso não pode virar uma afirmação de garantia.
         self.assertFalse(data["engine"]["permissao_garantida"])
@@ -404,9 +408,9 @@ class PermissaoFormatoHonestidadeTests(unittest.TestCase):
 
         code, out, err = _run(
             ["doctor", "--store", store, "--repo", repo,
-             "--engine", "claude-code", "--base", base]
+             "--engine", "claude-code", "--base", base, "--json"]
         )
-        data = json.loads(out)
+        data = json.loads(out)["summary"]["detail"]
         self.assertTrue(data["engine"]["permissao_garantida"])
         self.assertNotIn("aviso_permissao", data["engine"])
 

@@ -26,9 +26,11 @@ import json
 import os
 import pkgutil
 import re
+import shlex
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -477,6 +479,149 @@ def _check_wk_flow_command(
 
 
 def cmd_init(a) -> int:
+    """`wk init` (§10.1/§11): SEM `--engine` (padrão) prepara o store/repo/
+    agente do fluxo `analyze`/`ingest`/`update` — nunca instala pilotos de
+    outro fluxo. `--engine` é só o caminho de COMPATIBILIDADE do fluxo
+    antigo (materializa SKILL.md/pilotos em disco) — candidato à remoção
+    A01; nunca aparece em `next_actions` de nenhum comando."""
+    if getattr(a, "engine", None):
+        return _cmd_init_engine_compat(a)
+    return _cmd_init_store(a)
+
+
+def _cmd_init_store(a) -> int:
+    """Fluxo padrão de `init` sem `--engine` (§10.1/§11).
+
+    Cria/configura o store atual (`os.makedirs`), registra `--repo` no
+    mesmo perfil/namespace que `wk analyze` já lê (`_load_analysis_profile`/
+    `_repo_key` — a MESMA convenção, não uma segunda fonte da verdade),
+    persiste a preferência de `--agent` (nunca conecta — §10.1: selecionar
+    != conectado) e informa a PRÓXIMA operação com argv completo:
+    `agent connect` quando `--agent` foi informado, senão `analyze` quando
+    há `--repo`, senão `agent list`. Idempotente: quando nada muda em
+    relação à execução anterior, `operation_status` é `noop` (nunca
+    `succeeded` por engano — §10.3: "no-op preserva o estado agregado").
+    """
+    shell = "powershell" if os.name == "nt" else "posix"
+    if not a.store:
+        payload = _common_payload(
+            command="init", operation_status="blocked",
+            knowledge_status="not_applicable", delivery_status="not_applicable",
+            scope={"store": None, "repo": None}, store_root=os.path.abspath("."), repo=None,
+            summary={"mensagem": "init sem --engine exige --store (§10.1/§11)"},
+            pending=[{
+                "id": "init-sem-store", "tipo": "entrada_invalida",
+                "alvo": "--store", "causa": "init sem --engine exige --store",
+                "impacto": "nenhum store foi criado/alterado", "recuperacao_automatica": False,
+                "acoes": ["informe --store <caminho>"],
+            }],
+            next_actions=[{
+                "ator": "operador", "motivo": "informar --store e repetir `init`",
+                "argv": None, "shell": None, "acao_externa": None,
+            }],
+            publication=None, delivery_block=None,
+        )
+        _render_common(payload, json_out=bool(getattr(a, "json", False)))
+        return _exit_code_common(payload["operation_status"])
+
+    store_abs = os.path.abspath(a.store)
+    repo_abs = os.path.abspath(a.repo) if a.repo else None
+    if repo_abs is not None and not os.path.isdir(repo_abs):
+        payload = _common_payload(
+            command="init", operation_status="blocked",
+            knowledge_status="not_applicable", delivery_status="not_applicable",
+            scope={"store": store_abs, "repo": repo_abs}, store_root=store_abs, repo=None,
+            summary={"mensagem": f"--repo não existe: {repo_abs}"},
+            pending=[{
+                "id": "init-repo-inexistente", "tipo": "entrada_invalida",
+                "alvo": repo_abs, "causa": f"--repo não existe: {repo_abs}",
+                "impacto": "o store não foi alterado para este repo", "recuperacao_automatica": False,
+                "acoes": ["conferir o caminho de --repo e repetir"],
+            }],
+            next_actions=[{
+                "ator": "operador", "motivo": "corrigir --repo e repetir `init`",
+                "argv": None, "shell": None, "acao_externa": None,
+            }],
+            publication=None, delivery_block=None,
+        )
+        _render_common(payload, json_out=bool(getattr(a, "json", False)))
+        return _exit_code_common(payload["operation_status"])
+
+    mudou = False
+    store_ja_existia = os.path.isdir(store_abs)
+    os.makedirs(store_abs, exist_ok=True)
+    if not store_ja_existia:
+        mudou = True
+
+    namespace = None
+    repo_registrado = False
+    if repo_abs:
+        repo_registrado = True
+        profile_all = _load_analysis_profile(store_abs)
+        repo_key = _repo_key(repo_abs)
+        prior_entry = dict(profile_all.get(repo_key) or {})
+        namespace = prior_entry.get("namespace") or f"code/{repo_key}"
+        if prior_entry.get("namespace") != namespace:
+            entry = dict(prior_entry)
+            entry["namespace"] = namespace
+            entry.setdefault("registered_at", _utc_now())
+            profile_all[repo_key] = entry
+            _save_analysis_profile(store_abs, profile_all)
+            mudou = True
+
+    agent_id = getattr(a, "agent", None)
+    preferencia = None
+    if agent_id:
+        from runtime.bindings import BindingStore
+
+        bs = BindingStore(store_abs)
+        prior_pref = bs.get_preference(repo_abs)
+        preferencia = bs.set_preference(agent_id, repo=repo_abs)
+        if not (prior_pref and prior_pref.get("agent_id") == agent_id):
+            mudou = True
+        connect_argv = ["wk", "agent", "connect", "--store", store_abs]
+        if repo_abs:
+            connect_argv += ["--repo", repo_abs]
+        connect_argv += ["--agent", agent_id]
+        next_action = {
+            "ator": "operador",
+            "motivo": "conectar o agente selecionado (handshake real) antes do despacho",
+            "argv": connect_argv, "shell": shell,
+        }
+    elif repo_abs:
+        next_action = {
+            "ator": "operador",
+            "motivo": "rodar a análise profunda do repositório registrado",
+            "argv": ["wk", "analyze", "--repo", repo_abs, "--store", store_abs], "shell": shell,
+        }
+    else:
+        next_action = {
+            "ator": "operador",
+            "motivo": "escolher um agente (ou registrar um --repo) antes de analisar",
+            "argv": ["wk", "agent", "list", "--store", store_abs], "shell": shell,
+        }
+
+    payload = _common_payload(
+        command="init", operation_status=("succeeded" if mudou else "noop"),
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_abs, "repo": repo_abs}, store_root=store_abs, repo=repo_abs,
+        summary={
+            "store_criado": not store_ja_existia,
+            "repo_registrado": repo_registrado,
+            "namespace": namespace,
+            "agent_preferencia": preferencia,
+        },
+        pending=[], next_actions=[next_action], publication=None, delivery_block=None,
+    )
+    _render_common(payload, json_out=bool(getattr(a, "json", False)))
+    return _exit_code_common(payload["operation_status"])
+
+
+def _cmd_init_engine_compat(a) -> int:
+    """[compat — fluxo substituído, candidato à remoção A01] Caminho ANTIGO
+    de `init --engine ...`: materializa pilotos/SKILL.md em disco por
+    engine. Comportamento preservado tal-e-qual (não é o padrão desde que
+    `--engine` deixou de ser obrigatório — §10.1/§11)."""
     manifest = _docs_manifest()
     if "skill" not in manifest:
         print("SKILL.md não está embutido neste build", file=sys.stderr)
@@ -521,6 +666,40 @@ def cmd_init(a) -> int:
             p.get("permissoes_migradas") for p in permissoes
         )
 
+    # §10.4.6/§11: `init --agent ID` REGISTRA A PREFERÊNCIA — nunca um
+    # binding (§10.1: "selecionar um agente não significa que ele já está
+    # conectado"). Sem --repo, preferência do STORE; com --repo, do sistema.
+    # `set_preference` sempre sobrescreve com os mesmos dados de entrada:
+    # idempotente por construção.
+    agent_id = getattr(a, "agent", None)
+    if agent_id:
+        if not store_abs:
+            print(json.dumps({
+                "error": "init --agent exige --store (a preferência é persistida no store)",
+                "acao": "informe --store <caminho>",
+            }, ensure_ascii=False), file=sys.stderr)
+            return 2
+        from runtime.bindings import BindingStore
+
+        bs = BindingStore(store_abs)
+        preferencia = bs.set_preference(agent_id, repo=repo_abs)
+        shell = "powershell" if os.name == "nt" else "posix"
+        connect_argv = ["wk", "agent", "connect", "--store", store_abs]
+        if repo_abs:
+            connect_argv += ["--repo", repo_abs]
+        connect_argv += ["--agent", agent_id]
+        result["agent"] = {
+            "preferencia": preferencia,
+            "escopo": "repo" if repo_abs else "store",
+            "conectado": False,  # selecionar != conectado (§10.1)
+            "proxima_operacao": {
+                "ator": "operador",
+                "motivo": "conectar o agente selecionado (handshake real) antes do despacho",
+                "argv": connect_argv,
+                "shell": shell,
+            },
+        }
+
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -556,6 +735,19 @@ def cmd_check(a) -> int:
     engines, err = _resolve_engines(a.engine)
     if err:
         print(json.dumps({"error": err}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    # Fora do .pyz distribuído (execução a partir do source, ex.: `python -m
+    # wk.cli`), `_docs_manifest()` volta vazio — sem esta checagem, o acesso
+    # a `manifest["skill"]` mais abaixo levantava `KeyError: 'skill'` não
+    # tratado (exit 1 genérico do handler de topo). Comando legado: mensagem
+    # clara e exit 2, sem expandir o alcance de `check`.
+    if "skill" not in manifest and not a.all:
+        print(json.dumps({
+            "error": "SKILL.md não está embutido neste build (rode a partir do .pyz "
+                     "distribuído; `check` sem --all sempre precisa do documento 'skill')",
+            "acao": "use o executável .pyz distribuído, ou rode `wk check --all` "
+                    "para comparar apenas os documentos realmente embutidos",
+        }, ensure_ascii=False), file=sys.stderr)
         return 2
 
     invocation = a.invocation or _self_invocation()
@@ -843,6 +1035,15 @@ def cmd_doctor(a) -> int:
         bloqueios.append("repo")
 
     engine = a.engine or "claude-code"
+    # T15/A (achado da reprodução real): `--engine` é só o caminho de
+    # COMPATIBILIDADE (§10.1/§11) — skill/permissão de engine são infra
+    # daquele caminho, não do fluxo padrão (`init`/`agent connect`, SEM
+    # `--engine`). `engine_explicit` distingue quem pediu o diagnóstico
+    # compat de quem só está usando o padrão (onde `a.engine` nunca foi
+    # informado): só gate/`next_action` em cima de skill/permissão quando
+    # o operador OPTOU pelo compat — nunca empurra quem já tem um binding
+    # de agente conectado (o caminho padrão) de volta para `--engine`.
+    engine_explicit = a.engine is not None
     engines_resolved, engine_err = _resolve_engines(engine)
     engine_info: dict = {"nome": engine}
     valid_engines = sorted(ENGINES)
@@ -871,7 +1072,12 @@ def cmd_doctor(a) -> int:
                 formato, aviso = _permission_format_status(target)
                 formatos.add(formato)
                 entry = {"path": target, "ok": ok, "problemas": problems, "formato": formato}
-                if acao:
+                # T15/row3: `acao` (`MIGRACAO_ACAO` = "rode wk init --engine
+                # ...") é texto do caminho de COMPATIBILIDADE — só faz
+                # sentido para quem pediu `--engine` explicitamente; no
+                # fluxo padrão (`init`/`agent connect`, sem `--engine`) essa
+                # string nunca aparece em lugar nenhum do envelope.
+                if acao and engine_explicit:
                     entry["acao"] = acao
                     acao_migracao = acao
                 if aviso:
@@ -881,7 +1087,21 @@ def cmd_doctor(a) -> int:
             if acao_migracao:
                 engine_info["acao_permissao"] = acao_migracao
             if not perm_ok_all:
-                bloqueios.append("permissao")
+                if engine_explicit:
+                    bloqueios.append("permissao")
+                else:
+                    # Sem engine explícita, skill/permissão de engine é só
+                    # diagnóstico (fluxo padrão não depende disso) — nunca
+                    # bloqueia nem vira `next_action`/`proximo_passo`. Texto
+                    # sem o nome da flag de compatibilidade (§11: nenhuma
+                    # string do envelope do fluxo padrão cita esse caminho).
+                    engine_info["aviso_permissao_nao_bloqueante"] = (
+                        "arquivo(s) de permissão de engine ausente(s)/incorreto(s); "
+                        "irrelevante no fluxo padrão (§10.1/§11: sem engine explícita, "
+                        "nenhuma escrita de skill/permissão é esperada) — só "
+                        "importa para quem optou pelo caminho de compatibilidade "
+                        "(engine explícita em `wk init`)"
+                    )
             # `permissao_garantida` só é True quando o arquivo está correto
             # E o formato é o `verificado` (claude-code). Best-effort nunca
             # vira garantia, mesmo que o arquivo em disco esteja ok.
@@ -905,7 +1125,9 @@ def cmd_doctor(a) -> int:
                     "ok": wk_flow_ok,
                     "problemas": wk_flow_problems,
                 }
-                if wk_flow_acao:
+                # `WK_FLOW_ACAO` também é texto do caminho de compatibilidade
+                # (`wk init --engine claude-code ...`) — mesma regra acima.
+                if wk_flow_acao and engine_explicit:
                     wk_flow_entry["acao"] = wk_flow_acao
                 engine_info["comando_wk_flow"] = wk_flow_entry
         else:
@@ -918,39 +1140,173 @@ def cmd_doctor(a) -> int:
 
     skill_map = engine_info.get("skill_instalada")
     skill_completa = isinstance(skill_map, dict) and bool(skill_map) and all(skill_map.values())
+    # T15/A: mesma regra da linha de `permissao` acima — skill de engine só
+    # é PORTÃO/`next_action` quando `--engine` foi pedido explicitamente
+    # (caminho de compatibilidade); no fluxo padrão, `skill_completa` fica
+    # só como diagnóstico dentro de `engine_info`, nunca gera `--engine` em
+    # `proximo_passo`/`next_actions`.
+    skill_completa_ou_padrao = skill_completa or not engine_explicit
 
+    # §10.3/§10.4.6: bloco `agent` SEMPRE presente — situação da preferência/
+    # binding do repo (ou do store, na ausência) — `to_public_dict` tolera
+    # store ainda inexistente (BindingStore lê `agents.json` ausente como
+    # estado vazio). `--probe-agent` executa a tarefa mínima PELO MESMO
+    # binding resolvido — nunca escolhe outro agente (§10.4.2 item 5/T33).
+    agent_info = _agent_public_dict(store_root, repo_root)
+    probe_info: dict | None = None
+    if getattr(a, "probe_agent", False):
+        from runtime.bindings import BindingStore
+
+        rb = BindingStore(store_root).resolve(repo_root)
+        if not rb.connected:
+            probe_info = {
+                "aviso": "a sonda executa uma chamada real pelo binding conectado quando há um; "
+                         "isso pode consumir uma pequena chamada do provedor (README)",
+                "bloqueado": True,
+                "detalhe": rb.detail,
+                "acao": (
+                    f"selecione e conecte um agente: `wk init --store {store_root} --agent ID` "
+                    f"e `wk agent connect --store {store_root} --agent ID`"
+                ),
+            }
+            bloqueios.append("agent_probe")
+        else:
+            from runtime import agents as rt_agents
+
+            # A prova é do BINDING, mas o binding persistido não carrega
+            # executor vivo entre processos (cada invocação da CLI é um
+            # processo novo) — reconecta o MESMO `agent_id` resolvido nesta
+            # invocação, na MESMA instância de registro que faz a sonda
+            # (§10.4.6: "reconexão automática ao mesmo agente é permitida").
+            reg = rt_agents.default_registry()
+            try:
+                live_binding = reg.connect(rb.agent_id, transport=rb.binding.transport)
+            except rt_agents.TransportUnavailable as exc:
+                # T15/5 (achado de auditoria): `TransportUnavailable` já
+                # carrega os `setup_steps` REAIS daquele transporte — usados
+                # abaixo para `next_action_argv` em vez do texto genérico
+                # "conecte um agente e repita `doctor --probe-agent`".
+                proximos_passos_setup = _transport_unavailable_next_actions(exc)
+                probe_info = {
+                    "aviso": "esta sonda pode ter consumido uma pequena chamada do provedor (README)",
+                    "integration_available": False, "agent_connected": False,
+                    "access_usable": False, "contract_accepted": False, "ok": False,
+                    "detalhe": f"reconexão de {rb.agent_id!r} falhou nesta invocação: {exc}",
+                    "transporte_indisponivel": exc.to_dict(),
+                    "proximos_passos_setup": proximos_passos_setup,
+                }
+                if proximos_passos_setup:
+                    primeiro = proximos_passos_setup[0]
+                    probe_info["acao"] = (
+                        " ".join(str(v) for v in primeiro["argv"]) if primeiro.get("argv")
+                        else (primeiro.get("acao_externa") or primeiro["motivo"])
+                    )
+                bloqueios.append("agent_probe")
+                resultado = None
+            except rt_agents.AgentUnavailableError as exc:
+                probe_info = {
+                    "aviso": "esta sonda pode ter consumido uma pequena chamada do provedor (README)",
+                    "integration_available": False, "agent_connected": False,
+                    "access_usable": False, "contract_accepted": False, "ok": False,
+                    "detalhe": f"reconexão de {rb.agent_id!r} falhou nesta invocação: {exc}",
+                }
+                bloqueios.append("agent_probe")
+                resultado = None
+            else:
+                resultado = reg.probe(live_binding)
+                reg.close(live_binding)
+                probe_info = {
+                    "aviso": "esta sonda pode ter consumido uma pequena chamada do provedor (README)",
+                    "integration_available": resultado.integration_available,
+                    "agent_connected": resultado.agent_connected,
+                    "access_usable": resultado.access_usable,
+                    "contract_accepted": resultado.contract_accepted,
+                    "ok": resultado.ok,
+                    "detalhe": resultado.detail,
+                }
+            if resultado is not None and not resultado.ok:
+                probe_info["acao"] = (
+                    f"{resultado.detail or 'sonda sem sucesso'}; sem fallback automático — revise "
+                    f"a conexão de {rb.agent_id!r} (`wk agent setup --agent {rb.agent_id}`) e repita "
+                    "`doctor --probe-agent`"
+                )
+                bloqueios.append("agent_probe")
+
+    # §10.2: `next_actions` guarda o VETOR de argumentos (`next_action_argv`)
+    # quando o próximo passo é um comando `wk` executável; o texto copiável
+    # é renderizado a partir dele (`_quote_argv`/`_render_common`). Quando o
+    # próximo passo é orientação que depende do operador ler/decidir algo
+    # (ex.: "conecte um agente", "corrija --repo"), fica em
+    # `next_action_manual` (`acao_externa`) — nunca os dois ao mesmo tempo.
+    # `proximo`/`out["proximo_passo"]` (texto humano de compatibilidade) não
+    # muda: só ganha a contraparte estruturada.
+    shell = "powershell" if os.name == "nt" else "posix"
+    next_action_argv: list | None = None
+    next_action_manual: str | None = None
     if not store_existe:
         proximo = f"wk store init {store_root}"
+        next_action_argv = ["wk", "store", "init", store_root]
+    elif "agent_probe" in bloqueios:
+        # T15/5: quando a falha foi `TransportUnavailable`, `proximos_passos_setup[0]`
+        # já é um argv REAL verificado pelo adaptador — vira `next_action_argv`
+        # em vez de texto manual genérico.
+        setup_passos = (probe_info or {}).get("proximos_passos_setup") or []
+        primeiro = setup_passos[0] if setup_passos else None
+        if primeiro and primeiro.get("argv"):
+            proximo = " ".join(str(v) for v in primeiro["argv"])
+            next_action_argv = list(primeiro["argv"])
+        else:
+            proximo = (probe_info or {}).get("acao") or "conecte um agente e repita `doctor --probe-agent`"
+            next_action_manual = proximo
     elif "engine" in bloqueios:
-        # Nunca ecoar a engine inválida informada pelo usuário: a forma
-        # correta usa uma engine da lista de válidas.
-        parts = ["wk", "init", "--engine", valid_engines[0]]
+        # T15/A: `--engine` NUNCA aparece em `next_actions`/`proximo_passo`
+        # (compat só na ajuda de `init --engine`, §11) — nem para ecoar a
+        # engine inválida, nem para sugerir uma válida. O fluxo padrão nem
+        # precisa de `--engine`: a correção é simplesmente repetir `wk init`
+        # sem ele (ou, se o operador realmente quer o caminho de
+        # compatibilidade, escolher um valor válido por conta própria —
+        # `engines_validas` já viaja em `engine.erro`/`engine.engines_validas`).
+        parts = ["wk", "init"]
         if a.store:
             parts += ["--store", a.store]
         if a.repo:
             parts += ["--repo", a.repo]
         proximo = (
             f"engine inválida: {engine!r}. Válidas: {valid_engines}. "
-            f"Ex.: {' '.join(parts)}"
+            f"Fluxo padrão não precisa de --engine: {' '.join(parts)}"
         )
+        next_action_argv = parts
     elif "permissao" in bloqueios:
+        # Só chega aqui com `engine_explicit=True` (ver acima): o operador
+        # optou pelo caminho de compatibilidade, então a correção real É
+        # repetir `--engine` (a mesma engine que ele já escolheu) — nunca
+        # ecoada ao fluxo padrão, porque este ramo é inalcançável sem
+        # `--engine` explícito.
         parts = ["wk", "init", "--engine", engine]
         if a.store:
             parts += ["--store", a.store]
         if a.repo:
             parts += ["--repo", a.repo]
         proximo = " ".join(parts)
+        next_action_argv = parts
     elif "repo" in bloqueios:
         proximo = f"corrija --repo: caminho não existe: {repo_root}"
-    elif not skill_completa:
+        next_action_manual = proximo
+    elif not skill_completa_ou_padrao:
         parts = ["wk", "init", "--engine", engine]
         if a.store:
             parts += ["--store", a.store]
         if a.repo:
             parts += ["--repo", a.repo]
         proximo = " ".join(parts)
+        next_action_argv = parts
     elif repo_root and repo_existe:
-        proximo = f"wk code --repo {repo_root} --store {store_root} surface --topic <slug>"
+        # E05 (auditoria): nunca encaminhar para `wk code ... surface` —
+        # comando removido, não registrado em `_build_parser`. O fluxo padrão
+        # a partir de um ambiente preparado é `wk analyze`.
+        parts = ["wk", "analyze", "--repo", repo_root, "--store", store_root]
+        proximo = " ".join(parts)
+        next_action_argv = parts
     else:
         proximo = "ambiente ok — nenhuma ação necessária"
 
@@ -961,11 +1317,44 @@ def cmd_doctor(a) -> int:
         "store": store_info,
         "repo": repo_info,
         "engine": engine_info,
+        "agent": agent_info,
         "bloqueios": bloqueios,
         "proximo_passo": proximo,
     }
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 1 if bloqueios else 0
+    if probe_info is not None:
+        out["sonda_agente"] = probe_info
+
+    # §10.2/§10.3: envelope comum — os campos ANTIGOS (topo desta função,
+    # inclusive `data["agent"]`/`data["bloqueios"]`/`data["sonda_agente"]`)
+    # sobrevivem tal-e-qual dentro de `summary["detail"]`, para compatibilidade
+    # dos testes existentes; o `agent` de TOPO do envelope já é a MESMA
+    # `_agent_public_dict` que `agent_info` (nenhuma segunda leitura). Doctor
+    # é diagnóstico, não conhecimento/entrega: `knowledge_status`/
+    # `delivery_status` ficam `not_applicable` — o eixo que importa aqui é
+    # `operation_status` (bloqueado quando há QUALQUER bloqueio de
+    # diagnóstico, nunca `partial`: doctor não tem noção de "trabalho pela
+    # metade", só "diagnóstico limpo" ou "algo impede o diagnóstico/setup").
+    pending = [{
+        "id": f"doctor-{b}", "tipo": "diagnostico_bloqueado", "alvo": b,
+        "causa": f"bloqueio de diagnóstico: {b!r}",
+        "impacto": "ambiente não está pronto para o fluxo padrão nesta dimensão",
+        "recuperacao_automatica": False, "acoes": [proximo],
+    } for b in bloqueios]
+    payload = _common_payload(
+        command="doctor", operation_status=("blocked" if bloqueios else "succeeded"),
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_root}, store_root=store_root, repo=repo_root,
+        summary={"detail": out},
+        pending=pending,
+        next_actions=([{
+            "ator": "operador", "motivo": "próximo passo diagnosticado por `doctor`",
+            "argv": next_action_argv, "shell": (shell if next_action_argv else None),
+            "acao_externa": next_action_manual,
+        }] if (next_action_argv or next_action_manual) else []),
+        publication=None, delivery_block=None,
+    )
+    _render_common(payload, json_out=bool(getattr(a, "json", False)))
+    return _exit_code_common(payload["operation_status"])
 
 
 # Estrutura do store. inbox = entrada (nunca fonte); raw = fonte-verdade;
@@ -5103,13 +5492,17 @@ def _local_structural_worker(*, objective, references, schema, cancel_event, **_
 #: resposta que nunca fechava leitura nenhuma: exatamente o desperdício que
 #: este achado remove.
 #:
-#: A correção não é "não executar" — é não CRIAR a tarefa: `_plan_continuation_round`
-#: agora repassa `engine_capabilities=executor.capabilities()` a
-#: `coordinator.plan_continuations`, que recusa quando `capabilities()["deepening"]`
-#: é `False` (o caso de `LocalThreadExecutor`, ver `runtime/executors/local_thread.py`)
-#: ANTES de qualquer `round_no`/`task_round` ser lido — nenhuma rodada é
-#: consumida (ver `_continuation_cycle`). Com isso, uma tarefa de continuação
-#: (`objective["continuation"] is True`) nunca mais chega a
+#: A correção não é "não executar" — é não CRIAR a tarefa:
+#: `runtime.coordinator.plan_continuations` (chamado por `runtime.coordinator.
+#: run_chain`, dentro de `_run_investigation_chain` — nunca mais por um
+#: `_plan_continuation_round`/`_continuation_cycle` desta CLI, removidos
+#: nesta limpeza de código morto por não terem mais chamador desde que o
+#: laço de continuação virou UMA chamada por invocação, §7.3) recebe
+#: `engine_capabilities` e recusa CRIAR a continuação quando
+#: `capabilities()["deepening"]` é `False` (o caso de `LocalThreadExecutor`,
+#: ver `runtime/executors/local_thread.py`) ANTES de qualquer `round_no`/
+#: `task_round` ser lido — nenhuma rodada é consumida. Com isso, uma tarefa
+#: de continuação (`objective["continuation"] is True`) nunca mais chega a
 #: `_build_executor("local", ...)`: o worker que a "executaria" sem ler nada
 #: deixou de ter para quem trabalhar. O código antigo sobrevive no histórico
 #: do git (commit `e724553` em diante); não foi movido para lugar nenhum
@@ -5125,40 +5518,39 @@ def _build_executor(engine_name: str, plan_objectives: dict | None = None):
 
     `plan_objectives` não é mais consultado aqui (Onda11-T2b: ver comentário
     acima — a engine `local` só executa `capability`/`orphan_group`, que já
-    carregam o próprio `contract` no objetivo). O parâmetro sobrevive por
-    compatibilidade de assinatura com `_dispatch_objectives`/`_engine_capabilities`
-    e com os chamadores existentes (`cmd_analyze`/`cmd_update`/`cmd_resume`).
+    carregam o próprio `contract` no objetivo). O parâmetro sobrevive pela
+    assinatura histórica; nenhum caminho de produção (`cmd_analyze`/
+    `cmd_update`/`cmd_resume`, via `_run_investigation_chain`) chama esta
+    função diretamente hoje — quem conecta a engine da cadeia é
+    `_connect_chain_binding` (contrato adapter+binding, §10.4.6). Sobrevive
+    como utilitário isolado (`_engine_capabilities`, testes) para sondar
+    `capabilities()` de uma engine sem depender do resto do laço.
     """
     from runtime.executors import get_executor
 
     if engine_name == "local":
-        registry = {
-            "capability": _local_structural_worker,
-            "orphan_group": _local_structural_worker,
-        }
-        return get_executor("local", registry=registry, max_workers=4)
+        return get_executor("local", registry=_local_task_registry(), max_workers=4)
     return get_executor(engine_name)
 
 
 def _engine_capabilities(engine_name: str, plan_objectives: dict | None = None) -> dict:
     """`executor.capabilities()` desta engine, sem despachar nada.
 
-    Onda11-T2b (achado BLOQUEANTE #2/3ª auditoria): usada por
-    `_continuation_cycle`/`_plan_continuation_round` para decidir, ANTES de
-    criar qualquer tarefa de continuação, se a engine desta invocação
-    consegue aprofundar leitura (`capabilities()["deepening"]`) — a MESMA
-    engine que `_dispatch_objectives` usaria para executar, aqui só sondada.
-    Nenhum despacho acontece: `local` fecha o `ThreadPoolExecutor` ocioso
-    imediatamente (nenhuma thread chegou a ser criada — nenhuma tarefa foi
-    submetida); `claude-cli` só sonda o binário via `--version` dentro do seu
-    próprio `__init__` (`ClaudeCliExecutor._detect`), nunca invoca a engine de
-    verdade — a mesma garantia declarada em `_check_dispatch`/§7.3.
+    Sem chamador de produção hoje (a decisão "engine sem `deepening` não cria
+    continuação" agora é `runtime.coordinator.plan_continuations` lendo
+    `engine_capabilities` que `_run_investigation_chain` já tem à mão via
+    `binding.capabilities.to_executor_capabilities()` — nunca precisa
+    reconectar/sondar de novo). Sobrevive como sondador isolado (testes e
+    diagnóstico manual): nenhum despacho acontece — `local` fecha o
+    `ThreadPoolExecutor` ocioso imediatamente (nenhuma thread chegou a ser
+    criada — nenhuma tarefa foi submetida); `claude-cli` só sonda o binário
+    via `--version` dentro do seu próprio `__init__`
+    (`ClaudeCliExecutor._detect`), nunca invoca a engine de verdade — a mesma
+    garantia declarada em `_check_dispatch`/§7.3.
 
     `engine_name` desconhecida devolve `{}` (`deepening` ausente ⇒
     `coordinator.plan_continuations` trata como "sem capacidade" e recusa) em
-    vez de propagar `ValueError` aqui: quem relata erro de configuração de
-    engine para o operador é `_dispatch_objectives` (via `bloqueios`), não
-    este sondador auxiliar.
+    vez de propagar `ValueError` aqui.
     """
     try:
         executor = _build_executor(engine_name, plan_objectives)
@@ -5171,46 +5563,537 @@ def _engine_capabilities(engine_name: str, plan_objectives: dict | None = None) 
     return dict(caps)
 
 
-def _dispatch_objectives(store, engine_name: str, resolver=None, plan_objectives: dict | None = None) -> tuple[dict, list]:
-    """Roda `coordinator.run` sobre as tarefas `ready` se a engine despachar;
-    senão registra o bloqueio de despacho UMA vez e devolve resultados vazios
-    (§7.3: análise estrutural determinística nunca fica presa a isso).
+#: Registro local de callables (`kind` -> worker) usado por TODA conexão do
+#: agente `local` nesta CLI — uma implementação só, reaproveitada por
+#: `_build_executor` (compatibilidade dos testes existentes) e por
+#: `_connect_chain_binding` (conexão real da cadeia, via contrato de agente).
+def _local_task_registry() -> dict:
+    return {
+        "capability": _local_structural_worker,
+        "orphan_group": _local_structural_worker,
+    }
 
-    `plan_objectives` (`objective_id -> objetivo do plano`) é repassado a
-    `_build_executor` por compatibilidade — a engine `local` não o consulta
-    mais (Onda11-T2b: ver comentário acima de `_build_executor`).
-    """
-    from runtime import coordinator as rt_coordinator
+
+# ---------------------------------------------------------------------------
+# §7.3 — laço automático da cadeia: `analyze`/`update`/`resume` chamam
+# `coordinator.run_chain` UMA VEZ e ela repete as rodadas disponíveis até
+# conclusão ou motivo material de parada (nenhum destes comandos roda `while`
+# próprio nem depende de o operador invocar `resume` de novo por rodada).
+# ---------------------------------------------------------------------------
+
+
+def _connect_chain_binding(engine_name: str, bindings: Any = None):
+    """Conecta `engine_name` UMA VEZ para a cadeia inteira (§10.4.6: não
+    reconectar por rodada — o mesmo binding atende todas as rodadas de
+    `coordinator.run_chain`). Mesmo connect+checagem de capacidade que o
+    antigo `_dispatch_objectives` (removido — sem chamador desde que o laço
+    de continuação virou uma chamada por invocação) fazia, mas esta função
+    NÃO despacha nem fecha: quem chama decide quando (`registry.close(
+    binding)`, depois que `run_chain` terminar).
+
+    Devolve `(registry, adapter, binding, bloqueios)`. `bloqueios` não vazio
+    significa "sem despacho disponível nesta invocação" — `adapter`/`binding`
+    vêm `None` nesse caso (`AgentRegistry.connect` já fecha o que abriu antes
+    de recusar — nenhum leak)."""
+    from runtime import agents as rt_agents
 
     bloqueios: list = []
-    try:
-        executor = _build_executor(engine_name, plan_objectives)
-    except ValueError as exc:
-        bloqueios.append({"tipo": "engine_desconhecida", "detalhe": str(exc)})
-        return dict(_EMPTY_RESULTADOS), bloqueios
-
-    caps = executor.capabilities() if callable(getattr(executor, "capabilities", None)) else {}
-    if caps.get("dispatch") is False:
-        bloqueios.append({
-            "tipo": "dispatch_indisponivel",
-            "engine": engine_name,
-            "motivo": caps.get("reason") or "engine sem despacho disponível",
-            "impacto": (
-                "análise estrutural determinística concluída (entidades/relações/fatos "
-                "com evidência de código); nenhuma leitura adicional via engine foi feita"
-            ),
-        })
-        return dict(_EMPTY_RESULTADOS), bloqueios
-
-    from runtime import context as rt_context
-
-    report = rt_coordinator.run(
-        store, executor, rt_context.build_package, max_concurrency=4, resolver=resolver
+    registry = rt_agents.default_registry(
+        local_task_registry=_local_task_registry(), local_max_workers=4,
     )
-    shutdown = getattr(executor, "shutdown", None)
-    if callable(shutdown):
-        shutdown(wait=True)
-    return report.summary(), bloqueios
+    try:
+        binding = registry.connect(engine_name, transport="auto")
+    except rt_agents.TransportUnavailable as exc:
+        # T15/5 (achado de auditoria): mesmo bloqueio de sempre, mas com os
+        # `setup_steps` REAIS do transporte anexados (`_transport_unavailable_
+        # next_actions`) — quem lê este `bloqueios` (`_run_investigation_chain`)
+        # propaga para `next_actions` em vez de um `agent connect` genérico.
+        bloqueios.append({
+            "tipo": "dispatch_indisponivel", "engine": engine_name, "motivo": str(exc),
+            "impacto": "nenhuma tarefa desta cadeia foi despachada nesta invocação",
+            "next_actions": _transport_unavailable_next_actions(exc),
+            "detalhe_estruturado": exc.to_dict(),
+        })
+        return registry, None, None, bloqueios
+    except rt_agents.HandshakeFailed as exc:
+        bloqueios.append({
+            "tipo": "dispatch_indisponivel", "engine": engine_name, "motivo": str(exc),
+            "impacto": "nenhuma tarefa desta cadeia foi despachada nesta invocação",
+        })
+        return registry, None, None, bloqueios
+    except rt_agents.AgentUnavailableError as exc:
+        bloqueios.append({"tipo": "engine_desconhecida", "detalhe": str(exc)})
+        return registry, None, None, bloqueios
+
+    caps = binding.capabilities.to_executor_capabilities()
+    if caps.get("dispatch") is False:
+        registry.close(binding)
+        bloqueios.append({
+            "tipo": "dispatch_indisponivel", "engine": engine_name,
+            "motivo": caps.get("reason") or "engine sem despacho disponível",
+            "impacto": "nenhuma tarefa desta cadeia foi despachada nesta invocação",
+        })
+        return registry, None, None, bloqueios
+    return registry, registry.adapter(engine_name), binding, bloqueios
+
+
+def _run_investigation_chain(
+    store,
+    *,
+    store_root: str,
+    namespace: str,
+    snapshot,
+    extraction,
+    objectives,
+    capability_map,
+    objectives_by_id: dict,
+    inputs_by_objective: dict,
+    engine_name: str,
+    bindings_store: Any,
+    resolver,
+    reason: str,
+    max_rounds: int | None,
+) -> dict:
+    """§7.3 numa chamada só: `coordinator.run_chain` POR OBJETIVO (nunca um
+    `input_versions` só para o lote inteiro — cada objetivo tem seu próprio
+    escopo de arquivos/hash, a MESMA granularidade que `plan_from_objectives`/
+    `_expected_input_hashes` já usam; um `input_versions` genérico faria a
+    tarefa de continuação nascer com entradas que a integração seguinte
+    descartaria como "de outra versão", e o laço nunca fecharia), reintegrando
+    (`knowledge.integrate.integrate(..., accumulated_state=...)`) a cada
+    rodada — nunca o contrato do objetivo PRISTINO do plano: o contexto da
+    rodada seguinte é o CONSOLIDADO (`runtime.state.ConsolidatedState`), que
+    já viajou pelo `outcome` da rodada anterior (§7.2). `contract_state` de
+    cada outcome já vem de `knowledge.integrate` (campo nativo do relatório,
+    não recomputado aqui); só `capability_context` (entry_keys/símbolos/
+    módulos) é mirrorado por esta função — ver `_capability_context_of`.
+
+    Devolve `{"chain": {...agregado de todos os objetivos...}, "integracao",
+    "investigation_states", "revisao", "bloqueios", "resultados"}` — só um
+    dict cruza a fronteira desta função (nenhuma classe de `runtime`), para
+    `cmd_analyze`/`cmd_update`/`cmd_resume` montarem o envelope comum sem
+    reimportar `runtime.coordinator`/`runtime.state`.
+    """
+    from runtime import context as rt_context
+    from runtime import coordinator as rt_coordinator
+    from runtime import state as rt_state
+    from runtime import tasks as rt_tasks
+
+    repo_id = namespace
+    objective_ids = sorted(objectives_by_id)
+
+    if not objective_ids:
+        return {
+            "chain": {
+                "objective_ids": [], "rounds": 0, "stop_reason": rt_state.STOP_COMPLETED,
+                "detail": "nenhum objetivo elegível nesta invocação", "chain": {},
+            },
+            "integracao": {}, "investigation_states": {}, "revisao": None,
+            "bloqueios": [], "resultados": dict(_EMPTY_RESULTADOS),
+        }
+
+    def _inputs_of(oid: str) -> dict:
+        return inputs_by_objective.get(oid) or {"snapshot_id": snapshot.snapshot_id}
+
+    registry, adapter, binding, bloqueios = _connect_chain_binding(engine_name, bindings_store)
+    if binding is None:
+        # §7.3 "executor indisponível": persistido com o MESMO mecanismo que
+        # `run_chain` usaria ao capturar `DispatchUnavailable` — só que aqui o
+        # handshake falhou ANTES de `run_chain` poder ser chamado (sem
+        # adapter/binding não há sequer round 0). Nenhuma rodada é consumida.
+        now = rt_tasks.utc_now()
+        states_store = rt_state.StateStore.of(store)
+        detail = "; ".join(
+            str(b.get("motivo") or b.get("detalhe") or "") for b in bloqueios
+        ) or "engine sem despacho disponível"
+        chain_status: dict = {}
+        for oid in objective_ids:
+            inputs = _inputs_of(oid)
+            revision_oid = rt_tasks.input_versions_hash(inputs)
+            st = states_store.load_or_new(repo_id, oid, revision_oid, input_versions=inputs)
+            parado = rt_state.with_stop_reason(st, rt_state.STOP_EXECUTOR_UNAVAILABLE, now=now)
+            states_store.save(parado, now=now)
+            store.set_chain_stop(oid, rt_state.STOP_EXECUTOR_UNAVAILABLE, now=now)
+            chain_status[oid] = store.chain_status(oid)
+        # T15/5: primeiro bloqueio com `next_actions` REAIS (`TransportUnavailable`
+        # de `_connect_chain_binding`) vira o `dispatch_next_actions` que
+        # `_chain_envelope`/`_chain_next_action` preferem sobre o `agent
+        # connect`/`agent list` genérico.
+        dispatch_next_actions = next(
+            (b["next_actions"] for b in bloqueios if b.get("next_actions")), None,
+        )
+        chain_dict = {
+            "objective_ids": objective_ids, "rounds": 0,
+            "stop_reason": rt_state.STOP_EXECUTOR_UNAVAILABLE, "detail": detail,
+            "chain": chain_status,
+        }
+        if dispatch_next_actions:
+            chain_dict["dispatch_next_actions"] = dispatch_next_actions
+        return {
+            "chain": chain_dict,
+            "integracao": {}, "investigation_states": {}, "revisao": None,
+            "bloqueios": bloqueios, "resultados": dict(_EMPTY_RESULTADOS),
+        }
+
+    #: Prioridade de agregação quando objetivos terminam com motivos
+    #: DIFERENTES: o mais material vence (§7.3) — "executor indisponível"
+    #: sempre aparece antes de "sem progresso" de outro objetivo, senão o
+    #: operador não saberia que precisa reconectar o agente.
+    _STOP_PRIORITY = {
+        rt_state.STOP_EXECUTOR_UNAVAILABLE: 0, rt_state.STOP_AMBIGUITY: 1,
+        rt_state.STOP_BUDGET_EXHAUSTED: 2, rt_state.STOP_NO_PROGRESS: 3,
+        rt_state.STOP_EVIDENCE_CHANGED: 4, rt_state.STOP_INTERRUPTED: 5,
+        rt_state.STOP_COMPLETED: 6,
+    }
+    last: dict = {}
+    aggregate = {
+        "objective_ids": objective_ids, "rounds": 0, "stop_reason": "", "detail": "",
+        "state": {}, "chain": {}, "diagnostics": [],
+    }
+    resultados_total = dict(_EMPTY_RESULTADOS)
+    detalhes: list = []
+    pior_stop: str | None = None
+
+    def _outcomes_fn_for(oid: str):
+        def outcomes_fn(round_no: int):
+            states_store = rt_state.StateStore.of(store)
+            accumulated_state = {}
+            for other in objective_ids:
+                other_rev = rt_tasks.input_versions_hash(_inputs_of(other))
+                st = states_store.load(repo_id, other, other_rev)
+                if st is not None:
+                    accumulated_state[other] = st.to_dict()
+            esperados = _expected_input_hashes(inputs_by_objective)
+            integracao, investigation_states, integ_revisao, integ_report = _integrate_results(
+                store_root, namespace, store, snapshot, extraction, objectives, capability_map,
+                reason=f"{reason} — {oid} — rodada {round_no}",
+                expected_input_versions_hash=esperados,
+                accumulated_state=accumulated_state,
+            )
+            last["integracao"] = integracao
+            last["investigation_states"] = investigation_states
+            if integ_revisao:
+                last["revisao"] = integ_revisao
+            # `coordinator.plan_continuations` lê `outcome["unmet_needs"]` (ou
+            # `outcome["needs"]`) — `ObjectiveOutcome.to_dict()` publica a
+            # MESMA informação sob a chave `reading_needs` (§7.2: "obrigações
+            # de leitura AINDA ABERTAS, com alvo concreto — o formato que
+            # `coordinator.plan_continuations` consome"). Sem este
+            # espelhamento, `plan_continuations` sempre veria lista vazia e
+            # recusaria toda continuação. Filtrado a ESTE objetivo: o
+            # `outcomes` de um `run_chain(objective_ids=[oid])` só pode falar
+            # dele — outro objetivo `partial` aqui faria `pendentes` nunca
+            # esvaziar e `completed` nunca ser alcançado por ESTE objetivo.
+            outcomes = []
+            for item in integ_report.get("objetivos") or ():
+                if not isinstance(item, dict) or str(item.get("objective_id") or "") != oid:
+                    continue
+                extras = {}
+                if "unmet_needs" not in item:
+                    # `reading_needs` nativo (do PLANO, já com `evidence` —
+                    # `ReadingNeed.to_dict()`) + releitura que a VERIFICAÇÃO
+                    # abriu para ESTE objetivo (`_reread_needs_of`, Onda11-T2b):
+                    # sem o segundo termo, um veredito `disputed`/`unresolved`
+                    # de `knowledge.integrate.reread_obligations` ficava só no
+                    # relatório e nunca virava pedido de leitura de verdade.
+                    extras["unmet_needs"] = list(item.get("reading_needs") or []) + _reread_needs_of(
+                        oid, integ_report.get("reread_obligations")
+                    )
+                # `runtime.state._satisfied_of` lê `outcome["leituras"]` (ou
+                # `outcome["reading_satisfied"]`) — NUNCA `"leituras_satisfeitas"`,
+                # que é o nome do campo em `ObjectiveOutcome.to_dict()`. Sem
+                # este segundo espelhamento, nenhuma leitura fechada por
+                # `knowledge.integrate._satisfy_readings` chegava a marcar
+                # `ConsolidatedState.satisfied_readings` — a obrigação
+                # continuava aberta mesmo com evidência resolvida (T06).
+                if "leituras" not in item:
+                    extras["leituras"] = item.get("leituras_satisfeitas") or []
+                # `coordinator.plan_continuations` lê `outcome["capability_context"]`
+                # (entry_keys/símbolos/módulos, §7.2) e repassa tal-e-qual ao
+                # `objective["capability_context"]` da continuação (`runtime.
+                # tasks.create_continuation_tasks`) — que `context.build_package`
+                # publica no envelope da tarefa filha. Ao contrário de
+                # `contract_state` (campo NATIVO do relatório de
+                # `knowledge.integrate`, nunca precisou de espelhamento),
+                # `capability_context` não é algo que `knowledge.integrate`
+                # calcula — sem este espelhamento a continuação SEMPRE recebia
+                # `capability_context={}` (outcome sem a chave -> `.get(...)`
+                # devolve `None` -> `create_continuation_tasks` normaliza para
+                # `{}`), perdendo silenciosamente o resumo de entry_keys/
+                # símbolos/módulos que o worker da rodada seguinte usaria para
+                # se re-situar sem o plano inteiro de novo.
+                if "capability_context" not in item:
+                    objetivo_atual = objectives_by_id.get(oid)
+                    if objetivo_atual is not None:
+                        extras["capability_context"] = _capability_context_of(objetivo_atual)
+                if extras:
+                    item = {**item, **extras}
+                outcomes.append(item)
+            return outcomes
+        return outcomes_fn
+
+    engine_caps = binding.capabilities.to_executor_capabilities()
+    # T15/D (achado da reprodução real): `plan_continuations` (runtime) recusa
+    # a continuação e devolve motivo em texto livre (cita o nome legado
+    # `claude-cli`) quando `engine_caps["deepening"]` é `False` — o mesmo
+    # `engine_caps` já calculado aqui, ANTES de qualquer rodada rodar.
+    # Guardado no agregado para `_chain_envelope`/`_chain_next_action`
+    # decidirem por um SINAL explícito (`deepening is False`), nunca por
+    # casar substring no texto solto do runtime (frágil e vaza `claude-cli`
+    # para fora do vocabulário novo de agente).
+    aggregate["engine_capabilities"] = dict(engine_caps)
+    try:
+        for oid in objective_ids:
+            inputs = _inputs_of(oid)
+            revision_oid = rt_tasks.input_versions_hash(inputs)
+            chain_report = rt_coordinator.run_chain(
+                store,
+                objective_ids=[oid],
+                input_versions=inputs,
+                outcomes_fn=_outcomes_fn_for(oid),
+                repo_id=repo_id,
+                input_revision=revision_oid,
+                adapter=adapter,
+                binding=binding,
+                bindings=bindings_store,
+                budget=_DEFAULT_TASK_BUDGET,
+                max_rounds=max_rounds,
+                engine_capabilities=engine_caps,
+                run_kwargs={
+                    "context_builder": rt_context.build_package,
+                    "resolver": resolver,
+                    "max_concurrency": 4,
+                },
+            )
+            aggregate["rounds"] += chain_report.rounds
+            aggregate["state"].update(chain_report.state)
+            aggregate["chain"].update(chain_report.chain)
+            aggregate["diagnostics"].extend(chain_report.diagnostics)
+            if chain_report.detail:
+                detalhes.append(f"{oid}: {chain_report.detail}")
+            if pior_stop is None or (
+                _STOP_PRIORITY.get(chain_report.stop_reason, 6)
+                < _STOP_PRIORITY.get(pior_stop, 6)
+            ):
+                pior_stop = chain_report.stop_reason
+            ultima_rodada = chain_report.round_reports[-1] if chain_report.round_reports else None
+            if ultima_rodada is not None and ultima_rodada.run is not None:
+                for chave, valor in ultima_rodada.run.summary().items():
+                    resultados_total[chave] = resultados_total.get(chave, 0) + valor
+    finally:
+        registry.close(binding)
+
+    aggregate["stop_reason"] = pior_stop or rt_state.STOP_COMPLETED
+    aggregate["detail"] = "; ".join(detalhes)
+    return {
+        "chain": aggregate,
+        "integracao": last.get("integracao") or {},
+        "investigation_states": last.get("investigation_states") or {},
+        "revisao": last.get("revisao"),
+        "bloqueios": bloqueios,
+        "resultados": resultados_total,
+    }
+
+
+#: §7.3 -> §10.3: `stop_reason` da cadeia -> `operation_status` do envelope
+#: comum. `completed` é o único desfecho de sucesso; todo o resto é trabalho
+#: pendente (`partial`) ou bloqueio material (`executor_unavailable`).
+_CHAIN_STOP_OPERATION = {
+    "completed": "succeeded",
+    "executor_unavailable": "blocked",
+    "budget_exhausted": "partial",
+    "no_progress": "partial",
+    "ambiguity": "partial",
+    "evidence_changed": "partial",
+    "interrupted": "partial",
+}
+
+
+#: Onda12-D (achado da reprodução real do orquestrador): quando o executor
+#: conectado não tem `deepening` (ex.: `local`), `runtime.coordinator.
+#: plan_continuations` recusa a continuação e a cadeia para com
+#: `stop_reason=no_progress` — mas o `detail` que o runtime devolve é texto
+#: livre que cita o nome legado `claude-cli` e não vira uma ação executável.
+#: Este módulo NUNCA repete esse texto: detecta a causa pelo SINAL explícito
+#: (`engine_capabilities["deepening"] is False`, já calculado por
+#: `_run_investigation_chain` ANTES de qualquer rodada) e substitui por um
+#: motivo próprio + `next_action` executável (`agent connect`), sem nunca
+#: citar `claude-cli` (§11: nome legado nunca aparece no fluxo padrão).
+_NO_DEEPENING_MOTIVO = (
+    "executor sem capacidade de aprofundamento (deepening=False); "
+    "continuações de --mode deep exigem um agente com leitura real"
+)
+
+
+def _deep_capable_agent_suggestion(
+    store_root: str, repo_abs: str | None, current_agent_id: str | None,
+) -> str:
+    """Agente sugerido para `agent connect` quando o atual falta `deepening`.
+
+    Preferência já registrada (`BindingStore.get_preference`, repo depois
+    store) quando existe, é DIFERENTE do agente atual (sugerir reconectar o
+    mesmo agente sem `deepening` não resolve nada) e não é `local` (que
+    nunca tem `deepening` — ver `runtime/executors/local_thread.py`); senão
+    o padrão moderno `claude-code` (nunca o nome legado `claude-cli`, banido
+    do fluxo padrão por §11)."""
+    try:
+        from runtime.bindings import BindingStore
+
+        bs = BindingStore(store_root)
+        pref = bs.get_preference(repo_abs) if repo_abs else None
+        if not isinstance(pref, dict) or not pref.get("agent_id"):
+            pref = bs.get_preference(None)
+    except Exception:
+        pref = None
+    pref_agent = str(pref.get("agent_id")) if isinstance(pref, dict) and pref.get("agent_id") else None
+    if pref_agent and pref_agent != "local" and pref_agent != current_agent_id:
+        return pref_agent
+    return "claude-code"
+
+
+def _chain_next_action(
+    *,
+    command: str,
+    store_root: str,
+    repo_abs: str,
+    stop_reason: str,
+    detail: str,
+    chain_status_by_objective: dict,
+    agent_id: str | None,
+    engine_capabilities: dict | None = None,
+    dispatch_next_actions: list | None = None,
+) -> dict | None:
+    """UM `next_action` por motivo material de parada (§7.3, tabela) — nunca
+    `resume` como "próxima rodada" (o laço já rodou todas as disponíveis
+    nesta invocação); `resume` só aparece para RETOMADA depois de uma parada
+    material (`executor_unavailable`/`budget_exhausted`/`evidence_changed`/
+    `interrupted`)."""
+    shell = "powershell" if os.name == "nt" else "posix"
+    if not stop_reason or stop_reason == "completed":
+        return None
+    if stop_reason == "executor_unavailable":
+        # T15/5 (achado de auditoria): `dispatch_next_actions` (passos REAIS
+        # de `runtime.agents.TransportUnavailable.next_actions()`, quando o
+        # handshake falhou especificamente por falta de transporte) tem
+        # prioridade sobre o `agent connect`/`agent list` genérico — o
+        # próprio erro já sabe como se conectar.
+        if dispatch_next_actions:
+            return dispatch_next_actions[0]
+        acoes = _dispatch_next_actions(store_root, repo_abs, agent_id)
+        return acoes[0] if acoes else None
+    if stop_reason == "budget_exhausted":
+        atual = max(
+            (int(st.get("max_rounds") or 0) for st in chain_status_by_objective.values()),
+            default=3,
+        )
+        novo_teto = atual + 3
+        return {
+            "ator": "operador",
+            "motivo": f"orçamento de {atual} rodada(s) consumido; amplie o teto e retome",
+            "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs,
+                      "--max-rounds", str(novo_teto)],
+            "shell": shell,
+        }
+    if stop_reason == "no_progress":
+        if engine_capabilities is not None and not dict(engine_capabilities).get("deepening", True):
+            agente = _deep_capable_agent_suggestion(store_root, repo_abs, agent_id)
+            argv = ["wk", "agent", "connect", "--store", store_root]
+            if repo_abs:
+                argv += ["--repo", repo_abs]
+            argv += ["--agent", agente]
+            return {
+                "ator": "operador",
+                "motivo": f"{_NO_DEEPENING_MOTIVO} (ex.: {agente!r})",
+                "argv": argv, "shell": shell,
+            }
+        return {
+            "ator": "operador",
+            "motivo": "rodada sem progresso semântico — decisão humana sobre a obrigação parada",
+            "argv": None, "shell": None,
+            "acao_externa": detail or "ver chain.detail/diagnostics para a obrigação e o alvo",
+        }
+    if stop_reason == "ambiguity":
+        return {
+            "ator": "operador",
+            "motivo": f"ambiguidade de identidade/iniciativa registrada: {detail or 'ver chain.detail'}",
+            "argv": ["wk", "status", "--store", store_root, "--repo", repo_abs],
+            "shell": shell,
+        }
+    if stop_reason in ("evidence_changed", "interrupted"):
+        motivo = (
+            "leitura satisfeita foi invalidada; retome para replanejar automaticamente"
+            if stop_reason == "evidence_changed"
+            else "processo interrompido; retomada idempotente não reinicia conclusões válidas"
+        )
+        return {
+            "ator": "operador", "motivo": motivo,
+            "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs],
+            "shell": shell,
+        }
+    # `stop_reason` fora do vocabulário conhecido (ex.: um novo motivo
+    # adicionado em `runtime.state.STOP_REASONS` que este `cli.py` ainda não
+    # tem um ramo dedicado) — `_CHAIN_STOP_OPERATION.get(..., "blocked")` já
+    # trata isso como `blocked`; aqui a mesma folga vale para o
+    # `next_action`: nunca `None` (silêncio), sempre `wk resume` como
+    # recuperação padrão.
+    return {
+        "ator": "operador",
+        "motivo": f"cadeia parou por motivo não reconhecido ({stop_reason!r}); retome após investigar",
+        "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs],
+        "shell": shell,
+    }
+
+
+def _chain_envelope(
+    *, command: str, store_root: str, repo_abs: str, chain: dict, agent_id: str | None,
+) -> tuple[str, str, list, list]:
+    """`chain` (retorno de `_run_investigation_chain`, chave `"chain"`) ->
+    `(operation_status, knowledge_status, pending, next_actions)` do envelope
+    comum (§10.2/§10.3) — tradução única do vocabulário fechado de
+    `runtime.state.STOP_REASONS`, usada por `analyze`/`update`/`resume`."""
+    stop_reason = str(chain.get("stop_reason") or "")
+    detail = str(chain.get("detail") or "")
+    engine_capabilities = chain.get("engine_capabilities")
+    if not isinstance(engine_capabilities, dict):
+        engine_capabilities = None
+    dispatch_next_actions = chain.get("dispatch_next_actions")
+    if not isinstance(dispatch_next_actions, list):
+        dispatch_next_actions = None
+    status_por_objetivo = chain.get("chain")
+    if not isinstance(status_por_objetivo, dict):
+        status_por_objetivo = {}
+    operation_status = _CHAIN_STOP_OPERATION.get(stop_reason, "blocked")
+    knowledge_status = "complete" if operation_status == "succeeded" else "partial"
+    # T15/D: `no_progress` cujo motivo é "engine sem deepening" (o runtime
+    # devolve texto livre citando `claude-cli` em `detail`) usa um `detail`
+    # PRÓPRIO aqui — nunca o texto cru do runtime — para `causa`/`acoes` do
+    # `pending` também nunca citarem o nome legado.
+    detail_publico = detail
+    if (
+        stop_reason == "no_progress"
+        and engine_capabilities is not None
+        and not engine_capabilities.get("deepening", True)
+    ):
+        detail_publico = _NO_DEEPENING_MOTIVO
+    pending = []
+    if operation_status != "succeeded":
+        pending.append({
+            "id": f"{command.replace(' ', '-')}-cadeia-{stop_reason or 'sem-motivo'}",
+            "tipo": "conhecimento_bloqueado" if operation_status == "blocked" else "conhecimento_parcial",
+            "alvo": repo_abs,
+            "causa": detail_publico or f"cadeia parou por {stop_reason!r}",
+            "impacto": "conhecimento deste repo não está completo após esta invocação",
+            "recuperacao_automatica": stop_reason not in ("executor_unavailable", "ambiguity"),
+            "acoes": [detail_publico] if detail_publico else [],
+        })
+    na = _chain_next_action(
+        command=command, store_root=store_root, repo_abs=repo_abs,
+        stop_reason=stop_reason, detail=detail,
+        chain_status_by_objective=status_por_objetivo, agent_id=agent_id,
+        engine_capabilities=engine_capabilities,
+        dispatch_next_actions=dispatch_next_actions,
+    )
+    return operation_status, knowledge_status, pending, ([na] if na else [])
 
 
 # -- knowledge.db: entidades/relações/fatos ESTRUTURAIS (nunca de saída de LLM) --
@@ -5634,6 +6517,7 @@ def _integrate_results(
     *,
     reason: str,
     expected_input_versions_hash: dict | None = None,
+    accumulated_state: dict | None = None,
 ) -> tuple[dict, dict, str | None, dict]:
     """`knowledge.integrate.integrate` -> `(resumo, investigation_states, revisão, relatório)`.
 
@@ -5680,6 +6564,7 @@ def _integrate_results(
             objectives=objectives,
             capability_entity_map=cap_map,
             expected_input_versions_hash=dict(expected_input_versions_hash or {}) or None,
+            accumulated_state=dict(accumulated_state or {}) or None,
             reason=reason,
         )
         data = report.to_dict()
@@ -5697,148 +6582,31 @@ def _integrate_results(
     return _integration_summary(data), _integration_states(data), data.get("revisao"), data
 
 
-# -- laço BOUNDED de continuação (achado nº3 da 2ª auditoria) --------------
+# -- continuação: contexto que a rodada seguinte precisa (§7.3) ------------
 #
-# O laço tem DOIS níveis, e nenhum deles é infinito:
+# O laço inteiro (despacho -> integra -> planeja continuação -> repete) roda
+# dentro de `_run_investigation_chain` (uma chamada por invocação de
+# `analyze`/`update`/`resume`, até conclusão ou motivo material de parada —
+# nunca uma rodada por invocação, o desenho antigo de `_continuation_cycle`/
+# `_plan_continuation_round`, removido nesta limpeza por não ter mais
+# chamador). `unmet_needs`/`contract_state` de cada rodada não são mais
+# recomputados aqui na maior parte: `knowledge.integrate.integrate(...)` já
+# devolve os dois nativamente em cada item de `outcome` (`reading_needs`
+# via `ReadingNeed.to_dict()`, COM `evidence` — `contract_state` via
+# `knowledge.integrate._contract_state_dict`), espelhados por
+# `_run_investigation_chain` — ver `_outcomes_fn_for`. Duas exceções
+# continuam responsabilidade deste arquivo (nenhuma camada de `knowledge`/
+# `runtime` tem de onde tirar sozinha):
 #
-# 1. DENTRO de uma invocação: no máximo UMA rodada. Integrar -> planejar
-#    continuações -> executar as criadas -> reintegrar -> publicar. Nunca
-#    "enquanto houver pendência": um comando que não termina não é comando.
-# 2. ENTRE invocações: quem dirige é o operador com `wk resume`, e o teto é
-#    `runtime.tasks.get_max_continuation_rounds` (default 3). Chegado o teto,
-#    `plan_continuations` devolve `recusadas` com motivo e nada é criado — o
-#    objetivo fica `partial` esperando decisão humana, que é o desfecho certo
-#    para uma leitura que 3 rodadas não fecharam.
-
-#: Estado neutro de `continuacao` no JSON — mesmas chaves sempre, para quem lê
-#: a saída não precisar distinguir "não planejei" de "planejei e não criei".
-_EMPTY_CONTINUACAO = {
-    "round": 0, "round_historico": 0, "max_rounds": 0,
-    "criadas": [], "recusadas": [], "executadas": {}, "motivo": None,
-}
-
-
-def _dispatch_disponivel(bloqueios) -> bool:
-    """A engine desta execução despachou? (lido dos bloqueios de `_dispatch_objectives`)
-
-    Reconsultar `executor.capabilities()` aqui sondaria o binário de novo e
-    registraria o MESMO bloqueio duas vezes na saída; o bloqueio já emitido é
-    a resposta.
-    """
-    return not any(
-        isinstance(b, dict) and b.get("tipo") in ("dispatch_indisponivel", "engine_desconhecida")
-        for b in (bloqueios or ())
-    )
-
-
-def _unmet_needs_of(objective, outcome: dict, reread_obligations=()) -> list:
-    """Obrigações de leitura ABERTAS do objetivo, no formato de `plan_continuations`.
-
-    Fonte: as `reading_needs` do objetivo do PLANO corrente (nunca do payload
-    devolvido pelo worker — um worker não escolhe o que ainda precisa ler),
-    menos as que ESTA integração fechou com evidência resolvida
-    (`leituras_satisfeitas` com `satisfeita=True`) — mais as obrigações de
-    releitura da fonte primária que a VERIFICAÇÃO abriu para este objetivo
-    (`reread_obligations`, achado BLOQUEANTE #2/3ª auditoria/Onda11-T2b: um
-    veredito `disputed`/`unresolved` de `knowledge.integrate.reread_obligations`
-    antes só ficava no relatório — nunca virava pedido de leitura de verdade).
-
-    Onda11-T2a já resolve `needs[].evidence` em trecho de código real
-    (`runtime.tasks.create_continuation_tasks` + `runtime.context.build_package`);
-    a causa do achado NESTE arquivo era `_unmet_needs_of` descartar a evidência
-    ao serializar cada `ReadingNeed`/obrigação de releitura — corrigido aqui:
-    cada item carrega `evidence`, de `ReadingNeed.evidence.to_dict()`
-    (`{path, line_start, line_end, ...}`) para as necessidades do objetivo, e
-    de `reread_obligation["primary_source"]` (`{path, start_line, end_line}`,
-    já no formato que `runtime.tasks._normalize_locator` aceita) para as
-    releituras.
-
-    Só entra necessidade com `target`: `plan_continuations` recusa objetivo
-    `partial` sem alvo concreto, e criar tarefa para repetir o mesmo impasse
-    seria exatamente o laço que o achado nº3 (2ª auditoria) pede para não
-    existir.
-    """
-    fechadas_ids = set()
-    fechadas_targets = set()
-    for item in outcome.get("leituras_satisfeitas") or ():
-        if not isinstance(item, dict) or not item.get("satisfeita"):
-            continue
-        if item.get("need_id"):
-            fechadas_ids.add(str(item["need_id"]))
-        if item.get("target"):
-            fechadas_targets.add(str(item["target"]))
-
-    needs: list = []
-    for need in getattr(objective, "reading_needs", ()) or ():
-        if not getattr(need, "open", False):
-            continue
-        need_id = str(getattr(need, "need_id", "") or "")
-        target = str(getattr(need, "target", "") or "")
-        if not target or need_id in fechadas_ids or target in fechadas_targets:
-            continue
-        kind = getattr(need, "kind", None)
-        evidence_ref = getattr(need, "evidence", None)
-        to_dict = getattr(evidence_ref, "to_dict", None)
-        needs.append({
-            "need_id": need_id,
-            "kind": getattr(kind, "value", kind) or "",
-            "target": target,
-            "motivo": str(getattr(need, "motivo", "") or ""),
-            "evidence": to_dict() if callable(to_dict) else None,
-        })
-
-    oid = str(getattr(objective, "objective_id", "") or outcome.get("objective_id") or "")
-    for ob in reread_obligations or ():
-        if not isinstance(ob, dict) or str(ob.get("objective_id") or "") != oid:
-            continue  # obrigação de releitura de OUTRO objetivo: não pertence a esta lista
-        primary = ob.get("primary_source")
-        if not isinstance(primary, dict) or not primary.get("path"):
-            continue  # sem fonte primária resolvida: nada citável, não vira need
-        claim_id = str(ob.get("claim_id") or "")
-        target = str(ob.get("statement") or claim_id)
-        if not target:
-            continue
-        needs.append({
-            "need_id": f"reread:{claim_id}" if claim_id else f"reread:{len(needs)}",
-            "kind": str(ob.get("kind") or "reread_primary_source"),
-            "target": target,
-            "motivo": (
-                "; ".join(str(t) for t in (ob.get("triggers") or ()))
-                or "releitura da fonte primária exigida pela verificação"
-            ),
-            "evidence": {
-                "path": primary.get("path"),
-                "line_start": primary.get("start_line"),
-                "line_end": primary.get("end_line"),
-            },
-        })
-    return needs
-
-
-def _contract_state_of(objective) -> dict:
-    """Campos do §6.3 já PREENCHIDOS (`status == "filled"`) do objetivo do
-    plano corrente — vira `objective["contract_state"]` da continuação
-    (Onda11-T2b, achado BLOQUEANTE #2/3ª auditoria) para que o worker da
-    rodada seguinte não repita pergunta sobre o que já foi explicado.
-
-    Lido do objetivo do PLANO (o mesmo que `_unmet_needs_of` usa), não do
-    payload bruto do worker: é o objetivo quem aplica a regra de
-    preenchimento do §6.3 (`ContractField.fill`/`exclude`/`unresolve`); o
-    resultado do worker é só o que alimentou essa aplicação em
-    `knowledge.integrate._write_objective` (que este arquivo não importa).
-    Só os campos `filled` entram — `pending`/`unresolved`/`excluded` não são
-    "estado já preenchido" (achado #3, `unmet_obligations`, continua sendo
-    quem decide o que falta).
-    """
-    contract = getattr(objective, "contract", None) or {}
-    out: dict = {}
-    for name, fld in contract.items():
-        status = getattr(getattr(fld, "status", None), "value", None)
-        if status != "filled":
-            continue
-        to_dict = getattr(fld, "to_dict", None)
-        out[name] = to_dict() if callable(to_dict) else {"status": status}
-    return out
+# * `capability_context` (entry_keys/símbolos/módulos, abaixo) — resumo da
+#   capacidade para o worker da continuação se re-situar sem o plano inteiro;
+# * releitura da fonte primária pedida pela VERIFICAÇÃO
+#   (`knowledge.integrate.reread_obligations`, Onda11-T2b achado BLOQUEANTE
+#   #2/3ª auditoria): um veredito `disputed`/`unresolved` só aparece em
+#   `integ_report["reread_obligations"]` (nunca em `reading_needs` — não é
+#   uma obrigação do PLANO, é uma obrigação que a VERIFICAÇÃO abriu depois);
+#   sem convertê-la em necessidade de leitura aqui, ela ficava só no
+#   relatório e nunca virava pedido de leitura de verdade (`_reread_needs_of`).
 
 
 def _capability_context_of(objective) -> dict:
@@ -5865,228 +6633,44 @@ def _capability_context_of(objective) -> dict:
     }
 
 
-def _plan_continuation_round(
-    store,
-    report: dict,
-    objectives_by_id: dict,
-    input_versions_by_objective: dict,
-    *,
-    engine_capabilities: dict | None = None,
-    engine_name: str = "local",
-) -> dict:
-    """Uma rodada de `coordinator.plan_continuations` sobre o relatório recém-gerado.
+def _reread_needs_of(oid: str, reread_obligations) -> list:
+    """Obrigações de RELEITURA da fonte primária, no mesmo formato de
+    necessidade de leitura que `plan_continuations` consome (Onda11-T2b,
+    achado BLOQUEANTE #2/3ª auditoria) — filtradas a `oid` (a obrigação de
+    releitura de OUTRO objetivo não pertence a esta lista).
 
-    Chamada UMA VEZ POR OBJETIVO de propósito: `input_versions` é por escopo
-    (`_objective_input_versions`), e um único mapa para o lote inteiro faria a
-    continuação nascer com entradas que não são as da tarefa-mãe — a
-    integração seguinte a descartaria por `input_versions_hash` divergente
-    (achado nº5) e a continuação nunca fecharia nada.
-
-    `engine_capabilities` (Onda11-T2b, achado BLOQUEANTE #2/3ª auditoria):
-    repassado a `coordinator.plan_continuations` — que recusa CRIAR a tarefa
-    (não só executá-la) quando `capabilities()["deepening"]` é `False`, ANTES
-    de ler `round_no`/`task_round`, então nenhuma rodada é consumida (ver
-    `coordinator.plan_continuations`). `None` (default, usado pelos testes
-    que não passam engine nenhuma) preserva o comportamento anterior a esta
-    onda — a mesma compatibilidade que `plan_continuations` já documenta.
-    `contract_state`/`parent_result`/`capability_context` também são
-    montados aqui por objetivo (nunca em lote): são conteúdo do PACOTE da
-    continuação (`runtime.context.build_package`), não da identidade do
-    efeito, mas cada objetivo tem o seu próprio (§7.2 — `create_task` só
-    dedupe pela identidade; o conteúdo extra é livre por chamada). O
-    `parent_result` não é sobrescrito aqui: a chave fica ausente no `outcome`
-    passado adiante, e `plan_continuations` já usa o resultado ACEITO da
-    própria tarefa-mãe (`parent.result`, lido de `runtime.db` pelo
-    `task_id` do outcome) como default — reescrevê-lo aqui seria a mesma
-    leitura duas vezes sem nenhum ganho.
+    Fonte: `knowledge.integrate.reread_obligations` (via
+    `IntegrationReport.reread_obligations`/`integ_report["reread_obligations"]`
+    — um veredito `disputed`/`unresolved` sobre uma claim já aceita). Só
+    entra obrigação com `primary_source` resolvido: sem localizador não há o
+    que o worker da rodada seguinte leria de concreto.
     """
-    from runtime import coordinator as rt_coordinator
-    from runtime import tasks as rt_tasks
-
-    max_rounds = rt_tasks.get_max_continuation_rounds(store)
-    reread = report.get("reread_obligations") or ()
-    criadas: list = []
-    recusadas: list = []
-    round_historico = 0
-    for outcome in report.get("objetivos") or ():
-        if not isinstance(outcome, dict) or str(outcome.get("state") or "") != "partial":
+    needs: list = []
+    for ob in reread_obligations or ():
+        if not isinstance(ob, dict) or str(ob.get("objective_id") or "") != oid:
             continue
-        oid = str(outcome.get("objective_id") or "")
-        objective = objectives_by_id.get(oid)
-        inputs = input_versions_by_objective.get(oid)
-        if objective is None or inputs is None:
-            recusadas.append({
-                "objective_id": oid,
-                "motivo": "objetivo não pertence ao plano corrente deste repositório "
-                          "(sem escopo de entradas para continuar)",
-            })
+        primary = ob.get("primary_source")
+        if not isinstance(primary, dict) or not primary.get("path"):
             continue
-        plano = rt_coordinator.plan_continuations(
-            store,
-            [{
-                **outcome,
-                "unmet_needs": _unmet_needs_of(objective, outcome, reread),
-                "contract_state": _contract_state_of(objective),
-                "capability_context": _capability_context_of(objective),
-            }],
-            input_versions=inputs,
-            budget=_DEFAULT_TASK_BUDGET,
-            max_rounds=max_rounds,
-            engine_capabilities=engine_capabilities,
-        )
-        criadas.extend(plano.get("criadas") or ())
-        for recusada in plano.get("recusadas") or ():
-            # A recusa por falta de `deepening` é decidida ANTES do laço por
-            # objetivo em `plan_continuations` (§ ver docstring de lá) e por
-            # isso sai sem `objective_id` — anexado aqui para que
-            # `continuacao.recusadas` no JSON continue rastreável por
-            # objetivo, igual às demais recusas desta função.
-            recusadas.append(
-                recusada if "objective_id" in recusada else {**recusada, "objective_id": oid}
-            )
-        round_historico = max(round_historico, rt_tasks.continuation_rounds(store, oid))
-
-    # `round` é a rodada CRIADA AGORA (lida da própria tarefa), não a maior já
-    # existente para o objetivo: depois de um `wk update`, as entradas mudaram,
-    # a tarefa-mãe é nova e a cadeia recomeça em 1 — informar "3" ali seria
-    # dizer que resta 1 rodada quando restam 3. `round_historico` guarda a
-    # outra leitura, que é a que `wk status` mostra por objetivo.
-    rounds_criados = []
-    for task_id in criadas:
-        try:
-            rounds_criados.append(rt_tasks.task_round(store.get(task_id)))
-        except Exception:
+        claim_id = str(ob.get("claim_id") or "")
+        target = str(ob.get("statement") or claim_id)
+        if not target:
             continue
-    resultado = {
-        "round": max(rounds_criados, default=0),
-        "round_historico": round_historico,
-        "max_rounds": max_rounds,
-        "criadas": criadas,
-        "recusadas": recusadas,
-        "executadas": dict(_EMPTY_RESULTADOS),
-        "motivo": None,
-    }
-    # Onda11-T2b: quando TODA recusa desta rodada veio da falta de
-    # `deepening` (não de outro motivo, ex.: objetivo fora do plano), o JSON
-    # ganha um `motivo` de topo — resumo único e acionável, em vez de o
-    # operador ter que ler `recusadas[*].motivo` item a item para perceber
-    # que o problema é sempre o mesmo (a engine desta invocação não lê
-    # código). `_proximo_passo_continuacao` usa esta chave para orientar o
-    # comando exato.
-    if recusadas and all("deepening=False" in str(r.get("motivo") or "") for r in recusadas):
-        resultado["motivo"] = (
-            f"engine {engine_name!r} não aprofunda leitura (capabilities()['deepening'] "
-            "é False); nenhuma continuação foi criada — use --engine claude-cli para "
-            "leitura adicional real"
-        )
-    return resultado
-
-
-def _continuation_cycle(
-    store_root: str,
-    namespace: str,
-    store,
-    snapshot,
-    extraction,
-    objectives,
-    capability_map,
-    *,
-    report: dict,
-    objectives_by_id: dict,
-    inputs_by_objective: dict,
-    expected_input_versions_hash: dict,
-    engine_name: str,
-    resolver,
-    bloqueios,
-    reason: str,
-) -> tuple[dict, tuple | None]:
-    """Uma rodada de continuação: planejar -> (executar -> reintegrar).
-
-    Devolve `(continuacao, reintegrado)`, onde `reintegrado` é o retorno de
-    `_integrate_results` da segunda passada ou `None` quando não houve o que
-    reintegrar. `None` significa "o que o chamador já tem continua valendo" —
-    e é o caso de:
-
-    * nenhuma continuação criada (objetivos completos, ou teto de rodadas
-      atingido: as recusas viajam em `continuacao["recusadas"]`);
-    * engine sem despacho — as tarefas ficam `ready` em `runtime.db` e quem
-      as executa é o `wk resume` seguinte, com a engine configurada. Criar a
-      tarefa mesmo sem poder executá-la é deliberado: é ela que carrega, no
-      banco, QUAIS leituras faltam.
-    * engine sem `deepening` (Onda11-T2b, achado BLOQUEANTE #2/3ª auditoria)
-      — NENHUMA tarefa é criada (`_plan_continuation_round` recusa antes de
-      qualquer leitura de rodada): uma engine que não lê código novo (ex.:
-      `local`) não tem o que fazer com uma continuação, e criar a tarefa
-      mesmo assim só gastaria uma rodada do teto por uma resposta que nunca
-      fecha leitura nenhuma — o desperdício que este achado remove.
-    """
-    plan_objectives = {oid: o.to_dict() for oid, o in objectives_by_id.items()}
-    # Sondada ANTES de planejar (não só antes de despachar): é esta mesma
-    # engine que `_plan_continuation_round` repassa a
-    # `coordinator.plan_continuations` para decidir se vale a pena CRIAR a
-    # tarefa — nunca só se vale a pena executá-la.
-    engine_caps = _engine_capabilities(engine_name, plan_objectives)
-    continuacao = _plan_continuation_round(
-        store, report, objectives_by_id, inputs_by_objective,
-        engine_capabilities=engine_caps, engine_name=engine_name,
-    )
-    if not continuacao["criadas"] or not _dispatch_disponivel(bloqueios):
-        return continuacao, None
-
-    continuacao["executadas"], bloqueios_cont = _dispatch_objectives(
-        store, engine_name, resolver=resolver, plan_objectives=plan_objectives,
-    )
-    if bloqueios_cont:
-        continuacao["bloqueios"] = bloqueios_cont
-    reintegrado = _integrate_results(
-        store_root, namespace, store, snapshot, extraction, objectives, capability_map,
-        reason=reason, expected_input_versions_hash=expected_input_versions_hash,
-    )
-    return continuacao, reintegrado
-
-
-def _proximo_passo_continuacao(repo_abs: str, continuacao: dict, bloqueios) -> str | None:
-    """Frase de `proximo_passo` quando a continuação depende do operador."""
-    criadas = len(continuacao.get("criadas") or ())
-    motivo = continuacao.get("motivo")
-    if motivo:
-        # Onda11-T2b (achado BLOQUEANTE #2/3ª auditoria): engine sem
-        # `deepening` — nenhuma tarefa foi criada (`criadas` é sempre vazio
-        # aqui), e o comando exato para desbloquear é trocar de engine, não
-        # `wk resume` na mesma engine (que recusaria de novo, sem consumir
-        # rodada, mas também sem progresso).
-        return (
-            f"{motivo}; rode `wk analyze`/`wk update`/`wk resume --repo {repo_abs} "
-            "--engine claude-cli` (com o binário `claude` configurado) para que a "
-            "continuação seja criada e executada"
-        )
-    if criadas and not _dispatch_disponivel(bloqueios):
-        return (
-            f"{criadas} tarefa(s) de continuação (rodada {continuacao.get('round')}) ficaram "
-            f"`ready` em runtime.db com as leituras que faltam; configure o binário/credenciais "
-            f"da engine e rode `wk resume --repo {repo_abs}` para executá-las e reintegrar — a "
-            "análise estrutural já concluída não precisa ser refeita"
-        )
-    if bloqueios:
-        return (
-            "configure o binário/credenciais da engine e rode `wk resume --repo "
-            f"{repo_abs}` para despachar a leitura adicional pendente; a análise "
-            "estrutural já concluída não precisa ser refeita"
-        )
-    if continuacao.get("recusadas"):
-        return (
-            f"{len(continuacao['recusadas'])} objetivo(s) `partial` não geraram continuação "
-            f"(ver `continuacao.recusadas`: teto de {continuacao.get('max_rounds')} rodadas ou "
-            "nenhuma leitura com alvo concreto); o fechamento depende de decisão humana"
-        )
-    if criadas:
-        return (
-            f"{criadas} continuação(ões) executada(s) nesta invocação (rodada "
-            f"{continuacao.get('round')}); rode `wk resume --repo {repo_abs}` para a próxima "
-            f"rodada enquanto houver objetivo `partial` e o teto de "
-            f"{continuacao.get('max_rounds')} rodadas não for atingido"
-        )
-    return None
+        needs.append({
+            "need_id": f"reread:{claim_id}" if claim_id else f"reread:{len(needs)}",
+            "kind": str(ob.get("kind") or "reread_primary_source"),
+            "target": target,
+            "motivo": (
+                "; ".join(str(t) for t in (ob.get("triggers") or ()))
+                or "releitura da fonte primária exigida pela verificação"
+            ),
+            "evidence": {
+                "path": primary.get("path"),
+                "line_start": primary.get("start_line"),
+                "line_end": primary.get("end_line"),
+            },
+        })
+    return needs
 
 
 def _status_geral(
@@ -6137,6 +6721,20 @@ def _status_geral(
     ):
         return "parcial", 0
     return "completo", 0
+
+
+def _status_geral_to_common(status: str) -> tuple[str, str]:
+    """`status_geral` (acima) -> `(operation_status, knowledge_status)` do
+    envelope comum (§10.2/§10.3). Substitui o exit code embutido em
+    `_status_geral` (que devolvia 0 até para `parcial`, "achado nº6a") pelo
+    esquema comum 0/3/2: `partial` agora sai com exit 3 (`_exit_code_common`)
+    — trabalho pendente deixa de ser confundido com sucesso no código de
+    saída; o motivo continua explícito no corpo do JSON/saída humana."""
+    return {
+        "completo": ("succeeded", "complete"),
+        "parcial": ("partial", "partial"),
+        "bloqueado": ("blocked", "blocked"),
+    }.get(status, ("blocked", "blocked"))
 
 
 #: Publicação local (`store/publicacoes/`): raiz relativa ao store, fixa —
@@ -6282,9 +6880,722 @@ def _publish_local(
         publicacoes["bloqueios"] = [f"{type(exc).__name__}: {exc}"]
         return publicacoes
 
-    if not result.ok:
+    skipped = list(getattr(result, "skipped", None) or [])
+    if skipped:
+        # Achado (baixa) §10.6/`release._render_all`: documentos do plano
+        # pulados por falta de unidades (`unit_ids` vazio) — informativo
+        # SEMPRE que houver pulos, independente de `ok`/`skipped_all`.
+        publicacoes["skipped"] = skipped
+
+    if getattr(result, "skipped_all", False):
+        # Achado (baixa): plano TINHA documentos, mas TODOS foram pulados
+        # por falta de unidades — distinto de `nothing_to_publish` (plano
+        # sem documento nenhum). `release.publish_revision` já devolve
+        # `ok=True` (nada foi promovido, nada quebrou), mas isso NÃO pode
+        # virar sucesso silencioso indistinguível de "nada a publicar":
+        # `skipped_all=True` é o sinal explícito para `_apply_publicacao_status`
+        # rebaixar para `partial` com `pending` tipado.
+        publicacoes["skipped_all"] = True
+    elif getattr(result, "nothing_to_publish", False):
+        # S-remediação/§10.3: plano sem NENHUM documento publicável (fonte
+        # solta em namespace sem entidade planejável) nunca é bloqueio de
+        # publicação — `release.publish_revision` já devolve `ok=True` para
+        # este caso (§9.4/§10.3). Campo aditivo só informativo: nunca vira
+        # `publicacoes["bloqueios"]`, que é o que os chamadores tratam como
+        # `publicacao_bloqueada`/`not_ready`.
+        publicacoes["nothing_to_publish"] = True
+    elif not result.ok:
         publicacoes["bloqueios"] = list(result.blocked_by)
     return publicacoes
+
+
+def _delivery_status_from_publicacoes(publicacoes: dict | None) -> str:
+    """`delivery_status` (§10.3) a partir do resultado de `_publish_local`.
+
+    `not_applicable` quando não houve publicação nesta execução OU quando o
+    plano não produziu nenhum documento publicável (`nothing_to_publish`) —
+    não há nada para julgar "pronto"/"não pronto" nesses dois casos.
+    `skipped_all` (achado baixa §10.6: plano TINHA documentos, todos pulados
+    por falta de unidades) conta como `not_ready` — havia trabalho a fazer e
+    nada foi de fato publicado, distinto de `nothing_to_publish`.
+    `not_ready`/`ready` só quando há de fato um resultado de publicação real
+    a avaliar. Reaproveitada por `cmd_ingest`/`cmd_analyze`/`cmd_update`/
+    `cmd_resume` — uma função só, não quatro cópias divergentes."""
+    if publicacoes is None or publicacoes.get("nothing_to_publish"):
+        return "not_applicable"
+    if publicacoes.get("skipped_all"):
+        return "not_ready"
+    return "not_ready" if publicacoes.get("bloqueios") else "ready"
+
+
+# ---------------------------------------------------------------------------
+# Efeito de publicação pendente (§9.4/T8, S9.4-09)
+#
+# `_publish_local` NUNCA desfaz a revisão de conhecimento já gravada quando a
+# publicação falha (docstring acima) — mas, sem nada além disso, a
+# republicação daquela revisão dependia de o CHAMADOR ter uma revisão nova
+# para tentar de novo. Reingestão do MESMO arquivo (`ingestion.correlate`
+# devolve `duplicate=True`/`revision_id=None`, §8.2.1) não abre revisão nova
+# nenhuma — sem rastrear o efeito de publicação pendente à parte, o comando
+# saía cedo (`if revisoes:`) e nunca tentava publicar de novo.
+#
+# `scripts/knowledge/repository.py` já tem uma outbox de efeitos
+# (`RevisionBuilder.enqueue_effect`/`Repository.pending_effects`, §4.2), mas
+# ela só é gravável de DENTRO de `repo.revision(...)` — abrir uma revisão só
+# para enfileirar o efeito de "falhou ao publicar" gravaria uma linha nova em
+# `revisions` sem mudança semântica nenhuma (o requisito abaixo proíbe
+# exatamente isso ao CONCLUIR o efeito) — e não existe nenhuma API pública
+# ali para marcar um efeito como concluído fora de uma revisão nova. Por
+# isso o efeito `publicacao_pendente` vive num arquivo JSON versionado sob o
+# próprio `--store` (`_write_atomic`, já usado por `_save_ingest2_profile`
+# acima) — nunca dentro de `knowledge.db`.
+# ---------------------------------------------------------------------------
+
+_PENDING_PUBLISH_EFFECTS_FILE = "efeitos_publicacao_pendentes.json"
+_EFFECT_TYPE_PUBLICACAO_PENDENTE = "publicacao_pendente"
+
+#: T15/auditoria#1 (achado ALTA): `_record_pending_publish_effect`/
+#: `_resolve_pending_publish_effects_for` fazem leitura-modificação-escrita
+#: (`_load` -> mutação -> `_save`, `_save` substitui o arquivo INTEIRO via
+#: `_write_atomic`/`os.replace`) sobre `efeitos_publicacao_pendentes.json`
+#: SEM nenhum lock — duas invocações concorrentes (`wk ingest` de fontes
+#: diferentes em paralelo, por exemplo) podiam fazer as duas um `_load` do
+#: MESMO estado antigo, e o `_save` da segunda a terminar sobrescrever
+#: silenciosamente o efeito que a primeira acabara de gravar. Mesmo padrão
+#: de `publishing.delivery._DeliveryTransaction` (stdlib só — `msvcrt` no
+#: Windows, `fcntl` no POSIX) — arquivo de lock DEDICADO (nunca o próprio
+#: `.json` de dados, pelo mesmo motivo: travar o arquivo de dados encurtaria
+#: a janela onde `os.replace` promove o arquivo novo).
+_PENDING_EFFECTS_LOCK_FILENAME = "efeitos_publicacao_pendentes.lock"
+_PENDING_EFFECTS_LOCK_POLL_S = 0.05
+_PENDING_EFFECTS_LOCK_TIMEOUT_S = 15.0
+#: Camada extra IN-PROCESSO: o lock de arquivo abaixo é a garantia ENTRE
+#: processos; entre THREADS do mesmo processo, `msvcrt.locking` não é
+#: reentrante/robusto o bastante para serializar handles distintos do mesmo
+#: processo de forma determinística — este `Lock` fecha essa lacuna (ordem
+#: de aquisição fixa: processo primeiro, arquivo depois — evita deadlock).
+_PENDING_EFFECTS_PROCESS_LOCK = threading.Lock()
+
+
+def _lock_pending_effects_file(fh) -> None:
+    """Trava `fh` de forma exclusiva e NÃO-bloqueante; `OSError` sinaliza
+    "já travado por outro dono" — quem chama retenta até o timeout."""
+    if os.name == "nt":
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_pending_effects_file(fh) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        fh.seek(0)
+        with contextlib.suppress(OSError):
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        with contextlib.suppress(OSError):
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+class _PendingEffectsTransaction:
+    """Lock exclusivo ENTRE PROCESSOS (e entre threads do mesmo processo,
+    via `_PENDING_EFFECTS_PROCESS_LOCK`) sobre a leitura-modificação-escrita
+    de `efeitos_publicacao_pendentes.json` — envolve `_load` -> mutação do
+    chamador -> `_save` como UMA transação. Esgotado o timeout sem
+    conseguir o lock, levanta `TimeoutError` explicável — nunca trava a
+    chamada indefinidamente."""
+
+    def __init__(self, store_root: str, *, timeout: float = _PENDING_EFFECTS_LOCK_TIMEOUT_S):
+        self._path = os.path.join(os.path.abspath(store_root), _PENDING_EFFECTS_LOCK_FILENAME)
+        self._timeout = timeout
+        self._fh = None
+        self._process_lock_held = False
+
+    def __enter__(self) -> "_PendingEffectsTransaction":
+        deadline = time.monotonic() + self._timeout
+        if not _PENDING_EFFECTS_PROCESS_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise TimeoutError(
+                "não foi possível obter o lock de efeitos de publicação pendente em "
+                f"{self._timeout:.1f}s (outra chamada deste mesmo processo já está gravando); "
+                "tente novamente"
+            )
+        self._process_lock_held = True
+        try:
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            fh = open(self._path, "a+b")
+            if fh.tell() == 0:
+                fh.write(b"0")
+                fh.flush()
+            while True:
+                try:
+                    _lock_pending_effects_file(fh)
+                    self._fh = fh
+                    return self
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        fh.close()
+                        raise TimeoutError(
+                            "não foi possível obter o lock de efeitos de publicação pendente "
+                            f"({self._path}) em {self._timeout:.1f}s; outro processo pode estar "
+                            "gravando — tente novamente"
+                        )
+                    time.sleep(_PENDING_EFFECTS_LOCK_POLL_S)
+        except BaseException:
+            if self._process_lock_held:
+                _PENDING_EFFECTS_PROCESS_LOCK.release()
+                self._process_lock_held = False
+            raise
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            if self._fh is not None:
+                _unlock_pending_effects_file(self._fh)
+                self._fh.close()
+                self._fh = None
+        finally:
+            if self._process_lock_held:
+                _PENDING_EFFECTS_PROCESS_LOCK.release()
+                self._process_lock_held = False
+        return False
+
+
+def _pending_publish_effects_path(store_root: str) -> str:
+    return os.path.join(store_root, _PENDING_PUBLISH_EFFECTS_FILE)
+
+
+def _load_pending_publish_effects(store_root: str) -> dict:
+    """Lê o arquivo de efeitos `publicacao_pendente`; ausente/corrompido
+    devolve o esquema vazio (versionado — `version: 1`), nunca levanta."""
+    path = _pending_publish_effects_path(store_root)
+    if not os.path.exists(path):
+        return {"version": 1, "efeitos": []}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {"version": 1, "efeitos": []}
+    if not isinstance(data, dict) or not isinstance(data.get("efeitos"), list):
+        return {"version": 1, "efeitos": []}
+    return data
+
+
+def _save_pending_publish_effects(store_root: str, data: dict) -> None:
+    _write_atomic(
+        _pending_publish_effects_path(store_root),
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def _pending_publish_effects_for_namespace(store_root: str, namespace: str) -> list[dict]:
+    """Efeitos `publicacao_pendente` ainda `pending` para `namespace` (§9.4-09):
+    o que `cmd_ingest`/`cmd_analyze`/`cmd_update`/`cmd_resume` consultam ANTES
+    de decidir "nada a publicar"/"duplicada" — retentar antes de sair cedo."""
+    data = _load_pending_publish_effects(store_root)
+    return [
+        e for e in data["efeitos"]
+        if e.get("effect_type") == _EFFECT_TYPE_PUBLICACAO_PENDENTE
+        and e.get("namespace") == namespace
+        and e.get("status") == "pending"
+    ]
+
+
+def _record_pending_publish_effect(
+    store_root: str,
+    *,
+    namespace: str,
+    revision_id: str,
+    motivo: str,
+    comando: str,
+    argv_recuperacao: list,
+) -> dict:
+    """Persiste (ou atualiza) o efeito `publicacao_pendente` identificado por
+    `(namespace, revision_id)` — chave natural do requisito: uma falha
+    repetida da MESMA revisão atualiza `tentativas`/`motivo` no mesmo
+    registro, nunca empilha um efeito novo por tentativa."""
+    from knowledge.identity import new_effect_id  # reaproveita o mesmo esquema `eff_<hex>` da outbox
+
+    # T15/auditoria#1: `_load` -> mutação -> `_save` inteiro sob lock — ver
+    # `_PendingEffectsTransaction`.
+    with _PendingEffectsTransaction(store_root):
+        data = _load_pending_publish_effects(store_root)
+        now = _utc_now()
+        for efeito in data["efeitos"]:
+            if (
+                efeito.get("effect_type") == _EFFECT_TYPE_PUBLICACAO_PENDENTE
+                and efeito.get("namespace") == namespace
+                and efeito.get("revision_id") == revision_id
+                and efeito.get("status") == "pending"
+            ):
+                efeito["motivo"] = motivo
+                efeito["tentativas"] = int(efeito.get("tentativas") or 0) + 1
+                efeito["atualizado_em"] = now
+                efeito["comando_origem"] = comando
+                efeito["argv_recuperacao"] = list(argv_recuperacao)
+                _save_pending_publish_effects(store_root, data)
+                return efeito
+        novo = {
+            "effect_id": new_effect_id(),
+            "effect_type": _EFFECT_TYPE_PUBLICACAO_PENDENTE,
+            "namespace": namespace,
+            "revision_id": revision_id,
+            "motivo": motivo,
+            "status": "pending",
+            "tentativas": 1,
+            "criado_em": now,
+            "atualizado_em": now,
+            "comando_origem": comando,
+            "argv_recuperacao": list(argv_recuperacao),
+        }
+        data["efeitos"].append(novo)
+        _save_pending_publish_effects(store_root, data)
+        return novo
+
+
+def _resolve_pending_publish_effects_for(
+    store_root: str, *, namespace: str, revision_id: str, detail: str,
+) -> list[str]:
+    """Marca `done` todo efeito `publicacao_pendente` pendente de
+    `(namespace, revision_id)`. Só dá baixa no registro auxiliar — NUNCA abre
+    `repo.revision(...)`, então concluir o efeito não grava revisão nova em
+    `knowledge.db` (requisito §9.4: "conclusão desse efeito não cria uma
+    revisão de conhecimento sem mudança semântica"). Devolve os `effect_id`
+    resolvidos (vazio se não havia nenhum efeito pendente para retentar)."""
+    # T15/auditoria#1: mesma transação de `_record_pending_publish_effect`.
+    with _PendingEffectsTransaction(store_root):
+        data = _load_pending_publish_effects(store_root)
+        resolved: list[str] = []
+        now = _utc_now()
+        for efeito in data["efeitos"]:
+            if (
+                efeito.get("effect_type") == _EFFECT_TYPE_PUBLICACAO_PENDENTE
+                and efeito.get("namespace") == namespace
+                and efeito.get("revision_id") == revision_id
+                and efeito.get("status") == "pending"
+            ):
+                efeito["status"] = "done"
+                efeito["concluido_em"] = now
+                efeito["detalhe_conclusao"] = detail
+                resolved.append(str(efeito.get("effect_id")))
+        if resolved:
+            _save_pending_publish_effects(store_root, data)
+        return resolved
+
+
+def _publish_local_and_track_effect(
+    store_root: str,
+    namespace: str,
+    revision_id: str | None,
+    investigation_states: dict | None,
+    *,
+    comando: str,
+    argv_recuperacao: list,
+) -> dict:
+    """`_publish_local` + rastreio do efeito `publicacao_pendente` (§9.4-09).
+
+    Falha (`bloqueios` não-vazio) grava/atualiza o efeito pendente para esta
+    `(namespace, revision_id)`. Sucesso (inclusive `nothing_to_publish`, que
+    já é `ok=True` em `release.publish_revision`) resolve — dá baixa, sem
+    revisão nova — qualquer efeito pendente PRÉ-EXISTENTE da MESMA
+    `(namespace, revision_id)`; quando havia um, `publicacoes["efeito_pendente_concluido"]`
+    lista os `effect_id` resolvidos, para o chamador relatar "publicação
+    pendente concluída" em vez de tratar como uma publicação nova qualquer.
+
+    T15/auditoria#2 (achado MÉDIA): `_record_pending_publish_effect`/
+    `_resolve_pending_publish_effects_for` gravam `efeitos_publicacao_pendentes.json`
+    (`_write_atomic`/`_PendingEffectsTransaction`) — `OSError` (disco cheio,
+    permissão) ou `TimeoutError` (lock não obtido) daqui NUNCA escapam para
+    o handler genérico de `main()` (que devolveria exit 1, fora do contrato
+    0/2/3): a publicação em si (`_publish_local`, acima) já aconteceu ou já
+    foi reportada corretamente — só o registro AUXILIAR de retomada falhou.
+    Capturado e devolvido como `publicacoes["efeito_pendente_falha_persistencia"]`;
+    os 4 chamadores (`_apply_publicacao_status`/`cmd_ingest`) convertem isso
+    num `pending` `tipo=falha_interna` e `operation_status=blocked` (exit 2),
+    sem perder o resultado da publicação já calculado."""
+    publicacoes = _publish_local(store_root, namespace, revision_id, investigation_states)
+    if revision_id is None:
+        return publicacoes
+    try:
+        if publicacoes.get("bloqueios"):
+            efeito = _record_pending_publish_effect(
+                store_root, namespace=namespace, revision_id=revision_id,
+                motivo="; ".join(publicacoes["bloqueios"]),
+                comando=comando, argv_recuperacao=argv_recuperacao,
+            )
+            publicacoes["efeito_pendente"] = {
+                "effect_id": efeito["effect_id"], "tentativas": efeito["tentativas"],
+            }
+        else:
+            if publicacoes.get("nothing_to_publish"):
+                detail = "nada a publicar nesta revisão"
+            elif publicacoes.get("skipped_all"):
+                detail = "revisão sem bloqueios, mas todos os documentos do plano foram pulados (sem unidades)"
+            else:
+                detail = "publicação pendente concluída"
+            resolvidos = _resolve_pending_publish_effects_for(
+                store_root, namespace=namespace, revision_id=revision_id, detail=detail,
+            )
+            if resolvidos:
+                publicacoes["efeito_pendente_concluido"] = resolvidos
+    except (OSError, TimeoutError) as exc:
+        publicacoes["efeito_pendente_falha_persistencia"] = f"{type(exc).__name__}: {exc}"
+    return publicacoes
+
+
+def _apply_publicacao_status(
+    operation_status: str,
+    knowledge_status: str,
+    pending: list,
+    *,
+    command: str,
+    repo_abs: str | None,
+    publicacoes: dict | None,
+) -> tuple[str, str, list]:
+    """Dobra o resultado de `_publish_local_and_track_effect` sobre
+    `(operation_status, knowledge_status, pending)` já decididos pela cadeia/
+    ingestão — reaproveitada por `analyze`/`update`/`resume`/`ingest` (um
+    lugar só, não quatro cópias divergentes do mesmo `if`).
+
+    T15/auditoria#2: falha de PERSISTÊNCIA do registro auxiliar
+    (`publicacoes["efeito_pendente_falha_persistencia"]`) é bloqueio
+    EXPLÍCITO (`blocked`/exit 2, `pending` `tipo=falha_interna`) — distinto
+    de um bloqueio de publicação comum (que só rebaixa `succeeded` para
+    `partial`, comportamento já existente, preservado abaixo): sem o
+    registro auxiliar, uma retomada automática não sabe que precisa
+    retentar a publicação desta revisão.
+
+    Achado (baixa) §10.6: `publicacoes["skipped_all"]` (plano TINHA
+    documentos, todos pulados por falta de unidades — `release.ReleaseResult
+    .skipped_all`) NÃO é bloqueio de publicação (`ok=True` em
+    `publish_revision`, nada quebrou) e por isso não usa o ramo `bloqueios`
+    abaixo, mas também não pode virar `succeeded` silencioso: rebaixa para
+    `partial` (mesmo tratamento de um bloqueio comum) e soma um `pending`
+    tipado (`publicacao_documentos_pulados`) — `recuperacao_automatica=False`
+    porque o problema é o PLANO (documentos sem unidade), não algo que uma
+    nova tentativa sem intervenção resolva."""
+    publicacoes = publicacoes or {}
+    falha_persistencia = publicacoes.get("efeito_pendente_falha_persistencia")
+    if falha_persistencia:
+        operation_status = "blocked"
+        if knowledge_status == "complete":
+            knowledge_status = "partial"
+        pending = list(pending) + [{
+            "id": f"{command.replace(' ', '-')}-publicacao-persistencia",
+            "tipo": "falha_interna",
+            "alvo": repo_abs or "(sem repo)",
+            "causa": falha_persistencia,
+            "impacto": "publicação processada nesta invocação, mas o registro auxiliar de "
+                       "retomada (efeitos_publicacao_pendentes.json) não pôde ser gravado",
+            "recuperacao_automatica": False,
+            "acoes": ["reveja espaço em disco/permissões do --store e repita este comando"],
+        }]
+    elif publicacoes.get("skipped_all"):
+        if operation_status == "succeeded":
+            operation_status, knowledge_status = "partial", "partial"
+        skipped_items = publicacoes.get("skipped") or []
+        causa = "; ".join(
+            f"{item.get('doc_id')}: {item.get('reason')}" for item in skipped_items
+        ) or "documentos do plano sem unidades publicáveis"
+        pending = list(pending) + [{
+            "id": f"{command.replace(' ', '-')}-publicacao-documentos-pulados",
+            "tipo": "publicacao_documentos_pulados",
+            "alvo": repo_abs or "(sem repo)",
+            "causa": causa,
+            "impacto": "revisão de conhecimento gravada, mas nenhum documento do plano tinha "
+                       "unidades para publicar — manifesto ativo preservado sem mudanças",
+            "recuperacao_automatica": False,
+            "acoes": ["revise o plano de publicação: os documentos listados não geraram unidades semânticas"],
+        }]
+    elif publicacoes.get("bloqueios") and operation_status == "succeeded":
+        operation_status, knowledge_status = "partial", "partial"
+    return operation_status, knowledge_status, pending
+
+
+def _pending_publish_effect_status_entries(store_root: str, namespace: str | None = None) -> list[dict]:
+    """Efeitos `publicacao_pendente` (§9.4-09) ainda em aberto — `namespace=None`
+    lista os de TODO o store (`wk status` sem `--repo`); um namespace filtra
+    (`wk status --repo`, que só conhece o namespace daquele repo)."""
+    data = _load_pending_publish_effects(store_root)
+    return [
+        e for e in data["efeitos"]
+        if e.get("effect_type") == _EFFECT_TYPE_PUBLICACAO_PENDENTE
+        and e.get("status") == "pending"
+        and (namespace is None or e.get("namespace") == namespace)
+    ]
+
+
+def _pending_publish_effect_to_pending_item(efeito: dict) -> dict:
+    """Formata um efeito `publicacao_pendente` como item do array `pending`
+    do envelope comum (§10.2/§10.3) — `recuperacao_automatica=True` porque
+    `wk resume`/`wk ingest` (a `argv_recuperacao` gravada no efeito) retenta
+    sozinho, sem decisão humana adicional."""
+    argv = list(efeito.get("argv_recuperacao") or [])
+    return {
+        "id": f"publicacao-pendente-{efeito.get('effect_id')}",
+        "tipo": _EFFECT_TYPE_PUBLICACAO_PENDENTE,
+        "alvo": f"{efeito.get('namespace')}/{efeito.get('revision_id')}",
+        "causa": efeito.get("motivo") or "publicação anterior não foi confirmada",
+        "impacto": "revisão de conhecimento gravada, mas ainda não publicada "
+                   "(markdown/word/manifest.json) — tentativas: "
+                   f"{efeito.get('tentativas') or 0}",
+        "recuperacao_automatica": True,
+        "acoes": [" ".join(argv)] if argv else [
+            f"rode `wk resume` (ou reingira a mesma fonte) para retentar a publicação da revisão "
+            f"{efeito.get('revision_id')!r} do namespace {efeito.get('namespace')!r}"
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Seleção de agente para despacho real em analyze/update/resume (§10.4.6/§11)
+# ---------------------------------------------------------------------------
+
+#: Tradução de compatibilidade do `--engine` histórico (`local`|`claude-cli`)
+#: para o vocabulário novo (`--mode`/`--agent`). Existe só para não quebrar
+#: quem ainda invoca com `--engine`: nunca é a forma preferida (não aparece
+#: em `next_actions`) e `engine_compat` viaja na saída para decisão de
+#: remoção (§11: "Compatibilidade").
+_ENGINE_COMPAT_MODE = {"local": "structural", "claude-cli": "deep"}
+_ENGINE_COMPAT_AGENT = {"local": "local", "claude-cli": "claude-code"}
+
+
+class UnknownEngineError(ValueError):
+    """`--engine` (compat) informado com um valor fora de `_ENGINE_COMPAT_MODE`.
+
+    O parser das 3 chamadoras (`analyze`/`update`/`resume`) já restringe
+    `--engine` via `choices=["local", "claude-cli"]`, mas `_resolve_mode_and_agent`
+    é chamada diretamente por teste e por qualquer futuro chamador que monte
+    `a` fora do argparse — sem esta checagem, um valor desconhecido caía
+    silenciosamente em `mode="deep"`/`agent=None` (§11: nunca degradar sem
+    reportar; recusar é o comportamento exigido, não inferir)."""
+
+
+def _resolve_mode_and_agent(a) -> dict:
+    """`--mode`/`--agent` (novo) + `--engine` (compat) numa seleção só.
+
+    `--mode` ausente SEMPRE significa `deep` — nunca vira preferência
+    implícita após um diagnóstico anterior (§11: "o modo não deve virar uma
+    preferência implícita"). `--engine`, quando informado sem `--mode`/
+    `--agent` explícitos, traduz: `local` -> modo `structural` (worker
+    determinístico explícito); `claude-cli` -> modo `deep` com `--agent
+    claude-code`. `--mode`/`--agent` explícitos sempre vencem `--engine`.
+
+    `--engine` com valor fora de `_ENGINE_COMPAT_MODE` levanta
+    `UnknownEngineError` — nunca cai em `deep` por omissão silenciosa.
+    """
+    mode = getattr(a, "mode", None)
+    agent = getattr(a, "agent", None)
+    engine = getattr(a, "engine", None)
+    engine_compat = engine if engine else None
+    if engine:
+        if engine not in _ENGINE_COMPAT_MODE:
+            raise UnknownEngineError(
+                f"--engine {engine!r} desconhecido; valores aceitos: "
+                f"{', '.join(sorted(_ENGINE_COMPAT_MODE))} (ou use --mode/--agent)"
+            )
+        if mode is None:
+            mode = _ENGINE_COMPAT_MODE.get(engine)
+        if agent is None:
+            agent = _ENGINE_COMPAT_AGENT.get(engine)
+    if mode is None:
+        mode = "deep"
+    return {"mode": mode, "agent": agent, "engine_compat": engine_compat}
+
+
+def _transport_unavailable_next_actions(exc) -> list:
+    """T15/5 (achado de auditoria): `runtime.agents.TransportUnavailable`
+    (subclasse de `HandshakeFailed`, §10.4.3) já carrega os `setup_steps` —
+    argv REAL de preparação daquele agente/transporte, verificados pelo
+    próprio adaptador — em `exc.next_actions()`. Converte para o formato de
+    `next_actions` deste módulo (§10.2: `ator`/`motivo`/`argv`/`shell`/
+    `acao_externa`) em vez de um `agent connect`/`agent setup` GENÉRICO que
+    ignora o que o adaptador já sabe sobre como se conectar."""
+    shell = "powershell" if os.name == "nt" else "posix"
+    acoes = []
+    for passo in exc.next_actions():
+        argv = list(passo.get("argv") or [])
+        acoes.append({
+            "ator": "operador",
+            "motivo": str(passo.get("reason") or ""),
+            "argv": argv or None,
+            "shell": shell if argv else None,
+            "acao_externa": passo.get("manual_action"),
+        })
+    return acoes
+
+
+def _dispatch_next_actions(store_root: str, repo_abs: str | None, agent_id: str | None) -> list:
+    """`next_actions` de quem precisa conectar um agente antes de despachar
+    (§10.2: vetor de argumentos completo, `agent connect`/`agent list` — a
+    forma NOVA, nunca `--engine`)."""
+    shell = "powershell" if os.name == "nt" else "posix"
+    if agent_id:
+        argv = ["wk", "agent", "connect", "--store", store_root]
+        if repo_abs:
+            argv += ["--repo", repo_abs]
+        argv += ["--agent", agent_id]
+        motivo = f"conectar o agente {agent_id!r} antes da análise profunda (--mode deep é o padrão)"
+    else:
+        argv = ["wk", "agent", "list", "--store", store_root]
+        motivo = "selecionar um agente (`init --agent ID`) antes da análise profunda"
+    return [{"ator": "operador", "motivo": motivo, "argv": argv, "shell": shell}]
+
+
+def _resolve_dispatch_engine(store_root: str, repo_abs: str | None, selecao: dict):
+    """Resolve o `engine_name` (agent_id) efetivo para despacho pelo contrato
+    de binding (§10.4.6) — nunca por preferência implícita.
+
+    `mode == 'structural'`: agente `local` explícito (ou `selecao['agent']`
+    quando informado) — NUNCA consulta `BindingStore`: é o worker
+    determinístico do próprio wiki-ai, sem seleção de fornecedor.
+
+    `mode == 'deep'`: `BindingStore.resolve(repo, override_agent_id=...)`.
+    Preferência sem binding conectado (ou ausência total de preferência)
+    devolve `blocked` preenchido — o chamador decide como reportar; esta
+    função NUNCA escolhe outro agente nem degrada para `structural`.
+
+    Devolve `(engine_name, bindings, blocked)`; `blocked` é `None` quando
+    utilizável, senão `{"agent_id", "detail", "origin"}`.
+    """
+    from runtime.bindings import BindingStore
+
+    bs = BindingStore(store_root)
+    if selecao["mode"] == "structural":
+        return selecao.get("agent") or "local", bs, None
+
+    rb = bs.resolve(repo_abs, override_agent_id=selecao.get("agent"))
+    if not rb.connected:
+        return None, bs, {"agent_id": rb.agent_id, "detail": rb.detail, "origin": rb.origin}
+    return rb.agent_id, bs, None
+
+
+def _precondition_blocked(
+    *, command: str, store_root: str, repo_abs: str | None, causa: str, alvo: str, acoes: list,
+) -> dict:
+    """§10.3: falha de PRECONDIÇÃO (repo inexistente, `runtime.db` ausente,
+    manifesto de snapshot ausente, falha de captura/extração) -> envelope
+    comum, sempre `blocked`/exit 2 — nunca um `print` solto fora do
+    contrato de saída de `analyze`/`update`/`resume`/`status`."""
+    return _common_payload(
+        command=command, operation_status="blocked",
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs},
+        store_root=store_root, repo=repo_abs,
+        summary={"mensagem": causa},
+        pending=[{
+            "id": f"{command.replace(' ', '-')}-precondicao", "tipo": "precondicao_invalida",
+            "alvo": alvo, "causa": causa,
+            "impacto": "nenhum trabalho foi executado nesta invocação",
+            "recuperacao_automatica": False, "acoes": list(acoes),
+        }],
+        next_actions=[{
+            "ator": "operador", "motivo": causa,
+            "argv": None, "shell": None, "acao_externa": (acoes[0] if acoes else None),
+        }],
+        publication=None, delivery_block=None,
+    )
+
+
+def _internal_error_blocked(*, command: str, store_root: str, repo_abs: str | None, exc: Exception) -> dict:
+    """A2: falha INESPERADA de `_run_investigation_chain` (bug, exceção de
+    biblioteca, etc.) — nunca um traceback cru nem um exit code diferente de
+    `analyze`/`update`/`resume`. Mesmo envelope comum de `_precondition_blocked`,
+    mas com `tipo=falha_interna` (distinto de `precondicao_invalida`: aqui
+    trabalho já pode ter sido persistido antes da exceção — nada é apagado,
+    `store.close()` roda do mesmo jeito via `finally` no chamador) e dois
+    `next_actions`: `wk doctor` (diagnosticar o ambiente) e `wk resume`
+    (retomar a cadeia — idempotente, não reinicia conclusões válidas)."""
+    causa = f"{type(exc).__name__}: {exc}"
+    shell = "powershell" if os.name == "nt" else "posix"
+    doctor_argv = ["wk", "doctor", "--store", store_root]
+    if repo_abs:
+        doctor_argv += ["--repo", repo_abs]
+    resume_argv = ["wk", "resume", "--store", store_root, "--repo", repo_abs]
+    return _common_payload(
+        command=command, operation_status="blocked",
+        knowledge_status="partial", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs},
+        store_root=store_root, repo=repo_abs,
+        summary={"mensagem": causa},
+        pending=[{
+            "id": f"{command.replace(' ', '-')}-falha-interna", "tipo": "falha_interna",
+            "alvo": repo_abs, "causa": causa,
+            "impacto": "conhecimento deste repo pode estar incompleto após esta invocação; "
+                       "progresso já persistido antes da falha foi preservado",
+            "recuperacao_automatica": False,
+            "acoes": [f"{type(exc).__name__}: {exc}"],
+        }],
+        next_actions=[
+            {
+                "ator": "operador",
+                "motivo": "diagnosticar o ambiente/store antes de retomar",
+                "argv": doctor_argv, "shell": shell,
+            },
+            {
+                "ator": "operador",
+                "motivo": "retomar a cadeia — idempotente, não reinicia conclusões válidas",
+                "argv": resume_argv, "shell": shell,
+            },
+        ],
+        publication=None, delivery_block=None,
+    )
+
+
+def _blocked_deep_no_binding(*, command: str, store_root: str, repo_abs: str | None, blocked: dict) -> dict:
+    """§11: `--mode deep` sem binding utilizável — bloqueado ANTES de
+    qualquer trabalho (nenhuma tarefa nasce, nenhuma rodada de continuação é
+    consumida; progresso de invocações anteriores fica intacto)."""
+    causa = blocked.get("detail") or "nenhum agente conectado para análise profunda"
+    return _common_payload(
+        command=command, operation_status="blocked",
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs},
+        store_root=store_root, repo=repo_abs,
+        summary={"mensagem": causa, "modo": "deep", "agente": blocked.get("agent_id")},
+        pending=[{
+            "id": "analise-profunda-sem-binding", "tipo": "binding_indisponivel",
+            "alvo": blocked.get("agent_id") or "(nenhum)", "causa": causa,
+            "impacto": "nenhuma tarefa foi criada nesta invocação; progresso anterior preservado",
+            "recuperacao_automatica": False,
+            "acoes": ["conectar um agente (`wk agent connect --agent ID`) e repetir --mode deep, "
+                      "ou usar --mode structural para o worker determinístico local"],
+        }],
+        next_actions=_dispatch_next_actions(store_root, repo_abs, blocked.get("agent_id")),
+        publication=None, delivery_block=None,
+    )
+
+
+def _blocked_unknown_engine(*, command: str, store_root: str, repo_abs: str | None, exc: Exception) -> dict:
+    """`--engine` (compat) com valor desconhecido — recusado explicitamente
+    (exit 2), nunca degradado para `--mode deep` silencioso."""
+    causa = str(exc)
+    return _common_payload(
+        command=command, operation_status="blocked",
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs},
+        store_root=store_root, repo=repo_abs,
+        summary={"mensagem": causa},
+        pending=[{
+            "id": f"{command.replace(' ', '-')}-engine-desconhecido", "tipo": "entrada_invalida",
+            "alvo": getattr(exc, "engine", None) or "--engine", "causa": causa,
+            "impacto": "nenhuma tarefa foi criada nesta invocação",
+            "recuperacao_automatica": False,
+            "acoes": ["repetir com um --engine válido (local|claude-cli), ou preferir --mode/--agent"],
+        }],
+        next_actions=[{
+            "ator": "operador",
+            "motivo": "corrigir --engine (ou usar --mode/--agent) e repetir",
+            "argv": None, "shell": None, "acao_externa": None,
+        }],
+        publication=None, delivery_block=None,
+    )
 
 
 # -- comandos -----------------------------------------------------------
@@ -6296,15 +7607,41 @@ def cmd_analyze(a) -> int:
 
     store_root = _store_root(a)
     repo_abs = os.path.abspath(a.repo)
+    json_out = bool(getattr(a, "json", False))
     if not os.path.isdir(repo_abs):
-        print(json.dumps({"error": f"repo não encontrado: {repo_abs}", "acao": "confira --repo"},
-                          ensure_ascii=False), file=sys.stderr)
-        return 2
+        payload = _precondition_blocked(
+            command="analyze", store_root=store_root, repo_abs=repo_abs,
+            causa=f"repo não encontrado: {repo_abs}", alvo=repo_abs,
+            acoes=["confira --repo"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     profile_all = _load_analysis_profile(store_root)
     prior = _repo_profile(profile_all, repo_abs)
     topic = a.topic if a.topic is not None else prior.get("topic")
-    engine_name = a.engine or prior.get("engine") or "local"
+
+    # §10.4.6/§11: seleção de agente pelo contrato de binding — nunca por
+    # preferência implícita. `--mode deep` (default, mesmo sem --mode) sem
+    # binding utilizável bloqueia ANTES de qualquer trabalho (nenhuma tarefa
+    # nasce, nenhuma rodada de continuação é consumida); `--mode structural`
+    # é sempre o worker `local` explícito.
+    try:
+        selecao = _resolve_mode_and_agent(a)
+    except UnknownEngineError as exc:
+        payload = _blocked_unknown_engine(
+            command="analyze", store_root=store_root, repo_abs=repo_abs, exc=exc,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+    engine_name, bindings_store, blocked = _resolve_dispatch_engine(store_root, repo_abs, selecao)
+    if blocked is not None:
+        payload = _blocked_deep_no_binding(
+            command="analyze", store_root=store_root, repo_abs=repo_abs, blocked=blocked,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
     scope = prior.get("scope")
     namespace = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
 
@@ -6313,12 +7650,14 @@ def cmd_analyze(a) -> int:
             repo_abs, scope, namespace
         )
     except Exception as exc:
-        print(json.dumps({
-            "error": f"falha na captura/extração do repositório: {exc}",
-            "tipo": type(exc).__name__,
-            "acao": "confira se --repo aponta para um diretório válido (git ou não)",
-        }, ensure_ascii=False), file=sys.stderr)
-        return 1
+        payload = _precondition_blocked(
+            command="analyze", store_root=store_root, repo_abs=repo_abs,
+            causa=f"falha na captura/extração do repositório: {type(exc).__name__}: {exc}",
+            alvo=repo_abs,
+            acoes=["confira se --repo aponta para um diretório válido (git ou não)"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     _save_snapshot_manifest(store_root, snapshot)
 
@@ -6348,43 +7687,38 @@ def cmd_analyze(a) -> int:
                     "task_id": t.task_id, "reaproveitada": bool(t.reused), "estado": t.state.value,
                 })
 
-        resolver = _snapshot_resolver(snapshot)
-        resultados, bloqueios = _dispatch_objectives(
-            store, engine_name, resolver=resolver,
-            plan_objectives={o.objective_id: o.to_dict() for o in objectives},
-        )
-
         reason = f"wk analyze --repo {repo_abs}" + (f" --topic {topic}" if topic else "")
         kg_summary = _write_structural_knowledge(store_root, namespace, snapshot, capability_map, extraction, reason)
 
-        # Achado nº1: DEPOIS da revisão estrutural e ANTES de publicar. O que o
-        # worker afirmou é confrontado com o snapshot e vira fato; a publicação
-        # usa a revisão PÓS-integração (`integ_revisao`), senão sairia o estado
-        # anterior aos fatos que acabaram de ser gravados.
-        esperados = _expected_input_hashes(inputs_by_objective)
-        integracao, investigation_states, integ_revisao, integ_report = _integrate_results(
-            store_root, namespace, store, snapshot, extraction, objectives, capability_map,
-            reason=f"integração de resultados — {reason}",
-            expected_input_versions_hash=esperados,
-        )
+        # §7.3: o laço inteiro (despacho -> integra -> planeja continuação ->
+        # repete) numa chamada só, até conclusão ou motivo material de parada
+        # — nunca uma rodada por invocação (`_continuation_cycle` antigo).
+        resolver = _snapshot_resolver(snapshot)
+        max_rounds = getattr(a, "max_rounds", None)
+        try:
+            cadeia = _run_investigation_chain(
+                store, store_root=store_root, namespace=namespace, snapshot=snapshot,
+                extraction=extraction, objectives=objectives, capability_map=capability_map,
+                objectives_by_id=objectives_by_id, inputs_by_objective=inputs_by_objective,
+                engine_name=engine_name, bindings_store=bindings_store, resolver=resolver,
+                reason=f"integração de resultados — {reason}", max_rounds=max_rounds,
+            )
+        except Exception as exc:  # A2: falha inesperada — envelope comum, exit 2, sem apagar progresso
+            payload = _internal_error_blocked(
+                command="analyze", store_root=store_root, repo_abs=repo_abs, exc=exc,
+            )
+            _render_common(payload, json_out=json_out)
+            return _exit_code_common(payload["operation_status"])
+        integracao = cadeia["integracao"]
+        investigation_states = cadeia["investigation_states"]
+        bloqueios = list(cadeia["bloqueios"])
+        resultados = cadeia["resultados"]
 
-        # Achado nº3: UMA rodada de continuação por invocação. Publicar antes
-        # disto sairia com o estado anterior às leituras que a continuação
-        # acabou de fechar — o mesmo buraco do achado nº1, um passo adiante.
-        continuacao, reintegrado = _continuation_cycle(
-            store_root, namespace, store, snapshot, extraction, objectives, capability_map,
-            report=integ_report, objectives_by_id=objectives_by_id,
-            inputs_by_objective=inputs_by_objective, expected_input_versions_hash=esperados,
-            engine_name=engine_name, resolver=resolver, bloqueios=bloqueios,
-            reason=f"integração de continuações — {reason}",
-        )
-        if reintegrado is not None:
-            integracao, investigation_states, nova_revisao, _ = reintegrado
-            integ_revisao = nova_revisao or integ_revisao
-
-        revisao_publicada = integ_revisao or kg_summary.get("revision_id")
-        publicacoes = _publish_local(
-            store_root, namespace, revisao_publicada, investigation_states
+        revisao_publicada = cadeia["revisao"] or kg_summary.get("revision_id")
+        publicacoes = _publish_local_and_track_effect(
+            store_root, namespace, revisao_publicada, investigation_states,
+            comando="analyze",
+            argv_recuperacao=["wk", "resume", "--repo", repo_abs, "--store", store_root],
         )
 
         current_oids = sorted({str(o.get("objective_id")) for o in objective_dicts if o.get("objective_id")})
@@ -6395,20 +7729,11 @@ def cmd_analyze(a) -> int:
         }
         _save_analysis_profile(store_root, profile_all)
 
-        status, exit_code = _status_geral(
-            objetivos_por_estado=integracao.get("objetivos_por_estado"),
-            publicacao_bloqueada=bool(publicacoes.get("bloqueios")),
-            revisao_nova=bool(revisao_publicada) and bool(
-                int(kg_summary.get("mudancas") or 0) + int(integracao.get("mudancas") or 0)
-            ),
-            bloqueios_execucao=len(bloqueios) + len(integracao.get("bloqueios") or ()),
-        )
         out = {
-            "status_geral": status,
             "capacidades_analisadas": capacidades_analisadas,
             "revisao": kg_summary,
             "integracao": integracao,
-            "continuacao": continuacao,
+            "chain": cadeia["chain"],
             "publicacoes": publicacoes,
             "resultados": resultados,
             "lacunas": _lacunas_from_objectives(objectives),
@@ -6416,13 +7741,42 @@ def cmd_analyze(a) -> int:
             "escopo_efetivo": {
                 "repo": repo_abs, "topic": topic, "engine": engine_name,
                 "scope": scope, "namespace": namespace, "store": store_root,
+                "modo": selecao["mode"],
             },
+            "agent": _agent_public_dict(store_root, repo_abs),
         }
-        proximo = _proximo_passo_continuacao(repo_abs, continuacao, bloqueios)
-        if proximo:
-            out["proximo_passo"] = proximo
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return exit_code
+        if selecao.get("engine_compat"):
+            out["aviso_compat_engine"] = (
+                f"--engine {selecao['engine_compat']!r} é compatibilidade (§11); prefira "
+                "--mode/--agent — candidato à remoção"
+            )
+
+        # §7.3 -> §10.2/§10.3: `stop_reason` da cadeia é a autoridade de
+        # `operation_status`/`knowledge_status`/`next_actions` — nunca mais
+        # `_proximo_passo_continuacao` sugerindo "rode `wk resume` para a
+        # próxima rodada" (a cadeia já rodou todas as disponíveis aqui).
+        operation_status, knowledge_status, pending, next_actions = _chain_envelope(
+            command="analyze", store_root=store_root, repo_abs=repo_abs,
+            chain=cadeia["chain"], agent_id=selecao.get("agent") or engine_name,
+        )
+        operation_status, knowledge_status, pending = _apply_publicacao_status(
+            operation_status, knowledge_status, pending,
+            command="analyze", repo_abs=repo_abs, publicacoes=publicacoes,
+        )
+        payload = _common_payload(
+            command="analyze", operation_status=operation_status,
+            knowledge_status=knowledge_status,
+            delivery_status=_delivery_status_from_publicacoes(publicacoes),
+            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            summary={"detail": out}, pending=pending, next_actions=next_actions,
+            publication=(
+                {"revision": revisao_publicada, "root": os.path.join(store_root, _PUBLICACOES_DIRNAME)}
+                if revisao_publicada else None
+            ),
+            delivery_block=None,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
     finally:
         store.close()
 
@@ -6434,26 +7788,55 @@ def cmd_update(a) -> int:
 
     store_root = _store_root(a)
     repo_abs = os.path.abspath(a.repo)
+    json_out = bool(getattr(a, "json", False))
     if not os.path.isdir(repo_abs):
-        print(json.dumps({"error": f"repo não encontrado: {repo_abs}"}, ensure_ascii=False), file=sys.stderr)
-        return 2
+        payload = _precondition_blocked(
+            command="update", store_root=store_root, repo_abs=repo_abs,
+            causa=f"repo não encontrado: {repo_abs}", alvo=repo_abs, acoes=["confira --repo"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     profile_all = _load_analysis_profile(store_root)
     prior = _repo_profile(profile_all, repo_abs)
     if not prior.get("last_snapshot_id"):
-        print(json.dumps({
-            "error": "nenhuma análise anterior encontrada para este repo",
-            "acao": f"rode `wk analyze --repo {repo_abs}` primeiro",
-        }, ensure_ascii=False), file=sys.stderr)
-        return 2
+        payload = _precondition_blocked(
+            command="update", store_root=store_root, repo_abs=repo_abs,
+            causa="nenhuma análise anterior encontrada para este repo", alvo=repo_abs,
+            acoes=[f"rode `wk analyze --repo {repo_abs}` primeiro"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     old_snapshot = _load_snapshot_manifest(store_root, prior["last_snapshot_id"])
     if old_snapshot is None:
-        print(json.dumps({
-            "error": f"manifesto do snapshot anterior não encontrado: {prior['last_snapshot_id']}",
-            "acao": f"rode `wk analyze --repo {repo_abs}` novamente para recriar o manifesto",
-        }, ensure_ascii=False), file=sys.stderr)
-        return 2
+        payload = _precondition_blocked(
+            command="update", store_root=store_root, repo_abs=repo_abs,
+            causa=f"manifesto do snapshot anterior não encontrado: {prior['last_snapshot_id']}",
+            alvo=repo_abs,
+            acoes=[f"rode `wk analyze --repo {repo_abs}` novamente para recriar o manifesto"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
+    # §10.4.6/§11: mesma seleção de agente de `wk analyze` — bloqueado ANTES
+    # de capturar o novo snapshot quando `--mode deep` (default) não tem
+    # binding utilizável (nenhuma tarefa nasce, nenhuma rodada é consumida).
+    try:
+        selecao = _resolve_mode_and_agent(a)
+    except UnknownEngineError as exc:
+        payload = _blocked_unknown_engine(
+            command="update", store_root=store_root, repo_abs=repo_abs, exc=exc,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+    engine_name, bindings_store, blocked = _resolve_dispatch_engine(store_root, repo_abs, selecao)
+    if blocked is not None:
+        payload = _blocked_deep_no_binding(
+            command="update", store_root=store_root, repo_abs=repo_abs, blocked=blocked,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     from analysis import snapshot as snap_mod
 
@@ -6461,21 +7844,138 @@ def cmd_update(a) -> int:
     try:
         new_snapshot = snap_mod.capture(repo_abs, scope=scope)
     except Exception as exc:
-        print(json.dumps({"error": f"falha na captura do repositório: {exc}", "tipo": type(exc).__name__},
-                          ensure_ascii=False), file=sys.stderr)
-        return 1
+        payload = _precondition_blocked(
+            command="update", store_root=store_root, repo_abs=repo_abs,
+            causa=f"falha na captura do repositório: {type(exc).__name__}: {exc}", alvo=repo_abs,
+            acoes=["confira se --repo aponta para um diretório válido (git ou não)"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     if new_snapshot.snapshot_id == old_snapshot.snapshot_id:
-        print(json.dumps({
+        # §10.3: no-op EXPLÍCITO — "não mudou" não implica "conhecimento
+        # completo" (nada foi reavaliado nesta invocação). Mas "não mudou"
+        # TAMBÉM não implica "conhecimento inaplicável": `knowledge_status`
+        # preserva o estado AGREGADO do escopo deste repo — a MESMA leitura
+        # de `wk status --repo` (`_ingest_repo_scope_status`, já usada por
+        # `cmd_ingest` para o mesmo problema em T15/B) — nunca "conserta" por
+        # omissão um escopo que já está `partial`/`blocked`.
+        #
+        # T15/auditoria#7 (achado BAIXA): "sem delta" não pode sair cedo
+        # ignorando um efeito `publicacao_pendente` já registrado para este
+        # namespace (ex.: publicação de uma revisão anterior que falhou por
+        # disco cheio) — reaproveita o MESMO retentar de `cmd_ingest`
+        # (`_pending_publish_effects_for_namespace` + `_publish_local_and_track_effect`):
+        # conhecimento continua `noop` (nada foi reanalisado), só a
+        # publicação pendente é RETENTADA.
+        namespace_noop = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
+        publicacoes_retry = None
+        pendentes_noop = _pending_publish_effects_for_namespace(store_root, namespace_noop)
+        if pendentes_noop:
+            alvo_pendente = pendentes_noop[-1]
+            investigation_states = _integration_states(
+                _load_last_integration(store_root).get("integracao") or {}
+            )
+            publicacoes_retry = _publish_local_and_track_effect(
+                store_root, namespace_noop, alvo_pendente["revision_id"], investigation_states,
+                comando="update",
+                argv_recuperacao=["wk", "update", "--repo", repo_abs, "--store", store_root],
+            )
+
+        noop_detail = {
             "mudou": False, "mensagem": "sem mudanças desde a última análise; nada foi reexecutado",
             "snapshot_id": new_snapshot.snapshot_id,
-        }, ensure_ascii=False, indent=2))
-        return 0
+            "agent": _agent_public_dict(store_root, repo_abs),
+        }
+        if publicacoes_retry is not None:
+            noop_detail["publicacoes"] = publicacoes_retry
+
+        # T15/#1 (reprodução real): `knowledge_status`/`pending`/
+        # `next_actions` do no-op refletem o estado AGREGADO do escopo de
+        # análise deste repo (a mesma leitura de `wk status --repo`), não um
+        # `not_applicable` fixo que escondia um escopo `partial`/`blocked`
+        # já existente.
+        escopo_noop = _ingest_repo_scope_status(store_root, repo_abs)
+        knowledge_status_noop = escopo_noop.get("knowledge_status") or "not_applicable"
+        noop_detail["escopo_repo"] = escopo_noop
+
+        pending_noop: list = []
+        next_actions_noop: list = []
+        if knowledge_status_noop == "partial":
+            pending_noop.append({
+                "id": "update-conhecimento-parcial",
+                "tipo": "conhecimento_parcial",
+                "alvo": repo_abs,
+                "causa": (
+                    "escopo de análise deste repo permanece parcial "
+                    f"(stop_reason={escopo_noop.get('stop_reason')!r}); nada foi reavaliado "
+                    "nesta invocação (no-op: repositório sem mudanças)"
+                ),
+                "impacto": "conhecimento deste repo ainda não está completo",
+                "recuperacao_automatica": True,
+                "acoes": ["rodar `wk resume` para continuar a investigação pendente"],
+            })
+            if escopo_noop.get("stop_reason") == "executor_unavailable":
+                next_actions_noop = _dispatch_next_actions(
+                    store_root, repo_abs, escopo_noop.get("agent_id")
+                )
+            else:
+                next_actions_noop = [{
+                    "ator": "operador",
+                    "motivo": "escopo de análise deste repo continua parcial; retome a "
+                              "investigação",
+                    "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs],
+                    "shell": "powershell" if os.name == "nt" else "posix",
+                }]
+
+        # Mesma regra de `_status_geral`/`cmd_ingest`: publicação BLOQUEADA
+        # sem nenhuma revisão nova nesta invocação (é um no-op de
+        # conhecimento — nunca haveria revisão nova aqui) é bloqueio
+        # material, não um "noop" silencioso escondendo-o.
+        operation_status_noop = "noop"
+        if publicacoes_retry is not None and (
+            publicacoes_retry.get("bloqueios") or publicacoes_retry.get("efeito_pendente_falha_persistencia")
+        ):
+            operation_status_noop = "blocked"
+            falha_persistencia = publicacoes_retry.get("efeito_pendente_falha_persistencia")
+            causa = falha_persistencia or "; ".join(publicacoes_retry.get("bloqueios") or [])
+            pending_noop.append({
+                "id": "update-publicacao-pendente-bloqueada",
+                "tipo": "falha_interna" if falha_persistencia else "conhecimento_bloqueado",
+                "alvo": repo_abs, "causa": causa,
+                "impacto": "publicação pendente registrada para este namespace continua sem "
+                           "ser entregue",
+                "recuperacao_automatica": not bool(falha_persistencia),
+                "acoes": [causa],
+            })
+            next_actions_noop = [{
+                "ator": "operador",
+                "motivo": "publicação pendente ainda bloqueada após a retentativa; revise "
+                          "summary.detail.publicacoes",
+                "argv": ["wk", "update", "--repo", repo_abs, "--store", store_root],
+                "shell": "powershell" if os.name == "nt" else "posix",
+            }] + next_actions_noop
+        payload = _common_payload(
+            command="update", operation_status=operation_status_noop,
+            knowledge_status=knowledge_status_noop,
+            delivery_status=_status_delivery_status(store_root, repo_abs),
+            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            summary={"detail": noop_detail}, pending=pending_noop, next_actions=next_actions_noop,
+            publication=(
+                {
+                    "revision": pendentes_noop[-1]["revision_id"],
+                    "root": os.path.join(store_root, _PUBLICACOES_DIRNAME),
+                }
+                if pendentes_noop else None
+            ),
+            delivery_block=None,
+        )
+        _render_common(payload, json_out=bool(getattr(a, "json", False)))
+        return _exit_code_common(payload["operation_status"])
 
     delta = snap_mod.diff(old_snapshot, new_snapshot)
     namespace = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
     topic = prior.get("topic")
-    engine_name = a.engine or prior.get("engine") or "local"
 
     store = rt_tasks.TaskStore.open(_runtime_db_path(store_root))
     try:
@@ -6532,10 +8032,6 @@ def cmd_update(a) -> int:
                 })
 
         resolver = _snapshot_resolver(new_snapshot)
-        resultados, bloqueios = _dispatch_objectives(
-            store, engine_name, resolver=resolver,
-            plan_objectives={o.objective_id: o.to_dict() for o in objectives},
-        )
 
         from knowledge import invalidate as kg_invalidate
         from knowledge.repository import Repository
@@ -6566,36 +8062,41 @@ def cmd_update(a) -> int:
         finally:
             repo_kg.close()
 
-        # Mesma fiação do `wk analyze` (achados nº1, nº3 e nº5): integrar com
-        # escopo antes de publicar, rodar UMA rodada de continuação e publicar
-        # a revisão pós-integração. `wk update` compartilha a fiação de
-        # propósito — deixá-la só em `analyze`/`resume` reabriria o buraco pela
-        # porta do delta.
-        esperados = _expected_input_hashes(inputs_by_objective)
-        integracao, investigation_states, integ_revisao, integ_report = _integrate_results(
-            store_root, namespace, store, new_snapshot, extraction, objectives, capability_map,
-            reason=f"integração de resultados — {reason}",
-            expected_input_versions_hash=esperados,
-        )
-        continuacao, reintegrado = _continuation_cycle(
-            store_root, namespace, store, new_snapshot, extraction, objectives, capability_map,
-            report=integ_report, objectives_by_id=objectives_by_id,
-            inputs_by_objective=inputs_by_objective, expected_input_versions_hash=esperados,
-            engine_name=engine_name, resolver=resolver, bloqueios=bloqueios,
-            reason=f"integração de continuações — {reason}",
-        )
-        if reintegrado is not None:
-            integracao, investigation_states, nova_revisao, _ = reintegrado
-            integ_revisao = nova_revisao or integ_revisao
+        # §7.3: mesma fiação de `wk analyze` — o laço inteiro (despacho ->
+        # integra -> planeja continuação -> repete) numa chamada só, até
+        # conclusão ou motivo material de parada. `wk update` compartilha a
+        # fiação de propósito: deixá-la só em `analyze`/`resume` reabriria o
+        # buraco pela porta do delta.
+        max_rounds = getattr(a, "max_rounds", None)
+        try:
+            cadeia = _run_investigation_chain(
+                store, store_root=store_root, namespace=namespace, snapshot=new_snapshot,
+                extraction=extraction, objectives=objectives, capability_map=capability_map,
+                objectives_by_id=objectives_by_id, inputs_by_objective=inputs_by_objective,
+                engine_name=engine_name, bindings_store=bindings_store, resolver=resolver,
+                reason=f"integração de resultados — {reason}", max_rounds=max_rounds,
+            )
+        except Exception as exc:  # A2: falha inesperada — envelope comum, exit 2, sem apagar progresso
+            payload = _internal_error_blocked(
+                command="update", store_root=store_root, repo_abs=repo_abs, exc=exc,
+            )
+            _render_common(payload, json_out=json_out)
+            return _exit_code_common(payload["operation_status"])
+        integracao = cadeia["integracao"]
+        investigation_states = cadeia["investigation_states"]
+        bloqueios = list(cadeia["bloqueios"])
+        resultados = cadeia["resultados"]
 
-        revisao_publicada = integ_revisao or kg_summary.get("revision_id")
+        revisao_publicada = cadeia["revisao"] or kg_summary.get("revision_id")
 
         # Republica só quando houve mudança (§7.1/W8): esta função inteira só
         # roda dentro do ramo `mudou=True` — o `if new_snapshot.snapshot_id ==
         # old_snapshot.snapshot_id` acima já retorna sem chegar aqui quando
         # não há delta, então `wk update` sem mudança nunca republica.
-        publicacoes = _publish_local(
-            store_root, namespace, revisao_publicada, investigation_states
+        publicacoes = _publish_local_and_track_effect(
+            store_root, namespace, revisao_publicada, investigation_states,
+            comando="update",
+            argv_recuperacao=["wk", "resume", "--repo", repo_abs, "--store", store_root],
         )
 
         _save_snapshot_manifest(store_root, new_snapshot)
@@ -6606,17 +8107,8 @@ def cmd_update(a) -> int:
         }
         _save_analysis_profile(store_root, profile_all)
 
-        status, exit_code = _status_geral(
-            objetivos_por_estado=integracao.get("objetivos_por_estado"),
-            publicacao_bloqueada=bool(publicacoes.get("bloqueios")),
-            revisao_nova=bool(revisao_publicada) and bool(
-                int(kg_summary.get("mudancas") or 0) + int(integracao.get("mudancas") or 0)
-            ),
-            bloqueios_execucao=len(bloqueios) + len(integracao.get("bloqueios") or ()),
-        )
         out = {
             "mudou": True,
-            "status_geral": status,
             "delta": {"adicionados": delta["added"], "removidos": delta["removed"], "alterados": delta["changed"]},
             "objetivos_invalidados": objetivos_invalidados,
             "objetivos_obsoletos": objetivos_obsoletos,
@@ -6624,7 +8116,7 @@ def cmd_update(a) -> int:
             "capacidades_analisadas": capacidades_analisadas,
             "revisao": kg_summary,
             "integracao": integracao,
-            "continuacao": continuacao,
+            "chain": cadeia["chain"],
             "publicacoes": publicacoes,
             "resultados": resultados,
             "lacunas": _lacunas_from_objectives(objectives),
@@ -6632,34 +8124,206 @@ def cmd_update(a) -> int:
             "escopo_efetivo": {
                 "repo": repo_abs, "topic": topic, "engine": engine_name,
                 "scope": scope, "namespace": namespace, "store": store_root,
+                "modo": selecao["mode"],
             },
+            "agent": _agent_public_dict(store_root, repo_abs),
         }
-        proximo = _proximo_passo_continuacao(repo_abs, continuacao, bloqueios)
-        if proximo:
-            out["proximo_passo"] = proximo
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return exit_code
+        if selecao.get("engine_compat"):
+            out["aviso_compat_engine"] = (
+                f"--engine {selecao['engine_compat']!r} é compatibilidade (§11); prefira "
+                "--mode/--agent — candidato à remoção"
+            )
+
+        # §7.3 -> §10.2/§10.3: mesma tradução de `analyze` — ver `_chain_envelope`.
+        operation_status, knowledge_status, pending, next_actions = _chain_envelope(
+            command="update", store_root=store_root, repo_abs=repo_abs,
+            chain=cadeia["chain"], agent_id=selecao.get("agent") or engine_name,
+        )
+        operation_status, knowledge_status, pending = _apply_publicacao_status(
+            operation_status, knowledge_status, pending,
+            command="update", repo_abs=repo_abs, publicacoes=publicacoes,
+        )
+        payload = _common_payload(
+            command="update", operation_status=operation_status,
+            knowledge_status=knowledge_status,
+            delivery_status=_delivery_status_from_publicacoes(publicacoes),
+            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            summary={"detail": out}, pending=pending, next_actions=next_actions,
+            publication=(
+                {"revision": revisao_publicada, "root": os.path.join(store_root, _PUBLICACOES_DIRNAME)}
+                if revisao_publicada else None
+            ),
+            delivery_block=None,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
     finally:
         store.close()
 
 
+def _cmd_status_store(a, store_root: str) -> int:
+    """`wk status` SEM `--repo` (§11): visão agregada do store — sistemas
+    registrados, iniciativas conhecidas, preferência/binding do STORE
+    (`BindingStore.resolve(repo=None)`) e `delivery_status` agregado (a
+    MESMA `publishing.delivery.eligibility`, com `repo=None`). Aditivo: não
+    lê nem altera nada do ramo COM `--repo` abaixo — `status` sempre devolve
+    0 quando conseguiu ler o estado (§10.3)."""
+    profile_all = _load_analysis_profile(store_root)
+    sistemas = [
+        {
+            "repo": repo_key,
+            "topic": prof.get("topic"),
+            "engine": prof.get("engine"),
+            "namespace": prof.get("namespace"),
+            "last_snapshot_id": prof.get("last_snapshot_id"),
+            "last_revision_id": prof.get("last_revision_id"),
+            "updated_at": prof.get("updated_at"),
+        }
+        for repo_key, prof in sorted((profile_all or {}).items())
+        if isinstance(prof, dict)
+    ]
+
+    ingest_profile = _load_ingest2_profile(store_root)
+    iniciativas = sorted({
+        str(entry.get("initiative"))
+        for entry in (ingest_profile or {}).values()
+        if isinstance(entry, dict) and entry.get("initiative")
+    })
+    initiative_filtro = getattr(a, "initiative", None)
+    if initiative_filtro and initiative_filtro not in iniciativas:
+        # Filtro explícito sem histórico prévio: relatado mesmo assim — não
+        # esconder um id passado à mão só porque ainda não apareceu numa
+        # ingestão anterior.
+        iniciativas = sorted(set(iniciativas) | {initiative_filtro})
+
+    delivery_status = _status_delivery_status(store_root, None)
+    # §9.4-09: efeitos `publicacao_pendente` de TODOS os namespaces deste
+    # store — `wk status` sem `--repo` é a visão agregada, então nenhum
+    # namespace filtra aqui (ao contrário do ramo COM `--repo` abaixo).
+    publicacao_pendente = _pending_publish_effect_status_entries(store_root, namespace=None)
+    out = {
+        "escopo": "store",
+        "store": store_root,
+        "sistemas": sistemas,
+        "iniciativas": iniciativas,
+        "iniciativa_filtro": initiative_filtro,
+        "agent": _agent_public_dict(store_root, None),
+        "delivery_status": delivery_status,
+        "publicacao_pendente": publicacao_pendente,
+    }
+    pending = [_pending_publish_effect_to_pending_item(e) for e in publicacao_pendente]
+    # §10.2/§10.3: envelope comum — `summary.detail` preserva os campos
+    # antigos tal-e-qual; `delivery_status` do envelope é o MESMO valor já
+    # calculado acima (uma leitura só). `status` é consulta pura: sempre
+    # `succeeded`/exit 0 quando conseguiu ler o estado agregado do store.
+    payload = _common_payload(
+        command="status", operation_status="succeeded",
+        knowledge_status="not_applicable", delivery_status=delivery_status,
+        scope={"store": store_root, "repo": None, "initiative": initiative_filtro},
+        store_root=store_root, repo=None,
+        summary={"detail": out}, pending=pending, next_actions=[],
+        publication=None, delivery_block=None,
+    )
+    _render_common(payload, json_out=bool(getattr(a, "json", False)))
+    return _exit_code_common(payload["operation_status"])
+
+
 def cmd_status(a) -> int:
     store_root = _store_root(a)
+    if not getattr(a, "repo", None):
+        return _cmd_status_store(a, store_root)
+
     repo_abs = os.path.abspath(a.repo)
+    json_out = bool(getattr(a, "json", False))
+
+    # §10.3: "status e consultas retornam 0 quando conseguiram ler o
+    # estado, mesmo que relatem conhecimento parcial" — `blocked`/exit 2 é
+    # reservado a quando a LEITURA em si falha: store inexistente/corrompido,
+    # ou `--repo` que este store nunca conheceu (nem `wk init --repo`, nem
+    # `wk analyze`/`wk update` o registraram). Repo REGISTRADO sem análise
+    # ainda é um estado normal de conhecimento incompleto, não erro.
+    if not os.path.isdir(store_root):
+        payload = _precondition_blocked(
+            command="status", store_root=store_root, repo_abs=repo_abs,
+            causa=f"store não encontrado: {store_root}", alvo=store_root,
+            acoes=[f"rode `wk init --store {store_root}` (ou `wk analyze`) primeiro"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
     profile_all = _load_analysis_profile(store_root)
     prior = _repo_profile(profile_all, repo_abs)
+    if _repo_key(repo_abs) not in (profile_all or {}):
+        payload = _precondition_blocked(
+            command="status", store_root=store_root, repo_abs=repo_abs,
+            causa=f"repo não registrado neste store: {repo_abs}", alvo=repo_abs,
+            acoes=[f"rode `wk analyze --repo {repo_abs}` (ou `wk init --repo {repo_abs}`) primeiro"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     runtime_db = _runtime_db_path(store_root)
+    if not prior.get("last_snapshot_id"):
+        # Repo registrado (via `wk init --repo`, tipicamente) mas ainda SEM
+        # nenhuma `wk analyze` — nada para ler além do próprio registro:
+        # `succeeded`/exit 0, `knowledge_status=not_applicable` (§10.3),
+        # `next_actions` aponta `wk analyze`.
+        shell = "powershell" if os.name == "nt" else "posix"
+        delivery_status = _status_delivery_status(store_root, repo_abs)
+        out = {
+            "repo": repo_abs,
+            "escopo_efetivo": {
+                "topic": prior.get("topic"), "engine": prior.get("engine"),
+                "namespace": prior.get("namespace"), "scope": prior.get("scope"),
+            },
+            "ultimo_snapshot": None,
+            "mensagem": "repo registrado neste store, mas ainda sem `wk analyze`",
+            "delivery_status": delivery_status,
+        }
+        payload = _common_payload(
+            command="status", operation_status="succeeded",
+            knowledge_status="not_applicable", delivery_status=delivery_status,
+            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            summary={"detail": out}, pending=[],
+            next_actions=[{
+                "ator": "operador", "motivo": "nenhuma análise ainda para este repo",
+                "argv": ["wk", "analyze", "--repo", repo_abs, "--store", store_root],
+                "shell": shell,
+            }],
+            publication=None, delivery_block=None,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
     if not os.path.exists(runtime_db):
-        print(json.dumps({
-            "error": "nenhuma análise encontrada (runtime.db ausente)",
-            "acao": f"rode `wk analyze --repo {repo_abs}` primeiro",
-        }, ensure_ascii=False), file=sys.stderr)
-        return 2
+        # Inconsistência real: o perfil promete uma análise concluída
+        # (`last_snapshot_id`) mas `runtime.db` sumiu — isto é "store
+        # corrompido" (não "sem análise ainda"), continua bloqueado.
+        payload = _precondition_blocked(
+            command="status", store_root=store_root, repo_abs=repo_abs,
+            causa=(
+                f"store inconsistente: perfil registra análise concluída "
+                f"(snapshot {prior['last_snapshot_id']!r}) mas runtime.db não existe"
+            ),
+            alvo=repo_abs,
+            acoes=[f"rode `wk analyze --repo {repo_abs}` novamente para recriar o runtime.db"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     from runtime import tasks as rt_tasks
 
-    store = rt_tasks.TaskStore.open(runtime_db)
+    try:
+        store = rt_tasks.TaskStore.open(runtime_db)
+    except Exception as exc:
+        payload = _precondition_blocked(
+            command="status", store_root=store_root, repo_abs=repo_abs,
+            causa=f"store corrompido: não foi possível abrir runtime.db ({type(exc).__name__}: {exc})",
+            alvo=runtime_db,
+            acoes=["restaure runtime.db de um backup, ou rode `wk doctor --store <store>`"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
     try:
         latest = _latest_tasks_by_objective(store)
         # `current_objective_ids` (gravado por `wk analyze`/`wk update`) filtra
@@ -6708,6 +8372,14 @@ def cmd_status(a) -> int:
             finally:
                 repo_kg.close()
 
+        # §9.4-09: efeito `publicacao_pendente` (arquivo JSON sob o store —
+        # ver comentário de `_pending_publish_effect_status_entries`),
+        # filtrado ao namespace deste repo (`wk status --repo` só conhece o
+        # próprio escopo).
+        publicacao_pendente = _pending_publish_effect_status_entries(
+            store_root, namespace=prior.get("namespace")
+        )
+
         # Achado nº6a: estado da TAREFA não é estado do OBJETIVO. `runtime.db`
         # diz `done`; se o objetivo ficou `partial` porque uma obrigação segue
         # em aberto, quem sabe disso é o último `IntegrationReport` — daí ler
@@ -6716,6 +8388,7 @@ def cmd_status(a) -> int:
         objetivos_por_estado = {"complete": 0, "partial": 0, "blocked": 0}
         objetivos_pendentes = []
         rounds_por_objetivo: dict = {}
+        chain_status_por_objetivo: dict = {}
         for obj in integ.get("objetivos") or ():
             if not isinstance(obj, dict):
                 continue
@@ -6733,6 +8406,12 @@ def cmd_status(a) -> int:
             round_obj = rt_tasks.continuation_rounds(store, oid) if oid else 0
             if round_obj:
                 rounds_por_objetivo[oid] = round_obj
+            # §7.3: `chain_status` (rounds_used/max_rounds/consumed/
+            # stop_reason) por objetivo — a mesma leitura que `_run_investigation_chain`
+            # persiste a cada rodada (`TaskStore.chain_status`), agora visível
+            # em `wk status --repo` sem precisar abrir `runtime.db` à parte.
+            if oid:
+                chain_status_por_objetivo[oid] = store.chain_status(oid)
             if estado != "complete" or unmet_obj:
                 objetivos_pendentes.append({
                     "objective_id": oid,
@@ -6757,6 +8436,7 @@ def cmd_status(a) -> int:
                 "max_rounds": rt_tasks.get_max_continuation_rounds(store),
                 "round_maximo": max(rounds_por_objetivo.values(), default=0),
                 "por_objetivo": rounds_por_objetivo,
+                "chain_status": chain_status_por_objetivo,
             },
             "leituras": leituras,
             "integracao": {
@@ -6771,27 +8451,614 @@ def cmd_status(a) -> int:
             "revisao": revisao,
             "lacunas": lacunas,
             "efeitos_pendentes": efeitos_pendentes,
+            "publicacao_pendente": publicacao_pendente,
         }
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0
+        # `delivery_status` (§10.3): MESMA função de elegibilidade usada por
+        # `delivery prepare` (`publishing.delivery.eligibility`) — não uma
+        # segunda implementação. Aditivo: nenhum campo existente de `status`
+        # muda de lugar ou de valor; sem publicação/knowledge.db ainda,
+        # degrada para `not_applicable` em vez de derrubar o comando (`status`
+        # sempre retorna 0 quando conseguiu ler o estado — §10.3).
+        delivery_status = _status_delivery_status(store_root, repo_abs)
+        out["delivery_status"] = delivery_status
+        out["agent"] = _agent_public_dict(store_root, repo_abs)
+
+        # §10.2/§10.3: `knowledge_status` deriva de `objetivos_por_estado` —
+        # MESMOS números já calculados acima, nenhuma segunda contagem.
+        # `status` continua devolvendo exit 0 mesmo com conhecimento
+        # `partial`/`blocked` (§10.3: "status e consultas retornam 0 quando
+        # conseguiram ler o estado, mesmo que relatem conhecimento parcial").
+        if objetivos_por_estado.get("partial") or objetivos_por_estado.get("blocked"):
+            knowledge_status = "partial"
+        elif objetivos_por_estado.get("complete"):
+            knowledge_status = "complete"
+        else:
+            knowledge_status = "not_applicable"
+        pending = []
+        if objetivos_pendentes:
+            pending.append({
+                "id": "status-objetivos-pendentes", "tipo": "conhecimento_parcial",
+                "alvo": repo_abs,
+                "causa": f"{len(objetivos_pendentes)} objetivo(s) sem estado 'complete' "
+                         "ou com obrigação de leitura em aberto",
+                "impacto": "conhecimento deste repo ainda não é completo",
+                "recuperacao_automatica": True,
+                "acoes": ["rodar `wk resume` para continuar a investigação pendente"],
+            })
+        pending.extend(_pending_publish_effect_to_pending_item(e) for e in publicacao_pendente)
+        next_actions = [{
+            "ator": "operador", "motivo": "continuar a investigação pendente deste repo",
+            "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs],
+            "shell": "powershell" if os.name == "nt" else "posix",
+        }] if pending else []
+        payload = _common_payload(
+            command="status", operation_status="succeeded",
+            knowledge_status=knowledge_status, delivery_status=delivery_status,
+            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            summary={"detail": out}, pending=pending, next_actions=next_actions,
+            publication=None, delivery_block=None,
+        )
+        _render_common(payload, json_out=bool(getattr(a, "json", False)))
+        return _exit_code_common(payload["operation_status"])
     finally:
         store.close()
+
+
+def _status_delivery_status(store_root: str, repo: str | None) -> str:
+    from publishing import delivery as pub_delivery
+
+    publication_root = os.path.join(store_root, _PUBLICACOES_DIRNAME)
+    try:
+        return pub_delivery.eligibility(
+            store_root=store_root, publication_root=publication_root, repo=repo,
+        )["delivery_status"]
+    except pub_delivery.DeliveryError:
+        return "not_applicable"
+    except Exception:  # leitura de status nunca quebra por causa deste campo aditivo
+        return "not_applicable"
+
+
+# ---------------------------------------------------------------------------
+# `delivery prepare` / `delivery confirm` (§9.4/§10/§11) — envelope comum
+# ---------------------------------------------------------------------------
+
+
+def _agent_public_dict(store_root: str, repo: str | None) -> dict:
+    """Hook ÚNICO do campo JSON `agent` (§10.3: binding, agente, transporte,
+    versão do adaptador, capacidades, situação da conexão).
+
+    Delegado inteiramente a `runtime.bindings.BindingStore.to_public_dict`
+    (§10.4.6) — nenhum comando novo lê `runtime.bindings` diretamente; todos
+    passam por este hook, então uma mudança de esquema muda um lugar só."""
+    from runtime.bindings import BindingStore
+
+    return BindingStore(store_root).to_public_dict(repo)
+
+
+def _common_payload(
+    *,
+    command: str,
+    operation_status: str,
+    knowledge_status: str,
+    delivery_status: str,
+    scope: dict,
+    store_root: str,
+    repo: str | None,
+    summary: dict,
+    pending: list,
+    next_actions: list,
+    publication: dict | None,
+    delivery_block: dict | None,
+) -> dict:
+    """Envelope comum (§10.3): campos SEMPRE presentes — `null`/lista vazia
+    quando não aplicável, nunca removidos conforme o caminho de execução."""
+    return {
+        "schema_version": 1,
+        "command": command,
+        "operation_status": operation_status,
+        "knowledge_status": knowledge_status,
+        "delivery_status": delivery_status,
+        "scope": scope,
+        "agent": _agent_public_dict(store_root, repo),
+        "summary": summary,
+        "pending": pending,
+        "next_actions": next_actions,
+        "publication": publication,
+        "delivery": delivery_block,
+    }
+
+
+def _exit_code_common(operation_status: str) -> int:
+    """§10.3: `0` succeeded/noop, `3` partial (trabalho pendente), `2` blocked."""
+    if operation_status in ("succeeded", "noop"):
+        return 0
+    if operation_status == "partial":
+        return 3
+    return 2
+
+
+def _quote_argv(argv, shell: str) -> str:
+    """Texto copiável a partir do VETOR de argumentos (§10.2: "a representação
+    estruturada guarda o vetor; texto para copiar é renderizado a partir
+    dele"). `shell` declara a convenção de quoting: `powershell` ou `posix` —
+    nunca um texto pronto guardado à parte, que divergiria do vetor."""
+    if shell == "powershell":
+        def _q(tok: Any) -> str:
+            t = str(tok)
+            if t == "" or re.search(r'[\s"\'`$]', t):
+                return '"' + t.replace('"', '""') + '"'
+            return t
+        return " ".join(_q(a) for a in argv)
+    return " ".join(shlex.quote(str(a)) for a in argv)
+
+
+def _render_common(payload: dict, *, json_out: bool) -> None:
+    """§10.2: por padrão, saída humana concisa em português — resultado,
+    conhecimento, entrega, impedimento e próxima ação; `--json` dá o
+    detalhamento técnico completo (o mesmo `payload`, sem reformular)."""
+    if json_out:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    resultado_label = {
+        "succeeded": "concluído", "partial": "concluído com pendência",
+        "blocked": "bloqueado", "noop": "sem mudança (nada a fazer)",
+    }.get(payload["operation_status"], payload["operation_status"])
+    print(f"resultado: {resultado_label}")
+    print(f"conhecimento: {payload['knowledge_status']}")
+    print(f"entrega: {payload['delivery_status']}")
+    if payload["pending"]:
+        for item in payload["pending"]:
+            print(f"impedimento: {item.get('causa', '')}")
+    else:
+        print("impedimento: nenhum")
+    if payload["next_actions"]:
+        for na in payload["next_actions"]:
+            argv = na.get("argv")
+            if argv:
+                shell = na.get("shell") or ("powershell" if os.name == "nt" else "posix")
+                print(f"próxima ação ({shell}): {_quote_argv(argv, shell)}")
+            elif na.get("acao_externa"):
+                print(f"próxima ação (manual): {na['acao_externa']}")
+    else:
+        print("próxima ação: nenhuma")
+
+
+# ---------------------------------------------------------------------------
+# `agent list` / `agent setup` / `agent connect` (§10.4.6/§11)
+# ---------------------------------------------------------------------------
+
+
+def cmd_agent_list(a) -> int:
+    """Integrações distribuídas (`runtime.agents.default_registry().list()`)
+    + situação LOCAL (`BindingStore`, quando `--store` é informado — §11:
+    "agent list apresenta integrações distribuídas e sua situação local").
+    """
+    from runtime import agents as rt_agents
+
+    reg = rt_agents.default_registry()
+    store_root = os.path.abspath(a.store) if getattr(a, "store", None) else None
+    resolved = None
+    if store_root:
+        from runtime.bindings import BindingStore
+
+        resolved = BindingStore(store_root).resolve(None)
+
+    agentes = []
+    for descriptor in reg.list():
+        entry = descriptor.to_dict()
+        if not descriptor.verified_versions:
+            entry["aviso_homologacao"] = (
+                "verified_versions vazio: NÃO homologado neste ambiente (§10.4.5)"
+            )
+        if resolved is not None:
+            e_selecionado = resolved.agent_id == descriptor.agent_id
+            entry["situacao_local"] = {
+                "selecionado": e_selecionado,
+                "conectado": bool(e_selecionado and resolved.connected),
+                "origem_selecao": resolved.origin if e_selecionado else None,
+            }
+        else:
+            entry["situacao_local"] = None
+        agentes.append(entry)
+
+    out = {"store": store_root, "agentes": agentes}
+    if bool(getattr(a, "json", False)):
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        for entry in agentes:
+            homolog = "homologado" if entry["homologated"] else "NÃO homologado"
+            situacao = entry.get("situacao_local")
+            conexao = "n/d (informe --store)"
+            if situacao is not None:
+                conexao = "conectado" if situacao["conectado"] else (
+                    "selecionado, não conectado" if situacao["selecionado"] else "não selecionado"
+                )
+            print(
+                f"{entry['agent_id']} | adapter {entry['adapter_version']} | "
+                f"transportes {','.join(entry['transports']) or '(nenhum)'} | {homolog} | {conexao}"
+            )
+    return 0
+
+
+def cmd_agent_setup(a) -> int:
+    """Passos executáveis de preparação do agente/ponte (§10.4.6): erro claro
+    e a lista de IDs registrados quando `--agent` não existe — NUNCA sugere
+    outro agente como substituto automático (§10.4.2 item 5)."""
+    from runtime import agents as rt_agents
+
+    reg = rt_agents.default_registry()
+    agent_id = a.agent
+    if agent_id not in reg:
+        registrados = list(reg.agent_ids())
+        payload = {
+            "erro": f"agente não registrado: {agent_id!r}",
+            "agentes_registrados": registrados,
+            "acao": "escolha um ID de `wk agent list`; registre uma extensão via "
+                    f"{rt_agents.EXTENSIONS_ENV} se o agente não vier com o núcleo",
+        }
+        if bool(getattr(a, "json", False)):
+            print(json.dumps(payload, ensure_ascii=False, indent=2), file=sys.stderr)
+        else:
+            print(f"agente não registrado: {agent_id!r}", file=sys.stderr)
+            print(f"agentes registrados: {', '.join(registrados) or '(nenhum)'}", file=sys.stderr)
+        return 2
+
+    descriptor = reg.describe(agent_id)
+    out = {
+        "agent_id": descriptor.agent_id,
+        "adapter_version": descriptor.adapter_version,
+        "transports": list(descriptor.transports),
+        "homologado": descriptor.homologated,
+        "verified_versions": list(descriptor.verified_versions),
+        "prerequisites": [p.to_dict() for p in descriptor.prerequisites],
+        "setup_steps": [s.to_dict() for s in descriptor.setup_steps],
+        "summary": descriptor.summary,
+    }
+    if bool(getattr(a, "json", False)):
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        print(f"agente: {descriptor.agent_id} — {descriptor.summary}")
+        print(f"homologado: {'sim' if descriptor.homologated else 'NÃO (verified_versions vazio)'}")
+        if descriptor.prerequisites:
+            print("pré-requisitos:")
+            for p in descriptor.prerequisites:
+                print(f"  - {p.description}: {' '.join(p.check_argv)}")
+        if descriptor.setup_steps:
+            print("passos:")
+            for s in descriptor.setup_steps:
+                if s.argv:
+                    print(f"  - {s.description}: {' '.join(s.argv)}")
+                else:
+                    print(f"  - {s.description}: {s.manual_action} (verificar: {' '.join(s.verify_argv)})")
+    return 0
+
+
+def cmd_agent_connect(a) -> int:
+    """Conecta/troca o binding de um agente já registrado (§10.4.6): NUNCA
+    registra conexão antes do handshake (`BindingStore.save_binding` recusa
+    binding não conectado); falha de handshake NÃO grava nada e devolve
+    `next_actions` com os passos de `agent setup` daquele ID."""
+    from runtime import agents as rt_agents
+    from runtime.bindings import BindingError, BindingStore
+
+    store_root = _store_root(a)
+    repo_abs = os.path.abspath(a.repo) if a.repo else None
+    shell = "powershell" if os.name == "nt" else "posix"
+    bs = BindingStore(store_root)
+
+    cancelados = 0
+    if getattr(a, "cancel_active", False):
+        cancelados = bs.cancel_active(repo_abs, reason="agent connect --cancel-active")
+
+    reg = rt_agents.default_registry()
+    transport = getattr(a, "transport", None) or "auto"
+    scope_common = {"store": store_root, "repo": repo_abs, "agent": a.agent, "transport": transport}
+
+    try:
+        binding = reg.connect(a.agent, transport=transport)
+    except rt_agents.TransportUnavailable as exc:
+        # T15/5 (achado de auditoria): o próprio erro já carrega os
+        # `setup_steps` verificados daquele transporte (`exc.next_actions()`)
+        # — usa os argv REAIS em vez do `agent setup`/`agent list` genérico,
+        # e anexa `exc.to_dict()` (transports/setup_steps) em `pending` para
+        # quem lê o JSON ver o detalhe completo, não só a 1ª ação.
+        acoes_estruturadas = _transport_unavailable_next_actions(exc)
+        acoes_texto = [
+            " ".join(str(v) for v in ac["argv"]) if ac.get("argv") else (ac.get("acao_externa") or ac["motivo"])
+            for ac in acoes_estruturadas
+        ] or [f"corrigir a preparação de {a.agent!r} (`agent setup`) e repetir `agent connect`"]
+        payload = _common_payload(
+            command="agent connect", operation_status="blocked",
+            knowledge_status="not_applicable", delivery_status="not_applicable",
+            scope=scope_common, store_root=store_root, repo=repo_abs,
+            summary={"mensagem": str(exc), "leases_cancelados": cancelados},
+            pending=[{
+                "id": "agent-connect-blocked", "tipo": "transporte_indisponivel",
+                "alvo": a.agent, "causa": str(exc),
+                "impacto": "nenhum binding foi registrado; a seleção persistida não mudou",
+                "recuperacao_automatica": False,
+                "acoes": acoes_texto,
+                "detalhe_estruturado": exc.to_dict(),
+            }],
+            next_actions=acoes_estruturadas or [{
+                "ator": "operador",
+                "motivo": f"corrigir a preparação de {a.agent!r} (`agent setup`) e repetir `agent connect`",
+                "argv": ["wk", "agent", "setup", "--agent", a.agent], "shell": shell,
+            }],
+            publication=None, delivery_block=None,
+        )
+        _render_common(payload, json_out=bool(getattr(a, "json", False)))
+        return _exit_code_common(payload["operation_status"])
+    except (rt_agents.HandshakeFailed, rt_agents.AgentUnavailableError) as exc:
+        if a.agent in reg:
+            next_argv = ["wk", "agent", "setup", "--agent", a.agent]
+            motivo = f"corrigir a preparação de {a.agent!r} (`agent setup`) e repetir `agent connect`"
+        else:
+            next_argv = ["wk", "agent", "list", "--store", store_root]
+            motivo = f"{a.agent!r} não está registrado; escolha um ID de `agent list`"
+        payload = _common_payload(
+            command="agent connect", operation_status="blocked",
+            knowledge_status="not_applicable", delivery_status="not_applicable",
+            scope=scope_common, store_root=store_root, repo=repo_abs,
+            summary={"mensagem": str(exc), "leases_cancelados": cancelados},
+            pending=[{
+                "id": "agent-connect-blocked", "tipo": "handshake_falhou",
+                "alvo": a.agent, "causa": str(exc),
+                "impacto": "nenhum binding foi registrado; a seleção persistida não mudou",
+                "recuperacao_automatica": False,
+                "acoes": [motivo],
+            }],
+            next_actions=[{"ator": "operador", "motivo": motivo, "argv": next_argv, "shell": shell}],
+            publication=None, delivery_block=None,
+        )
+        _render_common(payload, json_out=bool(getattr(a, "json", False)))
+        return _exit_code_common(payload["operation_status"])
+
+    # Handshake concluído (`binding.connected`): a partir daqui o binding
+    # PRECISA ser fechado (`reg.close`) não importa o que aconteça — inclusive
+    # se `save_binding` falhar (ex.: store sem permissão de escrita/disco
+    # cheio). Falha de persistência NUNCA deixa um binding gravado pela
+    # metade: `save_binding` escreve tudo-ou-nada (`_write` é atômico) e,
+    # se levantar, nada foi gravado — só fechamos o recurso vivo aqui.
+    try:
+        bs.save_binding(binding, repo=repo_abs)
+    except BindingError as exc:
+        connect_argv = ["wk", "agent", "connect", "--store", store_root]
+        if repo_abs:
+            connect_argv += ["--repo", repo_abs]
+        connect_argv += ["--agent", a.agent]
+        payload = _common_payload(
+            command="agent connect", operation_status="blocked",
+            knowledge_status="not_applicable", delivery_status="not_applicable",
+            scope={**scope_common, "transport": binding.transport},
+            store_root=store_root, repo=repo_abs,
+            summary={"mensagem": str(exc), "leases_cancelados": cancelados},
+            pending=[{
+                "id": "agent-connect-blocked", "tipo": "persistencia_falhou",
+                "alvo": a.agent, "causa": str(exc),
+                "impacto": "handshake concluído, mas o binding NÃO foi gravado; "
+                           "a seleção persistida não mudou",
+                "recuperacao_automatica": False,
+                "acoes": ["corrigir o acesso ao store (permissão/espaço em disco) "
+                          "e repetir `agent connect`"],
+            }],
+            next_actions=[{
+                "ator": "operador",
+                "motivo": "corrigir o acesso ao store e repetir `agent connect`",
+                "argv": connect_argv, "shell": shell,
+            }],
+            publication=None, delivery_block=None,
+        )
+        _render_common(payload, json_out=bool(getattr(a, "json", False)))
+        return _exit_code_common(payload["operation_status"])
+    finally:
+        reg.close(binding)
+
+    payload = _common_payload(
+        command="agent connect", operation_status="succeeded",
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={**scope_common, "transport": binding.transport},
+        store_root=store_root, repo=repo_abs,
+        summary={
+            "binding_id": binding.binding_id, "agent_id": binding.agent_id,
+            "transport": binding.transport, "host_version": binding.host_version,
+            "model": binding.model, "escopo_da_selecao": "repo" if repo_abs else "store",
+            "leases_cancelados": cancelados,
+        },
+        pending=[], next_actions=[], publication=None, delivery_block=None,
+    )
+    _render_common(payload, json_out=bool(getattr(a, "json", False)))
+    return _exit_code_common(payload["operation_status"])
+
+
+def cmd_delivery_prepare(a) -> int:
+    from publishing import delivery as pub_delivery
+
+    store_root = _store_root(a)
+    repo = os.path.abspath(a.repo) if a.repo else None
+    initiative = a.initiative
+    destination = a.destination
+    out_dir = os.path.abspath(a.out)
+    publication_root = os.path.join(store_root, _PUBLICACOES_DIRNAME)
+    scope = {
+        "store": store_root, "repo": repo, "initiative": initiative,
+        "destination": destination, "out": out_dir, "documents": [], "units": [],
+    }
+
+    try:
+        payload = pub_delivery.prepare(
+            store_root=store_root, publication_root=publication_root,
+            destination=destination, out_dir=out_dir, repo=repo, initiative=initiative,
+        )
+    except pub_delivery.DeliveryError as exc:
+        common = _common_payload(
+            command="delivery prepare", operation_status="blocked",
+            knowledge_status="blocked", delivery_status="not_ready", scope=scope,
+            store_root=store_root, repo=repo, summary={"mensagem": str(exc)},
+            pending=[{
+                "id": "delivery-prepare-blocked", "tipo": "preparacao_bloqueada",
+                "alvo": destination, "causa": str(exc),
+                "impacto": "nenhum pacote de entrega foi criado; a última entrega confirmada não foi alterada",
+                "recuperacao_automatica": False,
+                "acoes": ["ajustar --repo/--initiative ou completar a evidência/cobertura pendente e repetir"],
+            }],
+            next_actions=[{
+                "ator": "operador",
+                "motivo": "corrigir a causa listada em pending antes de repetir `delivery prepare`",
+                "argv": None, "shell": None,
+                "acao_externa": "revisar a seleção e a cobertura de evidência informadas em `causa`",
+            }],
+            publication=None, delivery_block=None,
+        )
+        _render_common(common, json_out=bool(a.json))
+        return _exit_code_common(common["operation_status"])
+
+    knowledge_status = payload["knowledge_status"]
+    operation_status = "succeeded" if knowledge_status == "complete" else "partial"
+    scope["documents"] = payload["scope"]["documents"]
+    scope["units"] = payload["scope"]["units"]
+    pending = []
+    if knowledge_status != "complete":
+        pending.append({
+            "id": "delivery-partial-knowledge", "tipo": "conhecimento_parcial",
+            "alvo": payload["delivery_id"],
+            "causa": f"seleção preparada com knowledge_status={knowledge_status}: há documento "
+                     "parcial/estrutural com lacuna declarada dentro da seleção",
+            "impacto": "esta entrega não pode ser apresentada como conhecimento completo",
+            "recuperacao_automatica": False,
+            "acoes": ["completar a investigação pendente e repetir `delivery prepare` antes de confirmar"],
+        })
+    common = _common_payload(
+        command="delivery prepare", operation_status=operation_status,
+        knowledge_status=knowledge_status, delivery_status="ready", scope=scope,
+        store_root=store_root, repo=repo,
+        summary={
+            "delivery_id": payload["delivery_id"],
+            "publication_revision": payload["publication_revision"],
+            "documentos": len(payload["documents"]),
+            "adicionados": len(payload["changes"]["added"]),
+            "alterados": len(payload["changes"]["changed"]),
+            "retirados": len(payload["changes"]["removed"]),
+            "entidades_externas": len(payload["scope"]["external_entities"]),
+        },
+        pending=pending,
+        next_actions=[{
+            "ator": "operador",
+            "motivo": "confirmar a entrega DEPOIS de disponibilizar e verificar os arquivos no destino real",
+            "argv": ["wk", "delivery", "confirm", "--store", store_root, "--delivery",
+                     payload["delivery_id"], "--destination", destination, "--verified-by", "<seu-nome>"],
+            "shell": "powershell" if os.name == "nt" else "posix",
+            "acao_externa": "disponibilizar (upload manual) e verificar o conteúdo no destino real "
+                             "antes de rodar a próxima ação",
+        }],
+        publication={"revision": payload["publication_revision"], "root": publication_root},
+        delivery_block={
+            "delivery_id": payload["delivery_id"], "out_dir": out_dir,
+            "previous_confirmed_delivery_id": payload["previous_confirmed_delivery_id"],
+            "changes": payload["changes"], "limitations": payload["limitations"],
+        },
+    )
+    _render_common(common, json_out=bool(a.json))
+    return _exit_code_common(common["operation_status"])
+
+
+def cmd_delivery_confirm(a) -> int:
+    from publishing import delivery as pub_delivery
+
+    store_root = _store_root(a)
+    delivery_id = a.delivery_id
+    destination = a.destination
+    verified_by = a.verified_by
+    scope = {"store": store_root, "delivery_id": delivery_id, "destination": destination}
+
+    try:
+        result = pub_delivery.confirm(
+            store_root=store_root, delivery_id=delivery_id, destination=destination,
+            verified_by=verified_by,
+        )
+    except pub_delivery.DeliveryError as exc:
+        common = _common_payload(
+            command="delivery confirm", operation_status="blocked",
+            knowledge_status="not_applicable", delivery_status="not_applicable", scope=scope,
+            store_root=store_root, repo=None, summary={"mensagem": str(exc)},
+            pending=[{
+                "id": "delivery-confirm-blocked", "tipo": "confirmacao_bloqueada",
+                "alvo": delivery_id, "causa": str(exc),
+                "impacto": "a confirmação não foi registrada; a base da próxima entrega não mudou",
+                "recuperacao_automatica": False,
+                "acoes": ["conferir --delivery/--destination e repetir"],
+            }],
+            next_actions=[{
+                "ator": "operador", "motivo": "corrigir --delivery/--destination e repetir `delivery confirm`",
+                "argv": None, "shell": None, "acao_externa": None,
+            }],
+            publication=None, delivery_block=None,
+        )
+        _render_common(common, json_out=bool(a.json))
+        return _exit_code_common(common["operation_status"])
+
+    # `already_current` vem do PRÓPRIO `delivery.confirm` (calculado antes de
+    # qualquer mutação de estado, dentro da mesma chamada) — nunca de uma
+    # leitura de `state` feita aqui antes da chamada real (isso era um
+    # TOCTOU: o `cli.py` lia `_load`/`_selection_key` separadamente e podia
+    # divergir do que `confirm` de fato viu ao gravar).
+    operation_status = "noop" if result["already_current"] else "succeeded"
+    common = _common_payload(
+        command="delivery confirm", operation_status=operation_status,
+        knowledge_status="not_applicable", delivery_status="not_applicable", scope=scope,
+        store_root=store_root, repo=None,
+        summary={
+            "delivery_id": result["delivery_id"], "confirmado_em": result["confirmed_at"],
+            "verificado_por": result["verified_by"],
+            "publication_revision": result["publication_revision"],
+            "ocorrencias_confirmadas_desta_selecao": result["confirmations_for_selection"],
+            "already_current": result["already_current"],
+        },
+        pending=[], next_actions=[], publication=None,
+        delivery_block={
+            "delivery_id": result["delivery_id"],
+            "remote_verification": result["remote_verification"],
+        },
+    )
+    _render_common(common, json_out=bool(a.json))
+    return _exit_code_common(common["operation_status"])
 
 
 def cmd_resume(a) -> int:
     store_root = _store_root(a)
     repo_abs = os.path.abspath(a.repo)
+    json_out = bool(getattr(a, "json", False))
     profile_all = _load_analysis_profile(store_root)
     prior = _repo_profile(profile_all, repo_abs)
-    engine_name = a.engine or prior.get("engine") or "local"
 
     runtime_db = _runtime_db_path(store_root)
     if not os.path.exists(runtime_db):
-        print(json.dumps({
-            "error": "nenhuma análise encontrada (runtime.db ausente)",
-            "acao": f"rode `wk analyze --repo {repo_abs}` primeiro",
-        }, ensure_ascii=False), file=sys.stderr)
-        return 2
+        payload = _precondition_blocked(
+            command="resume", store_root=store_root, repo_abs=repo_abs,
+            causa="nenhuma análise encontrada (runtime.db ausente)", alvo=repo_abs,
+            acoes=[f"rode `wk analyze --repo {repo_abs}` primeiro"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
+    # §10.4.6/§11: mesma seleção de agente de `wk analyze`/`wk update` —
+    # bloqueado ANTES de abrir `runtime.db` quando `--mode deep` (default)
+    # não tem binding utilizável (progresso anterior preservado).
+    try:
+        selecao = _resolve_mode_and_agent(a)
+    except UnknownEngineError as exc:
+        payload = _blocked_unknown_engine(
+            command="resume", store_root=store_root, repo_abs=repo_abs, exc=exc,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+    engine_name, bindings_store, blocked = _resolve_dispatch_engine(store_root, repo_abs, selecao)
+    if blocked is not None:
+        payload = _blocked_deep_no_binding(
+            command="resume", store_root=store_root, repo_abs=repo_abs, blocked=blocked,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
 
     from runtime import recovery as rt_recovery
     from runtime import tasks as rt_tasks
@@ -6828,29 +9095,28 @@ def cmd_resume(a) -> int:
                 extraction = capability_map = objectives = None
                 pipeline_erro = exc
 
-        plan_objectives = (
-            {o.objective_id: o.to_dict() for o in objectives} if objectives is not None else {}
-        )
-        resultados, bloqueios = _dispatch_objectives(
-            store, engine_name, resolver=resolver, plan_objectives=plan_objectives
-        )
-
-        # Achado nº6b: retomar não é só despachar. Sem o MESMO pós-processamento
-        # do `wk analyze`, o resultado que esta retomada acabou de aceitar
-        # ficaria em `runtime.db` — a tarefa `done` e o fato inexistente em
-        # `knowledge.db`, exatamente o buraco do achado nº1 reaberto pela porta
-        # de trás. Por isso: integrar -> `investigation_states` -> republicar.
-        #
-        # Onda10-D (achado nº3): `wk resume` é também o passo que FECHA o laço
-        # de continuação — resume + run + integrar + planejar continuações +
-        # rodar as novas (UMA rodada) + republicar. É por invocação de `wk
-        # resume` que o laço avança; nunca dentro de um `while` interno.
+        # §7.3: `wk resume` retoma a cadeia — libera leases expirados
+        # (`rt_recovery.resume` acima) e roda `_run_investigation_chain` até
+        # conclusão ou motivo material de parada, com o MESMO pós-
+        # processamento de `wk analyze`/`wk update` (integrar ->
+        # `investigation_states` -> republicar). `resume` NUNCA aparece nos
+        # `next_actions` desta função como "próxima rodada" — só é chamado
+        # aqui como a própria retomada.
         integracao: dict = {}
         publicacoes: dict = {}
-        continuacao: dict = dict(_EMPTY_CONTINUACAO)
+        bloqueios: list = []
         revisao_publicada = None
+        max_rounds = getattr(a, "max_rounds", None)
+        cadeia: dict = {
+            "chain": {
+                "objective_ids": [], "rounds": 0, "stop_reason": "completed",
+                "detail": "nenhum objetivo elegível nesta retomada", "chain": {},
+            },
+            "integracao": {}, "investigation_states": {}, "revisao": None,
+            "bloqueios": [], "resultados": dict(_EMPTY_RESULTADOS),
+        }
         if snap is None:
-            bloqueios = list(bloqueios) + [{
+            bloqueios = [{
                 "tipo": "snapshot_ausente",
                 "detalhe": (
                     f"manifesto do snapshot {prior.get('last_snapshot_id')!r} não encontrado em "
@@ -6859,13 +9125,17 @@ def cmd_resume(a) -> int:
                 "impacto": "resultados não puderam ser integrados nem publicados nesta retomada",
                 "acao": f"rode `wk analyze --repo {repo_abs}` para recriar o manifesto",
             }]
+            cadeia["chain"]["stop_reason"] = "executor_unavailable"
+            cadeia["chain"]["detail"] = bloqueios[0]["detalhe"]
         else:
             if pipeline_erro is not None:
-                bloqueios = list(bloqueios) + [{
+                bloqueios = [{
                     "tipo": "extracao_indisponivel",
                     "detalhe": f"{type(pipeline_erro).__name__}: {pipeline_erro}",
                     "impacto": "resultados não puderam ser confrontados com o código nesta retomada",
                 }]
+                cadeia["chain"]["stop_reason"] = "executor_unavailable"
+                cadeia["chain"]["detail"] = bloqueios[0]["detalhe"]
             if objectives is not None:
                 from analysis.investigation import objectives_to_dict
 
@@ -6874,27 +9144,29 @@ def cmd_resume(a) -> int:
                     objectives_to_dict(objectives), snap, capability_map, symbol_path_index
                 )
                 objectives_by_id = {o.objective_id: o for o in objectives}
-                esperados = _expected_input_hashes(inputs_by_objective)
 
-                integracao, investigation_states, revisao_publicada, integ_report = _integrate_results(
-                    store_root, namespace, store, snap, extraction, objectives, capability_map,
-                    reason=f"integração de resultados — wk resume --repo {repo_abs}",
-                    expected_input_versions_hash=esperados,
-                )
-                continuacao, reintegrado = _continuation_cycle(
-                    store_root, namespace, store, snap, extraction, objectives, capability_map,
-                    report=integ_report, objectives_by_id=objectives_by_id,
-                    inputs_by_objective=inputs_by_objective,
-                    expected_input_versions_hash=esperados,
-                    engine_name=engine_name, resolver=resolver, bloqueios=bloqueios,
-                    reason=f"integração de continuações — wk resume --repo {repo_abs}",
-                )
-                if reintegrado is not None:
-                    integracao, investigation_states, nova_revisao, _ = reintegrado
-                    revisao_publicada = nova_revisao or revisao_publicada
-                revisao_publicada = revisao_publicada or prior.get("last_revision_id")
-                publicacoes = _publish_local(
-                    store_root, namespace, revisao_publicada, investigation_states
+                try:
+                    cadeia = _run_investigation_chain(
+                        store, store_root=store_root, namespace=namespace, snapshot=snap,
+                        extraction=extraction, objectives=objectives, capability_map=capability_map,
+                        objectives_by_id=objectives_by_id, inputs_by_objective=inputs_by_objective,
+                        engine_name=engine_name, bindings_store=bindings_store, resolver=resolver,
+                        reason=f"integração de resultados — wk resume --repo {repo_abs}",
+                        max_rounds=max_rounds,
+                    )
+                except Exception as exc:  # A2: falha inesperada — envelope comum, exit 2, sem apagar progresso
+                    payload = _internal_error_blocked(
+                        command="resume", store_root=store_root, repo_abs=repo_abs, exc=exc,
+                    )
+                    _render_common(payload, json_out=json_out)
+                    return _exit_code_common(payload["operation_status"])
+                integracao = cadeia["integracao"]
+                bloqueios = list(bloqueios) + list(cadeia["bloqueios"])
+                revisao_publicada = cadeia["revisao"] or prior.get("last_revision_id")
+                publicacoes = _publish_local_and_track_effect(
+                    store_root, namespace, revisao_publicada, cadeia["investigation_states"],
+                    comando="resume",
+                    argv_recuperacao=["wk", "resume", "--repo", repo_abs, "--store", store_root],
                 )
                 if integracao.get("revisao"):
                     profile_all[_repo_key(repo_abs)] = {
@@ -6903,26 +9175,45 @@ def cmd_resume(a) -> int:
                     }
                     _save_analysis_profile(store_root, profile_all)
 
-        status, exit_code = _status_geral(
-            objetivos_por_estado=integracao.get("objetivos_por_estado"),
-            publicacao_bloqueada=bool(publicacoes.get("bloqueios")),
-            revisao_nova=bool(integracao.get("revisao")) and bool(integracao.get("mudancas")),
-            bloqueios_execucao=len(bloqueios) + len(integracao.get("bloqueios") or ()),
-        )
         out = {
-            "status_geral": status,
             "retomada": resume_plan.summary(),
-            "resultados": resultados,
+            "resultados": cadeia["resultados"],
             "integracao": integracao,
-            "continuacao": continuacao,
+            "chain": cadeia["chain"],
             "publicacoes": publicacoes,
             "bloqueios": bloqueios,
+            "modo": selecao["mode"],
+            "agent": _agent_public_dict(store_root, repo_abs),
         }
-        proximo = _proximo_passo_continuacao(repo_abs, continuacao, bloqueios)
-        if proximo:
-            out["proximo_passo"] = proximo
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return exit_code
+        if selecao.get("engine_compat"):
+            out["aviso_compat_engine"] = (
+                f"--engine {selecao['engine_compat']!r} é compatibilidade (§11); prefira "
+                "--mode/--agent — candidato à remoção"
+            )
+
+        # §7.3 -> §10.2/§10.3: mesma tradução de `analyze`/`update`.
+        operation_status, knowledge_status, pending, next_actions = _chain_envelope(
+            command="resume", store_root=store_root, repo_abs=repo_abs,
+            chain=cadeia["chain"], agent_id=selecao.get("agent") or engine_name,
+        )
+        operation_status, knowledge_status, pending = _apply_publicacao_status(
+            operation_status, knowledge_status, pending,
+            command="resume", repo_abs=repo_abs, publicacoes=publicacoes,
+        )
+        payload = _common_payload(
+            command="resume", operation_status=operation_status,
+            knowledge_status=knowledge_status,
+            delivery_status=_delivery_status_from_publicacoes(publicacoes),
+            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            summary={"detail": out}, pending=pending, next_actions=next_actions,
+            publication=(
+                {"revision": revisao_publicada, "root": os.path.join(store_root, _PUBLICACOES_DIRNAME)}
+                if revisao_publicada else None
+            ),
+            delivery_block=None,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
     finally:
         store.close()
 
@@ -7084,6 +9375,157 @@ def _ingest2_pending_to_dict(pending) -> dict:
     }
 
 
+#: T15/B (achado da reprodução real do orquestrador): reingerir a MESMA
+#: fonte (`duplicate=True`, `correlate` faz curto-circuito por `svid` —
+#: nenhuma correlação nova roda, ver comentário acima de `duplicadas_count`)
+#: nunca podia enxergar o estado agregado do escopo do REPO associado
+#: (`--repo`): `_status_geral` só conta os números DESTA invocação, que são
+#: todos zero num no-op — "nada mudou" virava `knowledge_status=complete`
+#: mesmo com a análise (`wk analyze`/`resume`) daquele repo ainda `partial`/
+#: `blocked`. `_ingest_repo_scope_status` é a MESMA leitura que `wk status
+#: --repo` já faz (`objetivos_por_estado` via `store/.analysis/
+#: last_integration.json`, filtrado a `current_objective_ids`) + o
+#: `stop_reason` da cadeia (`runtime.db`, `TaskStore.chain_status`) do pior
+#: objetivo ainda pendente — nenhuma segunda implementação, só reaproveita
+#: os mesmos dados que `cmd_status` já lê.
+def _ingest_repo_scope_status(store_root: str, repo_abs: str | None) -> dict:
+    """`{"knowledge_status", "stop_reason", "agent_id"}` do escopo de análise
+    deste repo — todos `None` quando não há `--repo` associado, ou o repo
+    nunca rodou `wk analyze` (não é erro: `ingest` não depende disso)."""
+    resultado: dict = {"knowledge_status": None, "stop_reason": None, "agent_id": None}
+    if not repo_abs:
+        return resultado
+    profile_all = _load_analysis_profile(store_root)
+    if _repo_key(repo_abs) not in (profile_all or {}):
+        return resultado
+    prior = _repo_profile(profile_all, repo_abs)
+    if not prior.get("last_snapshot_id"):
+        return resultado
+
+    try:
+        from runtime.bindings import BindingStore
+
+        resultado["agent_id"] = BindingStore(store_root).resolve(repo_abs).agent_id
+    except Exception:
+        pass
+
+    integ = (_load_last_integration(store_root).get("integracao") or {})
+    current_oids = prior.get("current_objective_ids")
+    objetivos_por_estado = {"complete": 0, "partial": 0, "blocked": 0}
+    pendentes_oids: list[str] = []
+    for obj in integ.get("objetivos") or ():
+        if not isinstance(obj, dict):
+            continue
+        oid = str(obj.get("objective_id") or "")
+        if current_oids is not None and oid and oid not in current_oids:
+            continue
+        estado = str(obj.get("state") or "")
+        if estado in objetivos_por_estado:
+            objetivos_por_estado[estado] += 1
+        if estado in ("partial", "blocked") and oid:
+            pendentes_oids.append(oid)
+
+    if objetivos_por_estado.get("partial") or objetivos_por_estado.get("blocked"):
+        resultado["knowledge_status"] = "partial"
+    elif objetivos_por_estado.get("complete"):
+        resultado["knowledge_status"] = "complete"
+
+    if pendentes_oids:
+        runtime_db = _runtime_db_path(store_root)
+        if os.path.exists(runtime_db):
+            from runtime import tasks as rt_tasks
+
+            try:
+                store = rt_tasks.TaskStore.open(runtime_db)
+            except Exception:
+                store = None
+            if store is not None:
+                try:
+                    prioridade = {
+                        "executor_unavailable": 0, "ambiguity": 1, "budget_exhausted": 2,
+                        "no_progress": 3, "evidence_changed": 4, "interrupted": 5,
+                    }
+                    melhor: str | None = None
+                    for oid in pendentes_oids:
+                        st = str((store.chain_status(oid) or {}).get("stop_reason") or "")
+                        if not st:
+                            continue
+                        if melhor is None or prioridade.get(st, 9) < prioridade.get(melhor, 9):
+                            melhor = st
+                    resultado["stop_reason"] = melhor
+                finally:
+                    store.close()
+    return resultado
+
+
+def _ingest_next_actions(
+    *,
+    store_root: str,
+    repo_abs: str | None,
+    status: str,
+    publicacoes: dict | None,
+    decisoes_pendentes: int,
+    fontes_incompletas: int,
+    bloqueios_execucao: int,
+    escopo: dict,
+    argv_ingest_recuperacao: list,
+) -> list:
+    """T15/C (achado da reprodução real): `ingest` `parcial`/`bloqueado`
+    NUNCA sai com `next_actions=[]` — um argv concreto pela causa MATERIAL
+    da pendência, na mesma ordem de prioridade de `_chain_next_action`
+    (agente/execução indisponível > escopo de análise pendente > pendência
+    de correlação desta ingestão > causa não mapeada)."""
+    if status == "completo":
+        return []
+    shell = "powershell" if os.name == "nt" else "posix"
+    status_argv = ["wk", "status", "--store", store_root]
+    if repo_abs:
+        status_argv += ["--repo", repo_abs]
+
+    if escopo.get("stop_reason") == "executor_unavailable":
+        return _dispatch_next_actions(store_root, repo_abs, escopo.get("agent_id"))
+    if publicacoes and publicacoes.get("bloqueios"):
+        return [{
+            "ator": "operador",
+            "motivo": "publicação desta ingestão ficou bloqueada: "
+                      + "; ".join(publicacoes["bloqueios"]),
+            "argv": list(argv_ingest_recuperacao), "shell": shell,
+        }]
+    if publicacoes and publicacoes.get("skipped_all"):
+        # Achado (baixa) §10.6: plano tinha documentos, todos pulados por
+        # falta de unidades — recuperação não é "repita o comando" (nada
+        # de automático resolve isso), é revisar o plano/fonte.
+        skipped_items = publicacoes.get("skipped") or []
+        causa = "; ".join(
+            f"{item.get('doc_id')}: {item.get('reason')}" for item in skipped_items
+        ) or "documentos do plano sem unidades publicáveis"
+        return [{
+            "ator": "operador",
+            "motivo": "publicação desta ingestão pulou todos os documentos do plano (sem "
+                      f"unidades): {causa}",
+            "argv": status_argv, "shell": shell,
+        }]
+    if escopo.get("knowledge_status") == "partial":
+        return [{
+            "ator": "operador",
+            "motivo": "escopo de análise deste repo continua parcial; retome a investigação",
+            "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs],
+            "shell": shell,
+        }]
+    if decisoes_pendentes or fontes_incompletas or bloqueios_execucao:
+        return [{
+            "ator": "operador",
+            "motivo": "fonte(s) com decisão pendente, incompleta ou falha de extração/correlação "
+                      "nesta ingestão; consulte o status para decidir",
+            "argv": status_argv, "shell": shell,
+        }]
+    return [{
+        "ator": "operador",
+        "motivo": f"status_geral={status!r} sem causa mapeada nesta ingestão; consulte o status",
+        "argv": status_argv, "shell": shell,
+    }]
+
+
 def cmd_ingest(a) -> int:
     from ingestion import ingest as ing_ingest
     from ingestion.extract import extract_candidates
@@ -7102,7 +9544,26 @@ def cmd_ingest(a) -> int:
         }, ensure_ascii=False), file=sys.stderr)
         return 2
 
-    namespace = a.namespace or _INGEST2_DEFAULT_NAMESPACE
+    # §11 "Escopo de ingestão": `--repo` associa esta ingestão ao SISTEMA
+    # registrado — mesma convenção de namespace que `wk analyze --repo`
+    # calcula (`code/<repo>`, `_repo_key`). A API de `ingestion.correlate`
+    # já é agnóstica a isso (aceita qualquer `namespace: str` — nenhuma
+    # mudança em `scripts/ingestion/**`); a associação inteira vive nesta
+    # derivação de string, feita aqui.
+    repo_abs = os.path.abspath(a.repo) if getattr(a, "repo", None) else None
+    if repo_abs is not None and not os.path.isdir(repo_abs):
+        print(json.dumps({
+            "error": f"--repo não encontrado: {repo_abs}",
+            "causa": "caminho de --repo inexistente",
+            "impacto": "nenhuma fonte foi lida; nada foi gravado em knowledge.db",
+            "correcao_tentada": "nenhuma — falhou antes de tentar ler",
+            "decisao_necessaria": "confira --repo (mesmo caminho usado em `wk analyze --repo`)",
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    namespace = a.namespace or (
+        f"code/{_repo_key(repo_abs)}" if repo_abs else _INGEST2_DEFAULT_NAMESPACE
+    )
     ns_erro = _validate_namespace(namespace)
     if ns_erro:
         print(json.dumps({
@@ -7298,6 +9759,8 @@ def cmd_ingest(a) -> int:
     # knowledge.db). Bloqueio de publicação vira aviso; nunca desfaz o que já
     # foi correlacionado/gravado acima.
     publicacoes = None
+    revisao_para_publication = None
+    argv_ingest_recuperacao = ["wk", "ingest", src_path, "--store", store_root]
     if revisoes:
         # Achado nº5: o manifesto publicado aqui é a UNIÃO dos namespaces —
         # ingerir uma iniciativa não pode apagar do manifesto os documentos de
@@ -7307,18 +9770,74 @@ def cmd_ingest(a) -> int:
         investigation_states = _integration_states(
             _load_last_integration(store_root).get("integracao") or {}
         )
-        publicacoes = _publish_local(
-            store_root, namespace, revisoes[-1], investigation_states
+        revisao_para_publication = revisoes[-1]
+        publicacoes = _publish_local_and_track_effect(
+            store_root, namespace, revisoes[-1], investigation_states,
+            comando="ingest", argv_recuperacao=argv_ingest_recuperacao,
         )
         if publicacoes.get("bloqueios"):
             avisos.append(
                 "publicacao_com_bloqueio: " + "; ".join(publicacoes["bloqueios"])
             )
+        elif publicacoes.get("skipped_all"):
+            # Achado (baixa) §10.6: plano TINHA documentos, mas TODOS foram
+            # pulados por falta de unidades — distinto de `nothing_to_publish`
+            # (plano sem documento nenhum): isso NÃO pode ficar indistinguível
+            # de uma execução limpa.
+            skipped_items = publicacoes.get("skipped") or []
+            avisos.append(
+                "publicacao_documentos_pulados: plano de publicação tinha "
+                f"{len(skipped_items)} documento(s), mas todos foram pulados por falta de "
+                "unidades — nenhum foi publicado nesta revisão"
+            )
+        elif publicacoes.get("nothing_to_publish"):
+            # S-remediação/§10.3: informativo, nunca bloqueio — o lote foi
+            # ingerido e correlacionado normalmente; só não existe entidade
+            # planejável (fonte solta) para o plano de publicação gerar
+            # documento nenhum nesta revisão.
+            avisos.append(
+                "publicacao_sem_documento: plano de publicação não produziu nenhum "
+                "documento publicável nesta revisão (fonte sem entidade planejável)"
+            )
+    else:
+        # §9.4-09/T8: reingestão do MESMO arquivo (`correlate` devolve
+        # `duplicate=True`/`revision_id=None` — nenhuma revisão nova) nunca
+        # pode sair cedo por "fonte duplicada" sem antes checar se existe um
+        # efeito `publicacao_pendente` desta ingestão anterior para retentar.
+        # A revisão de conhecimento já existe (foi gravada quando a
+        # publicação falhou); retentar aqui só publica de novo — não abre
+        # `repo.revision(...)`, então sucesso NUNCA cria revisão nova.
+        pendentes = _pending_publish_effects_for_namespace(store_root, namespace)
+        if pendentes:
+            alvo = pendentes[-1]
+            revisao_para_publication = alvo["revision_id"]
+            investigation_states = _integration_states(
+                _load_last_integration(store_root).get("integracao") or {}
+            )
+            publicacoes = _publish_local_and_track_effect(
+                store_root, namespace, alvo["revision_id"], investigation_states,
+                comando="ingest", argv_recuperacao=argv_ingest_recuperacao,
+            )
+            if publicacoes.get("efeito_pendente_concluido"):
+                avisos.append(
+                    "publicacao_pendente_concluida: efeito de publicação pendente da revisão "
+                    f"{alvo['revision_id']!r} foi concluído nesta reingestão (nenhuma revisão de "
+                    "conhecimento nova foi criada)"
+                )
+            elif publicacoes.get("bloqueios"):
+                avisos.append(
+                    "publicacao_pendente_retentada_e_ainda_bloqueada: " + "; ".join(publicacoes["bloqueios"])
+                )
+            elif publicacoes.get("nothing_to_publish"):
+                avisos.append(
+                    "publicacao_pendente_concluida: efeito de publicação pendente da revisão "
+                    f"{alvo['revision_id']!r} não tinha documento publicável (nada a publicar)"
+                )
 
     # Achado nº6a: `ok_count > 0` sozinho não distingue "tudo entrou" de "entrou
     # metade". `bloqueado` (exit 2) é reservado a nenhum resultado útil: nenhuma
     # fonte ok, ou publicação bloqueada sem revisão nova.
-    status, exit_code = _status_geral(
+    status, _legacy_exit_code = _status_geral(
         decisoes_pendentes=pending_count,
         fontes_incompletas=incompletas_count,
         publicacao_bloqueada=bool((publicacoes or {}).get("bloqueios")),
@@ -7326,6 +9845,18 @@ def cmd_ingest(a) -> int:
         bloqueios_execucao=fail_count,
         erro_material=(ok_count == 0),
     )
+
+    # T15/B (achado da reprodução real): "nada mudou nesta ingestão" (status
+    # `completo` por contagem PRÓPRIA zerada) nunca pode mascarar o estado
+    # AGREGADO do escopo do repo associado — se a análise deste repo já está
+    # `partial`/`blocked`, este no-op PRESERVA esse estado (nunca "conserta"
+    # por omissão). Só rebaixa (`completo` -> `parcial`); nunca melhora um
+    # `bloqueado` desta própria invocação.
+    escopo = _ingest_repo_scope_status(store_root, repo_abs)
+    status_proprio_completo = status == "completo"
+    if status == "completo" and escopo.get("knowledge_status") == "partial":
+        status = "parcial"
+
     out = {
         "status_geral": status,
         "fontes": fontes,
@@ -7336,8 +9867,78 @@ def cmd_ingest(a) -> int:
     }
     if publicacoes is not None:
         out["publicacoes"] = publicacoes
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    return exit_code
+    if escopo.get("knowledge_status") is not None:
+        out["escopo_repo"] = escopo
+
+    # §10.2/§10.3: envelope comum — mesma tradução `_status_geral_to_common`
+    # de `analyze`/`update`/`resume` (0/3/2 via `_exit_code_common`, nunca o
+    # esquema legado 0/2 embutido em `_status_geral`); `--json` dá o
+    # detalhamento técnico completo, saída humana por padrão.
+    operation_status, knowledge_status = _status_geral_to_common(status)
+    # T15/#2 (reprodução real): reingestão idêntica SEM nenhum efeito
+    # pendente desta invocação (contagem PRÓPRIA zerada — nenhuma decisão/
+    # fonte incompleta/falha/publicação bloqueada; a única razão de não
+    # ficar "completo" é o rebaixamento acima pelo escopo do repo já
+    # `partial`) é um NO-OP desta operação, não uma pendência NOVA: exit 0/
+    # `operation_status=noop`, preservando `knowledge_status` do escopo
+    # agregado (nunca reportando `partial`/exit 3 por algo que esta
+    # invocação não tentou fazer nem deixou pendente).
+    if status_proprio_completo and status == "parcial" and duplicadas_count > 0 and not revisoes:
+        operation_status = "noop"
+    if (
+        knowledge_status == "complete"
+        and publicacoes is not None
+        and publicacoes.get("nothing_to_publish")
+    ):
+        # §10.3: fonte solta (sem entidade planejável) — nada ficou pendente
+        # (senão `status` já não seria "completo"), mas também não existe
+        # documento algum para chamar "conhecimento completo": o eixo
+        # `knowledge_status` não se aplica a um escopo publicável vazio.
+        knowledge_status = "not_applicable"
+    pending = []
+    if status != "completo":
+        pending.append({
+            "id": "ingest-conhecimento-nao-completo",
+            "tipo": "conhecimento_bloqueado" if status == "bloqueado" else "conhecimento_parcial",
+            "alvo": src_path,
+            "causa": f"status_geral={status!r}; ver summary.detail.avisos/fontes[].diagnostico",
+            "impacto": "conhecimento desta ingestão não está completo",
+            "recuperacao_automatica": status != "bloqueado",
+            "acoes": list(avisos) or ["ver summary.detail para o detalhe"],
+        })
+    next_actions = _ingest_next_actions(
+        store_root=store_root, repo_abs=repo_abs, status=status, publicacoes=publicacoes,
+        decisoes_pendentes=pending_count, fontes_incompletas=incompletas_count,
+        bloqueios_execucao=fail_count, escopo=escopo,
+        argv_ingest_recuperacao=argv_ingest_recuperacao,
+    )
+    # T15/auditoria#2: mesmo fold-in de `analyze`/`update`/`resume` — falha
+    # de PERSISTÊNCIA do registro auxiliar de publicação pendente nunca pode
+    # ficar escondida atrás de um `operation_status` que já veio `succeeded`/
+    # `partial` do resto desta ingestão.
+    operation_status, knowledge_status, pending = _apply_publicacao_status(
+        operation_status, knowledge_status, pending,
+        command="ingest", repo_abs=repo_abs, publicacoes=publicacoes,
+    )
+    payload = _common_payload(
+        command="ingest", operation_status=operation_status, knowledge_status=knowledge_status,
+        # T15/B: `delivery_status` da ELEGIBILIDADE REAL (mesma função de
+        # `wk status --repo`/`delivery prepare`, `publishing.delivery.
+        # eligibility`) — nunca só "houve publicação NESTA invocação?"
+        # (`_delivery_status_from_publicacoes`), que apagava o estado real
+        # de entrega sempre que este `ingest` não publicou nada (ex.: no-op).
+        delivery_status=_status_delivery_status(store_root, repo_abs),
+        scope={"store": store_root, "path": src_path, "namespace": namespace, "repo": repo_abs},
+        store_root=store_root, repo=repo_abs,
+        summary={"detail": out}, pending=pending, next_actions=next_actions,
+        publication=(
+            {"revision": revisao_para_publication, "root": os.path.join(store_root, _PUBLICACOES_DIRNAME)}
+            if revisao_para_publication else None
+        ),
+        delivery_block=None,
+    )
+    _render_common(payload, json_out=bool(getattr(a, "json", False)))
+    return _exit_code_common(payload["operation_status"])
 
 
 # ---------- W8: migrate (corpus legado -> knowledge.db; §16.1) ----------
@@ -7454,15 +10055,33 @@ def _build_parser() -> argparse.ArgumentParser:
     d.add_argument("--list", action="store_true", help="lista os documentos")
     d.set_defaults(fn=cmd_docs)
 
-    i = sub.add_parser("init", help="materializa a skill em disco por engine")
-    i.add_argument("--engine", required=True,
-                   help="claude-code | antigravity | devin | copilot | all (vírgula p/ vários)")
-    i.add_argument("--base", default=".", help="raiz do projeto (default: .)")
-    i.add_argument("--all", action="store_true", help="escreve todos os documentos, não só SKILL.md")
-    i.add_argument("--force", action="store_true", help="sobrescreve divergentes")
-    i.add_argument("--invocation", help="como chamar o executável (default: auto)")
-    i.add_argument("--store", default=None, help="caminho do store; se informado, grava permissões da engine")
-    i.add_argument("--repo", default=None, help="caminho do repo; se informado, grava permissões da engine")
+    i = sub.add_parser(
+        "init",
+        help="prepara o store atual (fluxo padrão) e, opcionalmente, registra repo/preferência de agente",
+    )
+    i.add_argument(
+        "--engine", required=False, default=None,
+        help="[compat — fluxo substituído, candidato à remoção A01] materializa pilotos/SKILL.md "
+             "do fluxo antigo em disco: claude-code | antigravity | devin | copilot | all "
+             "(vírgula p/ vários). Sem --engine (padrão, §10.1/§11): só prepara o store/repo/"
+             "agente do fluxo `analyze`/`ingest`/`update` — nunca instala pilotos.",
+    )
+    i.add_argument("--base", default=".", help="raiz do projeto (default: .; só usado com --engine)")
+    i.add_argument("--all", action="store_true",
+                    help="[compat] escreve todos os documentos, não só SKILL.md")
+    i.add_argument("--force", action="store_true", help="[compat] sobrescreve divergentes")
+    i.add_argument("--invocation", help="[compat] como chamar o executável (default: auto)")
+    i.add_argument("--store", default=None,
+                    help="raiz do store (obrigatório sem --engine; com --engine, grava "
+                         "permissões da engine se informado)")
+    i.add_argument("--repo", default=None,
+                    help="caminho do repo a registrar (perfil/namespace de `analyze`); "
+                         "com --engine, também grava permissões da engine")
+    i.add_argument("--agent", default=None,
+                    help="registra a PREFERÊNCIA de agente (ID de `agent list`) neste --store "
+                         "(ou neste --repo, se informado); NÃO conecta — use "
+                         "`agent connect` depois (§10.1: selecionar != conectado)")
+    i.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3; sem --engine)")
     i.set_defaults(fn=cmd_init)
 
     c = sub.add_parser("check", help="compara disco vs. embutido, por engine")
@@ -7487,7 +10106,48 @@ def _build_parser() -> argparse.ArgumentParser:
     dr.add_argument("--engine", default=None,
                      help="engine a diagnosticar (default: claude-code)")
     dr.add_argument("--base", default=".", help="raiz do projeto (default: .)")
+    dr.add_argument("--probe-agent", dest="probe_agent", action="store_true",
+                     help="executa a tarefa mínima pelo binding conectado (repo, senão store) e "
+                          "relata os 4 eixos do §10.1; PODE CONSUMIR uma pequena chamada do "
+                          "provedor quando há binding")
+    dr.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     dr.set_defaults(fn=cmd_doctor)
+
+    ag = sub.add_parser("agent", help="integrações de agente: list, setup, connect (§10.4.6)")
+    ag_sub = ag.add_subparsers(dest="agent_cmd", required=True)
+
+    agl = ag_sub.add_parser(
+        "list",
+        help="lista integrações distribuídas (IDs, transportes, versões verificadas, "
+             "pré-requisitos) e a situação local (preferência/binding do store)",
+    )
+    agl.add_argument("--store", default=None, help="raiz do store; informe p/ ver a situação local")
+    agl.add_argument("--json", action="store_true", help="saída estruturada")
+    agl.set_defaults(fn=cmd_agent_list, cmd="agent list")
+
+    ags = ag_sub.add_parser(
+        "setup",
+        help="passos executáveis de instalação/autenticação/verificação do agente escolhido",
+    )
+    ags.add_argument("--agent", required=True, help="ID do agente (ver `wk agent list`)")
+    ags.add_argument("--json", action="store_true", help="saída estruturada")
+    ags.set_defaults(fn=cmd_agent_setup, cmd="agent setup")
+
+    agc = ag_sub.add_parser(
+        "connect",
+        help="conecta/troca o binding de um agente já registrado (handshake real; nunca "
+             "registra conexão antes dele)",
+    )
+    agc.add_argument("--store", required=True, help="raiz do store (default: WK_STORE ou ./store)")
+    agc.add_argument("--repo", default=None, help="binding do sistema; sem isto, binding do store")
+    agc.add_argument("--agent", required=True, help="ID do agente (ver `wk agent list`)")
+    agc.add_argument("--transport", default="auto", choices=["auto", "process", "session"],
+                      help="transporte a usar (default: auto — o adaptador escolhe)")
+    agc.add_argument("--cancel-active", dest="cancel_active", action="store_true",
+                      help="invalida leases ativos do escopo ANTES de trocar o binding (decisão "
+                           "explícita de interromper trabalho em voo — nunca automático)")
+    agc.add_argument("--json", action="store_true", help="saída estruturada (§10.3)")
+    agc.set_defaults(fn=cmd_agent_connect, cmd="agent connect")
 
     s = sub.add_parser("store", help="cria a estrutura do store (inbox/raw/wiki)")
     s.add_argument("store_cmd", choices=("init",), help="init")
@@ -7509,8 +10169,22 @@ def _build_parser() -> argparse.ArgumentParser:
     an.add_argument("--repo", required=True, help="caminho do repositório a analisar")
     an.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
     an.add_argument("--topic", default=None, help="rótulo opcional do tópico (persistido no perfil)")
+    an.add_argument("--mode", default=None, choices=["deep", "structural"],
+                     help="deep (default, SEMPRE — nunca preferência implícita): despacha pelo "
+                          "agente conectado (`agent connect`); structural: worker determinístico "
+                          "local explícito, sem LLM")
+    an.add_argument("--agent", default=None,
+                     help="override explícito do agente para esta invocação (ID de `agent list`); "
+                          "sem isto, usa a preferência/binding do repo ou do store (`init --agent`/"
+                          "`agent connect`)")
     an.add_argument("--engine", default=None, choices=["local", "claude-cli"],
-                     help="executor de despacho (default: perfil salvo, senão 'local')")
+                     help="[compat — candidato à remoção; use --mode/--agent] 'local' equivale a "
+                          "--mode structural; 'claude-cli' equivale a --agent claude-code")
+    an.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
+                     help="§7.3: teto TOTAL da cadeia de continuação por objetivo (persistido; "
+                          "não é crédito novo por invocação). Sem a flag: default 3, sem "
+                          "sobrescrever um teto já persistido maior")
+    an.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     an.set_defaults(fn=cmd_analyze)
 
     def _add_ingest_args(sp: argparse.ArgumentParser) -> None:
@@ -7518,6 +10192,11 @@ def _build_parser() -> argparse.ArgumentParser:
         `ingest` e pelo alias oculto `ingest2` (compatibilidade), garantindo
         que os dois nunca divirjam de assinatura."""
         sp.add_argument("path", help="arquivo ou diretório de origem a ingerir")
+        sp.add_argument("--repo", default=None,
+                         help="§11: associa esta ingestão ao sistema registrado em --repo — "
+                              "mesma convenção de namespace de `wk analyze --repo` "
+                              "(`code/<repo>`); default do --namespace quando omitido, nunca "
+                              "sobrescreve um --namespace informado explicitamente")
         sp.add_argument("--initiative", default=None,
                          help="id da iniciativa (prioridade: argumento > frontmatter/metadata "
                               "do arquivo > contexto persistido por diretório de origem)")
@@ -7525,7 +10204,9 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="fase da iniciativa (mesma prioridade de --initiative)")
         sp.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
         sp.add_argument("--namespace", default=None,
-                         help=f"namespace do knowledge.db (default: {_INGEST2_DEFAULT_NAMESPACE!r})")
+                         help=f"namespace do knowledge.db (default: {_INGEST2_DEFAULT_NAMESPACE!r}, "
+                              "ou derivado de --repo quando informado)")
+        sp.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
         sp.set_defaults(fn=cmd_ingest)
 
     ig_new = sub.add_parser(
@@ -7547,20 +10228,71 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     up.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
     up.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    up.add_argument("--mode", default=None, choices=["deep", "structural"],
+                     help="deep (default, SEMPRE — nunca preferência implícita): despacha pelo "
+                          "agente conectado; structural: worker determinístico local explícito")
+    up.add_argument("--agent", default=None,
+                     help="override explícito do agente para esta invocação (ID de `agent list`)")
     up.add_argument("--engine", default=None, choices=["local", "claude-cli"],
-                     help="executor de despacho (default: perfil salvo desta análise)")
+                     help="[compat — candidato à remoção; use --mode/--agent] 'local' equivale a "
+                          "--mode structural; 'claude-cli' equivale a --agent claude-code")
+    up.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
+                     help="§7.3: teto TOTAL da cadeia de continuação por objetivo (persistido; "
+                          "não é crédito novo por invocação)")
+    up.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     up.set_defaults(fn=cmd_update)
 
-    st = sub.add_parser("status", help="leitura de runtime.db+knowledge.db: tarefas, revisão, lacunas, efeitos")
-    st.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    st = sub.add_parser("status", help="leitura de runtime.db+knowledge.db: tarefas, revisão, lacunas, efeitos "
+                                        "(sem --repo: visão agregada do store)")
+    st.add_argument("--repo", default=None, help="mesmo --repo usado em `wk analyze`; omitido: visão do store")
     st.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    st.add_argument("--initiative", default=None, help="filtra/inclui esta iniciativa na visão do store")
+    st.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     st.set_defaults(fn=cmd_status)
+
+    dl = sub.add_parser("delivery", help="prepara e confirma pacotes de entrega locais imutáveis (§9.4)")
+    dl_sub = dl.add_subparsers(dest="delivery_cmd", required=True)
+
+    dlp = dl_sub.add_parser(
+        "prepare",
+        help="cria diretório de entrega imutável (markdown/word/delivery.json) e calcula o delta "
+             "contra a última entrega confirmada para o mesmo destino e seleção",
+    )
+    dlp.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    dlp.add_argument("--repo", default=None, help="restringe a seleção ao conhecimento deste sistema")
+    dlp.add_argument("--initiative", default=None, help="restringe a seleção a esta iniciativa (entity_id)")
+    dlp.add_argument("--destination", required=True, help="nome do destino da entrega (ex.: sharepoint-prod)")
+    dlp.add_argument("--out", required=True, help="diretório NOVO onde a entrega será criada")
+    dlp.add_argument("--json", action="store_true", help="saída estruturada (§10.3)")
+    dlp.set_defaults(fn=cmd_delivery_prepare, cmd="delivery prepare")
+
+    dlc = dl_sub.add_parser(
+        "confirm",
+        help="registra que o operador disponibilizou e verificou a entrega no destino real "
+             "(declaração do operador; nunca upload/SharePoint)",
+    )
+    dlc.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    dlc.add_argument("--delivery", required=True, dest="delivery_id", help="delivery_id de `delivery prepare`")
+    dlc.add_argument("--destination", required=True, help="mesmo --destination usado em `delivery prepare`")
+    dlc.add_argument("--verified-by", required=True, dest="verified_by", help="quem verificou a disponibilização")
+    dlc.add_argument("--json", action="store_true", help="saída estruturada (§10.3)")
+    dlc.set_defaults(fn=cmd_delivery_confirm, cmd="delivery confirm")
 
     re_ = sub.add_parser("resume", help="libera leases expirados e retoma tarefas ready/invalidadas")
     re_.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
     re_.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    re_.add_argument("--mode", default=None, choices=["deep", "structural"],
+                      help="deep (default, SEMPRE — nunca preferência implícita): despacha pelo "
+                           "agente conectado; structural: worker determinístico local explícito")
+    re_.add_argument("--agent", default=None,
+                      help="override explícito do agente para esta invocação (ID de `agent list`)")
     re_.add_argument("--engine", default=None, choices=["local", "claude-cli"],
-                      help="executor de despacho (default: perfil salvo desta análise)")
+                      help="[compat — candidato à remoção; use --mode/--agent] 'local' equivale a "
+                           "--mode structural; 'claude-cli' equivale a --agent claude-code")
+    re_.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
+                      help="§7.3: amplia (ou reduz) o teto TOTAL da cadeia de continuação por "
+                           "objetivo; NUNCA é crédito novo — ampliar de 3 para 6 permite mais 3")
+    re_.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     re_.set_defaults(fn=cmd_resume)
 
     mi = sub.add_parser(

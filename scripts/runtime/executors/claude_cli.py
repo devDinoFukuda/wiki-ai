@@ -67,6 +67,10 @@ _DEFAULT_TIMEOUT_S = 60.0
 _DETECT_TIMEOUT_S = 5.0
 _STDERR_SUMMARY_LIMIT = 2000
 
+#: Espera máxima, por processo/thread, em `shutdown()`. Curta de propósito: o
+#: processo já recebeu `kill()`; isto só evita deixar zumbi sem `wait()`.
+_SHUTDOWN_WAIT_S = 5.0
+
 
 def _minimal_env() -> dict:
     return {k: v for k, v in os.environ.items() if k.upper() in _ENV_SAFELIST}
@@ -395,6 +399,47 @@ class ClaudeCliExecutor(BaseExecutor):
         if proc is not None and proc.poll() is None:
             proc.kill()
         return True
+
+    # -- shutdown ------------------------------------------------------------
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Encerra TODO subprocesso vivo deste executor. Idempotente.
+
+        Sem isto, `BaseExecutorAdapter.close()` só descartava a referência do
+        executor: o `claude -p ...` em voo continuava rodando (subprocesso
+        órfão), a thread de espera continuava viva e o diretório temporário
+        nunca era removido. `close()` chama `shutdown(wait=True)` — chamar duas
+        vezes (ou sobre um executor que nunca despachou) é no-op.
+        """
+        with self._lock:
+            items = list(self._procs.items())
+            threads = list(self._threads.values())
+            self._procs.clear()
+            self._threads.clear()
+        for execution_id, proc in items:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except OSError:
+                pass
+            if wait:
+                try:
+                    proc.wait(timeout=_SHUTDOWN_WAIT_S)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            with self._lock:
+                record = self._records.get(execution_id)
+                if record is not None and record.state not in ExecutionState.TERMINAL:
+                    record.state = ExecutionState.CANCELLED
+                    record.error = "executor encerrado (shutdown) antes do término"
+                    record.heartbeat_at = time.time()
+            self._cleanup_workdir(execution_id)
+        if wait:
+            for thread in threads:
+                if thread.is_alive():
+                    thread.join(timeout=_SHUTDOWN_WAIT_S)
+        for execution_id in list(self._workdirs):
+            self._cleanup_workdir(execution_id)
 
 
 def _coerce_timeout(value: Any, default: float) -> float:
