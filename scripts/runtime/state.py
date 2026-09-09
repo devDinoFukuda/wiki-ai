@@ -173,8 +173,12 @@ class Progress:
     obligations_closed: tuple[str, ...] = ()
     evidence_accepted: tuple[str, ...] = ()
     conflicts_resolved: tuple[str, ...] = ()
-    #: Campos do contrato que ganharam conteúdo (informativo; sozinho NÃO é
-    #: progresso — "mudança textual não representa progresso").
+    #: Campos do contrato que ganharam conteúdo NESTA rodada — campo antes
+    #: vazio que passou a ter conteúdo. É PROGRESSO (ver `has_progress`):
+    #: reescrever um campo já preenchido continua não sendo, porque
+    #: "mudança textual não representa progresso" — o que muda aqui é que
+    #: PREENCHER um campo que estava vazio move o contrato do §6.3 e por isso
+    #: não pode ser contado como rodada estéril.
     contract_fields_filled: tuple[str, ...] = ()
     readings_reopened: tuple[str, ...] = ()
     rejected: tuple[Mapping[str, Any], ...] = ()
@@ -185,7 +189,23 @@ class Progress:
 
     @property
     def has_progress(self) -> bool:
-        return bool(self.obligations_closed or self.evidence_accepted or self.conflicts_resolved)
+        """A rodada MOVEU alguma coisa?
+
+        Quatro movimentos contam: obrigação encerrada, evidência nova aceita,
+        conflito resolvido e campo do contrato que saiu de vazio para
+        preenchido. O quarto entrou porque uma rodada que apurou `regra` pela
+        primeira vez — sem fechar leitura e sem citação inédita — era
+        classificada como `no_progress` e a cadeia parava em cima de trabalho
+        real. Reescrita de campo JÁ preenchido continua fora (`apply_result`
+        só registra o campo quando `depois and not antes`), então texto novo
+        sobre conteúdo velho segue sem valer progresso.
+        """
+        return bool(
+            self.obligations_closed
+            or self.evidence_accepted
+            or self.conflicts_resolved
+            or self.contract_fields_filled
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {

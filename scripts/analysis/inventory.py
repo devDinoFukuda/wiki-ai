@@ -30,8 +30,9 @@ import enum
 import os
 import re
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Iterable, Mapping
 
+from .profile import matches_any as _matches_any
 from .snapshot import FileState, Snapshot
 
 __all__ = [
@@ -164,12 +165,33 @@ _EXCLUDED_DIR_NAMES: dict[str, tuple[str, str]] = {
 }
 
 
-def _excluded_dir_hit(path: str) -> tuple[str, str] | None:
+#: Motivo/impacto atribuídos a um diretório excluído PELO PERFIL (não pelo
+#: default do módulo). Fica separado para que a origem da exclusão apareça no
+#: `Exclusion.motivo` — quem lê o inventário distingue convenção de decisão.
+_PROFILE_DIR_REASON = (
+    "diretório excluído pelo perfil de análise deste sistema (extra_excluded_dirs)",
+    "conteúdo não classificado nem extraído: o perfil declarou que não descreve "
+    "comportamento deste sistema",
+)
+_PROFILE_PATH_REASON = (
+    "caminho excluído pelo perfil de análise deste sistema (exclude_paths)",
+    "conteúdo não classificado nem extraído: o perfil declarou que não descreve "
+    "comportamento deste sistema",
+)
+
+
+def _excluded_dir_hit(
+    path: str, excluded_dirs: Mapping[str, tuple[str, str]] = _EXCLUDED_DIR_NAMES
+) -> tuple[str, str] | None:
     """`(nome_do_diretório, caminho_ate_o_diretório)` se algum segmento de
-    diretório (não o arquivo final) casar com `_EXCLUDED_DIR_NAMES`."""
+    diretório (não o arquivo final) casar com `excluded_dirs`.
+
+    `excluded_dirs` é parâmetro para que o perfil possa ACRESCENTAR nomes numa
+    cópia local; `_EXCLUDED_DIR_NAMES` nunca é mutado.
+    """
     segments = path.split("/")
     for i, seg in enumerate(segments[:-1]):
-        if seg in _EXCLUDED_DIR_NAMES:
+        if seg in excluded_dirs:
             return seg, "/".join(segments[: i + 1])
     return None
 
@@ -338,27 +360,56 @@ def _classify(snapshot: Snapshot, path: str) -> FileClassification:
 # --------------------------------------------------------------------------
 
 
-def build(snapshot: Snapshot) -> "Inventory":
+def build(
+    snapshot: Snapshot,
+    *,
+    extra_excluded_dirs: Iterable[str] = (),
+    exclude_paths: Iterable[str] = (),
+) -> "Inventory":
     """Classifica todo arquivo do `snapshot` (exceto deletado — sem conteúdo
     a classificar) e registra exclusões/limitações explicitamente.
 
     Não existe piso de tamanho de diretório: um arquivo sozinho numa pasta
     própria entra normalmente, contanto que não esteja sob um diretório de
     `_EXCLUDED_DIR_NAMES`.
+
+    `extra_excluded_dirs` (nomes de diretório) e `exclude_paths` (prefixos OU
+    globs, mesma semântica de `snapshot.capture`) vêm do perfil de análise do
+    sistema. Ambos compõem uma cópia LOCAL das exclusões — `_EXCLUDED_DIR_NAMES`
+    permanece intocado — e cada acerto vira `Exclusion` com motivo e impacto,
+    exatamente como as exclusões default: nada some sem registro (§6.1.3).
     """
     files: list[FileClassification] = []
     limitations: list[Limitation] = []
     exclusion_hits: dict[str, dict[str, object]] = {}
 
+    extra_dirs = tuple(d.strip().strip("/") for d in extra_excluded_dirs if (d or "").strip())
+    excluded_dirs: dict[str, tuple[str, str]] = dict(_EXCLUDED_DIR_NAMES)
+    for name in extra_dirs:
+        excluded_dirs.setdefault(name, _PROFILE_DIR_REASON)
+    profile_dirs = frozenset(n for n in extra_dirs if n not in _EXCLUDED_DIR_NAMES)
+    path_patterns = tuple(p for p in exclude_paths if (p or "").strip())
+    path_hits: dict[str, int] = {}
+
     for entry in sorted(snapshot.files, key=lambda e: e.path):
         if entry.state is FileState.DELETED:
             continue  # sem conteúdo em disco: nada para classificar (não é exclusão)
 
-        hit = _excluded_dir_hit(entry.path)
+        hit = _excluded_dir_hit(entry.path, excluded_dirs)
         if hit is not None:
             dirname, boundary = hit
-            bucket = exclusion_hits.setdefault(boundary, {"dirname": dirname, "count": 0})
+            bucket = exclusion_hits.setdefault(
+                boundary,
+                {"dirname": dirname, "count": 0, "by_profile": dirname in profile_dirs},
+            )
             bucket["count"] = int(bucket["count"]) + 1
+            continue
+
+        if path_patterns and _matches_any(entry.path, path_patterns):
+            matched = next(
+                p for p in path_patterns if _matches_any(entry.path, (p,))
+            )
+            path_hits[matched] = path_hits.get(matched, 0) + 1
             continue
 
         classification = _classify(snapshot, entry.path)
@@ -366,17 +417,26 @@ def build(snapshot: Snapshot) -> "Inventory":
         if classification.file_class is FileClass.UNSUPPORTED:
             limitations.append(Limitation(path=entry.path, detalhe=classification.reason))
 
-    exclusions = tuple(
+    exclusions_list = [
         Exclusion(
             path=boundary,
-            motivo=_EXCLUDED_DIR_NAMES[str(info["dirname"])][0],
+            motivo=excluded_dirs[str(info["dirname"])][0],
             impacto=(
                 f"{info['count']} arquivo(s) fora da classificação — "
-                f"{_EXCLUDED_DIR_NAMES[str(info['dirname'])][1]}"
+                f"{excluded_dirs[str(info['dirname'])][1]}"
             ),
         )
         for boundary, info in sorted(exclusion_hits.items())
+    ]
+    exclusions_list.extend(
+        Exclusion(
+            path=pattern,
+            motivo=_PROFILE_PATH_REASON[0],
+            impacto=f"{count} arquivo(s) fora da classificação — {_PROFILE_PATH_REASON[1]}",
+        )
+        for pattern, count in sorted(path_hits.items())
     )
+    exclusions = tuple(exclusions_list)
 
     summary = _summarize(files, exclusions, limitations)
     return Inventory(

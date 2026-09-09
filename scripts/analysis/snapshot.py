@@ -39,6 +39,8 @@ from typing import Iterable, Mapping, Sequence
 from knowledge.evidence import snippet_hash as _snippet_hash, validate_locator
 from knowledge.models import LocatorInvalid, SourceKind
 
+from .profile import matches_any as _matches_any
+
 __all__ = [
     "FileState",
     "FileEntry",
@@ -114,6 +116,11 @@ class Snapshot:
     git_available: bool
     files: tuple[FileEntry, ...]
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    #: Quantos caminhos ADMITIDOS pelo escopo foram removidos por `exclude`.
+    #: Não entra em `snapshot_id` (identidade é conteúdo); existe para que a
+    #: exclusão do perfil seja contada e auditável, nunca silenciosa (§6.1.3).
+    excluded_by_profile: int = 0
+    exclude_patterns: tuple[str, ...] = field(default_factory=tuple)
 
     def file_map(self) -> dict[str, FileEntry]:
         return {f.path: f for f in self.files}
@@ -147,9 +154,16 @@ def _unquote_git_path(raw: str) -> str:
 
 
 def _within_scope(path: str, scopes: Sequence[str] | None) -> bool:
+    """`True` se `path` é admitido pelo escopo.
+
+    Escopo vazio/`None` admite tudo. Cada padrão é PREFIXO (`path == s` ou
+    `path` começando por `s + "/"`, semântica histórica) quando não tem
+    metacaractere, e GLOB `fnmatch` quando tem — a mesma função que
+    `inventory` usa, para que include/exclude não divirjam entre os módulos.
+    """
     if not scopes:
         return True
-    return any(path == s or path.startswith(s + "/") for s in scopes)
+    return _matches_any(path, scopes)
 
 
 def _normalize_scope(scope: Iterable[str] | None) -> tuple[str, ...] | None:
@@ -310,13 +324,25 @@ def _compute_snapshot_id(entries: Iterable[FileEntry]) -> str:
 # --------------------------------------------------------------------------
 
 
-def capture(repo_path: str, scope: Iterable[str] | None = None) -> Snapshot:
+def capture(
+    repo_path: str,
+    scope: Iterable[str] | None = None,
+    *,
+    exclude: Iterable[str] | None = None,
+) -> Snapshot:
     """Captura o conteúdo analisado de `repo_path`.
 
-    `scope`: prefixos de caminho (relativos, `/`) que admitem um arquivo —
-    `path == prefixo` ou `path` começando por `prefixo + "/"`. `None` admite
-    o repositório inteiro. Filtrar por escopo não é "exclusão silenciosa"
-    (§6.1 item 3): é o próprio contrato de `scope`, decidido por quem chama.
+    `scope` (= `include` do perfil): padrões de caminho relativos, separador
+    `/`. Cada padrão é PREFIXO quando não tem metacaractere (`path == prefixo`
+    ou `path` começando por `prefixo + "/"`, comportamento histórico) e GLOB
+    `fnmatch` quando tem (`src/**/*.py`). `None` admite o repositório inteiro.
+    Filtrar por escopo não é "exclusão silenciosa" (§6.1 item 3): é o próprio
+    contrato de `scope`, decidido por quem chama.
+
+    `exclude`: mesmos padrões, aplicados DEPOIS de `scope` — exclusão vence
+    inclusão. Quantos caminhos foram removidos por aqui fica em
+    `Snapshot.excluded_by_profile` (e em `warnings`, quando > 0), porque
+    exclusão contada é auditável e exclusão silenciosa não é.
 
     Com git: inclui todo arquivo rastreado no HEAD (limpo ou não) mais todo
     não-rastreado admitido pelo `.gitignore` — cobre exatamente "HEAD +
@@ -326,7 +352,19 @@ def capture(repo_path: str, scope: Iterable[str] | None = None) -> Snapshot:
     """
     repo = os.path.abspath(repo_path)
     scopes = _normalize_scope(scope)
+    excludes = _normalize_scope(exclude) or ()
+    excluded_count = 0
     warnings: list[str] = []
+
+    def _admitted(path: str) -> bool:
+        """Escopo admite E exclusão não remove. Cada remoção é contada."""
+        nonlocal excluded_count
+        if not _within_scope(path, scopes):
+            return False
+        if excludes and _matches_any(path, excludes):
+            excluded_count += 1
+            return False
+        return True
 
     if not os.path.isdir(repo):
         raise SnapshotError(f"repo_path não é um diretório existente: {repo_path!r}")
@@ -347,8 +385,8 @@ def capture(repo_path: str, scope: Iterable[str] | None = None) -> Snapshot:
         if status_warn:
             warnings.append(status_warn)
 
-        candidate_paths = {p for p in tracked if _within_scope(p, scopes)}
-        candidate_paths |= {p for p in status if _within_scope(p, scopes)}
+        candidate_paths = {p for p in sorted(tracked) if _admitted(p)}
+        candidate_paths |= {p for p in sorted(status) if _admitted(p) and p not in candidate_paths}
 
         for p in sorted(candidate_paths):
             state = status.get(p, FileState.TRACKED_CLEAN)
@@ -373,7 +411,7 @@ def capture(repo_path: str, scope: Iterable[str] | None = None) -> Snapshot:
             for fn in filenames:
                 full = os.path.join(dirpath, fn)
                 rel = _normalize_path(os.path.relpath(full, repo))
-                if not _within_scope(rel, scopes):
+                if not _admitted(rel):
                     continue
                 hashed = _file_sha256(full)
                 if hashed is None:
@@ -383,6 +421,12 @@ def capture(repo_path: str, scope: Iterable[str] | None = None) -> Snapshot:
                 entries.append(FileEntry(path=rel, size=size, sha256=sha, state=FileState.UNTRACKED))
 
     entries.sort(key=lambda e: e.path)
+    if excluded_count:
+        warnings.append(
+            f"{excluded_count} caminho(s) admitido(s) pelo escopo foram removidos por "
+            f"exclude={list(excludes)!r} (perfil de análise): a exclusão é contada em "
+            "Snapshot.excluded_by_profile, não silenciosa"
+        )
     snapshot_id = _compute_snapshot_id(entries)
     return Snapshot(
         repo=repo,
@@ -391,6 +435,8 @@ def capture(repo_path: str, scope: Iterable[str] | None = None) -> Snapshot:
         git_available=git_available,
         files=tuple(entries),
         warnings=tuple(warnings),
+        excluded_by_profile=excluded_count,
+        exclude_patterns=tuple(excludes),
     )
 
 

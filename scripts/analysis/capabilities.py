@@ -60,6 +60,7 @@ from knowledge.models import EntityType
 from .extractors.base import Entrypoint, Reference, Symbol
 from .extractors.registry import ExtractionResult
 from .inventory import FileClass, Inventory
+from .profile import ProfileError, validate_capability_tuning
 from .snapshot import EvidenceRangeInvalid, PathNotInSnapshot, Snapshot, SnapshotStale, resolve_evidence
 
 __all__ = [
@@ -76,6 +77,7 @@ __all__ = [
     "ExternalDependency",
     "GroupingBasis",
     "OrphanSymbol",
+    "ProfileError",
     "discover",
     "evidence_ref_for",
     "fingerprint",
@@ -777,8 +779,24 @@ def discover(
     snapshot:   quando presente, cada ponto-chave sai com localizador validado.
     hub_fraction / hub_min_entries: ver a nota sobre hubs no topo do módulo.
 
+    Os quatro parâmetros de ajuste (`hub_fraction`, `hub_min_entries`,
+    `max_evidence_per_capability`, `max_sites_per_gap`) são o que o perfil de
+    análise sobrescreve (`discover(..., **profile.capabilities)`). A FAIXA é
+    verificada aqui, no ponto de uso: `hub_fraction` fora de (0, 1] ou inteiro
+    negativo levanta `ProfileError` em vez de produzir um mapa de capacidades
+    silenciosamente degradado.
+
     O retorno já passou por `assert_accounted()`.
     """
+    validate_capability_tuning(
+        {
+            "hub_fraction": hub_fraction,
+            "hub_min_entries": hub_min_entries,
+            "max_evidence_per_capability": max_evidence_per_capability,
+            "max_sites_per_gap": max_sites_per_gap,
+        },
+        source="capabilities.discover",
+    )
     index = _SymbolIndex(extraction.symbols)
     graph = _build_graph(extraction.references, index)
     notes: list[str] = []

@@ -557,16 +557,17 @@ def _cmd_init_store(a) -> int:
     repo_registrado = False
     if repo_abs:
         repo_registrado = True
-        profile_all = _load_analysis_profile(store_abs)
         repo_key = _repo_key(repo_abs)
-        prior_entry = dict(profile_all.get(repo_key) or {})
+        prior_entry = _repo_profile(_load_analysis_profile(store_abs), repo_abs)
         namespace = prior_entry.get("namespace") or f"code/{repo_key}"
         if prior_entry.get("namespace") != namespace:
-            entry = dict(prior_entry)
-            entry["namespace"] = namespace
-            entry.setdefault("registered_at", _utc_now())
-            profile_all[repo_key] = entry
-            _save_analysis_profile(store_abs, profile_all)
+            def _init_mutate(fresh: dict, *, _namespace=namespace) -> dict:
+                entry = dict(fresh)
+                entry["namespace"] = _namespace
+                entry.setdefault("registered_at", _utc_now())
+                return entry
+
+            _update_analysis_profile_entry(store_abs, repo_key, _init_mutate)
             mudou = True
 
     agent_id = getattr(a, "agent", None)
@@ -1034,6 +1035,24 @@ def cmd_doctor(a) -> int:
     if repo_arg and not repo_existe:
         bloqueios.append("repo")
 
+    # § perfil (item 5): valida `.wiki-ai.json` do `--repo` quando informado
+    # E existente — inválido vira diagnóstico com caminho e motivo, e entra
+    # em `bloqueios`/`next_actions` como qualquer outro eixo de `doctor`.
+    perfil_info: dict = {"validado": False}
+    if repo_existe:
+        from analysis import profile as profile_mod
+
+        perfil_caminho = os.path.join(repo_root, profile_mod.REPO_CONFIG_FILENAME)
+        try:
+            repo_cfg = profile_mod.load_repo_config(repo_root)
+        except profile_mod.ProfileError as exc:
+            perfil_info = {"validado": False, "caminho": perfil_caminho, "erro": str(exc)}
+            bloqueios.append("perfil")
+        else:
+            perfil_info = {
+                "validado": True, "caminho": perfil_caminho, "presente": repo_cfg is not None,
+            }
+
     engine = a.engine or "claude-code"
     # T15/A (achado da reprodução real): `--engine` é só o caminho de
     # COMPATIBILIDADE (§10.1/§11) — skill/permissão de engine são infra
@@ -1292,6 +1311,9 @@ def cmd_doctor(a) -> int:
     elif "repo" in bloqueios:
         proximo = f"corrija --repo: caminho não existe: {repo_root}"
         next_action_manual = proximo
+    elif "perfil" in bloqueios:
+        proximo = f"corrija {perfil_info.get('caminho')}: {perfil_info.get('erro')}"
+        next_action_manual = proximo
     elif not skill_completa_ou_padrao:
         parts = ["wk", "init", "--engine", engine]
         if a.store:
@@ -1316,6 +1338,7 @@ def cmd_doctor(a) -> int:
         "wk": wk_info,
         "store": store_info,
         "repo": repo_info,
+        "perfil": perfil_info,
         "engine": engine_info,
         "agent": agent_info,
         "bloqueios": bloqueios,
@@ -5255,6 +5278,365 @@ def _repo_profile(profile: dict, repo_abs: str) -> dict:
     return dict(profile.get(_repo_key(repo_abs)) or {})
 
 
+# -- Onda F3/item 1 (achado ALTA->MÉDIA da auditoria, reproduzido com 2
+# processos): `profile.json` sofre leitura-modificação-escrita em 6 pontos
+# (`init`, `analyze`, `update`, `resume`, `profile set`, `profile unset`) —
+# SEM lock, dois processos concorrentes (ex.: `wk analyze --repo A` e `wk
+# analyze --repo B` no MESMO --store) podiam cada um `_load` o mesmo estado
+# antigo do arquivo INTEIRO e o `_save` de quem termina por último apagava a
+# entrada que o outro tinha acabado de gravar — mesmo os dois mexendo em
+# CHAVES (`repo_key`) diferentes do dict. Mesmo padrão de
+# `_PendingEffectsTransaction` (stdlib só — `msvcrt.locking` no Windows,
+# `fcntl.flock` no POSIX; arquivo de lock DEDICADO, nunca o `.json` de
+# dados) — arquivo/timeouts/lock em processo PRÓPRIOS deste recurso, nunca
+# compartilhados com o de efeitos de publicação (recursos diferentes não
+# devem se bloquear um ao outro).
+_PROFILE_LOCK_FILENAME = "profile.lock"
+_PROFILE_LOCK_POLL_S = 0.05
+_PROFILE_LOCK_TIMEOUT_S = 15.0
+_PROFILE_PROCESS_LOCK = threading.Lock()
+
+
+def _lock_profile_file(fh) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_profile_file(fh) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        fh.seek(0)
+        with contextlib.suppress(OSError):
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        with contextlib.suppress(OSError):
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+class _ProfileTransaction:
+    """Lock exclusivo ENTRE PROCESSOS (e entre threads do mesmo processo, via
+    `_PROFILE_PROCESS_LOCK`) sobre a leitura-modificação-escrita de
+    `profile.json` — envolve `_load` -> mutação do chamador -> `_save` como
+    UMA transação. Esgotado o timeout sem conseguir o lock, levanta
+    `TimeoutError` explicável — nunca trava a chamada indefinidamente."""
+
+    def __init__(self, store_root: str, *, timeout: float = _PROFILE_LOCK_TIMEOUT_S):
+        self._path = os.path.join(_analysis_dir(store_root), _PROFILE_LOCK_FILENAME)
+        self._timeout = timeout
+        self._fh = None
+        self._process_lock_held = False
+
+    def __enter__(self) -> "_ProfileTransaction":
+        deadline = time.monotonic() + self._timeout
+        if not _PROFILE_PROCESS_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise TimeoutError(
+                "não foi possível obter o lock de perfil de análise em "
+                f"{self._timeout:.1f}s (outra chamada deste mesmo processo já está gravando); "
+                "tente novamente"
+            )
+        self._process_lock_held = True
+        try:
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            fh = open(self._path, "a+b")
+            if fh.tell() == 0:
+                fh.write(b"0")
+                fh.flush()
+            while True:
+                try:
+                    _lock_profile_file(fh)
+                    self._fh = fh
+                    return self
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        fh.close()
+                        raise TimeoutError(
+                            f"não foi possível obter o lock de perfil de análise ({self._path}) "
+                            f"em {self._timeout:.1f}s; outro processo pode estar gravando — "
+                            "tente novamente"
+                        )
+                    time.sleep(_PROFILE_LOCK_POLL_S)
+        except BaseException:
+            if self._process_lock_held:
+                _PROFILE_PROCESS_LOCK.release()
+                self._process_lock_held = False
+            raise
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            if self._fh is not None:
+                _unlock_profile_file(self._fh)
+                self._fh.close()
+                self._fh = None
+        finally:
+            if self._process_lock_held:
+                _PROFILE_PROCESS_LOCK.release()
+                self._process_lock_held = False
+        return False
+
+
+def _update_analysis_profile_entry(store_root: str, repo_key: str, mutate) -> dict:
+    """Leitura-modificação-escrita ATÔMICA de `profile.json[repo_key]`, sob
+    `_ProfileTransaction`. `mutate(fresh_entry: dict) -> dict` recebe o
+    registro ATUAL deste repo, relido de DISCO dentro do lock (nunca uma
+    cópia capturada antes do trabalho longo de `analyze`/`update`/`resume`)
+    e devolve o registro NOVO — só a fatia `repo_key` é substituída no
+    `profile.json` inteiro, então duas invocações concorrentes em repos
+    DIFERENTES nunca perdem a escrita uma da outra."""
+    with _ProfileTransaction(store_root):
+        profile_all = _load_analysis_profile(store_root)
+        fresh_entry = dict(profile_all.get(repo_key) or {})
+        new_entry = mutate(fresh_entry)
+        profile_all[repo_key] = new_entry
+        _save_analysis_profile(store_root, profile_all)
+        return new_entry
+
+
+# -- perfil de análise (3 camadas: `.wiki-ai.json` < `profile.json[repo]` < cli) --
+#
+# `analysis.profile` é o módulo dono do contrato (`AnalysisProfile`,
+# `ProfileError`, `load_repo_config`, `resolve_profile`, `DEFAULT_PROFILE`).
+# Este bloco só monta as camadas a partir do que a CLI já sabe (argparse,
+# `profile.json` do store) e traduz `ProfileError` para o envelope comum —
+# nunca reimplementa merge/validação de perfil.
+
+
+def _profile_fields_from_flags(a) -> dict:
+    """Campos de perfil vindos de flags individuais desta invocação:
+    `--include/--exclude/--objective/--topic/--max-reading-needs/
+    --budget-bytes/--budget-tokens`. Reusado pela camada 'cli' de
+    `analyze`/`update`/`resume` E por `wk profile set` (sem `--json-file`).
+
+    `--topic` (§ entrega item 1) passa a ter efeito real como ALIAS de
+    `--objective` (substring) — nunca substitui `--objective`, os dois se
+    somam em `objectives`.
+    """
+    fields: dict = {}
+    include = getattr(a, "include", None)
+    if include:
+        fields["include"] = list(include)
+    exclude = getattr(a, "exclude", None)
+    if exclude:
+        fields["exclude"] = list(exclude)
+    objectives = list(getattr(a, "objective", None) or [])
+    topic = getattr(a, "topic", None)
+    if topic:
+        objectives.append(topic)
+    if objectives:
+        fields["objectives"] = objectives
+    max_reading_needs = getattr(a, "max_reading_needs", None)
+    if max_reading_needs is not None:
+        fields["max_reading_needs"] = max_reading_needs
+    budget: dict = {}
+    budget_bytes = getattr(a, "budget_bytes", None)
+    if budget_bytes is not None:
+        budget["max_bytes"] = budget_bytes
+    budget_tokens = getattr(a, "budget_tokens", None)
+    if budget_tokens is not None:
+        budget["max_tokens"] = budget_tokens
+    if budget:
+        fields["budget"] = budget
+    return fields
+
+
+def _profile_cli_overrides(a) -> dict:
+    """Camada 'cli' completa: `--profile CAMINHO.json` (base) sobrescrita
+    pelas flags individuais (`_profile_fields_from_flags`). Dict vazio
+    quando nenhuma flag de perfil foi usada nesta invocação — o chamador
+    passa `cli_overrides=None` nesse caso (§ contrato de `resolve_profile`).
+
+    `AnalysisProfile.from_mapping` TOLERA e ignora uma chave `source` vinda
+    do dado (round-trip fechado com `to_dict()`, ver `analysis/profile.py`)
+    — nenhum filtro extra é necessário aqui para um `--profile CAMINHO.json`
+    exportado por `wk profile show`."""
+    overrides: dict = {}
+    profile_path = getattr(a, "profile_file", None)
+    if profile_path:
+        with open(profile_path, encoding="utf-8") as f:
+            overrides.update(json.load(f))
+    overrides.update(_profile_fields_from_flags(a))
+    return overrides
+
+
+def _resolve_analysis_profile(*, repo_abs: str, store_profile: dict | None, cli_overrides: dict | None):
+    """Resolve as 3 camadas (repo `.wiki-ai.json` < store `perfil` < cli) numa
+    chamada só. Devolve `(profile, erro)`: `erro` é `None` no caminho feliz;
+    quando não é `None`, `profile` é `None` e o chamador bloqueia ANTES de
+    rodar qualquer análise (`ProfileError` de QUALQUER camada — repo config
+    inválido ou merge/coerção inválida)."""
+    from analysis import profile as profile_mod
+
+    try:
+        repo_config = profile_mod.load_repo_config(repo_abs)
+    except profile_mod.ProfileError as exc:
+        return None, str(exc)
+    try:
+        resolved = profile_mod.resolve_profile(
+            repo_config=repo_config, store_profile=(store_profile or None),
+            cli_overrides=(cli_overrides or None),
+        )
+    except profile_mod.ProfileError as exc:
+        return None, str(exc)
+    return resolved, None
+
+
+def _profile_hash(profile_dict: dict) -> str:
+    """Hash canônico do perfil EFETIVO (§ entrega item 3) — usado para
+    detectar, em `update`/`resume`, se o perfil resolvido nesta invocação
+    diverge do perfil sob o qual a última `wk analyze` rodou."""
+    payload = json.dumps(profile_dict, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _pending_profile_changed(repo_abs: str, store_root: str) -> dict:
+    return {
+        "id": "perfil-alterado", "tipo": "perfil_alterado",
+        "alvo": repo_abs,
+        "causa": "perfil de análise (repo/store) mudou desde a última `wk analyze` — "
+                 "esta invocação usou o perfil ATUAL, diferente do `perfil_efetivo` persistido",
+        "impacto": "resultado desta invocação pode ficar inconsistente com o estado acumulado "
+                   "produzido sob o perfil anterior",
+        "recuperacao_automatica": False,
+        "acoes": [f"rode `wk analyze --repo {repo_abs} --store {store_root}` para reanalisar "
+                  "com o perfil atual"],
+    }
+
+
+def _blocked_profile_error(*, command: str, store_root: str, repo_abs: str, causa: str) -> dict:
+    """§ entrega item 3: `ProfileError` de qualquer camada -> `blocked`/exit 2,
+    `pending` tipado, `next_actions` aponta `wk profile show` — nunca roda
+    análise nenhuma."""
+    shell = "powershell" if os.name == "nt" else "posix"
+    return _common_payload(
+        command=command, operation_status="blocked",
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs},
+        store_root=store_root, repo=repo_abs,
+        summary={"mensagem": causa},
+        pending=[{
+            "id": f"{command.replace(' ', '-')}-perfil-invalido", "tipo": "perfil_invalido",
+            "alvo": repo_abs, "causa": causa,
+            "impacto": "nenhuma análise foi executada nesta invocação",
+            "recuperacao_automatica": False,
+            "acoes": [f"rode `wk profile show --repo {repo_abs} --store {store_root}` para "
+                      "inspecionar as 3 camadas e corrigir o perfil"],
+        }],
+        next_actions=[{
+            "ator": "operador", "motivo": causa,
+            "argv": ["wk", "profile", "show", "--repo", repo_abs, "--store", store_root],
+            "shell": shell,
+        }],
+        publication=None, delivery_block=None,
+    )
+
+
+#: Onda F3/item 3 (achado real, reproduzido) + reprodução direta seguinte
+#: (achado: a lista de disponíveis só olhava `capability_map.capabilities`,
+#: ignorando objetivos de GRUPO DE ÓRFÃOS — o caso mais comum em `--mode
+#: structural`, onde o grafo raramente forma capacidade nenhuma): `--objective`/
+#: `--topic` que não casa com NENHUM objetivo deste repositório devolvia
+#: `succeeded`/`knowledge_status=complete` com 0 analisados — um filtro sem
+#: correspondência não pode parecer sucesso vazio (mesmo racional de
+#: `plan_accounting`: supressão nunca é cobertura). Teto de quantos objetivos
+#: disponíveis entram no `pending`/`summary` (repositório grande não pode
+#: inundar o envelope).
+_FILTRO_SEM_CORRESPONDENCIA_LIMITE = 20
+
+
+def _available_objectives_for_filtro(capability_map, extraction, inventory, snapshot, profile) -> list:
+    """Objetivos que EXISTIRIAM nesta mesma invocação SEM o filtro
+    `--objective`/`--topic` — replaneja com `profile.objectives=()` sobre o
+    MESMO `capability_map`/`extraction`/`inventory`/`snapshot` já calculados
+    (replanejar é barato: só itera capacidades/órfãos já descobertos, não
+    relê disco nem reextrai nada). Cobre os DOIS tipos de objetivo
+    (`capability` e `orphan_group` — `--mode structural` num repositório
+    pequeno tipicamente só produz o segundo), nunca só capacidades."""
+    from analysis import investigation as inv2_mod
+
+    profile_sem_filtro = dataclasses.replace(profile, objectives=())
+    objetivos = inv2_mod.plan(
+        capability_map, extraction, inventory=inventory, snapshot=snapshot, profile=profile_sem_filtro,
+    )
+    out = []
+    for o in objetivos[:_FILTRO_SEM_CORRESPONDENCIA_LIMITE]:
+        tipo = "capability" if o.kind is inv2_mod.ObjectiveKind.CAPABILITY else "orphan_group"
+        out.append({"id": o.objective_id, "nome": o.name, "tipo": tipo})
+    return out
+
+
+def _blocked_filtro_sem_correspondencia(
+    *, command: str, store_root: str, repo_abs: str, profile, mode: str, objetivos_disponiveis: list,
+) -> dict:
+    """`profile.objectives` (via `--objective`/`--topic`) sem NENHUM
+    objetivo selecionado (`plan_accounting()["objectives"] == 0`) ->
+    `blocked`/exit 2 ANTES de gravar tarefa ou revisão de conhecimento —
+    nunca um `succeeded`/`complete` vazio. `objetivos_disponiveis` (id +
+    nome/módulo + tipo `capability`|`orphan_group`, já truncado ao limite)
+    vem de `_available_objectives_for_filtro` — a mensagem "nenhum objetivo
+    encontrado" só aparece quando essa lista está REALMENTE vazia (plano sem
+    filtro nenhum), nunca como efeito colateral do próprio filtro."""
+    padroes = list(profile.objectives)
+    disponiveis = list(objetivos_disponiveis)
+    causa = (
+        f"--objective/--topic ({', '.join(padroes)}) não casou com nenhum objetivo "
+        "(capacidade ou grupo de símbolos órfãos) deste repositório"
+    )
+    shell = "powershell" if os.name == "nt" else "posix"
+    sugestao_argv = None
+    if disponiveis:
+        sugestao_argv = [
+            "wk", command, "--repo", repo_abs, "--store", store_root,
+            "--mode", mode, "--objective", disponiveis[0]["id"],
+        ]
+    acoes = [
+        "escolha um dos ids disponíveis: " + ", ".join(
+            f"{d['id']} ({d['tipo']}: {d['nome']})" for d in disponiveis
+        )
+        if disponiveis else
+        "nenhum objetivo (capacidade ou grupo de órfãos) encontrado neste repositório — "
+        "revise --include/--exclude"
+    ]
+    return _common_payload(
+        command=command, operation_status="blocked",
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs, "profile": profile.summary()},
+        store_root=store_root, repo=repo_abs,
+        summary={
+            "mensagem": causa, "padroes": padroes, "objetivos_disponiveis": disponiveis,
+        },
+        pending=[{
+            "id": f"{command.replace(' ', '-')}-filtro-sem-correspondencia",
+            "tipo": "filtro_sem_correspondencia",
+            "alvo": repo_abs, "causa": causa,
+            "impacto": "nenhum objetivo foi analisado nesta invocação; nenhuma revisão de "
+                       "conhecimento foi gravada",
+            "recuperacao_automatica": False,
+            "acoes": acoes,
+        }],
+        next_actions=([{
+            "ator": "operador",
+            "motivo": "repetir com um --objective que exista neste repositório",
+            "argv": sugestao_argv, "shell": shell,
+        }] if sugestao_argv else [{
+            "ator": "operador",
+            "motivo": "nenhum objetivo (capacidade/órfão) encontrado neste repositório — "
+                      "revise --include/--exclude",
+            "argv": None, "shell": None,
+            "acao_externa": "revise --include/--exclude/--objective e repita",
+        }]),
+        publication=None, delivery_block=None,
+    )
+
+
 # -- snapshot: (de)serialização para o manifest de `wk update` -------------
 
 
@@ -5269,6 +5651,11 @@ def _snapshot_to_dict(snap) -> dict:
             for f in snap.files
         ],
         "warnings": list(snap.warnings),
+        # § perfil (campos novos de `Snapshot`, ambos com default 0/() —
+        # `getattr` no `to_dict` e `.get(..., default)` no `from_dict`
+        # mantêm manifesto ANTIGO em disco legível sem migração).
+        "excluded_by_profile": getattr(snap, "excluded_by_profile", 0),
+        "exclude_patterns": list(getattr(snap, "exclude_patterns", ()) or ()),
     }
 
 
@@ -5283,6 +5670,8 @@ def _snapshot_from_dict(data: dict):
         repo=data["repo"], snapshot_id=data["snapshot_id"], head=data.get("head"),
         git_available=bool(data.get("git_available")), files=files,
         warnings=tuple(data.get("warnings", ())),
+        excluded_by_profile=int(data.get("excluded_by_profile") or 0),
+        exclude_patterns=tuple(data.get("exclude_patterns", ()) or ()),
     )
 
 
@@ -5303,12 +5692,19 @@ def _load_snapshot_manifest(store_root: str, snapshot_id: str):
 # -- pipeline determinístico: snapshot -> inventário -> extração -> capacidades -> objetivos
 
 
-def _analyze_pipeline(repo_abs: str, scope, namespace: str, precaptured=None):
+def _analyze_pipeline(repo_abs: str, scope, namespace: str, precaptured=None, *, exclude=None, profile=None):
     """Roda o pipeline determinístico (sem LLM) até os objetivos de investigação.
 
     `precaptured`: reaproveita um `Snapshot` já capturado (usado por
     `cmd_update`, que precisa do snapshot novo ANTES deste pipeline para
     calcular o diff — capturar duas vezes seria trabalho e I/O em dobro).
+
+    `profile`: `AnalysisProfile` já RESOLVIDO (3 camadas) pelo chamador —
+    `analysis.profile.DEFAULT_PROFILE` quando omitido, nunca um perfil
+    calculado aqui (esta função não decide perfil, só aplica). Molda
+    `snapshot.capture` (`scope`/`exclude`), `default_registry` (extensões),
+    `capabilities.discover` (kwargs de `profile.capabilities`) e
+    `investigation.plan` (`profile=` inteiro, inclusive `max_reading_needs`).
     """
     from analysis import capabilities as cap_mod
     from analysis import inventory as inv_mod
@@ -5316,9 +5712,14 @@ def _analyze_pipeline(repo_abs: str, scope, namespace: str, precaptured=None):
     from analysis import snapshot as snap_mod
     from analysis.extractors import registry as ext_registry
     from analysis.extractors.base import SourceFile
+    from analysis.profile import DEFAULT_PROFILE
 
-    snapshot = precaptured if precaptured is not None else snap_mod.capture(repo_abs, scope=scope)
-    inventory = inv_mod.build(snapshot)
+    profile = profile if profile is not None else DEFAULT_PROFILE
+    snapshot = (
+        precaptured if precaptured is not None
+        else snap_mod.capture(repo_abs, scope=scope, exclude=exclude)
+    )
+    inventory = inv_mod.build(snapshot, exclude_paths=profile.exclude)
     # Classes com conteúdo estrutural analisável. TEST entra porque
     # `investigation.plan` liga testes a alvo via `extraction.references`
     # (tests_by_target) — sem extrair teste, esse vínculo nunca existe.
@@ -5339,10 +5740,42 @@ def _analyze_pipeline(repo_abs: str, scope, namespace: str, precaptured=None):
         files.append(
             SourceFile(path=fc.path, content=content, language=(fc.language.value if fc.language else ""))
         )
-    extraction = ext_registry.default_registry().extract_all(files)
-    capability_map = cap_mod.discover(extraction, inventory, namespace=namespace, snapshot=snapshot)
-    objectives = inv2_mod.plan(capability_map, extraction, inventory=inventory, snapshot=snapshot)
-    return snapshot, inventory, extraction, capability_map, objectives
+    extraction = ext_registry.default_registry(extensions=profile.extractors).extract_all(files)
+    capability_map = cap_mod.discover(
+        extraction, inventory, namespace=namespace, snapshot=snapshot, **(profile.capabilities or {})
+    )
+    objectives = inv2_mod.plan(
+        capability_map, extraction, inventory=inventory, snapshot=snapshot, profile=profile
+    )
+    # § perfil (obrigatório quando `profile.objectives` filtra): confere que
+    # toda capacidade/órfão SELECIONADO (não o universo inteiro) tem
+    # objetivo — `PlanAccountingError` propaga para o `except Exception` do
+    # chamador (falha de integridade real, não erro de perfil). O que o
+    # filtro SUPRIMIU é contagem explícita (`plan_accounting`), nunca
+    # confundido com cobertura — devolvido para o chamador expor no envelope.
+    accounting = None
+    if profile.objectives:
+        inv2_mod.assert_plan_accounted(objectives, capability_map, profile=profile)
+        accounting = inv2_mod.plan_accounting(objectives, capability_map, profile=profile)
+    return snapshot, inventory, extraction, capability_map, objectives, accounting
+
+
+def _objective_from_store_dict(data: dict):
+    """Reconstrói `InvestigationObjective` a partir de dado que o PRÓPRIO
+    pipeline determinístico gravou em `runtime.db` (`task.objective` —
+    manifesto/escopo persistido por `wk analyze`/`wk update`, nunca payload
+    de agente). `trust_profile_cells=True` incondicional: célula de perfil
+    (`not_applicable` com `justification_source`) já foi validada por
+    `analysis.investigation.plan()`/`AnalysisProfile.from_mapping` no
+    momento em que o objetivo foi gravado — reconfirmar aqui rejeitaria dado
+    do PRÓPRIO pipeline. NUNCA usar este helper para reconstruir objetivo a
+    partir de payload devolvido por um agente (esse caminho não existe hoje
+    em `cli.py` — grep confirma um único ponto de reconstrução, `cmd_status`
+    via este helper; se um novo aparecer, o default `trust_profile_cells=False`
+    de `InvestigationObjective.from_dict` é quem se aplica)."""
+    from analysis.investigation import InvestigationObjective
+
+    return InvestigationObjective.from_dict(data, trust_profile_cells=True)
 
 
 def _objective_touched_paths(obj: dict, capability_map, symbol_path_index: dict) -> list:
@@ -5653,6 +6086,9 @@ def _run_investigation_chain(
     resolver,
     reason: str,
     max_rounds: int | None,
+    budget: Mapping[str, Any] | None = None,
+    policy: Mapping[str, Any] | None = None,
+    result_extra_keys: tuple = (),
 ) -> dict:
     """§7.3 numa chamada só: `coordinator.run_chain` POR OBJETIVO (nunca um
     `input_versions` só para o lote inteiro — cada objetivo tem seu próprio
@@ -5856,9 +6292,11 @@ def _run_investigation_chain(
                 adapter=adapter,
                 binding=binding,
                 bindings=bindings_store,
-                budget=_DEFAULT_TASK_BUDGET,
+                budget=dict(budget) if budget else dict(_DEFAULT_TASK_BUDGET),
+                policy=dict(policy) if policy else None,
                 max_rounds=max_rounds,
                 engine_capabilities=engine_caps,
+                result_extra_keys=tuple(result_extra_keys or ()),
                 run_kwargs={
                     "context_builder": rt_context.build_package,
                     "resolver": resolver,
@@ -7621,6 +8059,20 @@ def cmd_analyze(a) -> int:
     prior = _repo_profile(profile_all, repo_abs)
     topic = a.topic if a.topic is not None else prior.get("topic")
 
+    # § perfil de análise (item 3 da entrega): 3 camadas resolvidas ANTES de
+    # qualquer seleção de agente/trabalho — `ProfileError` bloqueia aqui,
+    # sem consumir binding nem rodada nenhuma.
+    cli_profile_overrides = _profile_cli_overrides(a)
+    profile, profile_erro = _resolve_analysis_profile(
+        repo_abs=repo_abs, store_profile=prior.get("perfil"), cli_overrides=cli_profile_overrides,
+    )
+    if profile_erro is not None:
+        payload = _blocked_profile_error(
+            command="analyze", store_root=store_root, repo_abs=repo_abs, causa=profile_erro,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
     # §10.4.6/§11: seleção de agente pelo contrato de binding — nunca por
     # preferência implícita. `--mode deep` (default, mesmo sem --mode) sem
     # binding utilizável bloqueia ANTES de qualquer trabalho (nenhuma tarefa
@@ -7642,19 +8094,53 @@ def cmd_analyze(a) -> int:
         _render_common(payload, json_out=json_out)
         return _exit_code_common(payload["operation_status"])
 
-    scope = prior.get("scope")
+    scope = profile.include or None
+    exclude = profile.exclude or None
     namespace = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
 
+    from analysis.extractors.registry import ExtractorExtensionError as _ExtractorExtensionError
+    from analysis.profile import ProfileError as _ProfileError
+
     try:
-        snapshot, _inventory, extraction, capability_map, objectives = _analyze_pipeline(
-            repo_abs, scope, namespace
+        snapshot, inventory, extraction, capability_map, objectives, perfil_accounting = _analyze_pipeline(
+            repo_abs, scope, namespace, exclude=exclude, profile=profile,
         )
+    except _ProfileError as exc:
+        payload = _blocked_profile_error(
+            command="analyze", store_root=store_root, repo_abs=repo_abs, causa=str(exc),
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+    except _ExtractorExtensionError as exc:
+        payload = _precondition_blocked(
+            command="analyze", store_root=store_root, repo_abs=repo_abs,
+            causa=f"extensão de extrator inválida no perfil (`extractors`): {exc}", alvo=repo_abs,
+            acoes=[f"rode `wk profile show --repo {repo_abs} --store {store_root}` e corrija "
+                   "`extractors` (formato 'pacote.modulo:fabrica')"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
     except Exception as exc:
         payload = _precondition_blocked(
             command="analyze", store_root=store_root, repo_abs=repo_abs,
             causa=f"falha na captura/extração do repositório: {type(exc).__name__}: {exc}",
             alvo=repo_abs,
             acoes=["confira se --repo aponta para um diretório válido (git ou não)"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
+    # Onda F3/item 3: `--objective`/`--topic` sem NENHUMA correspondência ->
+    # blocked/exit 2 ANTES de gravar snapshot manifest, tarefa ou revisão —
+    # nunca `succeeded`/`complete` vazio. Lista TODOS os objetivos
+    # disponíveis (capacidade E grupo de órfãos — ver `_available_objectives_for_filtro`).
+    if profile.objectives and perfil_accounting and perfil_accounting.get("objectives", 0) == 0:
+        payload = _blocked_filtro_sem_correspondencia(
+            command="analyze", store_root=store_root, repo_abs=repo_abs,
+            profile=profile, mode=selecao["mode"],
+            objetivos_disponiveis=_available_objectives_for_filtro(
+                capability_map, extraction, inventory, snapshot, profile,
+            ),
         )
         _render_common(payload, json_out=json_out)
         return _exit_code_common(payload["operation_status"])
@@ -7672,6 +8158,15 @@ def cmd_analyze(a) -> int:
         )
         objectives_by_id = {o.objective_id: o for o in objectives}
 
+        # § perfil: orçamento efetivo (`_DEFAULT_TASK_BUDGET` sobrescrito por
+        # `profile.budget`) aplicado desde o PRIMEIRO despacho — a mesma
+        # base que `_run_investigation_chain` usa nas rodadas de continuação
+        # (senão a rodada 0 e as seguintes divergiriam de orçamento).
+        effective_budget = {**_DEFAULT_TASK_BUDGET, **(profile.budget or {})}
+        effective_max_rounds = getattr(a, "max_rounds", None)
+        if effective_max_rounds is None:
+            effective_max_rounds = profile.max_rounds
+
         capacidades_analisadas = []
         for obj in objective_dicts:
             inputs = inputs_by_objective[str(obj.get("objective_id"))]
@@ -7679,7 +8174,7 @@ def cmd_analyze(a) -> int:
                 store, [obj],
                 snapshot_id=inputs["snapshot_id"],
                 source_version_ids=inputs["source_version_ids"],
-                kind=rt_tasks.TaskKind.INVESTIGATION, budget=_DEFAULT_TASK_BUDGET,
+                kind=rt_tasks.TaskKind.INVESTIGATION, budget=effective_budget,
             )
             for t in created:
                 capacidades_analisadas.append({
@@ -7694,14 +8189,14 @@ def cmd_analyze(a) -> int:
         # repete) numa chamada só, até conclusão ou motivo material de parada
         # — nunca uma rodada por invocação (`_continuation_cycle` antigo).
         resolver = _snapshot_resolver(snapshot)
-        max_rounds = getattr(a, "max_rounds", None)
         try:
             cadeia = _run_investigation_chain(
                 store, store_root=store_root, namespace=namespace, snapshot=snapshot,
                 extraction=extraction, objectives=objectives, capability_map=capability_map,
                 objectives_by_id=objectives_by_id, inputs_by_objective=inputs_by_objective,
                 engine_name=engine_name, bindings_store=bindings_store, resolver=resolver,
-                reason=f"integração de resultados — {reason}", max_rounds=max_rounds,
+                reason=f"integração de resultados — {reason}", max_rounds=effective_max_rounds,
+                budget=effective_budget, policy=profile.policy, result_extra_keys=profile.result_extra_keys,
             )
         except Exception as exc:  # A2: falha inesperada — envelope comum, exit 2, sem apagar progresso
             payload = _internal_error_blocked(
@@ -7722,12 +8217,30 @@ def cmd_analyze(a) -> int:
         )
 
         current_oids = sorted({str(o.get("objective_id")) for o in objective_dicts if o.get("objective_id")})
-        profile_all[_repo_key(repo_abs)] = {
-            "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
-            "last_snapshot_id": snapshot.snapshot_id, "last_revision_id": revisao_publicada,
-            "current_objective_ids": current_oids, "updated_at": _utc_now(),
-        }
-        _save_analysis_profile(store_root, profile_all)
+        # § perfil item 3: `perfil_efetivo` + hash persistidos para `update`/
+        # `resume` reutilizarem o MESMO perfil por padrão e detectarem
+        # divergência (ver `_pending_profile_changed`).
+        perfil_efetivo_dict = profile.to_dict()
+        perfil_efetivo_hash_novo = _profile_hash(perfil_efetivo_dict)
+
+        def _analyze_mutate(
+            fresh: dict, *, _snapshot=snapshot, _revisao=revisao_publicada,
+            _oids=current_oids, _perfil_efetivo=perfil_efetivo_dict, _hash=perfil_efetivo_hash_novo,
+        ) -> dict:
+            return {
+                "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
+                "last_snapshot_id": _snapshot.snapshot_id, "last_revision_id": _revisao,
+                "current_objective_ids": _oids, "updated_at": _utc_now(),
+                # `fresh.get("perfil")`, não `prior.get("perfil")`: relido de
+                # DISCO dentro do lock — um `wk profile set` concorrente
+                # durante esta `analyze` (potencialmente longa) não é
+                # apagado por esta gravação (Onda F3/item 1).
+                "perfil": fresh.get("perfil"),
+                "perfil_efetivo": _perfil_efetivo,
+                "perfil_efetivo_hash": _hash,
+            }
+
+        _update_analysis_profile_entry(store_root, _repo_key(repo_abs), _analyze_mutate)
 
         out = {
             "capacidades_analisadas": capacidades_analisadas,
@@ -7742,6 +8255,10 @@ def cmd_analyze(a) -> int:
                 "repo": repo_abs, "topic": topic, "engine": engine_name,
                 "scope": scope, "namespace": namespace, "store": store_root,
                 "modo": selecao["mode"],
+                # §6.6/perfil: contagem explícita do que `--objective`/`--topic`
+                # SUPRIMIU (nunca confundido com cobertura) — só quando o
+                # filtro está ativo (`profile.objectives`); `None` senão.
+                "perfil_accounting": perfil_accounting,
             },
             "agent": _agent_public_dict(store_root, repo_abs),
         }
@@ -7767,7 +8284,8 @@ def cmd_analyze(a) -> int:
             command="analyze", operation_status=operation_status,
             knowledge_status=knowledge_status,
             delivery_status=_delivery_status_from_publicacoes(publicacoes),
-            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            scope={"store": store_root, "repo": repo_abs, "profile": profile.summary()},
+            store_root=store_root, repo=repo_abs,
             summary={"detail": out}, pending=pending, next_actions=next_actions,
             publication=(
                 {"revision": revisao_publicada, "root": os.path.join(store_root, _PUBLICACOES_DIRNAME)}
@@ -7838,11 +8356,28 @@ def cmd_update(a) -> int:
         _render_common(payload, json_out=json_out)
         return _exit_code_common(payload["operation_status"])
 
+    # § perfil de análise (item 3): mesma resolução de `wk analyze`, ANTES de
+    # capturar o novo snapshot — `ProfileError` bloqueia sem tocar disco/db.
+    cli_profile_overrides = _profile_cli_overrides(a)
+    profile, profile_erro = _resolve_analysis_profile(
+        repo_abs=repo_abs, store_profile=prior.get("perfil"), cli_overrides=cli_profile_overrides,
+    )
+    if profile_erro is not None:
+        payload = _blocked_profile_error(
+            command="update", store_root=store_root, repo_abs=repo_abs, causa=profile_erro,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+    perfil_efetivo_dict = profile.to_dict()
+    perfil_efetivo_hash = _profile_hash(perfil_efetivo_dict)
+    perfil_mudou = bool(prior.get("perfil_efetivo_hash")) and prior.get("perfil_efetivo_hash") != perfil_efetivo_hash
+
     from analysis import snapshot as snap_mod
 
-    scope = prior.get("scope")
+    scope = profile.include or None
+    exclude = profile.exclude or None
     try:
-        new_snapshot = snap_mod.capture(repo_abs, scope=scope)
+        new_snapshot = snap_mod.capture(repo_abs, scope=scope, exclude=exclude)
     except Exception as exc:
         payload = _precondition_blocked(
             command="update", store_root=store_root, repo_abs=repo_abs,
@@ -7955,11 +8490,14 @@ def cmd_update(a) -> int:
                 "argv": ["wk", "update", "--repo", repo_abs, "--store", store_root],
                 "shell": "powershell" if os.name == "nt" else "posix",
             }] + next_actions_noop
+        if perfil_mudou:
+            pending_noop.append(_pending_profile_changed(repo_abs, store_root))
         payload = _common_payload(
             command="update", operation_status=operation_status_noop,
             knowledge_status=knowledge_status_noop,
             delivery_status=_status_delivery_status(store_root, repo_abs),
-            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            scope={"store": store_root, "repo": repo_abs, "profile": profile.summary()},
+            store_root=store_root, repo=repo_abs,
             summary={"detail": noop_detail}, pending=pending_noop, next_actions=next_actions_noop,
             publication=(
                 {
@@ -7981,9 +8519,22 @@ def cmd_update(a) -> int:
     try:
         rt_recovery.resume(store)  # housekeeping: libera leases expirados de uma execução anterior
 
-        _, _inventory, extraction, capability_map, objectives = _analyze_pipeline(
-            repo_abs, scope, namespace, precaptured=new_snapshot
+        _, inventory, extraction, capability_map, objectives, perfil_accounting = _analyze_pipeline(
+            repo_abs, scope, namespace, precaptured=new_snapshot, exclude=exclude, profile=profile,
         )
+
+        # Onda F3/item 3: mesma regra de `wk analyze` — ver comentário lá.
+        if profile.objectives and perfil_accounting and perfil_accounting.get("objectives", 0) == 0:
+            payload = _blocked_filtro_sem_correspondencia(
+                command="update", store_root=store_root, repo_abs=repo_abs,
+                profile=profile, mode=selecao["mode"],
+                objetivos_disponiveis=_available_objectives_for_filtro(
+                    capability_map, extraction, inventory, new_snapshot, profile,
+                ),
+            )
+            _render_common(payload, json_out=json_out)
+            return _exit_code_common(payload["operation_status"])
+
         symbol_path_index = {(s.qualname or s.name): s.path for s in extraction.symbols}
         from analysis.investigation import objectives_to_dict
         objective_dicts = objectives_to_dict(objectives)
@@ -8005,6 +8556,13 @@ def cmd_update(a) -> int:
         )
         objectives_by_id = {o.objective_id: o for o in objectives}
 
+        # § perfil: mesma base efetiva (`_DEFAULT_TASK_BUDGET` + `profile.budget`)
+        # do primeiro despacho de `wk analyze` — ver comentário lá.
+        effective_budget = {**_DEFAULT_TASK_BUDGET, **(profile.budget or {})}
+        effective_max_rounds = getattr(a, "max_rounds", None)
+        if effective_max_rounds is None:
+            effective_max_rounds = profile.max_rounds
+
         objetivos_invalidados, capacidades_analisadas = [], []
         for obj in objective_dicts:
             oid = str(obj.get("objective_id"))
@@ -8023,7 +8581,7 @@ def cmd_update(a) -> int:
                 store, [obj],
                 snapshot_id=inputs["snapshot_id"],
                 source_version_ids=inputs["source_version_ids"],
-                kind=rt_tasks.TaskKind.INVESTIGATION, budget=_DEFAULT_TASK_BUDGET,
+                kind=rt_tasks.TaskKind.INVESTIGATION, budget=effective_budget,
             )
             for t in created:
                 capacidades_analisadas.append({
@@ -8067,14 +8625,14 @@ def cmd_update(a) -> int:
         # conclusão ou motivo material de parada. `wk update` compartilha a
         # fiação de propósito: deixá-la só em `analyze`/`resume` reabriria o
         # buraco pela porta do delta.
-        max_rounds = getattr(a, "max_rounds", None)
         try:
             cadeia = _run_investigation_chain(
                 store, store_root=store_root, namespace=namespace, snapshot=new_snapshot,
                 extraction=extraction, objectives=objectives, capability_map=capability_map,
                 objectives_by_id=objectives_by_id, inputs_by_objective=inputs_by_objective,
                 engine_name=engine_name, bindings_store=bindings_store, resolver=resolver,
-                reason=f"integração de resultados — {reason}", max_rounds=max_rounds,
+                reason=f"integração de resultados — {reason}", max_rounds=effective_max_rounds,
+                budget=effective_budget, policy=profile.policy, result_extra_keys=profile.result_extra_keys,
             )
         except Exception as exc:  # A2: falha inesperada — envelope comum, exit 2, sem apagar progresso
             payload = _internal_error_blocked(
@@ -8100,12 +8658,22 @@ def cmd_update(a) -> int:
         )
 
         _save_snapshot_manifest(store_root, new_snapshot)
-        profile_all[_repo_key(repo_abs)] = {
-            "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
-            "last_snapshot_id": new_snapshot.snapshot_id, "last_revision_id": revisao_publicada,
-            "current_objective_ids": sorted(current_oids), "updated_at": _utc_now(),
-        }
-        _save_analysis_profile(store_root, profile_all)
+
+        def _update_mutate(
+            fresh: dict, *, _snapshot=new_snapshot, _revisao=revisao_publicada,
+            _oids=sorted(current_oids), _perfil_efetivo=perfil_efetivo_dict, _hash=perfil_efetivo_hash,
+        ) -> dict:
+            return {
+                "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
+                "last_snapshot_id": _snapshot.snapshot_id, "last_revision_id": _revisao,
+                "current_objective_ids": _oids, "updated_at": _utc_now(),
+                # `fresh.get("perfil")`: ver comentário equivalente em `cmd_analyze`.
+                "perfil": fresh.get("perfil"),
+                "perfil_efetivo": _perfil_efetivo,
+                "perfil_efetivo_hash": _hash,
+            }
+
+        _update_analysis_profile_entry(store_root, _repo_key(repo_abs), _update_mutate)
 
         out = {
             "mudou": True,
@@ -8124,7 +8692,7 @@ def cmd_update(a) -> int:
             "escopo_efetivo": {
                 "repo": repo_abs, "topic": topic, "engine": engine_name,
                 "scope": scope, "namespace": namespace, "store": store_root,
-                "modo": selecao["mode"],
+                "modo": selecao["mode"], "perfil_accounting": perfil_accounting,
             },
             "agent": _agent_public_dict(store_root, repo_abs),
         }
@@ -8143,11 +8711,14 @@ def cmd_update(a) -> int:
             operation_status, knowledge_status, pending,
             command="update", repo_abs=repo_abs, publicacoes=publicacoes,
         )
+        if perfil_mudou:
+            pending = list(pending) + [_pending_profile_changed(repo_abs, store_root)]
         payload = _common_payload(
             command="update", operation_status=operation_status,
             knowledge_status=knowledge_status,
             delivery_status=_delivery_status_from_publicacoes(publicacoes),
-            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            scope={"store": store_root, "repo": repo_abs, "profile": profile.summary()},
+            store_root=store_root, repo=repo_abs,
             summary={"detail": out}, pending=pending, next_actions=next_actions,
             publication=(
                 {"revision": revisao_publicada, "root": os.path.join(store_root, _PUBLICACOES_DIRNAME)}
@@ -8262,6 +8833,19 @@ def cmd_status(a) -> int:
         _render_common(payload, json_out=json_out)
         return _exit_code_common(payload["operation_status"])
 
+    # § perfil (item 4): `status` sempre LÊ, nunca bloqueia por perfil
+    # inválido (§10.3: "status retorna 0 quando conseguiu ler o estado") —
+    # `--cli_overrides=None` (só repo `.wiki-ai.json` < store `perfil`,
+    # `status` não tem flags de override); erro cai em `DEFAULT_PROFILE` e
+    # fica visível em `summary.detail.perfil_erro`, nunca escondido.
+    from analysis.profile import DEFAULT_PROFILE as _DEFAULT_PROFILE
+
+    profile_status, profile_status_erro = _resolve_analysis_profile(
+        repo_abs=repo_abs, store_profile=prior.get("perfil"), cli_overrides=None,
+    )
+    if profile_status_erro is not None:
+        profile_status = _DEFAULT_PROFILE
+
     runtime_db = _runtime_db_path(store_root)
     if not prior.get("last_snapshot_id"):
         # Repo registrado (via `wk init --repo`, tipicamente) mas ainda SEM
@@ -8280,10 +8864,13 @@ def cmd_status(a) -> int:
             "mensagem": "repo registrado neste store, mas ainda sem `wk analyze`",
             "delivery_status": delivery_status,
         }
+        if profile_status_erro is not None:
+            out["perfil_erro"] = profile_status_erro
         payload = _common_payload(
             command="status", operation_status="succeeded",
             knowledge_status="not_applicable", delivery_status=delivery_status,
-            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            scope={"store": store_root, "repo": repo_abs, "profile": profile_status.summary()},
+            store_root=store_root, repo=repo_abs,
             summary={"detail": out}, pending=[],
             next_actions=[{
                 "ator": "operador", "motivo": "nenhuma análise ainda para este repo",
@@ -8341,8 +8928,7 @@ def cmd_status(a) -> int:
                 continue
             por_estado[t.state.value] = por_estado.get(t.state.value, 0) + 1
             try:
-                from analysis.investigation import InvestigationObjective
-                unmet = InvestigationObjective.from_dict(t.objective).unmet_obligations()
+                unmet = _objective_from_store_dict(t.objective).unmet_obligations()
             except Exception:
                 unmet = []
             if unmet:
@@ -8462,6 +9048,9 @@ def cmd_status(a) -> int:
         delivery_status = _status_delivery_status(store_root, repo_abs)
         out["delivery_status"] = delivery_status
         out["agent"] = _agent_public_dict(store_root, repo_abs)
+        out["perfil"] = profile_status.summary()
+        if profile_status_erro is not None:
+            out["perfil_erro"] = profile_status_erro
 
         # §10.2/§10.3: `knowledge_status` deriva de `objetivos_por_estado` —
         # MESMOS números já calculados acima, nenhuma segunda contagem.
@@ -8494,7 +9083,8 @@ def cmd_status(a) -> int:
         payload = _common_payload(
             command="status", operation_status="succeeded",
             knowledge_status=knowledge_status, delivery_status=delivery_status,
-            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            scope={"store": store_root, "repo": repo_abs, "profile": profile_status.summary()},
+            store_root=store_root, repo=repo_abs,
             summary={"detail": out}, pending=pending, next_actions=next_actions,
             publication=None, delivery_block=None,
         )
@@ -9060,11 +9650,28 @@ def cmd_resume(a) -> int:
         _render_common(payload, json_out=json_out)
         return _exit_code_common(payload["operation_status"])
 
+    # § perfil de análise (item 3): mesma resolução de `wk analyze`/`wk
+    # update` — `ProfileError` bloqueia ANTES de abrir `runtime.db`.
+    cli_profile_overrides = _profile_cli_overrides(a)
+    profile, profile_erro = _resolve_analysis_profile(
+        repo_abs=repo_abs, store_profile=prior.get("perfil"), cli_overrides=cli_profile_overrides,
+    )
+    if profile_erro is not None:
+        payload = _blocked_profile_error(
+            command="resume", store_root=store_root, repo_abs=repo_abs, causa=profile_erro,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+    perfil_efetivo_dict = profile.to_dict()
+    perfil_efetivo_hash = _profile_hash(perfil_efetivo_dict)
+    perfil_mudou = bool(prior.get("perfil_efetivo_hash")) and prior.get("perfil_efetivo_hash") != perfil_efetivo_hash
+
     from runtime import recovery as rt_recovery
     from runtime import tasks as rt_tasks
 
     namespace = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
-    scope = prior.get("scope")
+    scope = profile.include or None
+    exclude = profile.exclude or None
 
     snap = None
     resolver = None
@@ -9085,15 +9692,36 @@ def cmd_resume(a) -> int:
         # continuação responder com contrato vazio e regredir o que já estava
         # gravado.
         extraction = capability_map = objectives = None
+        perfil_accounting = None
         pipeline_erro = None
         if snap is not None:
             try:
-                _snapshot, _inventory, extraction, capability_map, objectives = _analyze_pipeline(
-                    repo_abs, scope, namespace, precaptured=snap
+                _snapshot, inventory, extraction, capability_map, objectives, perfil_accounting = (
+                    _analyze_pipeline(
+                        repo_abs, scope, namespace, precaptured=snap, exclude=exclude, profile=profile,
+                    )
                 )
             except Exception as exc:
                 extraction = capability_map = objectives = None
                 pipeline_erro = exc
+            else:
+                # Onda F3/item 3: mesma regra de `wk analyze`/`wk update` —
+                # ver comentário lá. Hard return (não vira `bloqueios`
+                # degradado, como as demais falhas de pipeline desta
+                # função): exige exit 2 explícito, nunca `succeeded` vazio.
+                if (
+                    profile.objectives and perfil_accounting
+                    and perfil_accounting.get("objectives", 0) == 0
+                ):
+                    payload = _blocked_filtro_sem_correspondencia(
+                        command="resume", store_root=store_root, repo_abs=repo_abs,
+                        profile=profile, mode=selecao["mode"],
+                        objetivos_disponiveis=_available_objectives_for_filtro(
+                            capability_map, extraction, inventory, snap, profile,
+                        ),
+                    )
+                    _render_common(payload, json_out=json_out)
+                    return _exit_code_common(payload["operation_status"])
 
         # §7.3: `wk resume` retoma a cadeia — libera leases expirados
         # (`rt_recovery.resume` acima) e roda `_run_investigation_chain` até
@@ -9107,6 +9735,9 @@ def cmd_resume(a) -> int:
         bloqueios: list = []
         revisao_publicada = None
         max_rounds = getattr(a, "max_rounds", None)
+        if max_rounds is None:
+            max_rounds = profile.max_rounds
+        effective_budget = {**_DEFAULT_TASK_BUDGET, **(profile.budget or {})}
         cadeia: dict = {
             "chain": {
                 "objective_ids": [], "rounds": 0, "stop_reason": "completed",
@@ -9152,7 +9783,8 @@ def cmd_resume(a) -> int:
                         objectives_by_id=objectives_by_id, inputs_by_objective=inputs_by_objective,
                         engine_name=engine_name, bindings_store=bindings_store, resolver=resolver,
                         reason=f"integração de resultados — wk resume --repo {repo_abs}",
-                        max_rounds=max_rounds,
+                        max_rounds=max_rounds, budget=effective_budget, policy=profile.policy,
+                        result_extra_keys=profile.result_extra_keys,
                     )
                 except Exception as exc:  # A2: falha inesperada — envelope comum, exit 2, sem apagar progresso
                     payload = _internal_error_blocked(
@@ -9169,11 +9801,20 @@ def cmd_resume(a) -> int:
                     argv_recuperacao=["wk", "resume", "--repo", repo_abs, "--store", store_root],
                 )
                 if integracao.get("revisao"):
-                    profile_all[_repo_key(repo_abs)] = {
-                        **prior, "last_revision_id": integracao["revisao"],
-                        "updated_at": _utc_now(),
-                    }
-                    _save_analysis_profile(store_root, profile_all)
+                    def _resume_mutate(
+                        fresh: dict, *, _revisao=integracao["revisao"],
+                        _perfil_efetivo=perfil_efetivo_dict, _hash=perfil_efetivo_hash,
+                    ) -> dict:
+                        # `{**fresh, ...}`, não `{**prior, ...}`: `fresh` é o
+                        # registro relido de DISCO dentro do lock — ver
+                        # comentário equivalente em `cmd_analyze`.
+                        return {
+                            **fresh, "last_revision_id": _revisao, "updated_at": _utc_now(),
+                            "perfil": fresh.get("perfil"),
+                            "perfil_efetivo": _perfil_efetivo, "perfil_efetivo_hash": _hash,
+                        }
+
+                    _update_analysis_profile_entry(store_root, _repo_key(repo_abs), _resume_mutate)
 
         out = {
             "retomada": resume_plan.summary(),
@@ -9183,6 +9824,7 @@ def cmd_resume(a) -> int:
             "publicacoes": publicacoes,
             "bloqueios": bloqueios,
             "modo": selecao["mode"],
+            "perfil_accounting": perfil_accounting,
             "agent": _agent_public_dict(store_root, repo_abs),
         }
         if selecao.get("engine_compat"):
@@ -9200,11 +9842,14 @@ def cmd_resume(a) -> int:
             operation_status, knowledge_status, pending,
             command="resume", repo_abs=repo_abs, publicacoes=publicacoes,
         )
+        if perfil_mudou:
+            pending = list(pending) + [_pending_profile_changed(repo_abs, store_root)]
         payload = _common_payload(
             command="resume", operation_status=operation_status,
             knowledge_status=knowledge_status,
             delivery_status=_delivery_status_from_publicacoes(publicacoes),
-            scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+            scope={"store": store_root, "repo": repo_abs, "profile": profile.summary()},
+            store_root=store_root, repo=repo_abs,
             summary={"detail": out}, pending=pending, next_actions=next_actions,
             publication=(
                 {"revision": revisao_publicada, "root": os.path.join(store_root, _PUBLICACOES_DIRNAME)}
@@ -9216,6 +9861,149 @@ def cmd_resume(a) -> int:
         return _exit_code_common(payload["operation_status"])
     finally:
         store.close()
+
+
+# ---------- `wk profile show/set/unset` (§ perfil de análise por sistema) ----------
+#
+# Expõe as 3 camadas do perfil (`analysis.profile`) para inspeção (`show`) e
+# edição da camada 'store' (`set`/`unset`) — a MESMA camada que `analyze`/
+# `update`/`resume` leem via `_repo_profile(...).get("perfil")`. Nenhum
+# comando aqui roda análise: só lê/grava `profile.json[repo_key]["perfil"]`.
+
+
+def cmd_profile_show(a) -> int:
+    from analysis import profile as profile_mod
+
+    store_root = _store_root(a)
+    repo_abs = os.path.abspath(a.repo)
+    json_out = bool(getattr(a, "json", False))
+
+    try:
+        repo_config = profile_mod.load_repo_config(repo_abs)
+    except profile_mod.ProfileError as exc:
+        payload = _blocked_profile_error(
+            command="profile show", store_root=store_root, repo_abs=repo_abs, causa=str(exc),
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
+    profile_all = _load_analysis_profile(store_root)
+    prior = _repo_profile(profile_all, repo_abs)
+    store_profile = prior.get("perfil")
+
+    resolved, resolve_erro = _resolve_analysis_profile(
+        repo_abs=repo_abs, store_profile=store_profile, cli_overrides=None,
+    )
+    if resolve_erro is not None:
+        payload = _blocked_profile_error(
+            command="profile show", store_root=store_root, repo_abs=repo_abs, causa=resolve_erro,
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
+    out = {
+        "repo": repo_abs,
+        # 3 camadas CRUAS (repo `.wiki-ai.json` < store `perfil` < cli — `show`
+        # nunca recebe overrides de cli, então esta camada é sempre `None`
+        # aqui) — para o operador comparar contra `resolvido` abaixo.
+        "camadas": {
+            "repo": repo_config.to_dict() if repo_config is not None else None,
+            "store": store_profile,
+            "cli": None,
+        },
+        "resolvido": resolved.summary(),
+        "origem": resolved.source,
+        "perfil_efetivo_persistido": prior.get("perfil_efetivo"),
+        "perfil_efetivo_hash": prior.get("perfil_efetivo_hash"),
+    }
+    payload = _common_payload(
+        command="profile show", operation_status="succeeded",
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+        summary={"detail": out}, pending=[], next_actions=[],
+        publication=None, delivery_block=None,
+    )
+    _render_common(payload, json_out=json_out)
+    return _exit_code_common(payload["operation_status"])
+
+
+def cmd_profile_set(a) -> int:
+    from analysis import profile as profile_mod
+
+    store_root = _store_root(a)
+    repo_abs = os.path.abspath(a.repo)
+    json_out = bool(getattr(a, "json", False))
+
+    mapping: dict = {}
+    json_path = getattr(a, "json_file", None)
+    if json_path:
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                mapping.update(json.load(f))
+        except (OSError, ValueError) as exc:
+            payload = _blocked_profile_error(
+                command="profile set", store_root=store_root, repo_abs=repo_abs,
+                causa=f"não foi possível ler --json-file {json_path!r}: {type(exc).__name__}: {exc}",
+            )
+            _render_common(payload, json_out=json_out)
+            return _exit_code_common(payload["operation_status"])
+    mapping.update(_profile_fields_from_flags(a))
+
+    try:
+        profile_obj = profile_mod.AnalysisProfile.from_mapping(mapping, source="store")
+    except profile_mod.ProfileError as exc:
+        payload = _blocked_profile_error(
+            command="profile set", store_root=store_root, repo_abs=repo_abs, causa=str(exc),
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+
+    def _set_mutate(fresh: dict, *, _perfil=profile_obj.to_dict()) -> dict:
+        entry = dict(fresh)
+        entry["perfil"] = _perfil
+        return entry
+
+    _update_analysis_profile_entry(store_root, _repo_key(repo_abs), _set_mutate)
+
+    out = {"repo": repo_abs, "perfil_gravado": profile_obj.to_dict(), "resumo": profile_obj.summary()}
+    payload = _common_payload(
+        command="profile set", operation_status="succeeded",
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+        summary={"detail": out}, pending=[], next_actions=[],
+        publication=None, delivery_block=None,
+    )
+    _render_common(payload, json_out=json_out)
+    return _exit_code_common(payload["operation_status"])
+
+
+def cmd_profile_unset(a) -> int:
+    store_root = _store_root(a)
+    repo_abs = os.path.abspath(a.repo)
+    json_out = bool(getattr(a, "json", False))
+
+    resultado_unset = {"havia": False}
+
+    def _unset_mutate(fresh: dict) -> dict:
+        entry = dict(fresh)
+        resultado_unset["havia"] = "perfil" in entry
+        entry.pop("perfil", None)
+        return entry
+
+    _update_analysis_profile_entry(store_root, _repo_key(repo_abs), _unset_mutate)
+    havia = resultado_unset["havia"]
+
+    out = {"repo": repo_abs, "removido": havia}
+    payload = _common_payload(
+        command="profile unset",
+        operation_status=("succeeded" if havia else "noop"),
+        knowledge_status="not_applicable", delivery_status="not_applicable",
+        scope={"store": store_root, "repo": repo_abs}, store_root=store_root, repo=repo_abs,
+        summary={"detail": out}, pending=[], next_actions=[],
+        publication=None, delivery_block=None,
+    )
+    _render_common(payload, json_out=json_out)
+    return _exit_code_common(payload["operation_status"])
 
 
 # ---------- W5/W8: ingest (fonte -> extract -> correlate -> publica; §7.1) ----------
@@ -10160,6 +10948,46 @@ def _build_parser() -> argparse.ArgumentParser:
     # knowledge.migrate. Nenhum destes reaproveita ou remove `wk code <sub>`
     # (codescan.cli, fase 3/SDD — seção "Legado" mais abaixo).
 
+    def _add_profile_set_flags(sp: argparse.ArgumentParser) -> None:
+        """Campos de `wk profile set` (sem `--json-file`) — MESMOS nomes de
+        flag de `_add_analysis_profile_flags` (menos `--topic`/`--profile`,
+        que não fazem sentido para gravar a camada 'store' diretamente):
+        `_profile_fields_from_flags` é compartilhado pelos dois caminhos."""
+        sp.add_argument("--include", action="append", default=None, help="PADRÃO de escopo a incluir (repetível)")
+        sp.add_argument("--exclude", action="append", default=None, help="PADRÃO de escopo a excluir (repetível)")
+        sp.add_argument("--objective", action="append", default=None,
+                         help="ID ou substring de objetivo a priorizar (repetível)")
+        sp.add_argument("--max-reading-needs", dest="max_reading_needs", type=int, default=None,
+                         help="teto de obrigações de leitura por objetivo (§7.3.1)")
+        sp.add_argument("--budget-bytes", dest="budget_bytes", type=int, default=None,
+                         help="orçamento de bytes por pacote de contexto (§7.3.1)")
+        sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
+                         help="orçamento de tokens por pacote de contexto (§7.3.1)")
+
+    def _add_analysis_profile_flags(sp: argparse.ArgumentParser) -> None:
+        """§ perfil de análise por sistema — camada 'cli' (§10.3: repo
+        `.wiki-ai.json` < store `profile.json[repo]["perfil"]` < esta
+        camada). Reaproveitado por `analyze`/`update`/`resume` para os dois
+        nunca divergirem de assinatura."""
+        sp.add_argument("--include", action="append", default=None,
+                         help="PADRÃO de escopo a incluir (repetível); camada 'cli' de "
+                              "`analysis.profile` — some com `.wiki-ai.json`/perfil do store")
+        sp.add_argument("--exclude", action="append", default=None,
+                         help="PADRÃO de escopo a excluir (repetível)")
+        sp.add_argument("--objective", action="append", default=None,
+                         help="ID ou substring de objetivo a priorizar (repetível); some com "
+                              "--topic, que é um alias de --objective")
+        sp.add_argument("--max-reading-needs", dest="max_reading_needs", type=int, default=None,
+                         help="teto de obrigações de leitura por objetivo (§7.3.1)")
+        sp.add_argument("--budget-bytes", dest="budget_bytes", type=int, default=None,
+                         help="orçamento de bytes por pacote de contexto (§7.3.1)")
+        sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
+                         help="orçamento de tokens por pacote de contexto (§7.3.1)")
+        sp.add_argument("--profile", dest="profile_file", default=None,
+                         help="CAMINHO de um JSON de perfil (`analysis.profile.AnalysisProfile`) "
+                              "aplicado como base da camada 'cli' — sobrescrito por "
+                              "--include/--exclude/--objective/... desta mesma invocação")
+
     an = sub.add_parser(
         "analyze",
         help="pipeline completo do repositório em 1 comando: snapshot->extração->capacidades->"
@@ -10184,6 +11012,7 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="§7.3: teto TOTAL da cadeia de continuação por objetivo (persistido; "
                           "não é crédito novo por invocação). Sem a flag: default 3, sem "
                           "sobrescrever um teto já persistido maior")
+    _add_analysis_profile_flags(an)
     an.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     an.set_defaults(fn=cmd_analyze)
 
@@ -10228,6 +11057,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     up.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
     up.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    up.add_argument("--topic", default=None,
+                     help="alias de --objective (substring) para esta invocação; NÃO altera o "
+                          "rótulo de tópico persistido (esse continua vindo de `wk analyze`)")
     up.add_argument("--mode", default=None, choices=["deep", "structural"],
                      help="deep (default, SEMPRE — nunca preferência implícita): despacha pelo "
                           "agente conectado; structural: worker determinístico local explícito")
@@ -10239,6 +11071,7 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
                      help="§7.3: teto TOTAL da cadeia de continuação por objetivo (persistido; "
                           "não é crédito novo por invocação)")
+    _add_analysis_profile_flags(up)
     up.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     up.set_defaults(fn=cmd_update)
 
@@ -10249,6 +11082,41 @@ def _build_parser() -> argparse.ArgumentParser:
     st.add_argument("--initiative", default=None, help="filtra/inclui esta iniciativa na visão do store")
     st.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     st.set_defaults(fn=cmd_status)
+
+    pf = sub.add_parser(
+        "profile", help="perfil de análise por sistema (3 camadas: repo `.wiki-ai.json` < "
+                         "store < cli) — show/set/unset da camada 'store'",
+    )
+    pf_sub = pf.add_subparsers(dest="profile_cmd", required=True)
+
+    pfs = pf_sub.add_parser(
+        "show", help="mostra as 3 camadas e o perfil resolvido (com a origem de cada campo)",
+    )
+    pfs.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    pfs.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    pfs.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
+    pfs.set_defaults(fn=cmd_profile_show, cmd="profile show")
+
+    pfset = pf_sub.add_parser(
+        "set", help="grava a camada 'store' do perfil deste repo (--json-file, ou "
+                     "--include/--exclude/--objective/...)",
+    )
+    pfset.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    pfset.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    pfset.add_argument(
+        "--json-file", dest="json_file", default=None,
+        help="CAMINHO de um JSON de perfil (`analysis.profile.AnalysisProfile`) — base gravada "
+             "na camada 'store'; sobrescrita por --include/--exclude/--objective/... abaixo",
+    )
+    _add_profile_set_flags(pfset)
+    pfset.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
+    pfset.set_defaults(fn=cmd_profile_set, cmd="profile set")
+
+    pfu = pf_sub.add_parser("unset", help="remove a camada 'store' do perfil deste repo")
+    pfu.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
+    pfu.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    pfu.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
+    pfu.set_defaults(fn=cmd_profile_unset, cmd="profile unset")
 
     dl = sub.add_parser("delivery", help="prepara e confirma pacotes de entrega locais imutáveis (§9.4)")
     dl_sub = dl.add_subparsers(dest="delivery_cmd", required=True)
@@ -10281,6 +11149,9 @@ def _build_parser() -> argparse.ArgumentParser:
     re_ = sub.add_parser("resume", help="libera leases expirados e retoma tarefas ready/invalidadas")
     re_.add_argument("--repo", required=True, help="mesmo --repo usado em `wk analyze`")
     re_.add_argument("--store", default=None, help="raiz do store (default: WK_STORE ou ./store)")
+    re_.add_argument("--topic", default=None,
+                      help="alias de --objective (substring) para esta invocação; NÃO altera o "
+                           "rótulo de tópico persistido")
     re_.add_argument("--mode", default=None, choices=["deep", "structural"],
                       help="deep (default, SEMPRE — nunca preferência implícita): despacha pelo "
                            "agente conectado; structural: worker determinístico local explícito")
@@ -10292,6 +11163,7 @@ def _build_parser() -> argparse.ArgumentParser:
     re_.add_argument("--max-rounds", dest="max_rounds", type=int, default=None,
                       help="§7.3: amplia (ou reduz) o teto TOTAL da cadeia de continuação por "
                            "objetivo; NUNCA é crédito novo — ampliar de 3 para 6 permite mais 3")
+    _add_analysis_profile_flags(re_)
     re_.add_argument("--json", action="store_true", help="saída estruturada (§10.2/§10.3)")
     re_.set_defaults(fn=cmd_resume)
 

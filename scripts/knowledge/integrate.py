@@ -92,6 +92,7 @@ from analysis.investigation import (
     CONTRACT_LABELS,
     ContractField,
     ContractFieldStatus,
+    InvestigationError,
     InvestigationObjective,
     ObjectiveState,
 )
@@ -143,6 +144,8 @@ from .models import (
 __all__ = [
     "FIELD_PREDICATE_KIND",
     "INTEGRATOR",
+    "KNOWN_OUTPUT_FIELDS",
+    "UNFORESEEN_PREDICATE_KIND",
     "RULE_ENTITY_TYPE",
     "AcceptedResult",
     "FactWrite",
@@ -151,6 +154,7 @@ __all__ = [
     "collect_results",
     "integrate",
     "results_to_claims",
+    "unforeseen_contract_fields",
 ]
 
 
@@ -163,6 +167,37 @@ INTEGRATOR = "pipeline:knowledge-integrate"
 #: worker afirmou. Prefixo `llm:` deliberado: na dúvida, a afirmação é tratada
 #: como saída de modelo — o caminho mais restritivo (§5.3).
 DEFAULT_ASSERTED_BY = "llm:worker"
+
+#: Campos de TOPO do resultado do worker que o runtime já declara em
+#: `coordinator.DEFAULT_SCHEMA` (required + optional). Serve para uma coisa só:
+#: separar o vocabulário FIXO das chaves EXTRAS que o operador autorizou por
+#: perfil (`ResultSchema.with_extra`). Tudo que chega no topo do resultado e
+#: não está aqui é extensão de perfil e vai INTEIRO para
+#: `ObjectiveOutcome.extra` — descartar seria a mesma perda silenciosa que
+#: `campos_nao_previstos` corrige dentro de `contract`.
+#:
+#: A cópia (em vez de importar `runtime.coordinator`) mantém a fronteira de
+#: imports deste módulo — stdlib + knowledge + analysis + `runtime.tasks`. A
+#: divergência entre as duas listas é DETECTÁVEL: há teste que compara este
+#: conjunto com `coordinator.DEFAULT_SCHEMA.declared`.
+KNOWN_OUTPUT_FIELDS: frozenset[str] = frozenset(
+    {
+        "objective_id",
+        "capability_id",
+        "contract",
+        "evidence",
+        "facts",
+        "gaps",
+        "matrix",
+        "notes",
+        "reading_needs",
+        "reading_satisfied",
+        "relations",
+        "state",
+        "unresolved",
+    }
+)
+
 
 #: §6.3 -> `analysis.verification.PREDICATE_KINDS`. `lacunas` não aparece: um
 #: ponto não resolvido é lacuna declarada, nunca afirmação a verificar.
@@ -1496,6 +1531,100 @@ def _assertions_of(
     return out
 
 
+#: `predicate_kind` de afirmação vinda de campo NÃO previsto no §6.3.
+#: `behavior` é o mais genérico de `analysis.verification.PREDICATE_KINDS` — o
+#: único que não promete estrutura (comparação, dado, contrato, teste) que
+#: ninguém declarou para o campo novo.
+UNFORESEEN_PREDICATE_KIND = "behavior"
+
+
+def unforeseen_contract_fields(
+    result: AcceptedResult | Mapping[str, Any]
+) -> list[str]:
+    """Chaves de `contract` fora de `CONTRACT_FIELDS`, em ordem estável.
+
+    `results_to_claims` iterava `CONTRACT_FIELDS` e só isso: um campo novo
+    dentro de `contract` — aceito pelo schema do coordenador via
+    `ResultSchema.with_extra`/perfil — atravessava a integração inteira sem
+    virar claim e sem aparecer em lugar nenhum. Perda silenciosa: o worker
+    respondeu, o operador nunca soube. Esta função é o que torna a perda
+    VISÍVEL; `results_to_claims` é o que a torna verificável.
+
+    `CONTRACT_FIELDS` NÃO é alterada: campo novo não vira vocabulário do §6.3
+    por ter aparecido uma vez num resultado.
+    """
+    output, _, _ = _result_parts(result)
+    contract = output.get("contract")
+    if not isinstance(contract, Mapping):
+        return []
+    conhecidos = set(CONTRACT_FIELDS)
+    return sorted({str(k) for k in contract if str(k) not in conhecidos})
+
+
+def _degraded_assertions(campo: str, raw: Any) -> list[_Assertion]:
+    """Afirmações de um campo FORA do §6.3, sem estrutura mecânica.
+
+    Não passa por `ContractField` (que recusa nome fora de `CONTRACT_FIELDS`)
+    e não deriva `statement_fields`: a estrutura de um campo que ninguém
+    declarou não é derivável, e inventá-la faria `check_support` julgar um
+    formato imaginado. Enunciado, citação e símbolo são preservados — é o que
+    faz o campo desconhecido virar claim (tipicamente `unresolved`) em vez de
+    sumir.
+    """
+    field_evidence, field_symbol = _citations(
+        _evidence_dicts(raw if isinstance(raw, Mapping) else {})
+    )
+    items: list[Any] = []
+    if isinstance(raw, Mapping):
+        for key in _ASSERTION_KEYS:
+            value = raw.get(key)
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                items = list(value)
+                break
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        items = list(raw)
+    if not items:
+        content = ""
+        if isinstance(raw, Mapping):
+            content = str(raw.get("content") or "")
+        elif isinstance(raw, str):
+            content = raw
+        items = _split_statements(content)
+
+    out: list[_Assertion] = []
+    for item in items:
+        if isinstance(item, Mapping):
+            statement = ""
+            for key in _STATEMENT_KEYS:
+                statement = _norm_ws(item.get(key))
+                if statement:
+                    break
+            if not statement:
+                statement = _norm_ws(item.get("value"))
+            own_evidence, own_symbol = _citations(_evidence_dicts(item))
+            evidence = own_evidence or field_evidence
+            symbol = _norm_ws(item.get("symbol")) or own_symbol or field_symbol
+            nomeado = item
+        else:
+            statement = _norm_ws(item)
+            evidence = field_evidence
+            symbol = field_symbol
+            nomeado = {}
+        if len(statement) < 3:
+            continue
+        out.append(
+            _Assertion(
+                campo=campo,
+                statement=statement,
+                subject_name=_named_subject(nomeado, statement),
+                statement_fields={},
+                evidence=evidence,
+                symbol=symbol or None,
+            )
+        )
+    return out
+
+
 def results_to_claims(
     result: AcceptedResult | Mapping[str, Any],
     objective: InvestigationObjective | Mapping[str, Any] | None = None,
@@ -1560,6 +1689,31 @@ def results_to_claims(
                         scope=f"{objective_id}:{campo}",
                     )
                 )
+
+    # Campos NÃO previstos no §6.3: viram claim degradado (sem
+    # `statement_fields`, `predicate_kind` genérico). Ficam sujeitos à mesma
+    # verificação que qualquer outro — o que muda é que não se finge conhecer
+    # a estrutura deles. `integrate` conta o mesmo conjunto em
+    # `IntegrationReport.campos_nao_previstos`.
+    for campo in unforeseen_contract_fields(output):
+        for assertion in _degraded_assertions(campo, _field_payload(output, campo)):
+            claim_id = f"{objective_id}:{campo}:{_hash(assertion.statement)[:12]}"
+            if claim_id in seen:
+                continue
+            seen.add(claim_id)
+            claims.append(
+                Claim(
+                    claim_id=claim_id,
+                    subject=assertion.symbol or "",
+                    predicate_kind=UNFORESEEN_PREDICATE_KIND,
+                    statement_fields={},
+                    evidence_refs=assertion.evidence,
+                    asserted_by=asserted_by,
+                    statement=assertion.statement,
+                    symbol=assertion.symbol,
+                    scope=f"{objective_id}:{campo}",
+                )
+            )
     return claims
 
 
@@ -1574,21 +1728,88 @@ def _result_parts(
     return output, asserted_by, str(output.get("objective_id") or "")
 
 
+def _rebuild_objective(
+    data: Mapping[str, Any],
+    *,
+    origem: str,
+    trust_profile_cells: bool,
+    objective_id: str = "",
+    task_id: str = "",
+    rejeicoes: list[dict[str, Any]] | None = None,
+) -> InvestigationObjective | None:
+    """`InvestigationObjective.from_dict` com o erro virando DIAGNÓSTICO TIPADO.
+
+    `FailureEdgeMatrix.from_dict` passou a levantar `MatrixIntegrityError`
+    quando o payload do agente traz célula/família sem justificativa (§6.5), e
+    `InvestigationObjective.from_dict` a chama. Duas saídas eram inaceitáveis:
+    deixar a exceção subir (uma matriz malformada de UM agente derrubaria a
+    integração de TODOS os objetivos da revisão) e engolir com `except
+    Exception: pass` (o objetivo voltava ao estado anterior e ninguém ficava
+    sabendo por quê — a mesma perda silenciosa dos campos não previstos).
+
+    Devolve `None` quando não deu para reconstruir; o chamador FICA COM O
+    OBJETIVO ANTERIOR e o motivo entra em `rejeicoes` com `objective_id`,
+    `task_id` e o NOME da exceção (`MatrixIntegrityError`,
+    `MatrixJustificationRequired`, …), que é o que torna o diagnóstico tipado
+    e não um texto solto.
+
+    `trust_profile_cells` é decidido pela PROVENIÊNCIA DA MATRIZ que está em
+    `data`, nunca pelo chamador em bloco:
+
+    * `True` para matriz escrita pelo pipeline — o objetivo do plano
+      (`escopo`), o `objective_json` da tarefa (`objective_payload`), o estado
+      consolidado (`estado_acumulado`) e a matriz ANTERIOR reimposta na
+      segunda tentativa. Ali `justification_source` foi posto por
+      `investigation._matrix_for(profile)`, e recusá-lo seria rejeitar a
+      própria exclusão que o operador configurou.
+    * `False` para a matriz que veio no resultado do AGENTE. Sem isso, bastava
+      o worker escrever `justification_source: "profile:cli"` + `note` para uma
+      célula sair de `unmet_obligations()` — a exclusão de perfil forjada pelo
+      próprio investigado.
+    """
+    try:
+        return InvestigationObjective.from_dict(
+            data, trust_profile_cells=trust_profile_cells
+        )
+    except Exception as exc:  # noqa: BLE001 — vira diagnóstico, não crash
+        if rejeicoes is not None:
+            rejeicoes.append(
+                {
+                    "objective_id": str(objective_id or data.get("objective_id") or ""),
+                    "task_id": str(task_id or ""),
+                    "origem": origem,
+                    "erro": type(exc).__name__,
+                    "contrato": isinstance(exc, InvestigationError),
+                    "motivo": str(exc),
+                }
+            )
+        return None
+
+
 def _objective_of(
     objective: InvestigationObjective | Mapping[str, Any] | None,
     output: Mapping[str, Any],
     objective_id: str,
+    *,
+    task_id: str = "",
+    rejeicoes: list[dict[str, Any]] | None = None,
 ) -> InvestigationObjective:
     if isinstance(objective, InvestigationObjective):
         return objective
     if isinstance(objective, Mapping) and objective.get("objective_id"):
-        try:
-            return InvestigationObjective.from_dict(objective)
-        except Exception:
-            # Payload parcial (o `objective_json` da tarefa nem sempre traz o
-            # pacote inteiro): cai para o objetivo mínimo em vez de derrubar a
-            # integração dos demais objetivos.
-            pass
+        # Payload parcial (o `objective_json` da tarefa nem sempre traz o
+        # pacote inteiro) cai para o objetivo mínimo em vez de derrubar a
+        # integração dos demais objetivos — mas COM motivo registrado.
+        reconstruido = _rebuild_objective(
+            objective,
+            origem="objective_payload",
+            trust_profile_cells=True,
+            objective_id=objective_id,
+            task_id=task_id,
+            rejeicoes=rejeicoes,
+        )
+        if reconstruido is not None:
+            return reconstruido
     return InvestigationObjective(
         objective_id=objective_id or str(output.get("objective_id") or "objetivo"),
         kind="capability",
@@ -1693,7 +1914,10 @@ def _satisfy_readings(
 
 
 def _seed_with_accumulated(
-    objective: InvestigationObjective, accumulated: Mapping[str, Any] | None
+    objective: InvestigationObjective,
+    accumulated: Mapping[str, Any] | None,
+    *,
+    rejeicoes: list[dict[str, Any]] | None = None,
 ) -> InvestigationObjective:
     """Objetivo do índice + contrato JÁ APURADO em rodadas anteriores (§7.1).
 
@@ -1735,10 +1959,85 @@ def _seed_with_accumulated(
     if not mudou:
         return objective
     data["contract"] = campos
-    try:
-        return InvestigationObjective.from_dict(data)
-    except Exception:
-        return objective
+    reconstruido = _rebuild_objective(
+        data,
+        origem="estado_acumulado",
+        trust_profile_cells=True,
+        objective_id=objective.objective_id,
+        rejeicoes=rejeicoes,
+    )
+    return objective if reconstruido is None else reconstruido
+
+
+def _sanitize_agent_matrix(
+    raw: Mapping[str, Any], anterior: InvestigationObjective
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Matriz do agente CÉLULA A CÉLULA, antes de `from_dict(trust=False)`.
+
+    `trust_profile_cells=False` recusa a matriz INTEIRA assim que encontra uma
+    célula com `justification_source`. Isso é fail-closed correto e caro: um
+    resultado que apenas ECOA uma exclusão de perfil já existente — coisa que
+    um worker que recebeu a matriz no envelope faz naturalmente — derrubava
+    junto as células novas e legítimas da mesma rodada (uma `covered` com
+    `EvidenceRef` real). Progresso perdido por causa de uma linha copiada.
+
+    Aqui a proveniência de perfil é resolvida ANTES, por célula:
+
+    * eco IDÊNTICO de célula de perfil anterior — sai do payload (inócuo) e
+      volta intacto por `reapply_profile_cells`; nada é registrado, porque
+      repetir o que já valia não é tentativa de nada;
+    * eco DIVERGENTE (mesmo `justification_source`, outro estado/nota) ou
+      `justification_source` em célula que não é de perfil (forja) — a célula
+      volta ao que era antes (ou a `unresolved` sem marca, se não existia) e
+      entra em `resultados_rejeitados` com `descartado="celula"`;
+    * as demais seguem inalteradas para `from_dict`, que continua julgando
+      estado e evidência com o mesmo rigor.
+
+    Devolve `(matriz_saneada, revertidas, ecoadas)`.
+    """
+    perfil = anterior.matrix.profile_cells()
+    anteriores = anterior.matrix.cells
+    saneadas: list[Any] = []
+    revertidas: list[str] = []
+    ecoadas: list[str] = []
+    for bruta in raw.get("cells", ()) or ():
+        if not isinstance(bruta, Mapping):
+            # Formato fora do contrato: quem recusa é `from_dict`, não este
+            # saneamento — inventar uma célula aqui esconderia o erro real.
+            saneadas.append(bruta)
+            continue
+        familia = str(bruta.get("family", ""))
+        item = str(bruta.get("item", ""))
+        fonte = str(bruta.get("justification_source") or "").strip()
+        if not fonte:
+            saneadas.append(dict(bruta))
+            continue
+        chave = (familia, item)
+        rotulo = f"{familia}/{item}"
+        anterior_celula = anteriores.get(chave)
+        if (
+            chave in perfil
+            and anterior_celula is not None
+            and dict(bruta) == anterior_celula.to_dict()
+        ):
+            ecoadas.append(rotulo)
+            continue
+        revertidas.append(rotulo)
+        if chave in perfil:
+            # `reapply_profile_cells` reimpõe a versão ANTERIOR desta célula.
+            continue
+        if anterior_celula is not None:
+            saneadas.append(anterior_celula.to_dict())
+        # Sem célula anterior, a forjada simplesmente NÃO ENTRA. Escrever no
+        # lugar dela uma célula `unresolved` sintética seria pior: numa família
+        # que o §6.5 não conhece, essa célula é ela própria inválida
+        # (`fora do conjunto permitido e sem justificativa`) e derrubaria a
+        # matriz inteira — trocando a recusa pontual pelo fallback que esta
+        # onda existe para evitar. Omitida, a célula volta a ser o que era:
+        # nunca avaliada, e portanto pendente em `unmet_obligations()`.
+    matriz = dict(raw)
+    matriz["cells"] = saneadas
+    return matriz, revertidas, ecoadas
 
 
 def _objective_after_result(
@@ -1746,6 +2045,9 @@ def _objective_after_result(
     output: Mapping[str, Any],
     snapshot: Snapshot | None = None,
     accumulated: Mapping[str, Any] | None = None,
+    *,
+    task_id: str = "",
+    rejeicoes: list[dict[str, Any]] | None = None,
 ) -> tuple[InvestigationObjective, list[dict[str, Any]]]:
     """Objetivo do PLANO + o que o resultado preencheu, sem promoção indevida.
 
@@ -1758,24 +2060,158 @@ def _objective_after_result(
     fecha obrigação de leitura — e só quando a evidência resolve no snapshot.
     Devolve também o registro do que foi (e do que não foi) fechado.
     """
-    objective = _seed_with_accumulated(objective, accumulated)
+    objective = _seed_with_accumulated(objective, accumulated, rejeicoes=rejeicoes)
     data = objective.to_dict()
     contract = {name: _merged_field(objective, output, name).to_dict() for name in CONTRACT_FIELDS}
     data["contract"] = contract
     leituras = _satisfy_readings(data, output, snapshot)
     matrix = output.get("matrix")
-    if isinstance(matrix, Mapping) and matrix:
-        data["matrix"] = dict(matrix)
+    matriz_anterior = data.get("matrix")
+    matriz_do_payload = isinstance(matrix, Mapping) and bool(matrix)
+    revertidas: list[str] = []
+    ecoadas: list[str] = []
+    if matriz_do_payload:
+        # Saneamento POR CÉLULA antes do schema: proveniência de perfil é
+        # resolvida contra a matriz anterior, para que uma linha copiada não
+        # custe as células legítimas da mesma rodada.
+        data["matrix"], revertidas, ecoadas = _sanitize_agent_matrix(matrix, objective)
     declared = str(output.get("state") or "").strip().lower()
     if declared == ObjectiveState.BLOCKED.value:
         data["state"] = ObjectiveState.BLOCKED.value
     elif data.get("state") == ObjectiveState.COMPLETE.value:
         # Nunca reafirmar `complete` vindo do payload: recalcula do zero.
         data["state"] = ObjectiveState.PARTIAL.value
-    try:
-        return InvestigationObjective.from_dict(data), leituras
-    except Exception:
-        return objective, leituras
+    # Aqui mora o resultado do AGENTE: `matrix`, contrato e estado declarados
+    # por ele. Recusa de reconstrução (matriz sem justificativa, §6.5) mantém o
+    # objetivo NO ESTADO ANTERIOR e devolve o motivo pelo `rejeicoes` — nunca
+    # derruba a integração dos outros objetivos da mesma revisão.
+    marca = len(rejeicoes) if rejeicoes is not None else 0
+    reconstruido = _rebuild_objective(
+        data,
+        origem="resultado",
+        # A matriz em `data` é do AGENTE quando ele mandou uma; senão é a do
+        # objetivo anterior, escrita pelo pipeline. A confiança segue a
+        # proveniência da matriz, não a do resto do payload.
+        trust_profile_cells=not matriz_do_payload,
+        objective_id=objective.objective_id,
+        task_id=task_id,
+        rejeicoes=rejeicoes,
+    )
+    descartado = "resultado"
+    if reconstruido is None and matriz_do_payload:
+        # Degradação em vez de descarte total: a matriz do payload é a parte
+        # recusada, e jogar fora JUNTO o contrato apurado, as leituras fechadas
+        # e o estado declarado nesta rodada seria perder trabalho válido por
+        # causa de uma célula. Reconstrói com a matriz ANTERIOR (validada pelo
+        # pipeline, por isso `trust_profile_cells=True`); se nem assim der, aí
+        # sim o objetivo inteiro fica como estava.
+        data["matrix"] = matriz_anterior
+        reconstruido = _rebuild_objective(
+            data, origem="resultado", trust_profile_cells=True
+        )
+        if reconstruido is not None:
+            descartado = "matrix"
+    if reconstruido is None:
+        descartado = "resultado"
+    if rejeicoes is not None and len(rejeicoes) > marca:
+        # `descartado` diz O QUE a recusa custou: só a matriz do payload, ou a
+        # rodada inteira. Sem isso o operador não sabe se precisa reenviar o
+        # resultado ou só corrigir a matriz.
+        rejeicoes[marca]["descartado"] = descartado
+    elif reconstruido is not None and matriz_do_payload:
+        # As células que o saneamento reverteu são recusa PONTUAL: o resto da
+        # matriz do agente foi aceito, então o custo é a célula, não a matriz.
+        if revertidas and rejeicoes is not None:
+            rejeicoes.append(
+                {
+                    "objective_id": objective.objective_id,
+                    "task_id": task_id,
+                    "origem": "resultado",
+                    "erro": "MatrixIntegrityError",
+                    "contrato": True,
+                    "descartado": "celula",
+                    "celulas": list(revertidas),
+                    "motivo": (
+                        "proveniência de perfil não aceita do resultado (só o pipeline "
+                        "escreve `justification_source`); célula revertida ao estado "
+                        f"anterior: {', '.join(revertidas)}"
+                    ),
+                }
+            )
+        # A matriz do agente PASSOU no schema — o que ainda não impede que ela
+        # tenha APAGADO uma exclusão de perfil (transformando decisão do
+        # operador em obrigação coberta). `reapply_profile_cells` reimpõe as
+        # células de perfil da matriz ANTERIOR e despe qualquer proveniência
+        # que não seja dela. É a última barreira, depois do saneamento.
+        _reimpor_perfil(
+            reconstruido,
+            objective,
+            objective_id=objective.objective_id,
+            task_id=task_id,
+            rejeicoes=rejeicoes,
+            ignorar=ecoadas,
+        )
+    return (objective if reconstruido is None else reconstruido), leituras
+
+
+def _reimpor_perfil(
+    reconstruido: InvestigationObjective,
+    anterior: InvestigationObjective,
+    *,
+    objective_id: str,
+    task_id: str,
+    rejeicoes: list[dict[str, Any]] | None,
+    ignorar: Sequence[str] = (),
+) -> None:
+    """Reimpõe as células de perfil da matriz anterior e REGISTRA o que mexeu.
+
+    Quem decidiu que uma família não se aplica a este sistema foi o perfil de
+    análise; o worker investigado não tem autoridade para revogar essa decisão
+    nem para inventar uma nova em nome dela. Silenciar a reimposição seria
+    aceitar a tentativa sem deixar rastro — o operador precisa saber que o
+    agente tentou.
+    """
+    registro = reconstruido.matrix.reapply_profile_cells(anterior.matrix)
+    # `ignorar` são as células que o SANEAMENTO tirou do payload por serem eco
+    # idêntico do perfil: reimpô-las é operação interna, não tentativa do
+    # agente, e contá-las aqui acusaria o worker de apagar o que ele copiou
+    # certo.
+    silenciar = {str(x) for x in ignorar}
+    restauradas = [c for c in (registro.get("restored") or ()) if c not in silenciar]
+    forjadas = list(registro.get("revoked_forged_provenance") or ())
+    if not restauradas and not forjadas:
+        return
+    if rejeicoes is None:
+        return
+    partes: list[str] = []
+    if forjadas:
+        partes.append(
+            "proveniência de perfil FORJADA pelo resultado, revogada (célula volta a "
+            f"unresolved): {', '.join(forjadas)}"
+        )
+    if restauradas:
+        partes.append(
+            "exclusão de perfil que o resultado apagou ou alterou, reimposta: "
+            f"{', '.join(restauradas)}"
+        )
+    rejeicoes.append(
+        {
+            "objective_id": objective_id,
+            "task_id": task_id,
+            "origem": "resultado",
+            "erro": "MatrixProfileCellsReimposed",
+            "contrato": True,
+            # O custo é por CÉLULA: a matriz do agente foi aceita, só as
+            # células de perfil voltaram ao que o pipeline decidiu.
+            "descartado": "celula",
+            "celulas": sorted({*restauradas, *forjadas}),
+            "reimposicao": {
+                "restored": restauradas,
+                "revoked_forged_provenance": forjadas,
+            },
+            "motivo": "; ".join(partes),
+        }
+    )
 
 
 def _objective_after_results(
@@ -1783,6 +2219,8 @@ def _objective_after_results(
     results: Sequence[AcceptedResult],
     snapshot: Snapshot | None = None,
     accumulated: Mapping[str, Any] | None = None,
+    *,
+    rejeicoes: list[dict[str, Any]] | None = None,
 ) -> tuple[InvestigationObjective, list[dict[str, Any]]]:
     """Dobra a cadeia de resultados sobre o objetivo — A, depois B, resulta A+B.
 
@@ -1794,12 +2232,18 @@ def _objective_after_results(
     `satisfied=True`, nunca `False`.
     """
     leituras: list[dict[str, Any]] = []
-    atual = _seed_with_accumulated(objective, accumulated)
+    atual = _seed_with_accumulated(objective, accumulated, rejeicoes=rejeicoes)
     for result in results:
-        atual, fechadas = _objective_after_result(atual, result.output, snapshot)
+        # A rodada que trouxe o payload malformado é NOMEADA (`task_id`): sem
+        # isso o operador saberia que houve recusa mas não em qual rodada.
+        atual, fechadas = _objective_after_result(
+            atual, result.output, snapshot, task_id=result.task_id, rejeicoes=rejeicoes
+        )
         leituras.extend(fechadas)
     if not results:
-        atual, leituras = _objective_after_result(atual, {}, snapshot)
+        atual, leituras = _objective_after_result(
+            atual, {}, snapshot, rejeicoes=rejeicoes
+        )
     return atual, leituras
 
 
@@ -1936,6 +2380,20 @@ class ObjectiveOutcome:
     reading_needs: list[dict[str, Any]] = field(default_factory=list)
     #: `task_id` de TODAS as rodadas da cadeia que esta integração dobrou.
     chain_task_ids: list[str] = field(default_factory=list)
+    #: Chaves de TOPO do resultado fora de `KNOWN_OUTPUT_FIELDS` — o que o
+    #: operador autorizou por perfil (`ResultSchema.with_extra`). Preservadas
+    #: com o valor íntegro: o schema as aceitou, então descartá-las aqui seria
+    #: aceitar na porta e jogar fora no corredor. Última rodada da cadeia
+    #: vence em caso de repetição da mesma chave.
+    extra: dict[str, Any] = field(default_factory=dict)
+    #: Chaves dentro de `contract` fora do §6.3, com o claim degradado que
+    #: cada uma gerou. Diagnóstico, não descarte.
+    campos_nao_previstos: list[dict[str, Any]] = field(default_factory=list)
+    #: Payloads deste objetivo que a reconstrução RECUSOU (matriz do §6.5 sem
+    #: justificativa, contrato inválido): `{objective_id, task_id, origem,
+    #: erro, contrato, motivo}`. O objetivo ficou no estado ANTERIOR; a recusa
+    #: fica aqui em vez de virar crash da revisão inteira ou silêncio.
+    resultados_rejeitados: list[dict[str, Any]] = field(default_factory=list)
 
     def _count(self, status: EpistemicStatus) -> int:
         return sum(1 for f in self.fatos if f.epistemic == status.value)
@@ -1966,6 +2424,9 @@ class ObjectiveOutcome:
             "contract_state": dict(self.contract_state),
             "reading_needs": list(self.reading_needs),
             "chain_task_ids": list(self.chain_task_ids),
+            "extra": dict(self.extra),
+            "campos_nao_previstos": list(self.campos_nao_previstos),
+            "resultados_rejeitados": list(self.resultados_rejeitados),
             "fatos": [f.to_dict() for f in self.fatos],
         }
 
@@ -1985,6 +2446,18 @@ class IntegrationReport:
     #: que não são as do snapshot corrente. Descarte silencioso seria o mesmo
     #: erro com outra aparência.
     descartados: list[dict[str, Any]] = field(default_factory=list)
+    #: Campos dentro de `contract` que NÃO estão no §6.3, um item por
+    #: (objetivo, campo): `{objective_id, campo, claims, task_ids}`. Antes,
+    #: `results_to_claims` iterava só `CONTRACT_FIELDS` e a chave nova sumia
+    #: sem deixar rastro — o operador não tinha como saber que o worker havia
+    #: respondido algo que a integração ignorou.
+    campos_nao_previstos: list[dict[str, Any]] = field(default_factory=list)
+    #: Reconstruções de objetivo RECUSADAS, de qualquer origem (`escopo`,
+    #: `objective_payload`, `estado_acumulado`, `resultado`). Uma matriz do
+    #: §6.5 sem justificativa num resultado de agente entra aqui com
+    #: `erro="MatrixIntegrityError"`, `objective_id` e `task_id`; o objetivo
+    #: permanece no estado anterior e os demais seguem sendo integrados.
+    resultados_rejeitados: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def fatos_gravados(self) -> int:
@@ -2000,6 +2473,8 @@ class IntegrationReport:
             "verificacao": dict(self.verificacao),
             "bloqueios": list(self.bloqueios),
             "descartados": list(self.descartados),
+            "campos_nao_previstos": list(self.campos_nao_previstos),
+            "resultados_rejeitados": list(self.resultados_rejeitados),
         }
 
 
@@ -2163,7 +2638,7 @@ def integrate(
     com a mesma proveniência, ou nenhum entra (§4.2).
     """
     report = IntegrationReport()
-    index = _objectives_index(objectives)
+    index = _objectives_index(objectives, rejeicoes=report.resultados_rejeitados)
     scope = _scope_of(objectives, objective_ids)
     if not scope:
         report.bloqueios.append(
@@ -2215,12 +2690,26 @@ def integrate(
         # task_id, execution_id): é a rodada corrente. O CONTEÚDO, porém, vem
         # da cadeia inteira dobrada sobre o estado acumulado.
         result = chain[-1]
+        # Recusas de reconstrução DESTE objetivo, para viajarem no outcome (e
+        # não só no relatório agregado): o CLI imprime por objetivo.
+        rejeicoes: list[dict[str, Any]] = []
         base = index.get(objective_id)
         if base is None:
-            base = _objective_of(result.objective_payload or None, result.output, objective_id)
+            base = _objective_of(
+                result.objective_payload or None,
+                result.output,
+                objective_id,
+                task_id=result.task_id,
+                rejeicoes=rejeicoes,
+            )
         objective, leituras = _objective_after_results(
-            base, chain, snapshot, estado.get(objective_id)
+            base, chain, snapshot, estado.get(objective_id), rejeicoes=rejeicoes
         )
+        for item in rejeicoes:
+            # O `objective_id` do payload pode estar ausente justamente porque
+            # o payload é inválido: o id do ESCOPO é a identidade confiável.
+            if not item.get("objective_id"):
+                item["objective_id"] = objective_id
         claims: list[Claim] = []
         vistos: set[str] = set()
         for rodada in chain:
@@ -2260,6 +2749,7 @@ def integrate(
                 "inconsistencies": inconsistencies,
                 "escopos": escopos,
                 "leituras": leituras,
+                "rejeicoes": rejeicoes,
             }
         )
 
@@ -2284,10 +2774,14 @@ def integrate(
                     escopos=item["escopos"],
                     leituras=item["leituras"],
                     chain=item.get("chain") or (),
+                    rejeicoes=item.get("rejeicoes") or (),
                 )
             )
         report.revisao = rev.revision_id
         report.mudancas = rev.change_count
+    for outcome in report.objetivos:
+        report.campos_nao_previstos.extend(dict(c) for c in outcome.campos_nao_previstos)
+        report.resultados_rejeitados.extend(dict(r) for r in outcome.resultados_rejeitados)
     return report
 
 
@@ -2353,12 +2847,29 @@ def _out_of_scope_reason(
     return ""
 
 
-def _objectives_index(objectives: Iterable[Any] | None) -> dict[str, InvestigationObjective]:
+def _objectives_index(
+    objectives: Iterable[Any] | None,
+    *,
+    rejeicoes: list[dict[str, Any]] | None = None,
+) -> dict[str, InvestigationObjective]:
+    """Índice do ESCOPO. Objetivo irreconstruível não some: vira diagnóstico.
+
+    O id continua delimitando escopo por `_scope_of` (que lê o payload bruto),
+    então o resultado dele ainda é integrado — só que a partir do objetivo
+    mínimo. Antes, o `continue` mudo escondia justamente a diferença entre
+    "objetivo simples" e "objetivo cuja matriz o §6.5 recusou".
+    """
     out: dict[str, InvestigationObjective] = {}
     for raw in objectives or ():
-        try:
-            obj = raw if isinstance(raw, InvestigationObjective) else InvestigationObjective.from_dict(raw)
-        except Exception:
+        if isinstance(raw, InvestigationObjective):
+            out[raw.objective_id] = raw
+            continue
+        if not isinstance(raw, Mapping):
+            continue
+        obj = _rebuild_objective(
+            raw, origem="escopo", trust_profile_cells=True, rejeicoes=rejeicoes
+        )
+        if obj is None:
             continue
         out[obj.objective_id] = obj
     return out
@@ -2637,6 +3148,49 @@ def _contract_state_dict(objective: InvestigationObjective) -> dict[str, Any]:
     return out
 
 
+def _extra_fields(chain: Sequence[AcceptedResult]) -> dict[str, Any]:
+    """Chaves de topo fora de `KNOWN_OUTPUT_FIELDS`, dobradas sobre a cadeia.
+
+    A rodada mais recente vence, pela mesma razão que ela assina a gravação:
+    é a apuração corrente. Valor vai INTEIRO (nenhuma normalização), porque
+    este módulo não sabe o que a chave significa — só sabe que o schema do
+    coordenador a aceitou e que perdê-la aqui seria descarte silencioso.
+    """
+    out: dict[str, Any] = {}
+    for result in chain:
+        for name, value in dict(result.output or {}).items():
+            if str(name) in KNOWN_OUTPUT_FIELDS:
+                continue
+            out[str(name)] = value
+    return out
+
+
+def _campos_nao_previstos(
+    objective_id: str, chain: Sequence[AcceptedResult], claims: Mapping[str, Claim]
+) -> list[dict[str, Any]]:
+    """Um item por campo de `contract` fora do §6.3, com os claims que gerou."""
+    por_campo: dict[str, dict[str, Any]] = {}
+    for result in chain:
+        for campo in unforeseen_contract_fields(result):
+            registro = por_campo.setdefault(
+                campo,
+                {
+                    "objective_id": objective_id,
+                    "campo": campo,
+                    "claims": [],
+                    "task_ids": [],
+                },
+            )
+            if result.task_id and result.task_id not in registro["task_ids"]:
+                registro["task_ids"].append(result.task_id)
+    prefixos = {campo: f"{objective_id}:{campo}:" for campo in por_campo}
+    for claim_id in sorted(claims):
+        for campo, prefixo in prefixos.items():
+            if claim_id.startswith(prefixo):
+                por_campo[campo]["claims"].append(claim_id)
+    return [por_campo[c] for c in sorted(por_campo)]
+
+
 def _open_needs_dicts(objective: InvestigationObjective) -> list[dict[str, Any]]:
     """Obrigações de leitura ainda abertas, com `target` resolvível.
 
@@ -2668,6 +3222,7 @@ def _write_objective(
     escopos: Mapping[str, str] | None = None,
     leituras: Sequence[Mapping[str, Any]] = (),
     chain: Sequence[AcceptedResult] = (),
+    rejeicoes: Sequence[Mapping[str, Any]] = (),
 ) -> ObjectiveOutcome:
     """Grava os fatos de UM objetivo e recalcula seu estado (§6.6)."""
     state = objective.evaluate()
@@ -2686,6 +3241,11 @@ def _write_objective(
         contract_state=_contract_state_dict(objective),
         reading_needs=_open_needs_dicts(objective),
         chain_task_ids=[r.task_id for r in chain] or [result.task_id],
+        extra=_extra_fields(list(chain) or [result]),
+        campos_nao_previstos=_campos_nao_previstos(
+            objective.objective_id, list(chain) or [result], claims
+        ),
+        resultados_rejeitados=[dict(r) for r in rejeicoes],
     )
 
     capability_subject = _capability_subject(

@@ -24,6 +24,7 @@ de "há 12 arquivos desconhecidos".
 
 from __future__ import annotations
 
+import importlib
 import os
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -414,12 +415,86 @@ class ExtractorRegistry:
         )
 
 
-def default_registry() -> ExtractorRegistry:
+#: Variável de ambiente com extensões de extrator, no MESMO formato de
+#: `WIKI_AI_AGENT_ADAPTERS` (`runtime/agents.py`): specs `pacote.modulo:fabrica`
+#: separados por `os.pathsep`. A fábrica devolve um extrator ou uma sequência.
+EXTRACTOR_EXTENSIONS_ENV = "WIKI_AI_EXTRACTORS"
+
+
+class ExtractorExtensionError(ExtractionError):
+    """Extensão de extrator inválida: spec malformado, import falho ou
+    adaptador recusado pelo registro. Sempre nomeia o spec problemático —
+    registrar pela metade em silêncio seria pior do que não registrar."""
+
+
+def load_extractor_extensions(
+    registry: "ExtractorRegistry",
+    specs: Iterable[str] | None = None,
+    *,
+    env_var: str = EXTRACTOR_EXTENSIONS_ENV,
+) -> list[Any]:
+    """Registra extratores de terceiros por `pacote.modulo:fabrica`.
+
+    `specs=None` lê `env_var` do ambiente (separador `os.pathsep`), igual a
+    `AgentRegistry.load_extensions`. Qualquer falha vira
+    `ExtractorExtensionError` COM o spec — nunca um registro parcial mudo.
+    """
+    raw = (
+        list(specs)
+        if specs is not None
+        else [s.strip() for s in os.environ.get(env_var, "").split(os.pathsep) if s.strip()]
+    )
+    registered: list[Any] = []
+    for spec in raw:
+        spec = spec.strip()
+        if not spec:
+            continue
+        if ":" not in spec:
+            raise ExtractorExtensionError(
+                f"extensão de extrator inválida {spec!r}: use 'pacote.modulo:fabrica'"
+            )
+        module_name, _, factory_name = spec.partition(":")
+        if not module_name or not factory_name:
+            raise ExtractorExtensionError(
+                f"extensão de extrator inválida {spec!r}: use 'pacote.modulo:fabrica'"
+            )
+        try:
+            module = importlib.import_module(module_name)
+            factory = getattr(module, factory_name)
+        except Exception as exc:
+            raise ExtractorExtensionError(
+                f"extensão de extrator {spec!r} não carregou: {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            produced = factory()
+        except Exception as exc:
+            raise ExtractorExtensionError(
+                f"fábrica da extensão {spec!r} falhou: {type(exc).__name__}: {exc}"
+            ) from exc
+        candidates = produced if isinstance(produced, (list, tuple)) else [produced]
+        for extractor in candidates:
+            try:
+                registered.append(registry.register(extractor))
+            except ExtractionError as exc:
+                raise ExtractorExtensionError(
+                    f"extensão de extrator {spec!r} devolveu adaptador recusado: {exc}"
+                ) from exc
+    return registered
+
+
+def default_registry(*, extensions: Iterable[str] = ()) -> ExtractorRegistry:
     """Registro com os adaptadores da primeira leva (§6.2).
 
     A ordem importa: `TypeScriptExtractor` antes de `JavaScriptExtractor`
     porque ambos reivindicam `.ts`/`.tsx`, e `ManifestExtractor` antes dos
     demais para capturar `pyproject.toml`/`build.gradle` por basename.
+
+    `extensions` (ou, quando vazio, a variável de ambiente
+    `WIKI_AI_EXTRACTORS`) acrescenta extratores de terceiros DEPOIS dos nove
+    embutidos — a precedência dos embutidos é preservada, e um extrator novo só
+    ganha um arquivo que nenhum deles reivindicou. Linguagem sem adaptador
+    continua produzindo o `Diagnostic('no_adapter')` de `extract_all`: uma
+    extensão que não cobre a linguagem não apaga a lacuna.
     """
     from .java_ext import JavaExtractor
     from .javascript_ext import JavaScriptExtractor, TypeScriptExtractor
@@ -442,14 +517,19 @@ def default_registry() -> ExtractorRegistry:
     registry.register(YamlExtractor())
     registry.register(XmlExtractor())
     registry.register(SqlExtractor())
+    specs = list(extensions)
+    load_extractor_extensions(registry, specs if specs else None)
     return registry
 
 
 __all__ = [
+    "EXTRACTOR_EXTENSIONS_ENV",
     "LANGUAGE_BY_BASENAME",
     "LANGUAGE_BY_EXTENSION",
     "ExtractionResult",
+    "ExtractorExtensionError",
     "ExtractorRegistry",
     "default_registry",
     "guess_language",
+    "load_extractor_extensions",
 ]

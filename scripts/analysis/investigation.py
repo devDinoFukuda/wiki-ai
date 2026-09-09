@@ -29,7 +29,7 @@ from __future__ import annotations
 import builtins as _py_builtins
 import datetime as _dt
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from knowledge.evidence import validate_locator
@@ -47,6 +47,7 @@ from .capabilities import (
 )
 from .extractors.registry import ExtractionResult
 from .inventory import FileClass, Inventory
+from .profile import DEFAULT_PROFILE, AnalysisProfile, ProfileError
 from .snapshot import Snapshot
 
 __all__ = [
@@ -63,6 +64,7 @@ __all__ = [
     "InvestigationError",
     "InvestigationObjective",
     "MatrixCell",
+    "MatrixIntegrityError",
     "MatrixJustificationRequired",
     "MatrixState",
     "ObjectiveAccountingError",
@@ -97,6 +99,16 @@ class ContractViolation(InvestigationError):
 
 class MatrixJustificationRequired(InvestigationError):
     """§6.5 — estado afirmativo da matriz sem justificativa ligada ao código."""
+
+
+class MatrixIntegrityError(InvestigationError):
+    """§6.5 — matriz reconstruída de payload com família/célula fora do conjunto
+    permitido, ou com estado afirmativo sem justificativa.
+
+    Fecha a brecha entre `mark()` (que sempre exigiu justificativa) e
+    `from_dict()` (que aceitava o payload como verdade): reconstruir não pode
+    ser um caminho mais barato do que marcar.
+    """
 
 
 class ConclusionRejected(InvestigationError):
@@ -452,6 +464,11 @@ class MatrixCell:
     justification: EvidenceRef | None = None
     note: str = ""
     marked: bool = False
+    #: Proveniência NÃO-código de uma justificativa: hoje só o perfil de análise
+    #: do sistema (`"profile:<camada>"`). Existe para que uma exclusão declarada
+    #: pelo perfil seja distinguível de uma exclusão sustentada por evidência de
+    #: código — e para que nem uma nem outra possa ser vazia.
+    justification_source: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -461,6 +478,7 @@ class MatrixCell:
             "justification": self.justification.to_dict() if self.justification else None,
             "note": self.note,
             "marked": self.marked,
+            "justification_source": self.justification_source,
         }
 
     @classmethod
@@ -473,6 +491,7 @@ class MatrixCell:
             justification=EvidenceRef.from_dict(just) if just else None,
             note=str(data.get("note", "")),
             marked=bool(data.get("marked", False)),
+            justification_source=str(data.get("justification_source", "")),
         )
 
 
@@ -560,7 +579,123 @@ class FailureEdgeMatrix:
         cell.justification = justification_evidence
         cell.note = note
         cell.marked = True
+        cell.justification_source = ""
         return cell
+
+    # -- escrita vinda do perfil de análise --------------------------------
+    def exclude_family(self, family: str, motivo: str, *, source: str) -> list[MatrixCell]:
+        """Marca TODA célula de `family` como `not_applicable` com motivo do perfil.
+
+        É o único caminho que produz `not_applicable` sem `EvidenceRef`, e ele
+        custa exatamente o mesmo que `mark()`: motivo não vazio (senão
+        `MatrixJustificationRequired`) e proveniência registrada em
+        `justification_source`, que sai em `to_dict()`. Um consumidor consegue
+        separar "não se aplica, disse o código" de "não se aplica, disse o
+        perfil deste sistema".
+        """
+        if not (motivo or "").strip():
+            raise MatrixJustificationRequired(
+                f"família {family!r}: exclusão pelo perfil exige motivo não vazio — "
+                "exclusão silenciosa é proibida (§6.1.3/§6.5)"
+            )
+        if family not in self._families:
+            raise MatrixIntegrityError(
+                f"família desconhecida na matriz: {family!r} "
+                f"(presentes: {', '.join(sorted(self._families))})"
+            )
+        touched: list[MatrixCell] = []
+        for item in self._families[family]:
+            cell = self.cells[(family, item)]
+            cell.state = MatrixState.NOT_APPLICABLE
+            cell.justification = None
+            cell.justification_source = source
+            cell.note = motivo.strip()
+            cell.marked = True
+            touched.append(cell)
+        return touched
+
+    def add_family(
+        self, family: str, items: Sequence[str], *, source: str
+    ) -> list[MatrixCell]:
+        """Acrescenta uma família nova com células `unresolved` (o padrão do §6.5).
+
+        Célula nova nasce por obrigação, não por cobertura: `unresolved` e
+        `marked=False` mantêm o objetivo em `partial` até alguém marcar com
+        evidência. `justification_source` guarda de onde veio a família para que
+        `from_dict()` a reconheça como declarada, e não como injetada.
+        """
+        if family in self._families:
+            raise MatrixIntegrityError(
+                f"família {family!r} já existe na matriz: redefinir apagaria as células atuais"
+            )
+        parsed = tuple(str(i).strip() for i in items if str(i).strip())
+        if not parsed:
+            raise MatrixIntegrityError(
+                f"família {family!r} sem itens: família vazia não acrescenta obrigação nenhuma"
+            )
+        self._families[family] = parsed
+        created = [
+            MatrixCell(family=family, item=item, justification_source=source)
+            for item in parsed
+        ]
+        for cell in created:
+            self.cells[(family, cell.item)] = cell
+        return created
+
+    # -- proveniência de perfil -------------------------------------------
+    def profile_cells(self) -> frozenset[tuple[str, str]]:
+        """Células cuja justificativa vem do PERFIL, não de código.
+
+        É o conjunto que um resultado de agente não pode nem criar nem remover:
+        quem decidiu que uma família não se aplica a este sistema foi o perfil,
+        e o worker não tem autoridade para revogar nem para inventar essa
+        decisão. `reapply_profile_cells()` é o que impõe isso.
+        """
+        return frozenset(
+            (c.family, c.item)
+            for c in self.cells.values()
+            if (c.justification_source or "").strip()
+        )
+
+    def reapply_profile_cells(self, prior: "FailureEdgeMatrix") -> dict[str, list[str]]:
+        """Reimpõe sobre ESTA matriz exatamente as células de perfil de `prior`.
+
+        Uso: `prior` é a matriz do objetivo planejado (escrita pelo pipeline,
+        confiável); `self` é a matriz que voltou do agente (não confiável). O
+        agente pode ter apagado uma exclusão do perfil para transformar
+        obrigação em cobertura, ou forjado uma nova para se dispensar de
+        trabalho. Depois desta chamada:
+
+        - toda célula de perfil de `prior` volta idêntica (estado, note e
+          `justification_source`), com a família recriada se o agente a removeu;
+        - qualquer célula com `justification_source` que NÃO seja de `prior` é
+          despida da proveniência forjada e volta a `unresolved`/`marked=False`;
+        - as demais células ficam como o agente as deixou.
+
+        Devolve o registro do que foi mexido — reimposição contada, não muda.
+        """
+        restored: list[str] = []
+        revoked: list[str] = []
+        legit = prior.profile_cells()
+        for family, item in sorted(legit):
+            source_cell = prior.cells[(family, item)]
+            current = self.cells.get((family, item))
+            if current is None or current.to_dict() != source_cell.to_dict():
+                self.cells[(family, item)] = _dc_replace(source_cell)
+                items = self._families.get(family, ())
+                if item not in items:
+                    self._families[family] = items + (item,)
+                restored.append(f"{family}/{item}")
+        for key, cell in sorted(self.cells.items()):
+            if key in legit or not (cell.justification_source or "").strip():
+                continue
+            cell.justification_source = ""
+            cell.justification = None
+            cell.state = MatrixState.UNRESOLVED
+            cell.marked = False
+            cell.note = ""
+            revoked.append(f"{key[0]}/{key[1]}")
+        return {"restored": restored, "revoked_forged_provenance": revoked}
 
     # -- serialização ------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -571,12 +706,93 @@ class FailureEdgeMatrix:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "FailureEdgeMatrix":
-        matrix = cls(data.get("families") or FAILURE_FAMILIES)
+    def from_dict(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        allowed_families: Mapping[str, Sequence[str]] | None = None,
+        trust_profile_cells: bool = False,
+    ) -> "FailureEdgeMatrix":
+        """Reconstrói a matriz APLICANDO a mesma regra de `mark()` (§6.5).
+
+        Antes desta versão, `from_dict` aceitava do payload qualquer família,
+        qualquer célula e qualquer estado: bastava um resultado de agente
+        declarar `state: "not_applicable"` para a obrigação sumir sem
+        justificativa nenhuma — enquanto `mark()` exigia `EvidenceRef` ligada
+        ao código. Reconstruir era o caminho barato. Agora:
+
+        - célula em `covered`/`not_applicable` exige `justification` válida
+          (`_require_code_evidence`);
+        - célula MARCADA em `unresolved` exige `note` com o impacto;
+        - família/célula fora de `allowed_families` (default: `FAILURE_FAMILIES`)
+          exige justificativa não vazia — família inventada sem proveniência é
+          `MatrixIntegrityError`, nunca uma linha a mais na matriz.
+
+        `trust_profile_cells` decide se `justification_source` (a proveniência
+        "isto veio do perfil") vale como justificativa. **O default é `False`, e
+        isso é o ponto**: `justification_source` é só uma string, e o payload de
+        um agente chega aqui pelo mesmo caminho que o payload do pipeline. Sem
+        essa separação, um worker escreveria `"profile:cli"` numa célula e se
+        dispensaria da obrigação sem evidência nenhuma — exatamente a brecha que
+        `mark()` sempre recusou.
+
+        Quem chama decide pela ORIGEM do payload, nunca pelo conteúdo dele:
+
+        | Origem | `trust_profile_cells` |
+        |---|---|
+        | matriz escrita por `plan()`/store/estado acumulado | `True` |
+        | `output["matrix"]` de um agente | `False` (e depois `reapply_profile_cells`) |
+        """
+        allowed = allowed_families if allowed_families is not None else FAILURE_FAMILIES
+        allowed_pairs = {
+            (fam, item) for fam, items in allowed.items() for item in items
+        }
+        matrix = cls(data.get("families") or allowed)
         for raw in data.get("cells", ()):
             cell = MatrixCell.from_dict(raw)
             matrix.cells[(cell.family, cell.item)] = cell
+            matrix._families.setdefault(cell.family, ())
+            if cell.item not in matrix._families[cell.family]:
+                matrix._families[cell.family] = matrix._families[cell.family] + (cell.item,)
+        for cell in matrix.cells.values():
+            _validate_reconstructed_cell(cell, allowed_pairs, trust_profile_cells)
         return matrix
+
+
+def _validate_reconstructed_cell(
+    cell: MatrixCell, allowed_pairs: frozenset | set, trust_profile_cells: bool = False
+) -> None:
+    """Regra única de aceitação de uma célula vinda de payload (ver `from_dict`)."""
+    source = (cell.justification_source or "").strip()
+    if source and not trust_profile_cells:
+        raise MatrixIntegrityError(
+            f"{cell.family}/{cell.item}: proveniência de perfil não aceita desta origem "
+            f"(justification_source={source!r}). `justification_source` é texto: só o próprio "
+            "pipeline pode escrevê-lo, e este payload não veio dele. Se a célula se sustenta, "
+            "traga `justification` ligada ao código; se ela é do perfil, quem reconstrói deve "
+            "reimpô-la com `reapply_profile_cells(prior)` sobre a matriz anterior validada"
+        )
+    known = (cell.family, cell.item) in allowed_pairs
+    if not known and not source and cell.justification is None:
+        raise MatrixIntegrityError(
+            f"{cell.family}/{cell.item}: célula fora do conjunto permitido do §6.5 e sem "
+            "justificativa — uma família/célula nova precisa declarar de onde veio "
+            "(justification_source do perfil) ou trazer evidência de código; aceitar em "
+            "silêncio deixaria qualquer payload redesenhar a matriz"
+        )
+    if cell.state in (MatrixState.NOT_APPLICABLE, MatrixState.COVERED):
+        if not source:
+            _require_code_evidence(cell.family, cell.item, cell.state, cell.justification)
+        elif not (cell.note or "").strip():
+            raise MatrixJustificationRequired(
+                f"{cell.family}/{cell.item}: estado {cell.state.value!r} declarado por "
+                f"{source!r} sem motivo em `note` — exclusão sem motivo não é exclusão (§6.5)"
+            )
+    elif cell.state is MatrixState.UNRESOLVED and cell.marked and not (cell.note or "").strip():
+        raise MatrixIntegrityError(
+            f"{cell.family}/{cell.item}: 'unresolved' MARCADO exige note com o impacto do "
+            "desconhecido para o consumidor (§6.6) — a mesma exigência de `mark()`"
+        )
 
 
 def _require_code_evidence(
@@ -822,7 +1038,15 @@ class InvestigationObjective:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "InvestigationObjective":
+    def from_dict(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        allowed_families: Mapping[str, Sequence[str]] | None = None,
+        trust_profile_cells: bool = False,
+    ) -> "InvestigationObjective":
+        """`trust_profile_cells` só quando o payload foi escrito pelo próprio
+        pipeline (ver `FailureEdgeMatrix.from_dict`). Resultado de agente: `False`."""
         closure = data.get("closure")
         return cls(
             objective_id=str(data["objective_id"]),
@@ -837,7 +1061,11 @@ class InvestigationObjective:
             },
             evidence_refs=[EvidenceRef.from_dict(e) for e in data.get("evidence_refs", ())],
             reading_needs=[ReadingNeed.from_dict(n) for n in data.get("reading_needs", ())],
-            matrix=FailureEdgeMatrix.from_dict(data.get("matrix") or {}),
+            matrix=FailureEdgeMatrix.from_dict(
+                data.get("matrix") or {},
+                allowed_families=allowed_families,
+                trust_profile_cells=trust_profile_cells,
+            ),
             state=ObjectiveState(data.get("state", "partial")),
             closure=ClosureRecord.from_dict(closure) if closure else None,
             accounting=dict(data.get("accounting", {})),
@@ -921,6 +1149,21 @@ def classify_gap(gap: BoundaryGap) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 
 
+def _trigger_priority(profile: AnalysisProfile | None) -> Mapping[ReadingTrigger, int]:
+    """Prioridade EFETIVA desta chamada. `_TRIGGER_PRIORITY` nunca é mutado.
+
+    O perfil sobrescreve só os gatilhos que nomear; o resto mantém o valor
+    histórico, então um perfil que ajusta um gatilho não reordena os outros
+    por acidente.
+    """
+    if profile is None or not profile.trigger_priority:
+        return _TRIGGER_PRIORITY
+    merged = dict(_TRIGGER_PRIORITY)
+    for raw, value in profile.trigger_priority.items():
+        merged[ReadingTrigger(raw)] = int(value)
+    return merged
+
+
 def _need(
     prefix: str,
     kind: ReadingKind,
@@ -928,6 +1171,7 @@ def _need(
     motivo: str,
     trigger: ReadingTrigger,
     evidence: EvidenceRef | None,
+    priorities: Mapping[ReadingTrigger, int] = _TRIGGER_PRIORITY,
 ) -> ReadingNeed:
     need_id = "need_" + fingerprint([prefix, kind.value, target, trigger.value])[:24]
     return ReadingNeed(
@@ -937,12 +1181,14 @@ def _need(
         motivo=motivo,
         trigger=trigger,
         evidence=evidence,
-        priority=_TRIGGER_PRIORITY[trigger],
+        priority=priorities[trigger],
     )
 
 
 def _needs_from_gaps(
-    prefix: str, gaps: Sequence[BoundaryGap]
+    prefix: str,
+    gaps: Sequence[BoundaryGap],
+    priorities: Mapping[ReadingTrigger, int] = _TRIGGER_PRIORITY,
 ) -> tuple[list[ReadingNeed], list[tuple[BoundaryGap, str]]]:
     """§6.4 — "se não resolver, abrir lacuna rastreável"."""
     needs: list[ReadingNeed] = []
@@ -966,13 +1212,16 @@ def _needs_from_gaps(
                 ),
                 ReadingTrigger.UNRESOLVED_CALL,
                 gap.evidence,
+                priorities,
             )
         )
     return needs, excluded
 
 
 def _needs_from_externals(
-    prefix: str, deps: Sequence[ExternalDependency]
+    prefix: str,
+    deps: Sequence[ExternalDependency],
+    priorities: Mapping[ReadingTrigger, int] = _TRIGGER_PRIORITY,
 ) -> list[ReadingNeed]:
     """§6.4 — distinguir contrato consumido de implementação externa indisponível."""
     return [
@@ -988,9 +1237,67 @@ def _needs_from_externals(
             ),
             ReadingTrigger.EXTERNAL_INTEGRATION,
             dep.evidence,
+            priorities,
         )
         for dep in deps
     ]
+
+
+def _objective_id_for_capability(capability_id: str) -> str:
+    return "obj_" + fingerprint(["capability", capability_id])[:24]
+
+
+def _objective_id_for_orphans(module: str) -> str:
+    return "obj_" + fingerprint(["orphans", module])[:24]
+
+
+def _profile_source(profile: AnalysisProfile | None) -> str:
+    """Rótulo de proveniência que vai para dentro do payload (motivo/justificativa)."""
+    if profile is None or not profile.source:
+        return "profile"
+    return "profile:" + "<".join(profile.source)
+
+
+def _matrix_for(profile: AnalysisProfile | None) -> FailureEdgeMatrix:
+    """Matriz §6.5 desta chamada: famílias extras acrescentadas, famílias
+    excluídas marcadas `not_applicable` COM o motivo do perfil.
+
+    Sempre uma instância nova: `FAILURE_FAMILIES` não é tocado, e dois
+    objetivos nunca compartilham células.
+    """
+    matrix = FailureEdgeMatrix()
+    if profile is None:
+        return matrix
+    source = _profile_source(profile)
+    for family, items in sorted(profile.failure_families_extra.items()):
+        matrix.add_family(family, items, source=source)
+    for family, motivo in sorted(profile.failure_families_excluded.items()):
+        matrix.exclude_family(family, motivo, source=source)
+    return matrix
+
+
+def _apply_contract_exclusions(
+    obj: InvestigationObjective, profile: AnalysisProfile | None
+) -> None:
+    """Aplica `contract_exclusions` DEPOIS do pré-preenchimento.
+
+    Ordem importa: `_prefill_contract` escreve `identidade`, `gatilho`,
+    `dependencias`, `lacunas` e `verificacao`; excluir antes seria sobrescrito.
+    O motivo entra em `contract[campo]["motivo"]` com a proveniência colada —
+    é o que torna a exclusão auditável no payload e o que faz
+    `unmet_obligations()` parar de cobrar o campo (status vira `excluded`,
+    logo sai de `pending_fields()` e não é `unresolved`).
+    """
+    if profile is None or not profile.contract_exclusions:
+        return
+    source = _profile_source(profile)
+    for name, motivo in sorted(profile.contract_exclusions.items()):
+        obj.field(name).exclude(f"{motivo} [{source}]")
+    obj.notes.append(
+        f"{len(profile.contract_exclusions)} campo(s) do §6.3 excluído(s) pelo perfil de "
+        f"análise ({source}): {', '.join(sorted(profile.contract_exclusions))} — exclusão "
+        "nomeada com motivo no próprio contrato, não filtro silencioso"
+    )
 
 
 def plan(
@@ -1000,6 +1307,7 @@ def plan(
     inventory: Inventory | None = None,
     snapshot: Snapshot | None = None,
     max_reading_needs: int | None = None,
+    profile: AnalysisProfile | None = None,
 ) -> list[InvestigationObjective]:
     """Gera um objetivo por capacidade e um por grupo de símbolos órfãos.
 
@@ -1008,6 +1316,18 @@ def plan(
     `assert_plan_accounted()` confere que nenhuma capacidade e nenhum órfão
     ficou sem objetivo.
 
+    `profile` liga as alavancas por sistema, todas com o comportamento
+    histórico preservado quando ele é `None` ou `DEFAULT_PROFILE`:
+
+    | Alavanca | Efeito verificável |
+    |---|---|
+    | `objectives` | filtra por `objective_id` exato ou substring de `capability_id`/`name`; o corte é do chamador e aparece em `plan_accounting(..., profile=)` |
+    | `contract_exclusions` | campo do §6.3 vira `excluded` com o motivo do perfil no payload; sai de `unmet_obligations()` |
+    | `failure_families_excluded` | células da família viram `not_applicable` com `justification_source` do perfil |
+    | `failure_families_extra` | famílias novas entram `unresolved` (obrigação nova, não cobertura) |
+    | `trigger_priority` | reordena o despacho POR CHAMADA; `_TRIGGER_PRIORITY` não é mutado |
+    | `max_reading_needs` | usado quando o parâmetro homônimo é `None` |
+
     `max_reading_needs` é orçamento de pacote (§7.3.1) e **não** filtro de
     escopo. Por isso o padrão é `None` (sem corte): o orçamento é decisão do
     runtime que despacha, não do planejamento — planejar já cortando esconderia
@@ -1015,6 +1335,13 @@ def plan(
     ficou de fora é contado em `accounting["reading_needs_dropped"]`, entra em
     `notes` e passa a impedir `complete` (ver `unmet_obligations`).
     """
+    if profile is not None and not isinstance(profile, AnalysisProfile):
+        raise ProfileError(
+            f"plan(profile=...) exige AnalysisProfile, recebido {type(profile).__name__}"
+        )
+    if max_reading_needs is None and profile is not None:
+        max_reading_needs = profile.max_reading_needs
+    priorities = _trigger_priority(profile)
     objectives: list[InvestigationObjective] = []
 
     config_by_path: dict[str, list[Any]] = {}
@@ -1030,6 +1357,12 @@ def plan(
             tests_by_target.setdefault(ref.target, []).append(ref)
 
     for cap in capability_map.capabilities:
+        if profile is not None and not profile.selects_objective(
+            objective_id=_objective_id_for_capability(cap.capability_id),
+            capability_id=cap.capability_id,
+            name=cap.name,
+        ):
+            continue
         objectives.append(
             _objective_for_capability(
                 cap,
@@ -1038,6 +1371,8 @@ def plan(
                 config_by_path=config_by_path,
                 tests_by_target=tests_by_target,
                 max_reading_needs=max_reading_needs,
+                profile=profile,
+                priorities=priorities,
             )
         )
 
@@ -1045,9 +1380,19 @@ def plan(
     for orphan in capability_map.orphans:
         by_module.setdefault(orphan.module or orphan.path, []).append(orphan)
     for module in sorted(by_module):
+        if profile is not None and not profile.selects_objective(
+            objective_id=_objective_id_for_orphans(module),
+            capability_id="",
+            name=f"orfaos@{module}",
+        ):
+            continue
         objectives.append(
             _objective_for_orphans(
-                module, by_module[module], max_reading_needs=max_reading_needs
+                module,
+                by_module[module],
+                max_reading_needs=max_reading_needs,
+                profile=profile,
+                priorities=priorities,
             )
         )
     return objectives
@@ -1061,10 +1406,12 @@ def _objective_for_capability(
     config_by_path: Mapping[str, Sequence[Any]],
     tests_by_target: Mapping[str, Sequence[Any]],
     max_reading_needs: int | None,
+    profile: AnalysisProfile | None = None,
+    priorities: Mapping[ReadingTrigger, int] = _TRIGGER_PRIORITY,
 ) -> InvestigationObjective:
     prefix = cap.capability_id
-    needs, excluded_gaps = _needs_from_gaps(prefix, cap.gaps)
-    needs.extend(_needs_from_externals(prefix, cap.external_dependencies))
+    needs, excluded_gaps = _needs_from_gaps(prefix, cap.gaps, priorities)
+    needs.extend(_needs_from_externals(prefix, cap.external_dependencies, priorities))
 
     # Configuração (§6.4): default/override/origem — nunca inventar ambiente.
     seen_cfg: set[str] = set()
@@ -1092,6 +1439,7 @@ def _objective_for_capability(
                         role="configuration",
                         symbol=item.keypath,
                     ),
+                    priorities,
                 )
             )
 
@@ -1120,6 +1468,7 @@ def _objective_for_capability(
                 ),
                 ReadingTrigger.PREDICATE,
                 ev,
+                priorities,
             )
         )
         hits = [
@@ -1141,6 +1490,7 @@ def _objective_for_capability(
                     ),
                     ReadingTrigger.EFFECT,
                     ev,
+                    priorities,
                 )
             )
 
@@ -1170,6 +1520,7 @@ def _objective_for_capability(
                     ),
                     ReadingTrigger.LINKED_TEST,
                     ev,
+                    priorities,
                 )
             )
 
@@ -1180,9 +1531,10 @@ def _objective_for_capability(
         dropped = len(needs) - max_reading_needs
         needs = needs[:max_reading_needs]
 
-    objective_id = "obj_" + fingerprint(["capability", cap.capability_id])[:24]
+    objective_id = _objective_id_for_capability(cap.capability_id)
     obj = InvestigationObjective(
         objective_id=objective_id,
+        matrix=_matrix_for(profile),
         kind=ObjectiveKind.CAPABILITY,
         capability_id=cap.capability_id,
         name=cap.name,
@@ -1213,6 +1565,7 @@ def _objective_for_capability(
             f"(ex.: {excluded_gaps[0][0].to_name!r}) — exclusão nomeada, não filtro silencioso"
         )
     _prefill_contract(obj, cap, test_evidence)
+    _apply_contract_exclusions(obj, profile)
     return obj
 
 
@@ -1316,7 +1669,12 @@ def _prefill_contract(
 
 
 def _objective_for_orphans(
-    module: str, orphans: Sequence[OrphanSymbol], *, max_reading_needs: int | None
+    module: str,
+    orphans: Sequence[OrphanSymbol],
+    *,
+    max_reading_needs: int | None,
+    profile: AnalysisProfile | None = None,
+    priorities: Mapping[ReadingTrigger, int] = _TRIGGER_PRIORITY,
 ) -> InvestigationObjective:
     """§6.1.8 — símbolo público não alcançado também abre tarefa de investigação."""
     prefix = f"orphans:{module}"
@@ -1332,6 +1690,7 @@ def _objective_for_orphans(
             ),
             ReadingTrigger.UNRESOLVED_CALL,
             o.evidence,
+            priorities,
         )
         for o in orphans
     ]
@@ -1342,7 +1701,8 @@ def _objective_for_orphans(
         needs = needs[:max_reading_needs]
 
     obj = InvestigationObjective(
-        objective_id="obj_" + fingerprint(["orphans", module])[:24],
+        objective_id=_objective_id_for_orphans(module),
+        matrix=_matrix_for(profile),
         kind=ObjectiveKind.ORPHAN_GROUP,
         capability_id="",
         name=f"orfaos@{module}",
@@ -1371,6 +1731,7 @@ def _objective_for_orphans(
         "nenhuma entrada do escopo alcança estes símbolos: o gatilho é desconhecido e, "
         "se existir, está fora do conjunto analisado"
     )
+    _apply_contract_exclusions(obj, profile)
     return obj
 
 
@@ -1379,11 +1740,63 @@ def _objective_for_orphans(
 # --------------------------------------------------------------------------
 
 
+def _selected_capabilities(
+    capability_map: CapabilityMap, profile: AnalysisProfile | None
+) -> list[Any]:
+    if profile is None or not profile.objectives:
+        return list(capability_map.capabilities)
+    return [
+        c
+        for c in capability_map.capabilities
+        if profile.selects_objective(
+            objective_id=_objective_id_for_capability(c.capability_id),
+            capability_id=c.capability_id,
+            name=c.name,
+        )
+    ]
+
+
+def _selected_orphans(
+    capability_map: CapabilityMap, profile: AnalysisProfile | None
+) -> list[Any]:
+    if profile is None or not profile.objectives:
+        return list(capability_map.orphans)
+    by_module: dict[str, list[OrphanSymbol]] = {}
+    for orphan in capability_map.orphans:
+        by_module.setdefault(orphan.module or orphan.path, []).append(orphan)
+    out: list[Any] = []
+    for module, group in sorted(by_module.items()):
+        if profile.selects_objective(
+            objective_id=_objective_id_for_orphans(module),
+            capability_id="",
+            name=f"orfaos@{module}",
+        ):
+            out.extend(group)
+    return out
+
+
 def plan_accounting(
-    objectives: Sequence[InvestigationObjective], capability_map: CapabilityMap
+    objectives: Sequence[InvestigationObjective],
+    capability_map: CapabilityMap,
+    *,
+    profile: AnalysisProfile | None = None,
 ) -> dict[str, int]:
+    """Denominadores do plano. Com `profile`, o que o filtro `objectives`
+    suprimiu é CONTADO (`capabilities_suppressed_by_profile`,
+    `orphan_symbols_suppressed_by_profile`) — filtrar escopo nunca pode
+    parecer cobertura."""
+    selected_caps = _selected_capabilities(capability_map, profile)
+    selected_orphans = _selected_orphans(capability_map, profile)
     return {
         "capabilities": len(capability_map.capabilities),
+        "capabilities_selected": len(selected_caps),
+        "capabilities_suppressed_by_profile": (
+            len(capability_map.capabilities) - len(selected_caps)
+        ),
+        "orphan_symbols_selected": len(selected_orphans),
+        "orphan_symbols_suppressed_by_profile": (
+            len(capability_map.orphans) - len(selected_orphans)
+        ),
         "objectives": len(objectives),
         "objectives_capability": sum(
             1 for o in objectives if o.kind is ObjectiveKind.CAPABILITY
@@ -1402,10 +1815,19 @@ def plan_accounting(
 
 
 def assert_plan_accounted(
-    objectives: Sequence[InvestigationObjective], capability_map: CapabilityMap
+    objectives: Sequence[InvestigationObjective],
+    capability_map: CapabilityMap,
+    *,
+    profile: AnalysisProfile | None = None,
 ) -> None:
-    """Toda capacidade e todo órfão têm exatamente um objetivo (§6.6)."""
-    cap_ids = [c.capability_id for c in capability_map.capabilities]
+    """Toda capacidade e todo órfão SELECIONADOS têm exatamente um objetivo (§6.6).
+
+    Sem `profile` (ou com perfil sem filtro `objectives`), o denominador é o
+    `CapabilityMap` inteiro — comportamento histórico. Com filtro, o
+    denominador passa a ser o subconjunto que o próprio filtro escolheu: o que
+    ficou de fora não vira "coberto", vira contagem em `plan_accounting()`.
+    """
+    cap_ids = [c.capability_id for c in _selected_capabilities(capability_map, profile)]
     covered = [o.capability_id for o in objectives if o.kind is ObjectiveKind.CAPABILITY]
     if len(covered) != len(set(covered)):
         raise PlanAccountingError("capacidade com mais de um objetivo: despacho duplicado")
@@ -1419,7 +1841,7 @@ def assert_plan_accounted(
         raise PlanAccountingError(
             f"{len(extra)} objetivo(s) para capacidade inexistente: {extra[:3]}"
         )
-    orphan_names = {o.qualname for o in capability_map.orphans}
+    orphan_names = {o.qualname for o in _selected_orphans(capability_map, profile)}
     planned: list[str] = []
     for obj in objectives:
         if obj.kind is ObjectiveKind.ORPHAN_GROUP:
@@ -1440,6 +1862,18 @@ def objectives_to_dict(objectives: Iterable[InvestigationObjective]) -> list[dic
 
 
 def objectives_from_dict(
-    payload: Iterable[Mapping[str, Any]]
+    payload: Iterable[Mapping[str, Any]],
+    *,
+    allowed_families: Mapping[str, Sequence[str]] | None = None,
+    trust_profile_cells: bool = False,
 ) -> list[InvestigationObjective]:
-    return [InvestigationObjective.from_dict(item) for item in payload]
+    """Reconstrói objetivos. `trust_profile_cells=True` APENAS para payload
+    escrito pelo pipeline (escopo, objective_payload, estado acumulado)."""
+    return [
+        InvestigationObjective.from_dict(
+            item,
+            allowed_families=allowed_families,
+            trust_profile_cells=trust_profile_cells,
+        )
+        for item in payload
+    ]

@@ -36,7 +36,7 @@ from __future__ import annotations
 import enum
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import agents as A
@@ -211,10 +211,56 @@ class ResultSchema:
     types: Mapping[str, Any] = field(default_factory=dict)
     strict: bool = True
     version: str = "worker_result/1"
+    #: Chaves EXTRAS autorizadas pelo OPERADOR (nunca pelo worker) via
+    #: `with_extra`. Ficam também em `optional` — este campo existe para que
+    #: quem consome o resultado saiba QUAIS chaves são extensão de perfil e
+    #: possa preservá-las separadamente (`extra` do outcome integrado), em vez
+    #: de tratá-las como vocabulário fixo do runtime.
+    extra: tuple[str, ...] = ()
 
     @property
     def declared(self) -> frozenset[str]:
         return frozenset(self.required) | frozenset(self.optional)
+
+    def with_extra(self, keys: Iterable[str]) -> "ResultSchema":
+        """Novo schema com `keys` aceitas como opcionais — `strict` INTACTO.
+
+        Flexibilizar o vocabulário de DADOS é decisão do operador (perfil de
+        análise); flexibilizar CONTROLE não é decisão de ninguém. Por isso:
+
+        * chave em `CONTROL_FIELDS` ⇒ `ValueError` (o schema não abre porta que
+          `validate` fecharia depois — a recusa é na configuração, não em
+          runtime, para que o operador saiba antes de despachar);
+        * chave já declarada (`required`/`optional`) ⇒ `ValueError`, porque
+          "ampliar" um campo que o runtime já valida esconderia um conflito de
+          significado entre perfil e núcleo;
+        * `strict` continua o que era: chave NÃO listada segue rejeitada.
+        """
+        novas: list[str] = []
+        for raw in keys or ():
+            name = str(raw).strip()
+            if not name:
+                raise ValueError("chave extra vazia: um campo sem nome não é contrato")
+            if name in CONTROL_FIELDS:
+                raise ValueError(
+                    f"chave extra {name!r} é campo de CONTROLE (§13.1): orçamento, "
+                    "ferramentas, permissões e destino nunca vêm do worker"
+                )
+            if name in self.declared:
+                raise ValueError(
+                    f"chave extra {name!r} já é campo declarado do schema "
+                    f"({self.version}): redeclarar mudaria o significado do núcleo"
+                )
+            if name in novas:
+                continue
+            novas.append(name)
+        if not novas:
+            return self
+        return replace(
+            self,
+            optional=tuple(self.optional) + tuple(novas),
+            extra=tuple(self.extra) + tuple(novas),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Forma JSON-serializável enviada ao executor.
@@ -230,6 +276,9 @@ class ResultSchema:
             "optional": list(self.optional),
             "strict": self.strict,
             "forbidden": sorted(CONTROL_FIELDS),
+            # Só viaja quando existe: um envelope sem extensão de perfil
+            # continua byte-a-byte o que era antes desta capacidade.
+            **({"extra": list(self.extra)} if self.extra else {}),
         }
 
     def validate(self, output: Any) -> list[tuple[RejectionReason, str]]:
@@ -928,9 +977,12 @@ def _chain_refusal(
     2. **orçamento consumido** — teto declarado em `set_chain_limits` já
        atingido. Mesmo motivo canônico, detalhe diferente (consumo x teto).
     3. **ausência de progresso** — a rodada anterior não encerrou obrigação,
-       não aceitou evidência nova e não resolveu conflito, OU o pacote de
-       necessidades seria byte-a-byte o mesmo já despachado. Motivo canônico
-       `no_progress`, sempre com a obrigação e o alvo no diagnóstico.
+       não aceitou evidência nova, não resolveu conflito e não PREENCHEU campo
+       do contrato (`Progress.has_progress`), OU o pacote de necessidades seria
+       byte-a-byte o mesmo já despachado. Motivo canônico `no_progress`,
+       sempre com a obrigação e o alvo no diagnóstico. A segunda condição (o
+       pacote repetido) é independente da primeira: uma rodada COM progresso
+       que devolve o mesmo pacote continua parando aqui.
 
     Toda recusa PERSISTE o motivo (`set_chain_stop`): a próxima invocação —
     inclusive depois de reiniciar o processo — lê o mesmo diagnóstico.
@@ -968,7 +1020,8 @@ def _chain_refusal(
             "objective_id": objective_id,
             "motivo": (
                 "rodada anterior sem progresso semântico (nenhuma obrigação encerrada, "
-                "evidência nova aceita ou conflito resolvido): "
+                "evidência nova aceita, conflito resolvido ou campo do contrato "
+                "preenchido): "
                 + _obligation_diagnostic(needs)
             ),
             "stop_reason": S.STOP_NO_PROGRESS,
@@ -1155,6 +1208,7 @@ def run(
     max_concurrency: int = 2,
     policy: Mapping[str, Any] | None = None,
     schema: ResultSchema | Mapping[Any, ResultSchema] = DEFAULT_SCHEMA,
+    result_extra_keys: Iterable[str] = (),
     owner: str = "coordinator",
     lease_ttl_seconds: float = 300.0,
     resolver: Any = None,
@@ -1209,10 +1263,34 @@ def run(
     #: quantas vezes seguidas cada execução respondeu estado não observável
     unobservable: dict[str, int] = {}
 
+    # As chaves extras são do OPERADOR (perfil de análise) e valem para TODO
+    # schema desta invocação — inclusive os schemas por `TaskKind`. Derivar
+    # aqui, uma vez, garante que despacho e aceite usem o MESMO vocabulário:
+    # anunciar um schema ao worker e validar por outro é justamente como a
+    # chave nova sumiria sem diagnóstico.
+    #
+    # A derivação é EAGER de propósito: chave extra inválida (campo de
+    # controle, ou nome que o núcleo já declara) estoura `ValueError` ANTES de
+    # qualquer despacho. Descobrir a configuração errada tarefa a tarefa, no
+    # meio do laço, viraria falha de tarefa — e o operador leria "montagem de
+    # envelope falhou" no lugar de "essa chave é de controle".
+    #
+    # Compatibilidade: `with_extra(())` devolve `self`, então uma chamada sem
+    # `result_extra_keys` segue usando exatamente os objetos recebidos.
+    extra_keys = tuple(str(k) for k in (result_extra_keys or ()))
+    if isinstance(schema, ResultSchema):
+        fallback_schema = schema.with_extra(extra_keys)
+        schemas_por_kind: dict[Any, ResultSchema] | None = None
+    else:
+        fallback_schema = DEFAULT_SCHEMA.with_extra(extra_keys)
+        schemas_por_kind = {k: v.with_extra(extra_keys) for k, v in dict(schema).items()}
+
     def schema_for(task: T.Task) -> ResultSchema:
-        if isinstance(schema, ResultSchema):
-            return schema
-        return schema.get(task.kind, schema.get(task.kind.value, DEFAULT_SCHEMA))
+        if schemas_por_kind is None:
+            return fallback_schema
+        return schemas_por_kind.get(
+            task.kind, schemas_por_kind.get(task.kind.value, fallback_schema)
+        )
 
     def close_with_failure(
         task: T.Task,
@@ -1658,6 +1736,23 @@ class ChainReport:
         }
 
 
+def _validate_extra_keys(
+    schema: ResultSchema | Mapping[Any, ResultSchema], keys: Sequence[str]
+) -> None:
+    """Aplica `with_extra` sem guardar o resultado — só para levantar cedo.
+
+    Existe porque `run_chain` grava `set_chain_limits` ANTES da primeira
+    rodada: descobrir a configuração inválida dentro de `run()` deixaria a
+    cadeia com teto e orçamento persistidos para trabalho que não existe.
+    """
+    if isinstance(schema, ResultSchema):
+        schema.with_extra(keys)
+        return
+    DEFAULT_SCHEMA.with_extra(keys)
+    for candidato in dict(schema).values():
+        candidato.with_extra(keys)
+
+
 def _outcome_state(outcome: Mapping[str, Any]) -> str:
     return str(outcome.get("state") or "").strip().lower()
 
@@ -1676,6 +1771,8 @@ def run_chain(
     bindings: Any = None,
     budget: Mapping[str, Any] | None = None,
     max_rounds: int | None = None,
+    policy: Mapping[str, Any] | None = None,
+    result_extra_keys: Iterable[str] = (),
     engine_capabilities: Mapping[str, Any] | None = None,
     state_store: Any = None,
     on_round: Callable[[RoundReport], None] | None = None,
@@ -1699,6 +1796,17 @@ def run_chain(
       `T.input_versions_hash(input_versions)` quando não informado, e é a
       terceira parte da chave do estado consolidado (§7.1).
     * `executor` OU `(adapter, binding)` — mesma regra de `run()`.
+    * `policy` — limites de execução PEDIDOS pelo operador (perfil). Viaja em
+      `TaskEnvelope.vendor["policy"]` até
+      `AgentCapabilities.negotiate`, que devolve o mínimo entre pedido e
+      declarado. Sem ele, `negotiate` recebia `{}` e o operador não tinha como
+      pedir mais contexto/tempo a um agente que suporta mais.
+    * `budget` — teto de CONSUMO da cadeia; gravado em `set_chain_limits` e
+      lido de volta por `chain_status`, que é a fonte de
+      `state.budget_exhausted`.
+    * `result_extra_keys` — chaves de DADOS que o schema fechado passa a
+      aceitar nesta cadeia (`ResultSchema.with_extra`). Campo de controle
+      continua recusado.
 
     Parada, sempre com motivo canônico de `runtime.state`:
 
@@ -1722,6 +1830,20 @@ def run_chain(
     states = state_store if state_store is not None else S.StateStore.of(store)
     report = ChainReport(objective_ids=ids)
     extra = dict(run_kwargs or {})
+    # Parâmetros nomeados do operador vencem `run_kwargs` (que é a via genérica
+    # e antiga): declarar `policy=` e ver o valor ignorado por causa de um
+    # `run_kwargs` esquecido seria perda silenciosa de configuração.
+    if policy is not None:
+        extra["policy"] = dict(policy)
+    if result_extra_keys:
+        extra["result_extra_keys"] = tuple(str(k) for k in result_extra_keys)
+        # Validação ANTES de `set_chain_limits`: uma chave extra inválida
+        # (campo de controle, ou nome que o núcleo já declara — `matrix`,
+        # `contract`, `objective_id`…) não pode deixar teto e orçamento
+        # gravados para uma cadeia que nunca vai despachar. `run()` repete a
+        # mesma derivação; aqui ela é feita só para estourar cedo, com o mesmo
+        # `ValueError` e a mesma regra — sem persistir nada.
+        _validate_extra_keys(extra.get("schema", DEFAULT_SCHEMA), extra["result_extra_keys"])
 
     # Teto e orçamento são da CADEIA: gravados uma vez, não a cada rodada.
     for oid in ids:
