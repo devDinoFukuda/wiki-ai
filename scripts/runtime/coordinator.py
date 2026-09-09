@@ -849,7 +849,11 @@ def plan_continuations(
         limit = (
             T.get_max_continuation_rounds(store) if max_rounds is None else max(0, int(max_rounds))
         )
-        if round_no > limit:
+        # Sem teto (default de `T.DEFAULT_MAX_CONTINUATION_ROUNDS`): a rodada
+        # não é recusada por contagem. As guardas materiais de
+        # `_chain_refusal` (progresso, pacote repetido, orçamento) continuam
+        # valendo logo abaixo — é delas que vem a parada.
+        if limit is not None and round_no > limit:
             recusadas.append(
                 {
                     "objective_id": objective_id,
@@ -971,9 +975,11 @@ def _chain_refusal(
 
     Três condições materiais do §7.3, nesta ordem:
 
-    1. **teto total da cadeia** — `rounds_used` é persistido e não zera por
-       nova invocação; `--max-rounds N` é o teto DAQUELA cadeia. Motivo
-       canônico `budget_exhausted`.
+    1. **teto total da cadeia** — SÓ quando existe teto: `max_rounds` é `None`
+       por padrão (`T.DEFAULT_MAX_CONTINUATION_ROUNDS`), e sem teto esta
+       condição nunca dispara. Havendo teto (`--max-rounds N`, perfil ou
+       `set_chain_limits`), `rounds_used` é persistido e não zera por nova
+       invocação. Motivo canônico `budget_exhausted`.
     2. **orçamento consumido** — teto declarado em `set_chain_limits` já
        atingido. Mesmo motivo canônico, detalhe diferente (consumo x teto).
     3. **ausência de progresso** — a rodada anterior não encerrou obrigação,
@@ -989,7 +995,7 @@ def _chain_refusal(
     """
     status = store.chain_status(objective_id)
     limit = status["max_rounds"] if declared_max_rounds is None else max(0, int(declared_max_rounds))
-    if status["rounds_used"] >= limit:
+    if limit is not None and status["rounds_used"] >= limit:
         store.set_chain_stop(objective_id, S.STOP_BUDGET_EXHAUSTED, now=now)
         return {
             "objective_id": objective_id,

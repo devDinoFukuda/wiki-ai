@@ -48,6 +48,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
@@ -56,6 +57,7 @@ from analysis.investigation import InvestigationObjective, ReadingNeed
 
 __all__ = [
     "CHARS_PER_TOKEN_CONSERVADOR",
+    "SOURCE_FILE_TRIGGER",
     "Budget",
     "BudgetExceeded",
     "Package",
@@ -85,6 +87,31 @@ _MAX_TRUNCATION_PASSES = 500
 #: Continuações que dependem sintaticamente do bloco anterior — nunca podem
 #: virar o início de um corte no modo de linhas/chaves balanceadas.
 _CONTINUATION_KEYWORDS = ("else", "elif", "except", "catch", "finally")
+
+#: Gatilho de leitura cujo alvo é o ARQUIVO INTEIRO (objetivo de descoberta:
+#: módulo sem extrator, em que não há símbolo/faixa a pedir porque nada foi
+#: extraído). Vale como string, não como membro de enum, porque este módulo
+#: trabalha sobre o `dict` do objetivo — nunca sobre a classe de `analysis`.
+SOURCE_FILE_TRIGGER = "source_file"
+
+#: Sufixo `:<inicio>-<fim>` de um alvo de obrigação de leitura.
+_RANGE_SUFFIX = re.compile(r":\d+-\d+$")
+
+#: Motivo registrado no `ref` cuja leitura de arquivo inteiro não coube neste
+#: pacote. Constante porque o laço de partição a compara para saber se já a
+#: escreveu (marcar duas vezes mudaria o tamanho medido).
+_DEFERRED_READING_REASON = (
+    "leitura de arquivo inteiro adiada por orcamento: faixa em remaining_needs"
+)
+
+#: Passes do par (particionar, marcar `ref` adiada). Duas passadas bastam no
+#: caso normal; o teto existe para que nenhuma oscilação vire laço.
+_MAX_PARTITION_PASSES = 4
+
+#: Teto absoluto da sondagem de fim de arquivo (`_probe_last_line`). Existe
+#: para que um resolvedor que aceite QUALQUER faixa (stub, mock) não faça a
+#: sondagem crescer indefinidamente.
+_PROBE_MAX_LINES = 1 << 22
 
 _EXT_LANGUAGE: Mapping[str, str] = {
     ".py": "python",
@@ -293,6 +320,14 @@ class Package:
     payload_bytes: int
     token_estimate: int
     exact_tokens: bool
+    #: Faixas de leitura `source_file` que NÃO couberam neste pacote, já no
+    #: formato que `runtime.tasks.create_continuation_tasks` consome
+    #: (`{need_id, target, kind, trigger, motivo, priority, evidence:[...]}`).
+    #: Não entra em `content_payload()` — e portanto não é medido contra o teto
+    #: — porque é metadado de CONTINUAÇÃO (o que a próxima rodada precisa
+    #: pedir), não texto de contexto enviado ao worker desta rodada. Vazio
+    #: significa: tudo que a obrigação pedia coube.
+    remaining_needs: list[dict[str, Any]] = field(default_factory=list)
 
     def content_payload(self) -> dict[str, Any]:
         return _content_payload(self.objective_id, self.refs, self.parts)
@@ -302,6 +337,7 @@ class Package:
         out["payload_bytes"] = self.payload_bytes
         out["token_estimate"] = self.token_estimate
         out["exact_tokens"] = self.exact_tokens
+        out["remaining_needs"] = [dict(n) for n in self.remaining_needs]
         return out
 
 
@@ -658,6 +694,18 @@ def _objective_envelope(objective_dict: Mapping[str, Any]) -> dict[str, Any]:
         "schema": schema,
         "known_limits": known_limits,
     }
+    # Diretrizes de análise do objetivo (profundidade exigida, o que NÃO conta
+    # como evidência). Entram na whitelist de propósito: sem elas o worker
+    # recebe o contrato §6.3 sem saber que precisa apurar regra/invariante/edge
+    # case NÃO declarados e que README/comentário/docstring não sustentam
+    # afirmação. Só viajam quando o objetivo as traz — ausência não vira chave
+    # nula (o payload de quem não as usa continua byte-a-byte o mesmo).
+    directives = objective_dict.get("analysis_directives")
+    if directives:
+        envelope["analysis_directives"] = (
+            dict(directives) if isinstance(directives, Mapping) else list(directives)
+            if isinstance(directives, (list, tuple)) else directives
+        )
     if objective_dict.get("continuation"):
         # Onda11-T2a (achado BLOQUEANTE #2, 3ª auditoria): a continuação
         # precisa do estado do contrato acumulado e de um resumo do que a
@@ -672,6 +720,80 @@ def _objective_envelope(objective_dict: Mapping[str, Any]) -> dict[str, Any]:
         envelope["parent_result"] = dict(objective_dict.get("parent_result") or {})
         envelope["capability_context"] = dict(objective_dict.get("capability_context") or {})
     return envelope
+
+
+def _is_source_file_need(need: Mapping[str, Any]) -> bool:
+    """A obrigação pede o ARQUIVO INTEIRO (§6.4, objetivo de descoberta)?"""
+    return str(need.get("trigger") or "") == SOURCE_FILE_TRIGGER
+
+
+def _probe_last_line(resolver: ResolverFn, path: str) -> int | None:
+    """Última linha citável de `path`, descoberta pelo PRÓPRIO resolvedor.
+
+    Este módulo nunca lê arquivo (a leitura é sempre do `resolver` injetado,
+    que é quem conhece o snapshot). Quando a obrigação `source_file` chega sem
+    localizador — o plano só sabe o caminho, não quantas linhas o arquivo tem —
+    o fim é encontrado por dobra + busca binária sobre chamadas ao resolvedor:
+    `resolve(path, 1, n)` que levanta significa "n passou do fim".
+
+    `None` quando nem `resolve(path, 1, 1)` funciona (caminho fora do snapshot,
+    arquivo vazio, conteúdo mudou sob a citação): o chamador registra
+    `unavailable_reason` no `ref`, nunca fabrica trecho.
+    """
+
+    def ok(n: int) -> bool:
+        try:
+            resolver(path, 1, n)
+        except Exception:
+            return False
+        return True
+
+    if not ok(1):
+        return None
+    low, high = 1, 2
+    while high <= _PROBE_MAX_LINES and ok(high):
+        low = high
+        high *= 2
+    if high > _PROBE_MAX_LINES:
+        return low
+    while high - low > 1:
+        mid = (low + high) // 2
+        if ok(mid):
+            low = mid
+        else:
+            high = mid
+    return low
+
+
+def _whole_file_evidence(need: Mapping[str, Any], resolver: ResolverFn) -> dict[str, Any]:
+    """Localizador do arquivo INTEIRO para uma obrigação `source_file`.
+
+    Usa a faixa que a obrigação já traz quando ela é válida (o planejador que
+    tem o snapshot em mãos consegue citar `1..N` direto); só sonda o resolvedor
+    quando não há faixa. Devolve `{}` quando não há caminho nem fim
+    descobrível — o `ref` correspondente sai com `unavailable_reason`.
+    """
+    raw = need.get("evidence")
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else None
+    ev = dict(raw) if isinstance(raw, Mapping) else {}
+    if _evidence_source_key(ev) is not None:
+        return ev
+    path = str(ev.get("path") or "").strip()
+    if not path:
+        # `target` de obrigação de leitura vem como `caminho` ou como
+        # `caminho:inicio-fim` (`analysis.investigation._need`). O sufixo de
+        # faixa é descartado aqui de propósito: `source_file` pede o arquivo
+        # INTEIRO, e a faixa é redescoberta contra o snapshot corrente.
+        alvo = str(need.get("target") or "").strip()
+        path = _RANGE_SUFFIX.sub("", alvo)
+    if not path:
+        return {}
+    end = _probe_last_line(resolver, path)
+    if end is None:
+        return {}
+    ev.update({"path": path, "line_start": 1, "line_end": end})
+    return ev
 
 
 def _evidence_source_key(ev: Mapping[str, Any]) -> tuple[str, int, int] | None:
@@ -739,7 +861,25 @@ def build_package(
     for need in objective_dict.get("reading_needs", ()) or ():
         ev = need.get("evidence")
         is_open = not need.get("satisfied") and not need.get("waived_reason")
-        if ev and is_open:
+        if not is_open:
+            continue
+        if _is_source_file_need(need):
+            # Objetivo de descoberta (módulo sem extrator): a obrigação é o
+            # ARQUIVO INTEIRO. Entra como fonte mesmo SEM localizador — a faixa
+            # é descoberta pelo resolvedor (`_whole_file_evidence`) e, se nem
+            # isso funcionar, o `ref` sai com `unavailable_reason` em vez de
+            # sumir do pacote.
+            sources.append(
+                {
+                    "ref_id": str(need.get("need_id") or need.get("target") or ""),
+                    "ev": _whole_file_evidence(need, resolver),
+                    "kind": "reading_need",
+                    "need": need,
+                    "source_file": True,
+                }
+            )
+            continue
+        if ev:
             sources.append(
                 {"ref_id": str(need.get("need_id")), "ev": ev, "kind": "reading_need", "need": need}
             )
@@ -766,6 +906,11 @@ def build_package(
                 evidence_list = list(raw_evidence)
             else:
                 evidence_list = []
+            if not evidence_list and _is_source_file_need(need):
+                # Continuação de descoberta: a faixa restante costuma vir em
+                # `evidence`, mas uma continuação criada só com o alvo ainda
+                # precisa do arquivo inteiro (mesma regra do laço acima).
+                evidence_list = [_whole_file_evidence(need, resolver)]
             if not evidence_list:
                 sources.append(
                     {
@@ -783,6 +928,7 @@ def build_package(
                         "ev": ev if isinstance(ev, Mapping) else {},
                         "kind": "continuation_need",
                         "need": need,
+                        "source_file": _is_source_file_need(need),
                     }
                 )
 
@@ -871,7 +1017,205 @@ def build_package(
         refs.append(entry)
 
     parts = list(parts_by_key.values())
-    return _fit_to_budget(objective_id, refs, parts, b)
+
+    # Particionamento por FAIXA DE LINHAS das obrigações `source_file`. Corte
+    # semântico (`_fit_to_budget`) é o errado aqui: a obrigação de descoberta
+    # pede o arquivo INTEIRO, e entregar um arquivo com buracos silenciosos
+    # produziria afirmação sobre código que o worker não viu. O que cabe vai
+    # inteiro; o que não cabe vira `remaining_needs` (faixa exata) para a
+    # rodada seguinte.
+    source_file_needs: dict[str, Mapping[str, Any]] = {}
+    for src in sources:
+        if not src.get("source_file"):
+            continue
+        key = key_of_ref.get(src["ref_id"])
+        part = parts_by_key.get(key) if key is not None else None
+        if part is not None:
+            source_file_needs.setdefault(part.part_id, src["need"])
+
+    remaining_needs: list[dict[str, Any]] = []
+    if source_file_needs and not _payload_fits(objective_id, refs, parts, b):
+        # Referência cujo trecho foi ADIADO não pode continuar apontando um
+        # `part_id` que não viaja no pacote: seria um ponteiro órfão no worker.
+        # Vira `part_id=None` + motivo — a mesma forma que uma citação que não
+        # resolveu já usa (`unavailable_reason`), com causa diferente.
+        #
+        # Marcar o `ref` MUDA o tamanho do payload, e o tamanho é o que decide a
+        # partição: por isso o par (particionar, marcar) é iterado até o ponto
+        # fixo, sempre repartindo a partir das partes ÍNTEGRAS (`todas`) — nunca
+        # de uma partição anterior, que já teria perdido linhas.
+        todas = list(parts)
+        origem = [(entry, entry.get("part_id")) for entry in refs]
+        for _ in range(_MAX_PARTITION_PASSES):
+            parts, remaining_needs = _partition_source_files(
+                objective_id, refs, todas, source_file_needs, b
+            )
+            entregues = {p.part_id for p in parts}
+            mudou = False
+            for entry, pid in origem:
+                adiada = bool(pid) and pid not in entregues
+                alvo = None if adiada else pid
+                if entry.get("part_id") != alvo:
+                    entry["part_id"] = alvo
+                    mudou = True
+                motivo = entry.get("unavailable_reason")
+                if adiada and motivo != _DEFERRED_READING_REASON:
+                    entry["unavailable_reason"] = _DEFERRED_READING_REASON
+                    mudou = True
+                elif not adiada and motivo == _DEFERRED_READING_REASON:
+                    entry.pop("unavailable_reason", None)
+                    mudou = True
+            if not mudou:
+                break
+
+    package = _fit_to_budget(objective_id, refs, parts, b)
+    package.remaining_needs = remaining_needs
+    return package
+
+
+def _payload_fits(
+    objective_id: str,
+    refs: Sequence[Mapping[str, Any]],
+    parts: Sequence[PackagePart],
+    budget: Budget,
+) -> bool:
+    """Cabe? Sempre por MEDIÇÃO do payload serializado real (§7.3.1)."""
+    payload_bytes = serialized_bytes(_content_payload(objective_id, refs, parts))
+    return budget.fits(payload_bytes, estimate_tokens(payload_bytes))
+
+
+def _line_prefix_part(part: PackagePart, lines: int, original_end: int) -> PackagePart:
+    """Cópia da parte com apenas as `lines` PRIMEIRAS linhas do texto-fonte.
+
+    Corte por LINHA (nunca por caractere): a faixa citada continua sendo uma
+    faixa real do arquivo, e o que sobrou tem início e fim exatos para virar
+    `remaining_needs`.
+
+    A NOTA de partição nasce aqui, junto do corte, porque ela também é payload:
+    escrevê-la depois da busca binária faria o pacote aceito medir menos do que
+    o pacote enviado — exatamente o overflow silencioso que o §7.3.1 proíbe.
+    """
+    text = "".join(part.source_snippet.splitlines(keepends=True)[:lines])
+    line_end = part.line_start + lines - 1
+    notes = list(part.notes)
+    if line_end < original_end:
+        notes.append(
+            f"[orcamento] leitura de arquivo inteiro particionada: linhas "
+            f"{part.line_start}..{line_end} neste pacote; "
+            f"{line_end + 1}..{original_end} em remaining_needs"
+        )
+    return PackagePart(
+        part_id=part.part_id,
+        path=part.path,
+        line_start=part.line_start,
+        line_end=line_end,
+        language=part.language,
+        snippet=text,
+        locator=part.locator,
+        content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        truncated=True,
+        omitted_ranges=list(part.omitted_ranges),
+        refs=list(part.refs),
+        notes=notes,
+        source_snippet=text,
+    )
+
+
+def _largest_line_prefix(
+    objective_id: str,
+    refs: Sequence[Mapping[str, Any]],
+    fixed: Sequence[PackagePart],
+    part: PackagePart,
+    budget: Budget,
+) -> int:
+    """Maior nº de linhas iniciais de `part` que ainda cabe junto de `fixed`.
+
+    Busca binária sobre a MEDIÇÃO do payload inteiro — o payload cresce
+    monotonicamente com o nº de linhas, então o maior prefixo que cabe é único
+    e determinístico. `0` significa "nem a primeira linha cabe".
+    """
+    total = len(part.source_snippet.splitlines(keepends=True))
+    original_end = part.line_end
+    best = 0
+    low, high = 1, total
+    while low <= high:
+        mid = (low + high) // 2
+        trial = list(fixed) + [_line_prefix_part(part, mid, original_end)]
+        if _payload_fits(objective_id, refs, trial, budget):
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def _remaining_need(
+    need: Mapping[str, Any], path: str, start: int, end: int
+) -> dict[str, Any]:
+    """Faixa que ficou de fora, no formato de `create_continuation_tasks`."""
+    target = str(need.get("target") or path)
+    return {
+        "need_id": str(need.get("need_id") or target),
+        "target": target,
+        "kind": str(need.get("kind") or "range"),
+        "trigger": SOURCE_FILE_TRIGGER,
+        "motivo": str(
+            need.get("motivo")
+            or "leitura de arquivo inteiro particionada por orcamento"
+        ),
+        "priority": int(need.get("priority", 50) or 50),
+        "evidence": [{"path": path, "line_start": int(start), "line_end": int(end)}],
+    }
+
+
+def _partition_source_files(
+    objective_id: str,
+    refs: list[dict[str, Any]],
+    parts: Sequence[PackagePart],
+    source_file_needs: Mapping[str, Mapping[str, Any]],
+    budget: Budget,
+) -> tuple[list[PackagePart], list[dict[str, Any]]]:
+    """Reparte as leituras de arquivo inteiro em (o que vai agora, o que sobra).
+
+    Ordem determinística por `(priority, path)` — a mesma prioridade de
+    despacho do §6.4 —, então repetir a montagem com o mesmo orçamento produz
+    a MESMA partição (e o mesmo `remaining_needs`), que é o que permite à
+    continuação ter identidade estável (`effect_identity` em
+    `runtime.tasks.create_continuation_tasks`).
+
+    Assim que uma parte precisa ser cortada (ou não cabe nem cortada), NADA
+    depois dela entra: o orçamento acabou ali. Preencher os buracos com
+    arquivos menores tornaria a partição dependente do tamanho relativo dos
+    arquivos e quebraria a ordem de prioridade.
+    """
+    base = [p for p in parts if p.part_id not in source_file_needs]
+    ordered = sorted(
+        (p for p in parts if p.part_id in source_file_needs),
+        key=lambda p: (int(source_file_needs[p.part_id].get("priority", 50) or 50), p.path),
+    )
+    kept: list[PackagePart] = []
+    remaining: list[dict[str, Any]] = []
+    room = True
+    for part in ordered:
+        need = source_file_needs[part.part_id]
+        if room and _payload_fits(objective_id, refs, base + kept + [part], budget):
+            kept.append(part)
+            continue
+        original_end = part.line_end
+        cut = (
+            _largest_line_prefix(objective_id, refs, base + kept, part, budget) if room else 0
+        )
+        room = False
+        if cut > 0:
+            prefix = _line_prefix_part(part, cut, original_end)
+            kept.append(prefix)
+            if prefix.line_end < original_end:
+                remaining.append(
+                    _remaining_need(need, part.path, prefix.line_end + 1, original_end)
+                )
+        else:
+            remaining.append(_remaining_need(need, part.path, part.line_start, original_end))
+    return base + kept, remaining
 
 
 def build_package_from_objective(

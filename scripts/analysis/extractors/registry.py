@@ -64,6 +64,38 @@ LANGUAGE_BY_EXTENSION: dict[str, str] = {
     ".graphql": "graphql", ".gql": "graphql", ".md": "markdown", ".rst": "restructuredtext",
     ".txt": "text", ".csv": "csv", ".env": "dotenv", ".properties": "properties",
     ".dockerfile": "dockerfile", ".mk": "make", ".gradle": "gradle", ".cfg": "ini",
+    # -- mainframe e legado corporativo: sem adaptador, mas COM nome. É o que
+    #    faz o diagnóstico dizer "14 arquivos COBOL sem adaptador" em vez de
+    #    "14 arquivos desconhecidos" — e o que dá a chave por linguagem em
+    #    `files_without_adapter`/`plan_accounting`.
+    ".cbl": "cobol", ".cob": "cobol", ".cobol": "cobol", ".cpy": "cobol", ".ccp": "cobol",
+    ".jcl": "jcl", ".proc": "jcl", ".prm": "jcl",
+    ".pli": "pli", ".pl1": "pli",
+    ".asm": "assembler", ".s": "assembler", ".mac": "assembler",
+    ".rexx": "rexx", ".rex": "rexx",
+    ".abap": "abap", ".nsp": "natural", ".nsn": "natural",
+    # -- dialetos de banco (Sybase/T-SQL/PL-SQL)
+    ".dml": "sql", ".prc": "sql", ".sp": "sql", ".trg": "sql", ".vw": "sql",
+    ".viw": "sql", ".fnc": "sql", ".pks": "sql", ".pkb": "sql", ".pls": "sql",
+    ".tsql": "sql",
+    # -- demais famílias sem adaptador dedicado
+    ".pyw": "python", ".sc": "scala", ".gvy": "groovy",
+    ".hxx": "cpp", ".hh": "cpp", ".ipp": "cpp", ".csx": "csharp",
+    ".bas": "vbnet", ".cls": "vbnet", ".frm": "vbnet", ".vbs": "vbnet",
+    ".fsx": "fsharp", ".fsi": "fsharp",
+    ".pas": "pascal", ".dpr": "pascal", ".dfm": "pascal", ".pp": "pascal",
+    ".lpr": "pascal", ".dpk": "pascal",
+    ".ada": "ada", ".adb": "ada", ".ads": "ada",
+    ".f": "fortran", ".f77": "fortran", ".f90": "fortran", ".f95": "fortran",
+    ".for": "fortran",
+    ".rake": "ruby", ".gemspec": "ruby", ".erb": "ruby",
+    ".pm": "perl", ".t": "perl", ".phtml": "php", ".php5": "php",
+    ".hrl": "erlang", ".cljs": "clojure", ".cljc": "clojure", ".lhs": "haskell",
+    ".ml": "ocaml", ".mli": "ocaml", ".lisp": "lisp", ".el": "lisp",
+    ".scm": "scheme", ".ss": "scheme", ".nim": "nim", ".zig": "zig",
+    ".tcl": "tcl", ".mat": "matlab", ".sol": "solidity",
+    ".ksh": "shell", ".csh": "shell", ".psm1": "powershell", ".psd1": "powershell",
+    ".cmd": "batch", ".jsonc": "json", ".wsdl": "xml", ".tfvars": "terraform",
 }
 
 #: Basenames sem extensão útil.
@@ -119,6 +151,40 @@ class ExtractionResult:
     def complete_languages(self) -> list[str]:
         """Linguagens com todos os arquivos parseados por parser da gramática."""
         return sorted(lang for lang, cov in self.coverage.items() if cov.complete)
+
+    @property
+    def files_without_adapter(self) -> dict[str, tuple[str, ...]]:
+        """`{linguagem: caminhos}` dos arquivos que NENHUM adaptador reivindicou.
+
+        É a mesma informação do `Diagnostic('no_adapter')`, mas em estrutura
+        consultável: quem planeja (`investigation.plan`) precisa da lista de
+        caminhos por linguagem para abrir objetivo de descoberta, e ler isso de
+        volta do texto de um diagnóstico seria parsing de mensagem.
+        """
+        return {
+            lang: tuple(self.files_by_language.get(lang, ()))
+            for lang in self.languages_without_adapter
+        }
+
+    @property
+    def files_without_symbols(self) -> tuple[str, ...]:
+        """Arquivos que TÊM adaptador e mesmo assim não produziram símbolo algum.
+
+        Extração vazia não é cobertura: o arquivo foi lido por um parser que
+        não achou nada nomeável (ou achou só o que não vira `Symbol`). Sem esta
+        lista, esses arquivos ficariam indistinguíveis dos que foram de fato
+        descritos — que é como um arquivo desaparece do conhecimento sem
+        ninguém notar (§6.1.3).
+        """
+        with_symbols = {s.path for s in self.symbols}
+        out: set[str] = set()
+        for lang, cov in self.coverage.items():
+            if not cov.extractor:
+                continue
+            for path in self.files_by_language.get(lang, ()):
+                if path not in with_symbols:
+                    out.add(path)
+        return tuple(sorted(out))
 
     @property
     def resolved_references(self) -> list[Reference]:
@@ -181,6 +247,10 @@ class ExtractionResult:
                 for d in self.diagnostics
             ],
             "coverage": self.coverage_table(),
+            "files_without_adapter": {
+                lang: list(paths) for lang, paths in sorted(self.files_without_adapter.items())
+            },
+            "files_without_symbols": list(self.files_without_symbols),
         }
 
 

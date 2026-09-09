@@ -10,6 +10,8 @@ frase que o promete:
 | Regra do plano | Onde é aplicada |
 |---|---|
 | Objetivo por capacidade/entrada, nunca por documento | `plan()` itera `CapabilityMap.capabilities` e os órfãos; não existe parâmetro de quantidade nem de tipo de documento |
+| Análise não depende de haver extrator para a linguagem | `plan()` abre `ObjectiveKind.DISCOVERY` com `ReadingTrigger.SOURCE_FILE` para todo arquivo de código do inventário que nenhuma obrigação alcançou; `plan_coverage()` mede e `assert_plan_accounted(inventory=...)` recusa arquivo sem objetivo |
+| Teto de pacote particiona, não descarta | `_apply_budget()` com `defer_sink` manda o excedente para objetivo de descoberta; `reading_needs_dropped` só sobra para obrigação sem arquivo citável |
 | Chamada não resolvida vira lacuna rastreável | `_needs_from_gaps()` gera `ReadingNeed(trigger=UNRESOLVED_CALL)` com a `EvidenceRef` do sítio |
 | `not_applicable` exige justificativa ligada ao código | `FailureEdgeMatrix.mark()` levanta `MatrixJustificationRequired`; sem marcação a célula permanece `unresolved` por padrão |
 | `partial` não vira `complete` por decreto | `InvestigationObjective.set_state()` levanta `ConclusionRejected` enquanto houver obrigação aberta |
@@ -29,6 +31,8 @@ from __future__ import annotations
 import builtins as _py_builtins
 import datetime as _dt
 import enum
+import hashlib
+import os
 from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -47,12 +51,19 @@ from .capabilities import (
 )
 from .extractors.registry import ExtractionResult
 from .inventory import FileClass, Inventory
-from .profile import DEFAULT_PROFILE, AnalysisProfile, ProfileError
+from .profile import (
+    DEFAULT_PROFILE,
+    DISCOVERY_MAX_FILES_PER_OBJECTIVE,
+    AnalysisProfile,
+    ProfileError,
+)
 from .snapshot import Snapshot
 
 __all__ = [
+    "ANALYSIS_DIRECTIVES",
     "CONTRACT_FIELDS",
     "CONTRACT_LABELS",
+    "DISCOVERY_DIRECTIVES",
     "FAILURE_FAMILIES",
     "ClosureReason",
     "ClosureRecord",
@@ -81,6 +92,7 @@ __all__ = [
     "objectives_to_dict",
     "plan",
     "plan_accounting",
+    "plan_coverage",
 ]
 
 
@@ -162,6 +174,47 @@ CONTRACT_LABELS: Mapping[str, str] = {
     "lacunas": "Pontos não resolvidos e consequências para consumidores",
 }
 
+#: Instruções que viajam DENTRO do objetivo serializado
+#: (`InvestigationObjective.analysis_directives` -> `to_dict()`), para os TRÊS
+#: tipos de objetivo. Não é documentação: é o campo que o runtime coloca no
+#: envelope do pacote, e é sobre ele que o teste de contrato afirma. O ponto
+#: das três primeiras linhas é fechar a porta que faz uma análise parecer
+#: completa sem ser: descrever só o que o código declara, e aceitar prosa
+#: (README, comentário, docstring) como se fosse comportamento.
+ANALYSIS_DIRECTIVES: tuple[str, ...] = (
+    "Capture TODAS as regras de negócio, invariantes, pré-condições e pós-condições, "
+    "edge cases e comportamentos implícitos observáveis no código — inclusive os que "
+    "não estão declarados em lugar nenhum e só existem no fluxo de execução.",
+    "Cada afirmação exige evidência de CÓDIGO EXECUTÁVEL citada por path + faixa de "
+    "linhas. Afirmação sem evidência é lacuna registrada, nunca conteúdo.",
+    "README, comentários, docstrings e qualquer texto em prosa NÃO são evidência e não "
+    "podem ser usados como fonte: descrevem intenção declarada, não o comportamento "
+    "implementado — quando divergirem do código, o código é a verdade e a divergência "
+    "é um achado.",
+    "Os 13 campos do contrato §6.3 terminam explicados com evidência, excluídos com "
+    "motivo ou não resolvidos com impacto. Nenhum campo fica em branco.",
+    "A matriz de falhas e edge cases §6.5 é preenchida célula a célula: 'covered' e "
+    "'not_applicable' exigem justificativa ligada ao código; sem evidência a célula "
+    "permanece 'unresolved' — ausência de evidência nunca vira cobertura.",
+)
+
+#: Acrescentadas SÓ ao objetivo de descoberta: não houve extração estrutural
+#: para estes arquivos, então o que substitui símbolos e arestas é a leitura
+#: integral do fonte pelo próprio modelo.
+DISCOVERY_DIRECTIVES: tuple[str, ...] = (
+    "Objetivo de DESCOBERTA: não existe extração estrutural para estes arquivos. Leia "
+    "o fonte INTEIRO de cada arquivo listado nas obrigações de leitura antes de "
+    "afirmar qualquer coisa sobre o módulo.",
+    "Mapeie para este módulo, com path + linhas em cada item: capacidades e o que cada "
+    "uma faz; pontos de entrada (rota, job, fila, CLI, batch, transação); regras de "
+    "negócio e a ordem em que se aplicam; integrações externas e o contrato consumido; "
+    "persistência (o que é lido/escrito, quando e sob qual transação); e o que acontece "
+    "em cada falha, inclusive com efeito já executado.",
+    "A ausência de extrator para a linguagem é limitação da ferramenta, não do escopo: "
+    "o módulo é descrito lendo o código, no mesmo contrato de 13 campos e na mesma "
+    "matriz §6.5 dos demais objetivos.",
+)
+
 #: §6.5 — famílias e itens da matriz de falhas e edge cases.
 FAILURE_FAMILIES: Mapping[str, tuple[str, ...]] = {
     "entrada": (
@@ -222,11 +275,16 @@ class ClosureReason(str, enum.Enum):
 
 
 class ObjectiveKind(str, enum.Enum):
-    """Origem do objetivo. Ambos são "por capacidade/entrada"; nenhum é por documento."""
+    """Origem do objetivo. Nenhum é por documento."""
 
     CAPABILITY = "capability"
     #: §6.1.8 — símbolo público que nenhuma entrada alcança também abre tarefa.
     ORPHAN_GROUP = "orphan_group"
+    #: Arquivo de código do inventário que a extração estrutural NÃO cobriu:
+    #: linguagem sem adaptador, extração vazia, ou arquivo que nenhuma
+    #: capacidade/órfão alcançou. O objetivo existe para que a análise não
+    #: dependa de haver extrator — o modelo lê o fonte direto.
+    DISCOVERY = "discovery"
 
 
 class ReadingKind(str, enum.Enum):
@@ -246,6 +304,8 @@ class ReadingTrigger(str, enum.Enum):
     EXTERNAL_INTEGRATION = "external_integration"
     CONFIGURATION = "configuration"
     LINKED_TEST = "linked_test"
+    #: Arquivo de código inteiro, quando não há extração que o descreva.
+    SOURCE_FILE = "source_file"
 
 
 class MatrixState(str, enum.Enum):
@@ -260,6 +320,9 @@ class MatrixState(str, enum.Enum):
 #: primeiro porque são o que impede afirmar comportamento; predicado de corpo
 #: vem por último porque é o mais volumoso.
 _TRIGGER_PRIORITY: Mapping[ReadingTrigger, int] = {
+    #: Prioridade MÁXIMA: enquanto o fonte não foi lido não existe nem
+    #: símbolo nem aresta sobre a qual priorizar qualquer outra coisa.
+    ReadingTrigger.SOURCE_FILE: 5,
     ReadingTrigger.UNRESOLVED_CALL: 10,
     ReadingTrigger.EFFECT: 15,
     ReadingTrigger.EXTERNAL_INTEGRATION: 20,
@@ -880,6 +943,12 @@ class InvestigationObjective:
     closure: ClosureRecord | None = None
     accounting: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    #: Instruções de análise que o runtime entrega ao modelo junto do objetivo.
+    #: Default = `ANALYSIS_DIRECTIVES` para os TRÊS tipos: um objetivo sem
+    #: diretiva nenhuma seria um objetivo que aceita prosa como evidência.
+    analysis_directives: list[str] = field(
+        default_factory=lambda: list(ANALYSIS_DIRECTIVES)
+    )
 
     def __post_init__(self) -> None:
         self.kind = ObjectiveKind(self.kind)
@@ -1035,6 +1104,7 @@ class InvestigationObjective:
             "closure": self.closure.to_dict() if self.closure else None,
             "accounting": dict(self.accounting),
             "notes": list(self.notes),
+            "analysis_directives": list(self.analysis_directives),
         }
 
     @classmethod
@@ -1070,6 +1140,9 @@ class InvestigationObjective:
             closure=ClosureRecord.from_dict(closure) if closure else None,
             accounting=dict(data.get("accounting", {})),
             notes=list(data.get("notes", ())),
+            analysis_directives=[
+                str(d) for d in data.get("analysis_directives", ANALYSIS_DIRECTIVES)
+            ],
         )
 
 
@@ -1251,6 +1324,130 @@ def _objective_id_for_orphans(module: str) -> str:
     return "obj_" + fingerprint(["orphans", module])[:24]
 
 
+def _objective_id_for_discovery(module: str) -> str:
+    return "obj_" + fingerprint(["discovery", module])[:24]
+
+
+def _need_path(need: ReadingNeed) -> str:
+    """Arquivo que esta obrigação faz alguém ler, ou `""` quando não há um.
+
+    É o que liga obrigação a ARQUIVO — a unidade em que `plan_coverage()`
+    responde "sobrou algum arquivo de código que ninguém vai ler?".
+    """
+    ev = need.evidence
+    if ev is not None and getattr(ev, "path", ""):
+        return str(ev.path)
+    return ""
+
+
+def _apply_budget(
+    needs: list[ReadingNeed],
+    max_reading_needs: int | None,
+    defer_sink: list[ReadingNeed] | None,
+) -> tuple[list[ReadingNeed], int, int]:
+    """Ordena e aplica o orçamento. Devolve `(mantidas, descartadas, diferidas)`.
+
+    Com `defer_sink` (isto é: há inventário, logo há para onde diferir), o que
+    não coube NÃO é descartado — a obrigação sai deste pacote e o arquivo dela
+    volta obrigatoriamente por um objetivo de descoberta, porque
+    `plan()` calcula a cobertura a partir das obrigações que SOBRARAM. Só
+    obrigação sem arquivo citável (contrato de dependência externa, por
+    exemplo) continua sendo descarte, e descarte continua impedindo `complete`.
+    """
+    needs.sort(key=lambda n: (n.priority, n.target))
+    if max_reading_needs is None or len(needs) <= max_reading_needs:
+        return needs, 0, 0
+    kept = needs[:max_reading_needs]
+    cut = needs[max_reading_needs:]
+    if defer_sink is None:
+        return kept, len(cut), 0
+    deferred = [n for n in cut if _need_path(n)]
+    dropped = [n for n in cut if not _need_path(n)]
+    defer_sink.extend(deferred)
+    return kept, len(dropped), len(deferred)
+
+
+def _discovery_module(path: str) -> str:
+    """Módulo de agrupamento de um arquivo sem extração.
+
+    `Inventory` não tem noção de módulo (só `path`), e a noção de
+    `capabilities` depende de um `Symbol` de kind `module` — que por definição
+    não existe aqui. Sobra o diretório de 1º/2º nível, que é determinístico e
+    não depende de nenhum extrator.
+    """
+    dirs = path.split("/")[:-1]
+    if not dirs:
+        return "(raiz)"
+    return "/".join(dirs[:2])
+
+
+def _discovery_groups(
+    paths: Sequence[str], limit: int
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Agrupa por módulo e PARTICIONA pelo teto — nunca corta fora.
+
+    O rótulo do primeiro pedaço é o módulo puro, então um módulo que cabe
+    inteiro tem exatamente o id histórico `fingerprint(["discovery", modulo])`;
+    pedaços seguintes ganham sufixo `#2`, `#3`… e portanto ids próprios e
+    estáveis.
+    """
+    limit = max(1, int(limit))
+    by_module: dict[str, list[str]] = {}
+    for path in sorted(set(paths)):
+        by_module.setdefault(_discovery_module(path), []).append(path)
+    groups: list[tuple[str, tuple[str, ...]]] = []
+    for module in sorted(by_module):
+        files = by_module[module]
+        for start in range(0, len(files), limit):
+            chunk = tuple(files[start:start + limit])
+            index = start // limit
+            groups.append((module if index == 0 else f"{module}#{index + 1}", chunk))
+    return groups
+
+
+def _line_counts(snapshot: Snapshot | None, paths: Sequence[str]) -> dict[str, int]:
+    """`{path: total_de_linhas}` para os arquivos que o snapshot ainda sustenta.
+
+    Confere o hash contra o capturado pelo mesmo motivo de
+    `snapshot.resolve_evidence`: citar "arquivo inteiro, linhas 1..N" de um
+    arquivo que mudou sob a análise seria evidência errada. Path ausente do
+    resultado significa faixa não resolvida — a obrigação continua existindo,
+    sem faixa e sem evidência, e diz isso no motivo.
+    """
+    out: dict[str, int] = {}
+    if snapshot is None:
+        return out
+    file_map = snapshot.file_map()
+    for path in paths:
+        entry = file_map.get(path)
+        if entry is None or entry.sha256 is None:
+            continue
+        full = os.path.join(snapshot.repo, *path.split("/"))
+        try:
+            with open(full, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        if hashlib.sha256(raw).hexdigest() != entry.sha256:
+            continue
+        total = len(raw.decode("utf-8", errors="replace").splitlines())
+        if total >= 1:
+            out[path] = total
+    return out
+
+
+def _inventory_code_files(inventory: Inventory) -> tuple[str, ...]:
+    """Arquivos de CÓDIGO do inventário — o denominador de `plan_coverage()`.
+
+    `FileClass.CODE` cobre toda linguagem, com adaptador ou sem
+    (`inventory._LANGUAGE_BY_EXT` mapeia COBOL, JCL, PL/I, Assembler, dialetos
+    Sybase, Delphi, ABAP… e o piso `Language.UNKNOWN` para texto não mapeado).
+    """
+    return tuple(
+        sorted(f.path for f in inventory.files if f.file_class is FileClass.CODE)
+    )
+
+
 def _profile_source(profile: AnalysisProfile | None) -> str:
     """Rótulo de proveniência que vai para dentro do payload (motivo/justificativa)."""
     if profile is None or not profile.source:
@@ -1309,12 +1506,26 @@ def plan(
     max_reading_needs: int | None = None,
     profile: AnalysisProfile | None = None,
 ) -> list[InvestigationObjective]:
-    """Gera um objetivo por capacidade e um por grupo de símbolos órfãos.
+    """Gera um objetivo por capacidade, um por grupo de órfãos e um por módulo
+    de código que a extração não cobriu.
 
     Nunca por documento: não há parâmetro de tipo de documento, de quantidade
-    nem de granularidade editorial. O denominador é o `CapabilityMap`, e
-    `assert_plan_accounted()` confere que nenhuma capacidade e nenhum órfão
-    ficou sem objetivo.
+    nem de granularidade editorial. O denominador é duplo e ambos são
+    conferidos por `assert_plan_accounted()`: o `CapabilityMap` (nenhuma
+    capacidade e nenhum órfão sem objetivo) e, quando `inventory` é passado, o
+    conjunto de arquivos `FileClass.CODE` (nenhum arquivo de código sem
+    obrigação de leitura em objetivo nenhum).
+
+    O segundo denominador é o que faz a análise valer para QUALQUER linguagem.
+    Capacidade e órfão nascem de extratores; um repositório Go, COBOL, Delphi
+    ou Sybase não tem extrator e antes produzia plano VAZIO — `succeeded` com
+    zero objetivos e zero pendências, porque o modelo nunca era consultado.
+    Agora o que sobra vira `ObjectiveKind.DISCOVERY`: cada arquivo entra como
+    obrigação `ReadingTrigger.SOURCE_FILE` sobre a faixa 1..N inteira, e o
+    contrato de 13 campos e a matriz §6.5 são exatamente os mesmos.
+
+    `inventory=None` desliga a descoberta e restaura o comportamento
+    histórico byte a byte — é o que os testes de compatibilidade fixam.
 
     `profile` liga as alavancas por sistema, todas com o comportamento
     histórico preservado quando ele é `None` ou `DEFAULT_PROFILE`:
@@ -1327,13 +1538,17 @@ def plan(
     | `failure_families_extra` | famílias novas entram `unresolved` (obrigação nova, não cobertura) |
     | `trigger_priority` | reordena o despacho POR CHAMADA; `_TRIGGER_PRIORITY` não é mutado |
     | `max_reading_needs` | usado quando o parâmetro homônimo é `None` |
+    | `discovery_max_files_per_objective` | teto de arquivos por objetivo de descoberta; PARTICIONA em `modulo`, `modulo#2`, … (default `DISCOVERY_MAX_FILES_PER_OBJECTIVE`) |
 
     `max_reading_needs` é orçamento de pacote (§7.3.1) e **não** filtro de
     escopo. Por isso o padrão é `None` (sem corte): o orçamento é decisão do
     runtime que despacha, não do planejamento — planejar já cortando esconderia
-    escopo antes de alguém decidir sobre ele. Quando um teto é passado, o que
-    ficou de fora é contado em `accounting["reading_needs_dropped"]`, entra em
-    `notes` e passa a impedir `complete` (ver `unmet_obligations`).
+    escopo antes de alguém decidir sobre ele. Com `inventory`, o que não cabe é
+    DIFERIDO (`accounting["reading_needs_deferred"]`) e volta pelo objetivo de
+    descoberta do módulo, então nenhum arquivo sai do plano por orçamento. Sem
+    `inventory` não há para onde diferir: o excedente continua sendo
+    `accounting["reading_needs_dropped"]`, entra em `notes` e impede `complete`
+    (ver `unmet_obligations`) — igual a antes.
     """
     if profile is not None and not isinstance(profile, AnalysisProfile):
         raise ProfileError(
@@ -1356,46 +1571,315 @@ def plan(
         if ref.resolved and ref.target and ref.path in test_paths:
             tests_by_target.setdefault(ref.target, []).append(ref)
 
-    for cap in capability_map.capabilities:
-        if profile is not None and not profile.selects_objective(
-            objective_id=_objective_id_for_capability(cap.capability_id),
-            capability_id=cap.capability_id,
-            name=cap.name,
-        ):
-            continue
-        objectives.append(
-            _objective_for_capability(
-                cap,
-                snapshot=snapshot,
-                symbols_by_qual=symbols_by_qual,
-                config_by_path=config_by_path,
-                tests_by_target=tests_by_target,
-                max_reading_needs=max_reading_needs,
-                profile=profile,
-                priorities=priorities,
-            )
+    # Descoberta só é possível com inventário (é dele que sai o denominador
+    # de arquivos). Sem inventário, `defer_sink=None` e o orçamento volta a
+    # DESCARTAR como sempre descartou — o caminho histórico, byte a byte.
+    discovery_enabled = inventory is not None
+    deferred_needs: list[ReadingNeed] | None = [] if discovery_enabled else None
+
+    # Os objetivos de capacidade/órfão são construídos SEM o filtro e só
+    # depois filtrados. É o que impede o filtro `objectives` de virar fábrica
+    # de descoberta: um arquivo já descrito por uma capacidade suprimida
+    # continua "coberto por capacidade", não vira objetivo novo.
+    capability_objectives = [
+        _objective_for_capability(
+            cap,
+            snapshot=snapshot,
+            symbols_by_qual=symbols_by_qual,
+            config_by_path=config_by_path,
+            tests_by_target=tests_by_target,
+            max_reading_needs=max_reading_needs,
+            profile=profile,
+            priorities=priorities,
+            defer_sink=deferred_needs,
         )
+        for cap in capability_map.capabilities
+    ]
 
     by_module: dict[str, list[OrphanSymbol]] = {}
     for orphan in capability_map.orphans:
         by_module.setdefault(orphan.module or orphan.path, []).append(orphan)
-    for module in sorted(by_module):
+    orphan_objectives = [
+        _objective_for_orphans(
+            module,
+            by_module[module],
+            max_reading_needs=max_reading_needs,
+            profile=profile,
+            priorities=priorities,
+            defer_sink=deferred_needs,
+        )
+        for module in sorted(by_module)
+    ]
+
+    for obj, cap in zip(capability_objectives, capability_map.capabilities):
         if profile is not None and not profile.selects_objective(
-            objective_id=_objective_id_for_orphans(module),
-            capability_id="",
-            name=f"orfaos@{module}",
+            objective_id=obj.objective_id,
+            capability_id=cap.capability_id,
+            name=cap.name,
         ):
             continue
-        objectives.append(
-            _objective_for_orphans(
+        objectives.append(obj)
+    for obj in orphan_objectives:
+        if profile is not None and not profile.selects_objective(
+            objective_id=obj.objective_id, capability_id="", name=obj.name
+        ):
+            continue
+        objectives.append(obj)
+
+    if not discovery_enabled:
+        return objectives
+
+    objectives.extend(
+        _discovery_objectives(
+            capability_objectives + orphan_objectives,
+            deferred_needs or [],
+            extraction,
+            inventory,
+            snapshot=snapshot,
+            max_reading_needs=max_reading_needs,
+            profile=profile,
+            priorities=priorities,
+        )
+    )
+    return objectives
+
+
+def _discovery_objectives(
+    prior_objectives: Sequence[InvestigationObjective],
+    deferred_needs: Sequence[ReadingNeed],
+    extraction: ExtractionResult,
+    inventory: Inventory,
+    *,
+    snapshot: Snapshot | None,
+    max_reading_needs: int | None,
+    profile: AnalysisProfile | None,
+    priorities: Mapping[ReadingTrigger, int],
+) -> list[InvestigationObjective]:
+    """Um objetivo por módulo para TODO arquivo de código que sobrou.
+
+    "Sobrou" tem definição única e verificável: arquivo `FileClass.CODE` do
+    inventário que não aparece em nenhuma obrigação de leitura dos objetivos de
+    capacidade/órfão. Isso engloba, sem precisar de três caminhos diferentes:
+    linguagem sem adaptador, extração vazia, arquivo extraído que nenhuma
+    entrada alcança, e obrigação diferida por orçamento. O motivo de cada
+    arquivo é registrado individualmente na obrigação de leitura.
+    """
+    covered: set[str] = set()
+    for obj in prior_objectives:
+        for need in obj.reading_needs:
+            path = _need_path(need)
+            if path:
+                covered.add(path)
+    forced = {p for p in (_need_path(n) for n in deferred_needs) if p}
+    code_files = _inventory_code_files(inventory)
+    uncovered = [p for p in code_files if p not in covered or p in forced]
+    if not uncovered:
+        return []
+
+    without_adapter: dict[str, str] = {}
+    for lang, paths in extraction.files_without_adapter.items():
+        for path in paths:
+            without_adapter[path] = lang
+    without_symbols = set(extraction.files_without_symbols)
+    language_of = {
+        f.path: (f.language.value if f.language is not None else "")
+        for f in inventory.files
+    }
+
+    imports_by_path: dict[str, list[Any]] = {}
+    for ref in extraction.references:
+        if ref.kind == "import":
+            imports_by_path.setdefault(ref.path, []).append(ref)
+
+    limit = DISCOVERY_MAX_FILES_PER_OBJECTIVE
+    if profile is not None and profile.discovery_max_files_per_objective is not None:
+        limit = profile.discovery_max_files_per_objective
+    if max_reading_needs is not None:
+        # Teto de pacote também PARTICIONA aqui: um objetivo de descoberta
+        # nunca sai com obrigação a menos do que os arquivos que declara.
+        limit = max(1, min(limit, max_reading_needs))
+
+    line_counts = _line_counts(snapshot, uncovered)
+    out: list[InvestigationObjective] = []
+    for module, files in _discovery_groups(uncovered, limit):
+        objective_id = _objective_id_for_discovery(module)
+        name = f"discovery@{module}"
+        if profile is not None and not profile.selects_objective(
+            objective_id=objective_id, capability_id="", name=name
+        ):
+            continue
+        out.append(
+            _objective_for_discovery(
                 module,
-                by_module[module],
-                max_reading_needs=max_reading_needs,
+                files,
+                snapshot=snapshot,
+                line_counts=line_counts,
+                without_adapter=without_adapter,
+                without_symbols=without_symbols,
+                language_of=language_of,
+                imports_by_path=imports_by_path,
                 profile=profile,
                 priorities=priorities,
             )
         )
-    return objectives
+    return out
+
+
+def _discovery_reason(
+    path: str,
+    without_adapter: Mapping[str, str],
+    without_symbols: set[str],
+    language_of: Mapping[str, str],
+) -> tuple[str, str]:
+    """`(chave_de_contagem, razão)` — a razão executável que vai na obrigação."""
+    lang = without_adapter.get(path) or language_of.get(path) or "desconhecida"
+    if path in without_adapter:
+        return (
+            "files_without_extractor",
+            f"linguagem {lang} sem extrator — leitura direta",
+        )
+    if path in without_symbols:
+        return ("files_without_symbols", "arquivo sem símbolos extraídos")
+    return (
+        "files_not_reached",
+        f"arquivo de linguagem {lang} extraído, porém não alcançado por nenhuma "
+        "capacidade nem grupo de órfãos — leitura direta",
+    )
+
+
+def _objective_for_discovery(
+    module: str,
+    files: Sequence[str],
+    *,
+    snapshot: Snapshot | None,
+    line_counts: Mapping[str, int],
+    without_adapter: Mapping[str, str],
+    without_symbols: set[str],
+    language_of: Mapping[str, str],
+    imports_by_path: Mapping[str, Sequence[Any]],
+    profile: AnalysisProfile | None = None,
+    priorities: Mapping[ReadingTrigger, int] = _TRIGGER_PRIORITY,
+) -> InvestigationObjective:
+    """Objetivo de descoberta: o arquivo INTEIRO vira obrigação de leitura."""
+    prefix = f"discovery:{module}"
+    needs: list[ReadingNeed] = []
+    evidence_refs: list[EvidenceRef] = []
+    counts = {
+        "files_without_extractor": 0,
+        "files_without_symbols": 0,
+        "files_not_reached": 0,
+    }
+    for path in files:
+        key, razao = _discovery_reason(path, without_adapter, without_symbols, language_of)
+        counts[key] += 1
+        total = int(line_counts.get(path, 0))
+        if total >= 1:
+            target = f"{path}:1-{total}"
+            faixa = f"linhas 1..{total}"
+            evidence = evidence_ref_for(
+                snapshot, path, 1, total, role="source_file", symbol=path
+            )
+            evidence_refs.append(evidence)
+        else:
+            target = path
+            faixa = (
+                "faixa integral NÃO resolvida nesta execução (arquivo ausente do "
+                "snapshot, alterado sob a análise ou vazio): leia o arquivo inteiro"
+            )
+            evidence = None
+        needs.append(
+            _need(
+                prefix,
+                ReadingKind.RANGE,
+                target,
+                (
+                    f"{razao}: ler {path} por inteiro ({faixa}). Extrair deste fonte as "
+                    "capacidades, os pontos de entrada, as regras de negócio e a ordem em "
+                    "que se aplicam, as integrações e seus contratos, a persistência e o "
+                    "comportamento em falha — cada item citando path + linhas do próprio "
+                    "código. Comentário e docstring do arquivo não sustentam nenhuma "
+                    "dessas afirmações"
+                ),
+                ReadingTrigger.SOURCE_FILE,
+                evidence,
+                priorities,
+            )
+        )
+
+    needs, dropped, deferred = _apply_budget(needs, None, None)
+
+    obj = InvestigationObjective(
+        objective_id=_objective_id_for_discovery(module),
+        matrix=_matrix_for(profile),
+        kind=ObjectiveKind.DISCOVERY,
+        capability_id="",
+        name=f"discovery@{module}",
+        symbols=(),
+        evidence_refs=evidence_refs,
+        reading_needs=needs,
+        accounting={
+            "discovery_files": len(files),
+            "reading_needs": len(needs),
+            "reading_needs_dropped": dropped,
+            "reading_needs_deferred": deferred,
+            **counts,
+        },
+        analysis_directives=list(ANALYSIS_DIRECTIVES) + list(DISCOVERY_DIRECTIVES),
+    )
+    obj.notes.append(
+        f"{len(files)} arquivo(s) de código do módulo {module} sem cobertura estrutural: "
+        f"{counts['files_without_extractor']} sem extrator para a linguagem, "
+        f"{counts['files_without_symbols']} extraído(s) sem nenhum símbolo, "
+        f"{counts['files_not_reached']} extraído(s) e não alcançado(s) por capacidade/órfão. "
+        "A leitura do fonte pelo próprio modelo SUBSTITUI a extração aqui: não há símbolo, "
+        "aresta nem entrada pré-computados para este módulo"
+    )
+    if evidence_refs:
+        obj.field("identidade").fill(
+            (
+                f"Módulo (diretório) {module}, {len(files)} arquivo(s): "
+                + ", ".join(files[:8])
+                + (" …" if len(files) > 8 else "")
+                + ". Agrupamento: diretório do inventário (não há símbolo de módulo "
+                "extraído para estes arquivos). Nome de NEGÓCIO e nome técnico do "
+                "componente exigem a leitura do fonte."
+            ),
+            evidence_refs,
+        )
+    else:
+        obj.field("identidade").unresolve(
+            f"nenhum dos {len(files)} arquivo(s) de {module} pôde ser citado com "
+            "localizador nesta execução: sem citação, nem a identidade técnica do módulo "
+            "é afirmável"
+        )
+
+    import_refs = [r for path in files for r in imports_by_path.get(path, ())]
+    import_evidence = [
+        evidence_ref_for(
+            snapshot, r.path, r.line, r.line_end or r.line, role="import", symbol=r.to_name
+        )
+        for r in import_refs[:20]
+    ]
+    if import_refs and import_evidence:
+        modules = sorted({r.to_name for r in import_refs})
+        obj.field("dependencias").fill(
+            f"{len(import_refs)} import(s) extraído(s) nestes arquivos: "
+            + ", ".join(modules[:10])
+            + (" …" if len(modules) > 10 else "")
+            + ". O que cada dependência entrega (operação, contrato, timeout, retry, "
+            "fallback, idempotência) exige leitura do ponto de uso.",
+            import_evidence,
+        )
+    else:
+        langs = sorted({without_adapter.get(f) or language_of.get(f, "") for f in files} - {""})
+        obj.field("dependencias").unresolve(
+            "nenhum import pôde ser extraído destes arquivos "
+            f"(linguagem(ns): {', '.join(langs) or 'desconhecida'}): as dependências deste "
+            "módulo são desconhecidas até que o fonte seja lido, e qualquer afirmação sobre "
+            "o que ele consome carece de evidência"
+        )
+    _apply_contract_exclusions(obj, profile)
+    return obj
 
 
 def _objective_for_capability(
@@ -1408,6 +1892,7 @@ def _objective_for_capability(
     max_reading_needs: int | None,
     profile: AnalysisProfile | None = None,
     priorities: Mapping[ReadingTrigger, int] = _TRIGGER_PRIORITY,
+    defer_sink: list[ReadingNeed] | None = None,
 ) -> InvestigationObjective:
     prefix = cap.capability_id
     needs, excluded_gaps = _needs_from_gaps(prefix, cap.gaps, priorities)
@@ -1524,12 +2009,10 @@ def _objective_for_capability(
                 )
             )
 
-    # Orçamento de pacote: corte é contado e passa a impedir `complete`.
-    needs.sort(key=lambda n: (n.priority, n.target))
-    dropped = 0
-    if max_reading_needs is not None and len(needs) > max_reading_needs:
-        dropped = len(needs) - max_reading_needs
-        needs = needs[:max_reading_needs]
+    # Orçamento de pacote. Com `defer_sink` (há inventário), o que não coube é
+    # DIFERIDO para objetivo de descoberta e não impede `complete`; sem ele, o
+    # corte continua sendo descarte contado e bloqueante.
+    needs, dropped, deferred = _apply_budget(needs, max_reading_needs, defer_sink)
 
     objective_id = _objective_id_for_capability(cap.capability_id)
     obj = InvestigationObjective(
@@ -1550,6 +2033,7 @@ def _objective_for_capability(
             "external_dependencies": len(cap.external_dependencies),
             "reading_needs": len(needs),
             "reading_needs_dropped": dropped,
+            "reading_needs_deferred": deferred,
         },
         notes=list(cap.notes),
     )
@@ -1558,6 +2042,13 @@ def _objective_for_capability(
             f"{dropped} obrigação(ões) de leitura acima do orçamento de {max_reading_needs} "
             "não entraram no pacote; enquanto isso não for revisto o objetivo não pode ser "
             "declarado complete"
+        )
+    if deferred:
+        obj.notes.append(
+            f"{deferred} obrigação(ões) de leitura acima do orçamento de "
+            f"{max_reading_needs} foram DIFERIDAS: os arquivos delas voltam ao plano em "
+            "objetivo(s) de descoberta, então nenhum arquivo saiu do escopo — teto de "
+            "pacote particiona, não descarta"
         )
     if excluded_gaps:
         obj.notes.append(
@@ -1675,6 +2166,7 @@ def _objective_for_orphans(
     max_reading_needs: int | None,
     profile: AnalysisProfile | None = None,
     priorities: Mapping[ReadingTrigger, int] = _TRIGGER_PRIORITY,
+    defer_sink: list[ReadingNeed] | None = None,
 ) -> InvestigationObjective:
     """§6.1.8 — símbolo público não alcançado também abre tarefa de investigação."""
     prefix = f"orphans:{module}"
@@ -1694,11 +2186,7 @@ def _objective_for_orphans(
         )
         for o in orphans
     ]
-    needs.sort(key=lambda n: (n.priority, n.target))
-    dropped = 0
-    if max_reading_needs is not None and len(needs) > max_reading_needs:
-        dropped = len(needs) - max_reading_needs
-        needs = needs[:max_reading_needs]
+    needs, dropped, deferred = _apply_budget(needs, max_reading_needs, defer_sink)
 
     obj = InvestigationObjective(
         objective_id=_objective_id_for_orphans(module),
@@ -1713,8 +2201,15 @@ def _objective_for_orphans(
             "orphan_symbols": len(orphans),
             "reading_needs": len(needs),
             "reading_needs_dropped": dropped,
+            "reading_needs_deferred": deferred,
         },
     )
+    if deferred:
+        obj.notes.append(
+            f"{deferred} obrigação(ões) de leitura acima do orçamento de "
+            f"{max_reading_needs} foram DIFERIDAS para objetivo(s) de descoberta: teto de "
+            "pacote particiona, não descarta"
+        )
     ev = obj.evidence_refs
     if ev:
         obj.field("identidade").fill(
@@ -1775,19 +2270,51 @@ def _selected_orphans(
     return out
 
 
+def plan_coverage(
+    objectives: Sequence[InvestigationObjective],
+    inventory: Inventory,
+) -> dict[str, Any]:
+    """Invariante de cobertura POR ARQUIVO: `{files_total, files_covered,
+    files_uncovered}`.
+
+    Um arquivo está coberto quando alguma obrigação de leitura de algum
+    objetivo aponta para ele. É a única definição usada em todo o módulo, e é
+    ela que `plan()` fecha por construção: o que sobra depois dos objetivos de
+    capacidade/órfão vira objetivo de DESCOBERTA. Objetivo de capacidade
+    acelera e permite verificação mecânica, mas nunca limita o que é lido —
+    quando ele não alcança um arquivo, o arquivo não sai do plano, muda de
+    objetivo.
+    """
+    code_files = _inventory_code_files(inventory)
+    covered: set[str] = set()
+    for obj in objectives:
+        for need in obj.reading_needs:
+            path = _need_path(need)
+            if path:
+                covered.add(path)
+    uncovered = [p for p in code_files if p not in covered]
+    return {
+        "files_total": len(code_files),
+        "files_covered": len(code_files) - len(uncovered),
+        "files_uncovered": uncovered,
+    }
+
+
 def plan_accounting(
     objectives: Sequence[InvestigationObjective],
     capability_map: CapabilityMap,
     *,
     profile: AnalysisProfile | None = None,
-) -> dict[str, int]:
+    extraction: ExtractionResult | None = None,
+    inventory: Inventory | None = None,
+) -> dict[str, Any]:
     """Denominadores do plano. Com `profile`, o que o filtro `objectives`
     suprimiu é CONTADO (`capabilities_suppressed_by_profile`,
     `orphan_symbols_suppressed_by_profile`) — filtrar escopo nunca pode
     parecer cobertura."""
     selected_caps = _selected_capabilities(capability_map, profile)
     selected_orphans = _selected_orphans(capability_map, profile)
-    return {
+    out: dict[str, Any] = {
         "capabilities": len(capability_map.capabilities),
         "capabilities_selected": len(selected_caps),
         "capabilities_suppressed_by_profile": (
@@ -1811,7 +2338,44 @@ def plan_accounting(
         ),
         "entrypoints_total": int(capability_map.totals.get("entrypoints_total", 0)),
         "entry_keys_in_objectives": sum(len(o.entry_keys) for o in objectives),
+        "discovery_objectives": sum(
+            1 for o in objectives if o.kind is ObjectiveKind.DISCOVERY
+        ),
+        "discovery_files": sum(
+            int(o.accounting.get("discovery_files", 0))
+            for o in objectives
+            if o.kind is ObjectiveKind.DISCOVERY
+        ),
+        "reading_needs_deferred": sum(
+            int(o.accounting.get("reading_needs_deferred", 0)) for o in objectives
+        ),
+        # Sem `extraction` não há como afirmar POR LINGUAGEM quantos arquivos
+        # ficaram sem adaptador; devolver 0/{} seria dizer "nenhum". Devolver
+        # o mapa vazio com a contagem ausente é o comportamento honesto: quem
+        # quer o número passa `extraction=`.
+        "files_without_extractor": (
+            {
+                lang: len(paths)
+                for lang, paths in sorted(extraction.files_without_adapter.items())
+            }
+            if extraction is not None
+            else {}
+        ),
+        "files_without_symbols": (
+            len(extraction.files_without_symbols) if extraction is not None else 0
+        ),
     }
+    if inventory is not None:
+        coverage = plan_coverage(objectives, inventory)
+        out["files_total"] = coverage["files_total"]
+        out["files_covered"] = coverage["files_covered"]
+        out["files_uncovered"] = len(coverage["files_uncovered"])
+        out["files_uncovered_suppressed_by_profile"] = (
+            len(coverage["files_uncovered"])
+            if (profile is not None and profile.objectives)
+            else 0
+        )
+    return out
 
 
 def assert_plan_accounted(
@@ -1819,6 +2383,7 @@ def assert_plan_accounted(
     capability_map: CapabilityMap,
     *,
     profile: AnalysisProfile | None = None,
+    inventory: Inventory | None = None,
 ) -> None:
     """Toda capacidade e todo órfão SELECIONADOS têm exatamente um objetivo (§6.6).
 
@@ -1854,6 +2419,30 @@ def assert_plan_accounted(
             f"{len(lost)} símbolo(s) órfão(s) sem objetivo: {lost[:3]} — símbolo público "
             "descoberto não pode desaparecer do plano (§6.1.8)"
         )
+    discovery_ids = [
+        o.objective_id for o in objectives if o.kind is ObjectiveKind.DISCOVERY
+    ]
+    if len(discovery_ids) != len(set(discovery_ids)):
+        raise PlanAccountingError(
+            "objetivo de descoberta duplicado: o mesmo módulo despachado duas vezes"
+        )
+    if inventory is None:
+        return
+    uncovered = plan_coverage(objectives, inventory)["files_uncovered"]
+    if not uncovered:
+        return
+    if profile is not None and profile.objectives:
+        # Com filtro por objetivo, o denominador é o subconjunto escolhido pelo
+        # chamador; o que ficou fora é CONTADO em `plan_accounting`
+        # (`files_uncovered_suppressed_by_profile`), nunca apresentado como
+        # coberto — mesma regra já aplicada a capacidades e órfãos.
+        return
+    raise PlanAccountingError(
+        f"{len(uncovered)} arquivo(s) de código sem NENHUMA obrigação de leitura: "
+        f"{uncovered[:3]} — todo arquivo de código do inventário termina em um objetivo "
+        "(capacidade, órfão ou descoberta); arquivo que ninguém vai ler é escopo perdido "
+        "em silêncio (§6.1.3/§6.6)"
+    )
 
 
 def objectives_to_dict(objectives: Iterable[InvestigationObjective]) -> list[dict[str, Any]]:

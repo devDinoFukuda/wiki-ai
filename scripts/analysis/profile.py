@@ -47,6 +47,7 @@ __all__ = [
     "BUDGET_KEYS",
     "CAPABILITY_KEYS",
     "DEFAULT_PROFILE",
+    "DISCOVERY_MAX_FILES_PER_OBJECTIVE",
     "POLICY_KEYS",
     "PROFILE_KEYS",
     "REPO_CONFIG_FILENAME",
@@ -66,6 +67,14 @@ class ProfileError(ValueError):
 
 
 REPO_CONFIG_FILENAME = ".wiki-ai.json"
+
+#: Teto EFETIVO de arquivos por objetivo de descoberta quando nenhuma camada
+#: declara `discovery_max_files_per_objective`. O campo do perfil é
+#: `int | None` (e não `int` com default 12) para que `None` continue
+#: significando "nenhuma camada decidiu": é o que faz `merge()` herdar o valor
+#: da camada de baixo e `to_dict()`/`is_default()` não emitirem a chave num
+#: perfil que nunca a declarou.
+DISCOVERY_MAX_FILES_PER_OBJECTIVE: int = 12
 
 #: Chaves aceitas em `budget` (orçamento de pacote do runtime).
 BUDGET_KEYS: tuple[str, ...] = (
@@ -108,6 +117,7 @@ REPO_LAYER_KEYS: frozenset[str] = frozenset(
         "failure_families_excluded",
         "failure_families_extra",
         "trigger_priority",
+        "discovery_max_files_per_objective",
     }
 )
 
@@ -405,6 +415,11 @@ class AnalysisProfile:
     failure_families_excluded: Mapping[str, str] = _EMPTY_MAP
     failure_families_extra: Mapping[str, tuple[str, ...]] = _EMPTY_MAP
     trigger_priority: Mapping[str, int] = _EMPTY_MAP
+    #: Teto de arquivos por objetivo de descoberta (`ObjectiveKind.DISCOVERY`).
+    #: `None` = nenhuma camada decidiu; `investigation.plan()` aplica
+    #: `DISCOVERY_MAX_FILES_PER_OBJECTIVE`. Mínimo aceito: 1 (0 significaria
+    #: objetivo sem arquivo nenhum, isto é, escopo apagado em silêncio).
+    discovery_max_files_per_objective: int | None = None
     extractors: tuple[str, ...] = ()
     result_extra_keys: tuple[str, ...] = ()
     source: tuple[str, ...] = ()
@@ -463,6 +478,16 @@ class AnalysisProfile:
         for scalar in ("max_reading_needs", "max_rounds"):
             if scalar in data and data[scalar] is not None:
                 kwargs[scalar] = _as_int(source, scalar, data[scalar], minimum=0)
+        if (
+            "discovery_max_files_per_objective" in data
+            and data["discovery_max_files_per_objective"] is not None
+        ):
+            kwargs["discovery_max_files_per_objective"] = _as_int(
+                source,
+                "discovery_max_files_per_objective",
+                data["discovery_max_files_per_objective"],
+                minimum=1,
+            )
         if "budget" in data:
             kwargs["budget"] = _freeze(_as_int_map(source, "budget", data["budget"], BUDGET_KEYS))
         if "policy" in data:
@@ -530,6 +555,11 @@ class AnalysisProfile:
                 {**self.failure_families_extra, **other.failure_families_extra}
             ),
             trigger_priority=_freeze({**self.trigger_priority, **other.trigger_priority}),
+            discovery_max_files_per_objective=(
+                other.discovery_max_files_per_objective
+                if other.discovery_max_files_per_objective is not None
+                else self.discovery_max_files_per_objective
+            ),
             extractors=_dedup(self.extractors, other.extractors),
             result_extra_keys=_dedup(self.result_extra_keys, other.result_extra_keys),
             source=self.source + other.source,
@@ -583,6 +613,10 @@ class AnalysisProfile:
             overrides["max_reading_needs"] = self.max_reading_needs
         if self.max_rounds is not None:
             overrides["max_rounds"] = self.max_rounds
+        if self.discovery_max_files_per_objective is not None:
+            overrides["discovery_max_files_per_objective"] = (
+                self.discovery_max_files_per_objective
+            )
         for name in ("budget", "policy", "capabilities", "trigger_priority"):
             value = getattr(self, name)
             if value:

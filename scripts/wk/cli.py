@@ -1053,6 +1053,40 @@ def cmd_doctor(a) -> int:
                 "validado": True, "caminho": perfil_caminho, "presente": repo_cfg is not None,
             }
 
+    # ENTREGA item 3: cobertura de extração do repo (linguagens com/sem
+    # extrator + contagem) como informação EXECUTÁVEL — mesma inventariação/
+    # extração de `wk analyze` (`_capture_inventory_and_extraction`), sem o
+    # plano de investigação inteiro (capacidades/objetivos, mais caro e
+    # irrelevante para este diagnóstico). Nunca derruba `doctor`: uma falha
+    # aqui vira `{"disponivel": False, "erro": ...}` visível, não traceback.
+    cobertura_extracao_info: dict | None = None
+    if repo_existe and "perfil" not in bloqueios:
+        try:
+            profile_all_doc = _load_analysis_profile(store_root) if store_existe else {}
+        except Exception:
+            profile_all_doc = {}
+        prior_doc = _repo_profile(profile_all_doc, repo_root)
+        profile_doc, _profile_doc_erro = _resolve_analysis_profile(
+            repo_abs=repo_root, store_profile=prior_doc.get("perfil"), cli_overrides=None,
+        )
+        if profile_doc is None:
+            from analysis.profile import DEFAULT_PROFILE as _DEFAULT_PROFILE_DOC
+            profile_doc = _DEFAULT_PROFILE_DOC
+        try:
+            _snap_doc, inv_doc, ext_doc = _capture_inventory_and_extraction(
+                repo_root, (profile_doc.include or None), exclude=(profile_doc.exclude or None),
+                profile=profile_doc,
+            )
+        except Exception as exc:
+            cobertura_extracao_info = {
+                "disponivel": False,
+                "erro": f"{type(exc).__name__}: {exc}",
+            }
+        else:
+            cobertura_extracao_info = {
+                "disponivel": True, **_cobertura_extracao_dict(inv_doc, ext_doc),
+            }
+
     engine = a.engine or "claude-code"
     # T15/A (achado da reprodução real): `--engine` é só o caminho de
     # COMPATIBILIDADE (§10.1/§11) — skill/permissão de engine são infra
@@ -1339,6 +1373,7 @@ def cmd_doctor(a) -> int:
         "store": store_info,
         "repo": repo_info,
         "perfil": perfil_info,
+        "cobertura_extracao": cobertura_extracao_info,
         "engine": engine_info,
         "agent": agent_info,
         "bloqueios": bloqueios,
@@ -5445,6 +5480,12 @@ def _profile_fields_from_flags(a) -> dict:
         budget["max_tokens"] = budget_tokens
     if budget:
         fields["budget"] = budget
+    # ENTREGA item 4: `--discovery-max-files N` -> `discovery_max_files_per_objective`
+    # (já existe em `analysis.profile.AnalysisProfile`/`PROFILE_KEYS` — só
+    # falta a flag de CLI para as 3 camadas conseguirem declará-la).
+    discovery_max_files = getattr(a, "discovery_max_files_per_objective", None)
+    if discovery_max_files is not None:
+        fields["discovery_max_files_per_objective"] = discovery_max_files
     return fields
 
 
@@ -5692,23 +5733,15 @@ def _load_snapshot_manifest(store_root: str, snapshot_id: str):
 # -- pipeline determinístico: snapshot -> inventário -> extração -> capacidades -> objetivos
 
 
-def _analyze_pipeline(repo_abs: str, scope, namespace: str, precaptured=None, *, exclude=None, profile=None):
-    """Roda o pipeline determinístico (sem LLM) até os objetivos de investigação.
-
-    `precaptured`: reaproveita um `Snapshot` já capturado (usado por
-    `cmd_update`, que precisa do snapshot novo ANTES deste pipeline para
-    calcular o diff — capturar duas vezes seria trabalho e I/O em dobro).
-
-    `profile`: `AnalysisProfile` já RESOLVIDO (3 camadas) pelo chamador —
-    `analysis.profile.DEFAULT_PROFILE` quando omitido, nunca um perfil
-    calculado aqui (esta função não decide perfil, só aplica). Molda
-    `snapshot.capture` (`scope`/`exclude`), `default_registry` (extensões),
-    `capabilities.discover` (kwargs de `profile.capabilities`) e
-    `investigation.plan` (`profile=` inteiro, inclusive `max_reading_needs`).
-    """
-    from analysis import capabilities as cap_mod
+def _capture_inventory_and_extraction(repo_abs: str, scope, *, exclude=None, profile=None, precaptured=None):
+    """`snapshot -> inventory -> extraction`, o prefixo COMUM de
+    `_analyze_pipeline` (analyze/update) e de `doctor --repo`/`status --repo`
+    (ENTREGA item 3: cobertura de extração como diagnóstico, sem precisar do
+    plano de investigação inteiro — capacidades/objetivos custam mais e
+    `doctor`/`status` só precisam do RETRATO de cobertura). Extraído para um
+    lugar só: os dois caminhos usam exatamente a mesma classificação/filtro
+    de arquivo (nunca dois `keep`/duas leituras de disco divergentes)."""
     from analysis import inventory as inv_mod
-    from analysis import investigation as inv2_mod
     from analysis import snapshot as snap_mod
     from analysis.extractors import registry as ext_registry
     from analysis.extractors.base import SourceFile
@@ -5741,23 +5774,61 @@ def _analyze_pipeline(repo_abs: str, scope, namespace: str, precaptured=None, *,
             SourceFile(path=fc.path, content=content, language=(fc.language.value if fc.language else ""))
         )
     extraction = ext_registry.default_registry(extensions=profile.extractors).extract_all(files)
+    return snapshot, inventory, extraction
+
+
+def _analyze_pipeline(repo_abs: str, scope, namespace: str, precaptured=None, *, exclude=None, profile=None):
+    """Roda o pipeline determinístico (sem LLM) até os objetivos de investigação.
+
+    `precaptured`: reaproveita um `Snapshot` já capturado (usado por
+    `cmd_update`, que precisa do snapshot novo ANTES deste pipeline para
+    calcular o diff — capturar duas vezes seria trabalho e I/O em dobro).
+
+    `profile`: `AnalysisProfile` já RESOLVIDO (3 camadas) pelo chamador —
+    `analysis.profile.DEFAULT_PROFILE` quando omitido, nunca um perfil
+    calculado aqui (esta função não decide perfil, só aplica). Molda
+    `snapshot.capture` (`scope`/`exclude`), `default_registry` (extensões),
+    `capabilities.discover` (kwargs de `profile.capabilities`) e
+    `investigation.plan` (`profile=` inteiro, inclusive `max_reading_needs`).
+    """
+    from analysis import capabilities as cap_mod
+    from analysis import investigation as inv2_mod
+    from analysis.profile import DEFAULT_PROFILE
+
+    profile = profile if profile is not None else DEFAULT_PROFILE
+    snapshot, inventory, extraction = _capture_inventory_and_extraction(
+        repo_abs, scope, exclude=exclude, profile=profile, precaptured=precaptured,
+    )
     capability_map = cap_mod.discover(
         extraction, inventory, namespace=namespace, snapshot=snapshot, **(profile.capabilities or {})
     )
     objectives = inv2_mod.plan(
         capability_map, extraction, inventory=inventory, snapshot=snapshot, profile=profile
     )
-    # § perfil (obrigatório quando `profile.objectives` filtra): confere que
-    # toda capacidade/órfão SELECIONADO (não o universo inteiro) tem
-    # objetivo — `PlanAccountingError` propaga para o `except Exception` do
-    # chamador (falha de integridade real, não erro de perfil). O que o
-    # filtro SUPRIMIU é contagem explícita (`plan_accounting`), nunca
-    # confundido com cobertura — devolvido para o chamador expor no envelope.
-    accounting = None
-    if profile.objectives:
-        inv2_mod.assert_plan_accounted(objectives, capability_map, profile=profile)
-        accounting = inv2_mod.plan_accounting(objectives, capability_map, profile=profile)
-    return snapshot, inventory, extraction, capability_map, objectives, accounting
+    # § reforço (analysis entregou `inventory=`/`extraction=` em
+    # `plan_accounting`/`assert_plan_accounted`): a invariante "todo arquivo
+    # de código termina numa obrigação de leitura (capacidade, órfão OU
+    # descoberta)" roda SEMPRE agora — não só quando `profile.objectives`
+    # filtra. `PlanAccountingError` é bug do PLANO (código sem nenhuma
+    # obrigação, capacidade com objetivo duplicado, ...), nunca erro de
+    # perfil/operador — propaga para o chamador, que mapeia para
+    # `_internal_error_blocked` (nunca `_precondition_blocked`).
+    inv2_mod.assert_plan_accounted(objectives, capability_map, profile=profile, inventory=inventory)
+    plan_accounting_full = inv2_mod.plan_accounting(
+        objectives, capability_map, profile=profile, extraction=extraction, inventory=inventory,
+    )
+    # § perfil (obrigatório quando `profile.objectives` filtra): MESMO dado
+    # de `plan_accounting_full`, exposto como campo PRÓPRIO
+    # (`perfil_accounting`, em `escopo_efetivo.perfil_accounting`) porque seu
+    # contrato histórico é `None` quando nenhum filtro está ativo — "sem
+    # filtro" nunca pode ser confundido com "cobertura completa" (ver
+    # `test_sem_filtro_de_objective_perfil_accounting_e_none`). Nunca
+    # recalculado — é uma VIEW do mesmo dict, não uma segunda chamada.
+    perfil_accounting = plan_accounting_full if profile.objectives else None
+    return (
+        snapshot, inventory, extraction, capability_map, objectives,
+        perfil_accounting, plan_accounting_full,
+    )
 
 
 def _objective_from_store_dict(data: dict):
@@ -5872,6 +5943,466 @@ def _lacunas_from_objectives(objectives) -> list:
                 "nome": obj.name, "pendencias": unmet,
             })
     return out
+
+
+#: DEFEITO REPRODUZIDO (repo Go sintético sem extrator nenhum): `objectives`
+#: vazio faz `_run_investigation_chain` (nenhum `objective_id` para iterar)
+#: devolver `stop_reason=completed` INCONDICIONALMENTE — a função não tem
+#: como saber se "nada a fazer" é legítimo (repo sem código nenhum) ou lacuna
+#: de cobertura (código presente, sem adaptador/símbolo extraído). Só
+#: `cmd_analyze`, que tem `inventory`/`extraction` em mãos, sabe distinguir —
+#: por isso a correção mora aqui (`_apply_cobertura_status`, dobrada sobre o
+#: envelope como `_apply_publicacao_status`), nunca em `_run_investigation_chain`.
+#:
+#: Classe de arquivo que, sozinha, nunca sustenta "há código neste repo":
+#: doc/dado/binário/gerado (mesmo racional de `FileClass.DOC` em
+#: `analysis.inventory._classify` — "não sustenta comportamento implementado").
+#: QUALQUER outra classe (code/config/manifest/test/migration/unsupported) já
+#: é sinal de código possivelmente analisável — inclusive `unsupported`
+#: (extensão sem NENHUM classificador, ex.: `.cbl`/`.jcl` de mainframe): a
+#: ausência de classificador não pode virar "não há código", senão o mesmo
+#: defeito reaparece para toda linguagem que `analysis.inventory` ainda não
+#: nomeia.
+_CLASSES_SEM_CODIGO = frozenset({"data", "binary", "generated", "doc"})
+
+
+def _tem_possivel_codigo(inventory) -> bool:
+    by_class = dict(inventory.summary.get("by_class") or {})
+    return any(n for cls, n in by_class.items() if cls not in _CLASSES_SEM_CODIGO)
+
+
+def _arquivos_sem_extrator_dict(extraction) -> dict:
+    """Linguagem -> contagem de arquivos sem adaptador — direto de
+    `extraction.files_without_adapter` (§6.1.3/§6.2 do módulo de extração), a
+    MESMA fonte que `analysis.investigation.plan_accounting()` usa para
+    `files_without_extractor` (nunca um texto solto/uma segunda contagem
+    divergente inventada aqui)."""
+    return {
+        lang: len(paths) for lang, paths in sorted(extraction.files_without_adapter.items())
+    }
+
+
+def _arquivos_nao_classificados_dict(inventory) -> dict:
+    """Extensão -> contagem, para arquivo que nem chegou a ter linguagem
+    atribuída (`FileClass.UNSUPPORTED` — ex.: `.cbl`/`.jcl` de mainframe, sem
+    NENHUM classificador em `analysis.inventory._classify`). Fonte é
+    `inventory.limitations` (um por arquivo, motivo já registrado por
+    `_classify` — nunca inferido aqui); estes arquivos nem chegam a
+    `_analyze_pipeline`/`extraction` (só as classes `keep` chegam lá), por
+    isso precisam de uma fonte própria — `extraction.coverage` nunca os vê."""
+    out: dict = {}
+    for lim in inventory.limitations:
+        ext = os.path.splitext(lim.path)[1].lower() or "(sem extensão)"
+        out[ext] = out.get(ext, 0) + 1
+    return dict(sorted(out.items()))
+
+
+def _cobertura_extracao_dict(inventory, extraction) -> dict:
+    """Retrato único de cobertura — reusado por `analyze`/`doctor`/`status`
+    para nunca divergir de definição entre os três comandos."""
+    return {
+        "arquivos_totais": int(inventory.summary.get("total_files") or 0),
+        "por_classe": dict(inventory.summary.get("by_class") or {}),
+        "linguagens_sem_extrator": _arquivos_sem_extrator_dict(extraction),
+        "arquivos_nao_classificados": _arquivos_nao_classificados_dict(inventory),
+    }
+
+
+#: § entrega item 2: `ObjectiveKind.DISCOVERY` — no momento desta mudança
+#: ainda em implementação em `analysis.investigation` (grep confirma que
+#: `ObjectiveKind` só declara `capability`/`orphan_group`; `analysis.profile`
+#: já reserva `discovery_max_files_per_objective`/`DISCOVERY_MAX_FILES_PER_OBJECTIVE`
+#: para quando o kind chegar). Checagem por CHAVE do dict serializado
+#: (`o.get("kind")`), nunca por importar um símbolo que pode não existir
+#: ainda — o valor textual "discovery" é o único contrato estável entre os
+#: dois módulos enquanto o kind não é publicado.
+_DISCOVERY_KIND_VALUE = "discovery"
+
+
+def _is_discovery_kind(kind_value) -> bool:
+    return str(getattr(kind_value, "value", kind_value)) == _DISCOVERY_KIND_VALUE
+
+
+_DISCOVERY_TARGET_RANGE_RE = re.compile(r":\d+-\d+$")
+
+
+def _objetivos_discovery_info(objective_dicts) -> list:
+    """Objetivos `discovery` presentes nesta invocação — id/módulo/nº de
+    arquivos/linguagens, tudo lido de campos que `analysis.investigation.
+    _objective_for_discovery` já grava (nunca reconstruído/adivinhado aqui):
+    `accounting["discovery_files"]` é a contagem EXPLÍCITA de arquivos do
+    módulo; `name` é sempre `f"discovery@{module}"` (mesmo `_discovery_module`
+    que agrupa por diretório); os `paths` vêm de `reading_needs[i]["target"]`
+    (`f"{path}:1-{total}"` ou `path` puro quando a faixa não resolveu), e a
+    linguagem de cada um vem de `analysis.extractors.registry.guess_language`
+    (mesma função que a própria extração usa para nomear `no_adapter`).
+    Lista vazia enquanto `analysis` não publicar o kind — ramo inerte, não
+    morto: reativa sozinho no dia em que `objective_dicts` trouxer `kind ==
+    "discovery"`, sem exigir NENHUMA outra mudança neste módulo."""
+    from analysis.extractors.registry import guess_language
+
+    out = []
+    for o in objective_dicts:
+        if not isinstance(o, dict) or not _is_discovery_kind(o.get("kind")):
+            continue
+        nome = str(o.get("name") or "")
+        modulo = nome[len("discovery@"):] if nome.startswith("discovery@") else None
+        accounting = o.get("accounting") or {}
+        paths = []
+        for need in o.get("reading_needs") or ():
+            if not isinstance(need, dict):
+                continue
+            target = str(need.get("target") or "")
+            if not target:
+                continue
+            paths.append(_DISCOVERY_TARGET_RANGE_RE.sub("", target))
+        linguagens = sorted({guess_language(p) for p in paths}) if paths else []
+        out.append({
+            "objective_id": o.get("objective_id"),
+            "modulo": modulo,
+            "nome": nome,
+            "arquivos": int(accounting.get("discovery_files") or len(paths)),
+            "linguagens": linguagens,
+        })
+    return out
+
+
+def _pending_sem_codigo(*, command: str, repo_abs: str) -> dict:
+    return {
+        "id": f"{command.replace(' ', '-')}-sem-codigo", "tipo": "sem_codigo",
+        "alvo": repo_abs,
+        "causa": "inventário deste repositório não tem nenhum arquivo fora de "
+                 "doc/dado/binário/gerado — nada para extrair nem investigar",
+        "impacto": "nenhuma capacidade, símbolo órfão ou objetivo de descoberta foi "
+                   "produzido porque não há código neste inventário",
+        "recuperacao_automatica": False,
+        "acoes": ["confira se --repo/--include apontam para o diretório certo"],
+    }
+
+
+def _pending_sem_objetivos(*, command: str, repo_abs: str, cobertura: dict) -> dict:
+    """ENTREGA item 1: `objective_dicts` vazio com código presente (defeito
+    reproduzido) — causa executável a partir de `_cobertura_extracao_dict`
+    (linguagem sem adaptador + contagem; extensão nunca classificada +
+    contagem), nunca texto solto sem lastro em `inventory`/`extraction`."""
+    sem_extrator = cobertura.get("linguagens_sem_extrator") or {}
+    nao_classificados = cobertura.get("arquivos_nao_classificados") or {}
+    partes = []
+    if sem_extrator:
+        partes.append(
+            "sem adaptador registrado: " + ", ".join(f"{lang} ({n})" for lang, n in sem_extrator.items())
+        )
+    if nao_classificados:
+        partes.append(
+            "extensão sem classificador: " + ", ".join(f"{ext} ({n})" for ext, n in nao_classificados.items())
+        )
+    causa = "nenhuma capacidade nem grupo de símbolos órfãos foi produzido a partir deste inventário"
+    causa += (" — " + "; ".join(partes)) if partes else (
+        " (todas as linguagens têm extrator, mas nenhum símbolo analisável foi encontrado)"
+    )
+    acoes = []
+    if sem_extrator:
+        acoes.append(
+            "registre um extrator para a(s) linguagem(ns) sem adaptador via `--extractors "
+            "pacote.modulo:fabrica` (ou `wk profile set --repo <repo> --store <store> "
+            "--extractors pacote.modulo:fabrica`)"
+        )
+    if nao_classificados:
+        acoes.append(
+            "extensão(ões) sem NENHUM classificador em `analysis.inventory`: "
+            f"{', '.join(sorted(nao_classificados))} — precisa de suporte novo em "
+            "`analysis.inventory`/`analysis.extractors` (não é contornável só por perfil)"
+        )
+    if not acoes:
+        acoes.append("revise --include/--exclude e o inventário deste repositório")
+    return {
+        "id": f"{command.replace(' ', '-')}-sem-objetivos", "tipo": "sem_objetivos",
+        "alvo": repo_abs, "causa": causa,
+        "impacto": "estrutura registrada (sistema/componentes), mas NENHUMA capacidade nem "
+                   "símbolo órfão foi investigado nesta invocação — conhecimento estrutural "
+                   "sem cobertura de comportamento",
+        "recuperacao_automatica": False, "acoes": acoes,
+    }
+
+
+def _pending_descoberta_requer_agente(*, command: str, repo_abs: str, descobertas: list) -> dict:
+    ids = ", ".join(str(d.get("objective_id") or "?") for d in descobertas[:10])
+    return {
+        "id": f"{command.replace(' ', '-')}-descoberta-requer-agente",
+        "tipo": "descoberta_requer_agente",
+        "alvo": repo_abs,
+        "causa": (
+            f"{len(descobertas)} objetivo(s) de descoberta (ObjectiveKind.DISCOVERY) não "
+            f"pode(m) ser executado(s) em --mode structural (worker local não lê código): {ids}"
+        ),
+        "impacto": "módulo(s)/linguagem(ns) sem adaptador dedicado permanece(m) sem "
+                   "investigação de conteúdo nesta invocação",
+        "recuperacao_automatica": False,
+        "acoes": ["conecte um agente e reanalise em --mode deep: `wk agent connect --store "
+                  "<store> --repo <repo> --agent <id>` seguido de `wk analyze --repo <repo> "
+                  "--store <store> --mode deep --agent <id>`"],
+    }
+
+
+def _next_actions_descoberta(store_root: str, repo_abs: str, agent_id) -> list:
+    shell = "powershell" if os.name == "nt" else "posix"
+    agente = agent_id or _deep_capable_agent_suggestion(store_root, repo_abs, None)
+    return [
+        {
+            "ator": "operador",
+            "motivo": "objetivo(s) de descoberta exigem leitura real de código — só um agente "
+                      "conectado (--mode deep) executa",
+            "argv": ["wk", "agent", "connect", "--store", store_root, "--repo", repo_abs,
+                      "--agent", agente],
+            "shell": shell,
+        },
+        {
+            "ator": "operador", "motivo": "após conectar, reanalise em --mode deep",
+            "argv": ["wk", "analyze", "--repo", repo_abs, "--store", store_root,
+                      "--mode", "deep", "--agent", agente],
+            "shell": shell,
+        },
+    ]
+
+
+def _apply_cobertura_status(
+    operation_status: str, knowledge_status: str, pending: list, next_actions: list,
+    *, command: str, store_root: str, repo_abs: str, mode: str,
+    objective_dicts: list, inventory, extraction,
+) -> tuple:
+    """ENTREGA itens 1/2, dobrada sobre o envelope já decidido por
+    `_chain_envelope`/`_apply_publicacao_status` (mesmo racional de
+    `_apply_publicacao_status`: nunca recomputa a cadeia, só corrige o
+    veredito quando `objective_dicts` não sustenta `succeeded`/`complete`).
+
+    1. `objective_dicts` vazio + inventário SEM código -> não mexe no
+       `operation_status` decidido (deixa `_apply_publicacao_status` correr),
+       mas se ainda for `succeeded` vira `noop`/`not_applicable` (nada
+       aplicável) — sempre com `pending` explicando.
+    2. `objective_dicts` vazio + inventário COM código (defeito reproduzido)
+       -> `partial`/`partial` (nunca `succeeded`/`complete` vazio), com
+       `pending` tipado `sem_objetivos`.
+    3. `objective_dicts` não vazio mas contém objetivo(s) `discovery` em
+       `--mode structural` (worker local não lê código) -> `partial`/`partial`
+       com `pending` tipado `descoberta_requer_agente` — `--mode deep` segue
+       pela cadeia normal (não entra aqui: só readequa quando `mode ==
+       "structural"`).
+    """
+    if objective_dicts:
+        descobertas = _objetivos_discovery_info(objective_dicts)
+        if descobertas and mode == "structural":
+            pending = list(pending) + [_pending_descoberta_requer_agente(
+                command=command, repo_abs=repo_abs, descobertas=descobertas,
+            )]
+            next_actions = list(next_actions) + _next_actions_descoberta(store_root, repo_abs, None)
+            if operation_status == "succeeded":
+                operation_status, knowledge_status = "partial", "partial"
+        return operation_status, knowledge_status, pending, next_actions
+    if not _tem_possivel_codigo(inventory):
+        if operation_status == "succeeded":
+            operation_status, knowledge_status = "noop", "not_applicable"
+        pending = list(pending) + [_pending_sem_codigo(command=command, repo_abs=repo_abs)]
+        return operation_status, knowledge_status, pending, next_actions
+    cobertura = _cobertura_extracao_dict(inventory, extraction)
+    pending = list(pending) + [
+        _pending_sem_objetivos(command=command, repo_abs=repo_abs, cobertura=cobertura)
+    ]
+    if operation_status == "succeeded":
+        operation_status, knowledge_status = "partial", "partial"
+    return operation_status, knowledge_status, pending, next_actions
+
+
+def _target_to_path(target) -> str:
+    """`ReadingNeed.target` -> caminho do arquivo — mesma faixa que
+    `_objetivos_discovery_info` já normaliza (`f"{path}:1-{total}"` vira
+    `path`). Reusado para COBERTURA DE LEITURA (por objetivo `capability`/
+    `orphan_group`/`discovery`, todos usam a mesma convenção de `target`)."""
+    return _DISCOVERY_TARGET_RANGE_RE.sub("", str(target or ""))
+
+
+def _target_looks_like_path(target: str) -> bool:
+    """GAP EXECUTÁVEL (reforço item 2): `ReadingNeed.kind` (`analysis.
+    investigation.py:290-295` — `symbol`/`range`/`contract`) decide o formato
+    de `target`, mas só sobrevive em `reading_needs` (obrigação AINDA
+    ABERTA, `ReadingNeed.to_dict()` completo, `scripts/knowledge/
+    integrate.py:3725` `_open_needs_dicts`); `leituras_satisfeitas`
+    (obrigação FECHADA) grava só `{need_id, target, satisfeita, evidencia,
+    motivo}` — SEM `kind` (`scripts/knowledge/integrate.py:2161-2167`
+    `registro`). Sem `kind` ali, `target` de necessidade `symbol` (qualname,
+    ex. `app.add`) é INDISTINGUÍVEL por forma de `target` de necessidade
+    `range`/`contract` (caminho, ex. `cmd/api/main.go`) usando só o dado
+    persistido — por isso esta heurística (barra no caminho OU extensão
+    reconhecida por `analysis.extractors.registry.LANGUAGE_BY_EXTENSION`/
+    `LANGUAGE_BY_BASENAME`, a MESMA tabela que a extração usa para nomear
+    linguagem) decide, e `simbolos_sem_mapeamento` (no chamador) CONTA o que
+    ficou de fora em vez de inventar um caminho de arquivo para um símbolo."""
+    if not target:
+        return False
+    if "/" in target:
+        return True
+    from analysis.extractors.registry import LANGUAGE_BY_BASENAME, LANGUAGE_BY_EXTENSION
+
+    base = os.path.basename(target)
+    if base in LANGUAGE_BY_BASENAME:
+        return True
+    ext = os.path.splitext(base)[1].lower()
+    return ext in LANGUAGE_BY_EXTENSION
+
+
+#: Reforço item 2 (cobertura de LEITURA — distinta da cobertura de PLANO de
+#: `_cobertura_extracao_dict`/`plan_accounting`, que só sabe se um arquivo
+#: tem OBRIGAÇÃO de leitura, não se foi de fato lido): fonte executável é
+#: `knowledge.integrate.ObjectiveOutcome` (`scripts/knowledge/integrate.py:2653`
+#: `leituras_satisfeitas` — obrigação FECHADA, com `satisfeita: bool`
+#: dizendo se a citação resolveu no snapshot; `scripts/knowledge/integrate.py:2666`
+#: `reading_needs` — obrigação AINDA ABERTA, nunca fechada), persistida por
+#: `_save_last_integration`/lida por `_load_last_integration` — a MESMA fonte
+#: que `_leituras_do_relatorio`/`wk status` já leem (nenhuma contagem nova).
+def _cobertura_leitura_from_report(report: dict, objective_ids) -> dict:
+    """`{files_total, files_read, files_unread, files_unread_total,
+    objetivos_completos, claims_rejeitados}` — arquivo é "lido" quando
+    algum `leituras_satisfeitas` daquele caminho tem `satisfeita=True` OU
+    aparece em `evidence_refs` (citação ACEITA pelo portão de integração —
+    `knowledge.integrate.ObjectiveOutcome.evidence_refs`,
+    `scripts/knowledge/integrate.py:2630-2639`: `{path, line_start,
+    line_end, content_kind}`, já filtrado a código real, nunca comentário/
+    docstring/documento — a segunda fonte de "lido com evidência" que o
+    reforço pediu). "total" é a união dos alvos de `leituras_satisfeitas`
+    (fechados, satisfeitos ou não) E `reading_needs` (ainda abertos,
+    `scripts/knowledge/integrate.py:2664-2666`) de TODOS os objetivos
+    filtrados por `objective_ids` (`None` = não filtra). `objetivos_completos`
+    é `True` só quando há PELO MENOS um objetivo neste escopo e TODOS estão
+    `state == "complete"` — lista vazia nunca é "completo" por vacuidade.
+    `claims_rejeitados` (`ObjectiveOutcome.rejeitados`,
+    `scripts/knowledge/integrate.py:2650`) é exposto aqui para o operador ver
+    POR QUE uma citação não fechou obrigação nenhuma (`tipo`: `evidencia_nao_
+    resolvida`/`evidencia_nao_codigo`/`evidencia_fora_do_snapshot`)."""
+    ids_filtro = None if objective_ids is None else {str(i) for i in objective_ids}
+    total_paths: set = set()
+    read_paths: set = set()
+    simbolos_sem_mapeamento: set = set()
+    objetivos_no_escopo = 0
+    todos_completos = True
+    rejeitados: list = []
+    for obj in report.get("objetivos") or ():
+        if not isinstance(obj, dict):
+            continue
+        oid = str(obj.get("objective_id") or "")
+        if ids_filtro is not None and oid not in ids_filtro:
+            continue
+        objetivos_no_escopo += 1
+        if str(obj.get("state") or "") != "complete":
+            todos_completos = False
+        for item in obj.get("leituras_satisfeitas") or ():
+            if not isinstance(item, dict):
+                continue
+            path = _target_to_path(item.get("target"))
+            # `leituras_satisfeitas` NÃO carrega `kind` (ver
+            # `_target_looks_like_path`) — heurística de forma decide.
+            if not path or not _target_looks_like_path(path):
+                if path:
+                    simbolos_sem_mapeamento.add(path)
+                continue
+            total_paths.add(path)
+            if item.get("satisfeita"):
+                read_paths.add(path)
+        for need in obj.get("reading_needs") or ():
+            if not isinstance(need, dict):
+                continue
+            path = _target_to_path(need.get("target"))
+            if not path:
+                continue
+            # `reading_needs` (obrigação ainda ABERTA) carrega `kind` —
+            # fonte EXATA, não heurística: `symbol` nunca é caminho de
+            # arquivo (é qualname), `range`/`contract` sempre são.
+            kind = str(need.get("kind") or "")
+            if kind == "symbol" or (not kind and not _target_looks_like_path(path)):
+                simbolos_sem_mapeamento.add(path)
+                continue
+            total_paths.add(path)
+        for ev in obj.get("evidence_refs") or ():
+            if not isinstance(ev, dict):
+                continue
+            path = str(ev.get("path") or "")
+            if path:
+                total_paths.add(path)
+                read_paths.add(path)
+        for rej in obj.get("rejeitados") or ():
+            if isinstance(rej, dict):
+                rejeitados.append({"objective_id": oid, **rej})
+    unread = sorted(total_paths - read_paths)
+    return {
+        "files_total": len(total_paths),
+        "files_read": len(read_paths),
+        "files_unread": unread[:20],
+        "files_unread_total": len(unread),
+        "objetivos_no_escopo": objetivos_no_escopo,
+        "objetivos_completos": bool(objetivos_no_escopo) and todos_completos,
+        "claims_rejeitados": rejeitados[:_INTEGRATION_SAMPLE],
+        "claims_rejeitados_total": len(rejeitados),
+        # GAP EXECUTÁVEL (ver `_target_looks_like_path`): obrigação de
+        # leitura por SÍMBOLO (qualname, ex. `app.add`) — `runtime`/
+        # `knowledge` não persistem o caminho do arquivo daquele símbolo em
+        # `leituras_satisfeitas`/`reading_needs` de forma fechada nesta
+        # camada; contado aqui em vez de virar "arquivo não lido" inventado.
+        "simbolos_sem_mapeamento_de_arquivo": len(simbolos_sem_mapeamento),
+    }
+
+
+def _pending_cobertura_incompleta(*, command: str, repo_abs: str, cobertura_leitura: dict) -> dict:
+    unread = cobertura_leitura.get("files_unread") or []
+    unread_total = int(cobertura_leitura.get("files_unread_total") or 0)
+    causa_partes = []
+    if unread_total:
+        causa_partes.append(
+            f"{unread_total} arquivo(s) com obrigação de leitura sem citação que resolveu no "
+            f"snapshot: {', '.join(unread[:5])}" + (" …" if unread_total > 5 else "")
+        )
+    if not cobertura_leitura.get("objetivos_completos"):
+        causa_partes.append("nem todo objetivo deste repo está em estado 'complete'")
+    causa = "; ".join(causa_partes) or "cobertura de leitura incompleta"
+    return {
+        "id": f"{command.replace(' ', '-')}-cobertura-incompleta", "tipo": "cobertura_incompleta",
+        "alvo": repo_abs, "causa": causa,
+        "impacto": "knowledge_status não pode ser 'complete' enquanto houver arquivo com "
+                   "obrigação de leitura não satisfeita ou objetivo fora de 'complete'",
+        "recuperacao_automatica": True,
+        "acoes": [f"rode `wk resume --repo {repo_abs}` para continuar a leitura pendente"],
+    }
+
+
+def _apply_leitura_status(
+    operation_status: str, knowledge_status: str, pending: list, next_actions: list,
+    *, command: str, store_root: str, repo_abs: str, cobertura_leitura: dict | None,
+) -> tuple:
+    """Reforço item 2: `knowledge_status=complete` SOMENTE quando
+    `files_unread == []` E todos os objetivos completos — nunca herdado só
+    do `stop_reason` da cadeia (`_chain_envelope`). `cobertura_leitura=None`
+    (nenhum objetivo neste escopo — ex.: `_apply_cobertura_status` já tratou
+    como `sem_objetivos`/`sem_codigo`/`descoberta_requer_agente`) não mexe em
+    nada: esta função só aperta um resultado que JÁ tem objetivo integrado,
+    nunca inventa um motivo nesse caso."""
+    if not cobertura_leitura or not cobertura_leitura.get("objetivos_no_escopo"):
+        return operation_status, knowledge_status, pending, next_actions
+    completo = (
+        not cobertura_leitura.get("files_unread_total")
+        and cobertura_leitura.get("objetivos_completos")
+    )
+    if completo:
+        return operation_status, knowledge_status, pending, next_actions
+    if knowledge_status == "complete":
+        knowledge_status = "partial"
+    if operation_status == "succeeded":
+        operation_status = "partial"
+    shell = "powershell" if os.name == "nt" else "posix"
+    pending = list(pending) + [_pending_cobertura_incompleta(
+        command=command, repo_abs=repo_abs, cobertura_leitura=cobertura_leitura,
+    )]
+    next_actions = list(next_actions) + [{
+        "ator": "operador", "motivo": "cobertura de leitura incompleta — retome a investigação",
+        "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs], "shell": shell,
+    }]
+    return operation_status, knowledge_status, pending, next_actions
 
 
 def _latest_tasks_by_objective(store) -> dict:
@@ -6420,16 +6951,39 @@ def _chain_next_action(
         acoes = _dispatch_next_actions(store_root, repo_abs, agent_id)
         return acoes[0] if acoes else None
     if stop_reason == "budget_exhausted":
-        atual = max(
-            (int(st.get("max_rounds") or 0) for st in chain_status_by_objective.values()),
-            default=3,
-        )
-        novo_teto = atual + 3
+        # § reforço (runtime entregou `max_rounds=None` = SEM TETO, `0` =
+        # teto zero — `chain_status()`/`get_max_continuation_rounds` não
+        # fingem infinito com um número): `None` e `0` NÃO são o mesmo valor
+        # — tratá-los igual (`or 0` colapsava os dois) sugeria `--max-rounds
+        # 3` mesmo quando NENHUM teto de rodadas está em jogo. Só sugere
+        # ampliar `--max-rounds` quando algum objetivo desta cadeia tem teto
+        # NUMÉRICO de fato atingido.
+        tetos_numericos = [
+            int(v) for v in (st.get("max_rounds") for st in chain_status_by_objective.values())
+            if v is not None
+        ]
+        if tetos_numericos:
+            atual = max(tetos_numericos)
+            novo_teto = atual + 3
+            return {
+                "ator": "operador",
+                "motivo": f"orçamento de {atual} rodada(s) consumido; amplie o teto e retome",
+                "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs,
+                          "--max-rounds", str(novo_teto)],
+                "shell": shell,
+            }
+        # Sem teto de rodadas (`max_rounds=None` em todos os objetivos desta
+        # cadeia): `budget_exhausted` aqui só pode ser o ORÇAMENTO do PACOTE
+        # de contexto desta rodada (bytes/tokens), nunca o teto de rodadas —
+        # `wk resume` sozinho já tenta a próxima rodada com o MESMO
+        # orçamento; se persistir, o operador amplia `--budget-bytes`/
+        # `--budget-tokens` (perfil ou flag de `analyze`/`update`/`resume`).
         return {
             "ator": "operador",
-            "motivo": f"orçamento de {atual} rodada(s) consumido; amplie o teto e retome",
-            "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs,
-                      "--max-rounds", str(novo_teto)],
+            "motivo": "orçamento do pacote de contexto (bytes/tokens) esgotado nesta rodada, "
+                      "sem teto de rodadas — retome; se persistir, amplie --budget-bytes/"
+                      "--budget-tokens",
+            "argv": ["wk", "resume", "--store", store_root, "--repo", repo_abs],
             "shell": shell,
         }
     if stop_reason == "no_progress":
@@ -8099,10 +8653,14 @@ def cmd_analyze(a) -> int:
     namespace = prior.get("namespace") or f"code/{_repo_key(repo_abs)}"
 
     from analysis.extractors.registry import ExtractorExtensionError as _ExtractorExtensionError
+    from analysis.investigation import PlanAccountingError as _PlanAccountingError
     from analysis.profile import ProfileError as _ProfileError
 
     try:
-        snapshot, inventory, extraction, capability_map, objectives, perfil_accounting = _analyze_pipeline(
+        (
+            snapshot, inventory, extraction, capability_map, objectives,
+            perfil_accounting, plan_accounting_full,
+        ) = _analyze_pipeline(
             repo_abs, scope, namespace, exclude=exclude, profile=profile,
         )
     except _ProfileError as exc:
@@ -8117,6 +8675,16 @@ def cmd_analyze(a) -> int:
             causa=f"extensão de extrator inválida no perfil (`extractors`): {exc}", alvo=repo_abs,
             acoes=[f"rode `wk profile show --repo {repo_abs} --store {store_root}` e corrija "
                    "`extractors` (formato 'pacote.modulo:fabrica')"],
+        )
+        _render_common(payload, json_out=json_out)
+        return _exit_code_common(payload["operation_status"])
+    except _PlanAccountingError as exc:
+        # § reforço: falha de INTEGRIDADE do plano (ex.: arquivo de código
+        # sem nenhuma obrigação de leitura) — bug do pipeline determinístico,
+        # nunca erro de perfil/precondição do operador. Mesmo envelope de
+        # `_run_investigation_chain` falhando inesperadamente (A2).
+        payload = _internal_error_blocked(
+            command="analyze", store_root=store_root, repo_abs=repo_abs, exc=exc,
         )
         _render_common(payload, json_out=json_out)
         return _exit_code_common(payload["operation_status"])
@@ -8226,6 +8794,7 @@ def cmd_analyze(a) -> int:
         def _analyze_mutate(
             fresh: dict, *, _snapshot=snapshot, _revisao=revisao_publicada,
             _oids=current_oids, _perfil_efetivo=perfil_efetivo_dict, _hash=perfil_efetivo_hash_novo,
+            _cobertura=plan_accounting_full,
         ) -> dict:
             return {
                 "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
@@ -8238,6 +8807,10 @@ def cmd_analyze(a) -> int:
                 "perfil": fresh.get("perfil"),
                 "perfil_efetivo": _perfil_efetivo,
                 "perfil_efetivo_hash": _hash,
+                # § reforço item 4: `plan_accounting_full` persistido — `wk
+                # status`/`wk resume` (quando não recomputam o pipeline) leem
+                # `prior.get("cobertura")` em vez de recalcular do zero.
+                "cobertura": _cobertura,
             }
 
         _update_analysis_profile_entry(store_root, _repo_key(repo_abs), _analyze_mutate)
@@ -8261,6 +8834,17 @@ def cmd_analyze(a) -> int:
                 "perfil_accounting": perfil_accounting,
             },
             "agent": _agent_public_dict(store_root, repo_abs),
+            # ENTREGA item 1/2: sempre presente (lista/dict vazios quando não
+            # aplicável) — nunca omitido conforme o caminho de execução.
+            "objetivos_descoberta": _objetivos_discovery_info(objective_dicts),
+            "arquivos_sem_extrator": _arquivos_sem_extrator_dict(extraction),
+            "cobertura_extracao": _cobertura_extracao_dict(inventory, extraction),
+            # § reforço: `analysis.investigation.plan_accounting(...,
+            # extraction=, inventory=)` — fonte CANÔNICA (mesma função que
+            # `assert_plan_accounted` valida) de arquivos cobertos/não
+            # cobertos, objetivos de descoberta e arquivos sem
+            # extrator/símbolo, sempre calculada (nunca só sob filtro).
+            "cobertura": plan_accounting_full,
         }
         if selecao.get("engine_compat"):
             out["aviso_compat_engine"] = (
@@ -8279,6 +8863,31 @@ def cmd_analyze(a) -> int:
         operation_status, knowledge_status, pending = _apply_publicacao_status(
             operation_status, knowledge_status, pending,
             command="analyze", repo_abs=repo_abs, publicacoes=publicacoes,
+        )
+        # DEFEITO REPRODUZIDO (repo sem NENHUM extrator de linguagem): dobra
+        # final sobre o envelope — nunca `succeeded`/`complete` com zero
+        # objetivos quando há código; nunca objetivo `discovery` silenciado
+        # em `--mode structural`. Ver `_apply_cobertura_status`.
+        operation_status, knowledge_status, pending, next_actions = _apply_cobertura_status(
+            operation_status, knowledge_status, pending, next_actions,
+            command="analyze", store_root=store_root, repo_abs=repo_abs, mode=selecao["mode"],
+            objective_dicts=objective_dicts, inventory=inventory, extraction=extraction,
+        )
+        # § reforço item 2: cobertura de LEITURA (distinta da cobertura de
+        # PLANO acima) — `_load_last_integration` é a MESMA fonte que `wk
+        # status` já lê, atualizada a cada rodada por `_integrate_results`
+        # (`_save_last_integration`, dentro de `_run_investigation_chain`
+        # desta própria invocação). Filtrada por `current_oids` (objetivos
+        # DESTA análise) para nunca misturar leitura de outro repo do mesmo
+        # store.
+        cobertura_leitura = _cobertura_leitura_from_report(
+            _load_last_integration(store_root).get("integracao") or {}, current_oids,
+        )
+        out["cobertura_leitura"] = cobertura_leitura
+        operation_status, knowledge_status, pending, next_actions = _apply_leitura_status(
+            operation_status, knowledge_status, pending, next_actions,
+            command="analyze", store_root=store_root, repo_abs=repo_abs,
+            cobertura_leitura=cobertura_leitura,
         )
         payload = _common_payload(
             command="analyze", operation_status=operation_status,
@@ -8519,9 +9128,23 @@ def cmd_update(a) -> int:
     try:
         rt_recovery.resume(store)  # housekeeping: libera leases expirados de uma execução anterior
 
-        _, inventory, extraction, capability_map, objectives, perfil_accounting = _analyze_pipeline(
-            repo_abs, scope, namespace, precaptured=new_snapshot, exclude=exclude, profile=profile,
-        )
+        from analysis.investigation import PlanAccountingError as _PlanAccountingError
+
+        try:
+            (
+                _, inventory, extraction, capability_map, objectives,
+                perfil_accounting, plan_accounting_full,
+            ) = _analyze_pipeline(
+                repo_abs, scope, namespace, precaptured=new_snapshot, exclude=exclude, profile=profile,
+            )
+        except _PlanAccountingError as exc:
+            # § reforço: mesmo tratamento de `cmd_analyze` — bug de
+            # integridade do plano, nunca precondição do operador.
+            payload = _internal_error_blocked(
+                command="update", store_root=store_root, repo_abs=repo_abs, exc=exc,
+            )
+            _render_common(payload, json_out=json_out)
+            return _exit_code_common(payload["operation_status"])
 
         # Onda F3/item 3: mesma regra de `wk analyze` — ver comentário lá.
         if profile.objectives and perfil_accounting and perfil_accounting.get("objectives", 0) == 0:
@@ -8662,6 +9285,7 @@ def cmd_update(a) -> int:
         def _update_mutate(
             fresh: dict, *, _snapshot=new_snapshot, _revisao=revisao_publicada,
             _oids=sorted(current_oids), _perfil_efetivo=perfil_efetivo_dict, _hash=perfil_efetivo_hash,
+            _cobertura=plan_accounting_full,
         ) -> dict:
             return {
                 "topic": topic, "engine": engine_name, "scope": scope, "namespace": namespace,
@@ -8671,6 +9295,7 @@ def cmd_update(a) -> int:
                 "perfil": fresh.get("perfil"),
                 "perfil_efetivo": _perfil_efetivo,
                 "perfil_efetivo_hash": _hash,
+                "cobertura": _cobertura,
             }
 
         _update_analysis_profile_entry(store_root, _repo_key(repo_abs), _update_mutate)
@@ -8695,6 +9320,10 @@ def cmd_update(a) -> int:
                 "modo": selecao["mode"], "perfil_accounting": perfil_accounting,
             },
             "agent": _agent_public_dict(store_root, repo_abs),
+            "objetivos_descoberta": _objetivos_discovery_info(objective_dicts),
+            "arquivos_sem_extrator": _arquivos_sem_extrator_dict(extraction),
+            "cobertura_extracao": _cobertura_extracao_dict(inventory, extraction),
+            "cobertura": plan_accounting_full,
         }
         if selecao.get("engine_compat"):
             out["aviso_compat_engine"] = (
@@ -8710,6 +9339,25 @@ def cmd_update(a) -> int:
         operation_status, knowledge_status, pending = _apply_publicacao_status(
             operation_status, knowledge_status, pending,
             command="update", repo_abs=repo_abs, publicacoes=publicacoes,
+        )
+        # DEFEITO REPRODUZIDO — mesmo racional de `cmd_analyze` (ver
+        # `_apply_cobertura_status`): `wk update` roda o MESMO pipeline
+        # determinístico e pode reproduzir o mesmo "zero objetivos ->
+        # succeeded/complete" quando o delta introduz código sem cobertura.
+        operation_status, knowledge_status, pending, next_actions = _apply_cobertura_status(
+            operation_status, knowledge_status, pending, next_actions,
+            command="update", store_root=store_root, repo_abs=repo_abs, mode=selecao["mode"],
+            objective_dicts=objective_dicts, inventory=inventory, extraction=extraction,
+        )
+        # § reforço item 2 — mesma leitura de `cmd_analyze`.
+        cobertura_leitura = _cobertura_leitura_from_report(
+            _load_last_integration(store_root).get("integracao") or {}, current_oids,
+        )
+        out["cobertura_leitura"] = cobertura_leitura
+        operation_status, knowledge_status, pending, next_actions = _apply_leitura_status(
+            operation_status, knowledge_status, pending, next_actions,
+            command="update", store_root=store_root, repo_abs=repo_abs,
+            cobertura_leitura=cobertura_leitura,
         )
         if perfil_mudou:
             pending = list(pending) + [_pending_profile_changed(repo_abs, store_root)]
@@ -9052,15 +9700,54 @@ def cmd_status(a) -> int:
         if profile_status_erro is not None:
             out["perfil_erro"] = profile_status_erro
 
+        # ENTREGA item 3: mesma cobertura de extração de `doctor --repo`
+        # (`_capture_inventory_and_extraction`/`_cobertura_extracao_dict`) —
+        # `status` LÊ o repo no disco de novo (é o único jeito de saber
+        # cobertura ATUAL sem persistir um segundo estado): se o `--repo` não
+        # está mais acessível, isso vira `disponivel=False` com o motivo,
+        # nunca derruba a leitura de `status` (§10.3: "status retorna 0
+        # quando conseguiu ler o estado").
+        if os.path.isdir(repo_abs):
+            try:
+                _snap_st, inv_st, ext_st = _capture_inventory_and_extraction(
+                    repo_abs, (profile_status.include or None),
+                    exclude=(profile_status.exclude or None), profile=profile_status,
+                )
+            except Exception as exc:
+                out["cobertura_extracao"] = {"disponivel": False, "erro": f"{type(exc).__name__}: {exc}"}
+            else:
+                out["cobertura_extracao"] = {
+                    "disponivel": True, **_cobertura_extracao_dict(inv_st, ext_st),
+                }
+        else:
+            out["cobertura_extracao"] = {
+                "disponivel": False, "erro": f"repo não acessível neste momento: {repo_abs}",
+            }
+
+        # § reforço item 4: accounting do PLANO (`plan_accounting`) PERSISTIDO
+        # pela última `wk analyze`/`wk update` (`_analyze_mutate`/
+        # `_update_mutate`, chave `"cobertura"`) — `status` nunca recalcula o
+        # pipeline inteiro (capacidades/objetivos) só para exibir isto.
+        out["cobertura"] = prior.get("cobertura")
+        # § reforço item 2: cobertura de LEITURA, mesma fonte de `leituras`
+        # acima (`integ`, já filtrado por `current_oids` linhas abaixo).
+        cobertura_leitura = _cobertura_leitura_from_report(integ, current_oids)
+        out["cobertura_leitura"] = cobertura_leitura
+
         # §10.2/§10.3: `knowledge_status` deriva de `objetivos_por_estado` —
         # MESMOS números já calculados acima, nenhuma segunda contagem.
         # `status` continua devolvendo exit 0 mesmo com conhecimento
         # `partial`/`blocked` (§10.3: "status e consultas retornam 0 quando
         # conseguiram ler o estado, mesmo que relatem conhecimento parcial").
+        # § reforço item 2: mesmo com todo objetivo `complete`, `knowledge_
+        # status` só fecha `complete` quando a cobertura de LEITURA também
+        # fecha (`files_unread_total == 0`) — nunca herdado só da contagem
+        # de estado de objetivo.
+        cobertura_incompleta = bool(cobertura_leitura.get("files_unread_total"))
         if objetivos_por_estado.get("partial") or objetivos_por_estado.get("blocked"):
             knowledge_status = "partial"
         elif objetivos_por_estado.get("complete"):
-            knowledge_status = "complete"
+            knowledge_status = "partial" if cobertura_incompleta else "complete"
         else:
             knowledge_status = "not_applicable"
         pending = []
@@ -9074,6 +9761,14 @@ def cmd_status(a) -> int:
                 "recuperacao_automatica": True,
                 "acoes": ["rodar `wk resume` para continuar a investigação pendente"],
             })
+        elif cobertura_incompleta:
+            # Todo objetivo está `complete`, mas ainda há arquivo com
+            # obrigação de leitura sem citação que resolveu no snapshot —
+            # pending PRÓPRIO (nunca herdado do `if objetivos_pendentes`
+            # acima, que já não dispara neste caso).
+            pending.append(_pending_cobertura_incompleta(
+                command="status", repo_abs=repo_abs, cobertura_leitura=cobertura_leitura,
+            ))
         pending.extend(_pending_publish_effect_to_pending_item(e) for e in publicacao_pendente)
         next_actions = [{
             "ator": "operador", "motivo": "continuar a investigação pendente deste repo",
@@ -9693,14 +10388,29 @@ def cmd_resume(a) -> int:
         # gravado.
         extraction = capability_map = objectives = None
         perfil_accounting = None
+        plan_accounting_full = None
         pipeline_erro = None
         if snap is not None:
+            from analysis.investigation import PlanAccountingError as _PlanAccountingError
+
             try:
-                _snapshot, inventory, extraction, capability_map, objectives, perfil_accounting = (
-                    _analyze_pipeline(
-                        repo_abs, scope, namespace, precaptured=snap, exclude=exclude, profile=profile,
-                    )
+                (
+                    _snapshot, inventory, extraction, capability_map, objectives,
+                    perfil_accounting, plan_accounting_full,
+                ) = _analyze_pipeline(
+                    repo_abs, scope, namespace, precaptured=snap, exclude=exclude, profile=profile,
                 )
+            except _PlanAccountingError as exc:
+                # § reforço item 1: falha de INTEGRIDADE do plano — mesmo
+                # tratamento de `cmd_analyze`/`cmd_update` (`_internal_error_
+                # blocked`, exit 2), nunca o `bloqueios` degradado que as
+                # demais falhas de pipeline desta função usam (aquele existe
+                # para falha de EXTRAÇÃO/ambiente; isto é bug do PLANO).
+                payload = _internal_error_blocked(
+                    command="resume", store_root=store_root, repo_abs=repo_abs, exc=exc,
+                )
+                _render_common(payload, json_out=json_out)
+                return _exit_code_common(payload["operation_status"])
             except Exception as exc:
                 extraction = capability_map = objectives = None
                 pipeline_erro = exc
@@ -9734,6 +10444,7 @@ def cmd_resume(a) -> int:
         publicacoes: dict = {}
         bloqueios: list = []
         revisao_publicada = None
+        objective_dicts: list = []
         max_rounds = getattr(a, "max_rounds", None)
         if max_rounds is None:
             max_rounds = profile.max_rounds
@@ -9770,9 +10481,10 @@ def cmd_resume(a) -> int:
             if objectives is not None:
                 from analysis.investigation import objectives_to_dict
 
+                objective_dicts = objectives_to_dict(objectives)
                 symbol_path_index = {(s.qualname or s.name): s.path for s in extraction.symbols}
                 inputs_by_objective = _objective_input_versions(
-                    objectives_to_dict(objectives), snap, capability_map, symbol_path_index
+                    objective_dicts, snap, capability_map, symbol_path_index
                 )
                 objectives_by_id = {o.objective_id: o for o in objectives}
 
@@ -9804,6 +10516,7 @@ def cmd_resume(a) -> int:
                     def _resume_mutate(
                         fresh: dict, *, _revisao=integracao["revisao"],
                         _perfil_efetivo=perfil_efetivo_dict, _hash=perfil_efetivo_hash,
+                        _cobertura=plan_accounting_full,
                     ) -> dict:
                         # `{**fresh, ...}`, não `{**prior, ...}`: `fresh` é o
                         # registro relido de DISCO dentro do lock — ver
@@ -9812,6 +10525,12 @@ def cmd_resume(a) -> int:
                             **fresh, "last_revision_id": _revisao, "updated_at": _utc_now(),
                             "perfil": fresh.get("perfil"),
                             "perfil_efetivo": _perfil_efetivo, "perfil_efetivo_hash": _hash,
+                            # § reforço item 1/4: `plan_accounting_full` desta
+                            # retomada quando o pipeline rodou; senão preserva
+                            # o que já estava persistido (nunca `None` por
+                            # cima de um valor bom só porque este round não
+                            # recomputou).
+                            "cobertura": (_cobertura if _cobertura is not None else fresh.get("cobertura")),
                         }
 
                     _update_analysis_profile_entry(store_root, _repo_key(repo_abs), _resume_mutate)
@@ -9826,6 +10545,21 @@ def cmd_resume(a) -> int:
             "modo": selecao["mode"],
             "perfil_accounting": perfil_accounting,
             "agent": _agent_public_dict(store_root, repo_abs),
+            # § reforço item 1: mesmos campos de `analyze`/`update` quando o
+            # pipeline foi recomputado nesta retomada (`objective_dicts`
+            # não-vazio); senão o accounting PERSISTIDO da última `analyze`/
+            # `update` (nunca recalcula o pipeline inteiro só para exibir —
+            # item 1/4 do reforço).
+            "objetivos_descoberta": (
+                _objetivos_discovery_info(objective_dicts) if objective_dicts else []
+            ),
+            "arquivos_sem_extrator": (
+                _arquivos_sem_extrator_dict(extraction) if extraction is not None else {}
+            ),
+            "cobertura_extracao": (
+                _cobertura_extracao_dict(inventory, extraction) if extraction is not None else None
+            ),
+            "cobertura": (plan_accounting_full if plan_accounting_full is not None else prior.get("cobertura")),
         }
         if selecao.get("engine_compat"):
             out["aviso_compat_engine"] = (
@@ -9841,6 +10575,29 @@ def cmd_resume(a) -> int:
         operation_status, knowledge_status, pending = _apply_publicacao_status(
             operation_status, knowledge_status, pending,
             command="resume", repo_abs=repo_abs, publicacoes=publicacoes,
+        )
+        # § reforço itens 1/2: mesma dobra de `cmd_analyze`/`cmd_update`,
+        # só quando o pipeline foi recomputado nesta retomada
+        # (`objective_dicts` vazio já é coberto pelos `bloqueios` acima —
+        # snapshot ausente/erro de extração/nenhuma tarefa elegível).
+        if objective_dicts:
+            operation_status, knowledge_status, pending, next_actions = _apply_cobertura_status(
+                operation_status, knowledge_status, pending, next_actions,
+                command="resume", store_root=store_root, repo_abs=repo_abs, mode=selecao["mode"],
+                objective_dicts=objective_dicts, inventory=inventory, extraction=extraction,
+            )
+        current_oids_resume = (
+            {str(o.get("objective_id")) for o in objective_dicts if o.get("objective_id")}
+            if objective_dicts else set(prior.get("current_objective_ids") or ())
+        )
+        cobertura_leitura = _cobertura_leitura_from_report(
+            _load_last_integration(store_root).get("integracao") or {}, current_oids_resume,
+        )
+        out["cobertura_leitura"] = cobertura_leitura
+        operation_status, knowledge_status, pending, next_actions = _apply_leitura_status(
+            operation_status, knowledge_status, pending, next_actions,
+            command="resume", store_root=store_root, repo_abs=repo_abs,
+            cobertura_leitura=cobertura_leitura,
         )
         if perfil_mudou:
             pending = list(pending) + [_pending_profile_changed(repo_abs, store_root)]
@@ -10963,6 +11720,11 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="orçamento de bytes por pacote de contexto (§7.3.1)")
         sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
                          help="orçamento de tokens por pacote de contexto (§7.3.1)")
+        sp.add_argument("--discovery-max-files", dest="discovery_max_files_per_objective",
+                         type=int, default=None,
+                         help="teto de arquivos por objetivo de descoberta "
+                              "(ObjectiveKind.DISCOVERY); default do runtime quando omitido "
+                              "(analysis.profile.DISCOVERY_MAX_FILES_PER_OBJECTIVE)")
 
     def _add_analysis_profile_flags(sp: argparse.ArgumentParser) -> None:
         """§ perfil de análise por sistema — camada 'cli' (§10.3: repo
@@ -10983,6 +11745,11 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="orçamento de bytes por pacote de contexto (§7.3.1)")
         sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
                          help="orçamento de tokens por pacote de contexto (§7.3.1)")
+        sp.add_argument("--discovery-max-files", dest="discovery_max_files_per_objective",
+                         type=int, default=None,
+                         help="teto de arquivos por objetivo de descoberta "
+                              "(ObjectiveKind.DISCOVERY); default do runtime quando omitido "
+                              "(analysis.profile.DISCOVERY_MAX_FILES_PER_OBJECTIVE)")
         sp.add_argument("--profile", dest="profile_file", default=None,
                          help="CAMINHO de um JSON de perfil (`analysis.profile.AnalysisProfile`) "
                               "aplicado como base da camada 'cli' — sobrescrito por "

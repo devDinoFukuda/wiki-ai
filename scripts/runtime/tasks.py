@@ -1203,8 +1203,10 @@ class TaskStore:
         código novo, que é exatamente o que o §7.3 proíbe.
 
         `max_rounds` ausente cai no teto global de `policies`
-        (`get_max_continuation_rounds`, default 3): a cadeia só tem teto
-        próprio depois de `set_chain_limits`.
+        (`get_max_continuation_rounds`, SEM TETO por padrão): a cadeia só tem
+        teto próprio depois de `set_chain_limits`. Sem teto, `max_rounds` e
+        `rounds_left` são `None` — nunca um número grande fingindo de infinito,
+        que quem imprime o status leria como limite real.
         """
         oid = str(objective_id or "")
         row = self.conn.execute(
@@ -1224,7 +1226,9 @@ class TaskStore:
                 "stop_reason": "",
                 "last_package_hash": "",
                 "last_progress": {},
-                "rounds_left": max(0, global_limit - historic),
+                "rounds_left": (
+                    None if global_limit is None else max(0, global_limit - historic)
+                ),
             }
         declared = row["max_rounds"]
         max_rounds = global_limit if declared is None else max(0, int(declared))
@@ -1238,7 +1242,9 @@ class TaskStore:
             "stop_reason": str(row["stop_reason"] or ""),
             "last_package_hash": str(row["last_package_hash"] or ""),
             "last_progress": _loads(row["last_progress_json"]),
-            "rounds_left": max(0, max_rounds - rounds_used),
+            "rounds_left": (
+                None if max_rounds is None else max(0, max_rounds - rounds_used)
+            ),
         }
 
     def set_chain_limits(
@@ -1457,20 +1463,41 @@ class TaskStore:
 # chamada para a mesma tarefa-mãe sempre pede a MESMA rodada — e
 # `effect_identity` (que inclui objective_id+round+hash(needs)+input_versions)
 # faz `create_task` devolver a tarefa já existente em vez de duplicar
-# trabalho; (2) `round_no > max_rounds` é recusa peremptória, sem exceção.
+# trabalho; (2) `round_no > max_rounds` é recusa peremptória, sem exceção,
+# QUANDO existe teto — sem teto (default), a trava contra laço é (1) mais as
+# guardas materiais de `coordinator._chain_refusal` (`no_progress` por
+# `Progress.has_progress`/pacote repetido, orçamento consumido).
 
 #: Chave usada na tabela `policies` (PK livre, sem CHECK) para persistir o
 #: teto de rodadas de continuação. Não colide com nenhum `ErrorClass` de
 #: `recovery.py` (todos em minúsculas com nomes de classe de erro).
 CONTINUATION_ROUNDS_POLICY_KEY = "runtime:continuation_max_rounds"
 
-#: Default do plano: no máximo 3 rodadas de continuação por objetivo antes de
-#: exigir decisão humana (o objetivo fica `partial` sem nova tarefa).
-DEFAULT_MAX_CONTINUATION_ROUNDS = 3
+#: SEM TETO por padrão (`None`). Um teto fixo de rodadas é rigidez de
+#: PROCESSO, não invariante de conhecimento: em codebase grande (mainframe,
+#: monólito Java, Go com centenas de pacotes) a cadeia precisa de quantas
+#: rodadas o material exigir, e parar por contagem descartaria material ainda
+#: não lido — sem nenhuma evidência de que a análise terminou.
+#:
+#: O que PARA a cadeia continua sendo material e verificável, nunca aritmético:
+#: `completed` (objetivo fechado), `no_progress` (`Progress.has_progress` falso
+#: ou pacote de necessidades idêntico ao já despachado — ver
+#: `coordinator._chain_refusal`), `budget_exhausted` (orçamento de tokens/custo
+#: consumido), `executor_unavailable`, `ambiguity` e `interrupted`.
+#:
+#: `--max-rounds N` (CLI) e `max_rounds` de perfil continuam funcionando: viram
+#: TETO EXPLÍCITO daquela cadeia. `0` continua significando "nenhuma
+#: continuação" — é teto zero, não ausência de teto.
+DEFAULT_MAX_CONTINUATION_ROUNDS: int | None = None
 
 
-def get_max_continuation_rounds(store: "TaskStore", *, default: int = DEFAULT_MAX_CONTINUATION_ROUNDS) -> int:
+def get_max_continuation_rounds(
+    store: "TaskStore", *, default: int | None = DEFAULT_MAX_CONTINUATION_ROUNDS
+) -> int | None:
     """Teto de rodadas de continuação persistido em `policies`, ou `default`.
+
+    `None` significa SEM TETO (ver `DEFAULT_MAX_CONTINUATION_ROUNDS`); um
+    inteiro é teto, e `0` proíbe qualquer continuação.
 
     Leitura pura (não semeia a tabela): ausência de linha é "usar o default",
     igual a como `load_policies` trata classes de erro ausentes antes de
@@ -1484,16 +1511,25 @@ def get_max_continuation_rounds(store: "TaskStore", *, default: int = DEFAULT_MA
         return default
     try:
         data = json.loads(row["policy_json"])
-        return max(0, int(data.get("max_rounds", default)))
+        if "max_rounds" not in data:
+            return default
+        value = data["max_rounds"]
+        if value is None:
+            return None
+        return max(0, int(value))
     except (TypeError, ValueError, json.JSONDecodeError):
         return default
 
 
 def set_max_continuation_rounds(
-    store: "TaskStore", max_rounds: int, *, now: str | None = None
-) -> int:
-    """Persiste o teto de rodadas de continuação. Devolve o valor efetivamente gravado."""
-    value = max(0, int(max_rounds))
+    store: "TaskStore", max_rounds: int | None, *, now: str | None = None
+) -> int | None:
+    """Persiste o teto de rodadas de continuação. Devolve o valor gravado.
+
+    `None` grava "sem teto" EXPLICITAMENTE (distinto de nunca ter gravado, que
+    também cai no default sem teto, mas por ausência).
+    """
+    value = None if max_rounds is None else max(0, int(max_rounds))
     moment = now or utc_now()
     with store.immediate() as conn:
         conn.execute(
@@ -1702,7 +1738,9 @@ def create_continuation_tasks(
         return []
     round_no = int(round_no)
     limit = get_max_continuation_rounds(store) if max_rounds is None else max(0, int(max_rounds))
-    if round_no > limit:
+    # `limit is None` = sem teto (default): a cadeia para por material
+    # (`no_progress`, `budget_exhausted`, `completed`), nunca por contagem.
+    if limit is not None and round_no > limit:
         return []
     moment = now or utc_now()
     # Subconjunto que determina a IDENTIDADE do efeito — idêntico ao objetivo

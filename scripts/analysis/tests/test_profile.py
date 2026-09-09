@@ -501,6 +501,7 @@ class TestRepoLayerPrivilege(unittest.TestCase):
                 "failure_families_excluded": {"mensageria": "sem fila"},
                 "failure_families_extra": {"fiscal": ["nota_cancelada"]},
                 "trigger_priority": {"predicate": 1},
+                "discovery_max_files_per_objective": 4,
             },
             source="repo:.wiki-ai.json",
         )

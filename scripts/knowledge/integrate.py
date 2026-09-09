@@ -65,6 +65,21 @@ Invariantes em código, não em prosa
 9. **Fato nunca aponta entidade de outro namespace.** `_capability_subject` e
    `_write_claim` conferem o namespace da entidade ANTES de gravar; citação cujo
    caminho não existe no snapshot corrente rejeita o claim com motivo.
+10. **Evidência é CÓDIGO.** `_gate_rejection` recusa, com código estável em
+   `rejeitados[*]["tipo"]`, citação para documento ou para faixa que só tem
+   comentário/docstring (`evidencia_nao_codigo`), citação cuja faixa não
+   resolve (`evidencia_nao_resolvida`) e citação de fora do snapshot
+   (`evidencia_fora_do_snapshot`). `is_comment_only` cobre família por família
+   (C-like, Python, `#`, SQL/Sybase, COBOL coluna 7 e `*>`, JCL `//*`, XML) e
+   cai em `generic` no desconhecido — a análise precisa valer para mainframe,
+   Java 7-25, Go, C++ e Rust, e o comentário de cada uma tem forma diferente.
+11. **Descoberta é afirmação do agente, nunca verificação.** Em objetivo
+   `ObjectiveKind.DISCOVERY` (módulo sem extrator) não há gramática extraída
+   contra a qual conferir: `_cap_discovery_verdict` rebaixa qualquer
+   `supported` para `inferred`, a entidade nasce `LifecycleStatus.PROPOSED`
+   com `asserted_by` do agente nos atributos, e só nasce se houver citação de
+   código RESOLVIDA (`_support_evidence_ids`). Claim de descoberta sem
+   nenhuma citação é recusado — ali, afirmação sem path/linhas é opinião.
 
 O que este módulo NÃO faz
 -------------------------
@@ -82,6 +97,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field, replace
@@ -142,9 +158,14 @@ from .models import (
 )
 
 __all__ = [
+    "DISCOVERY_KIND",
+    "DOC_EXTENSIONS",
     "FIELD_PREDICATE_KIND",
     "INTEGRATOR",
     "KNOWN_OUTPUT_FIELDS",
+    "REJECT_EVIDENCE_NOT_CODE",
+    "REJECT_EVIDENCE_UNRESOLVED",
+    "REJECT_EVIDENCE_OUT_OF_SNAPSHOT",
     "UNFORESEEN_PREDICATE_KIND",
     "RULE_ENTITY_TYPE",
     "AcceptedResult",
@@ -153,9 +174,38 @@ __all__ = [
     "ObjectiveOutcome",
     "collect_results",
     "integrate",
+    "is_comment_only",
     "results_to_claims",
+    "strip_comments",
     "unforeseen_contract_fields",
 ]
+
+
+#: `ObjectiveKind.DISCOVERY.value` (`analysis.investigation`). Comparado como
+#: STRING de propósito: este módulo já reconstrói o objetivo com
+#: `InvestigationObjective.from_dict`, e ler `.value` mantém a comparação
+#: estável mesmo quando o objetivo chega como dicionário cru (payload de
+#: resultado, fixture de teste) e não como instância da enum.
+DISCOVERY_KIND = "discovery"
+
+#: Códigos ESTÁVEIS de rejeição de claim por evidência. Ficam em
+#: `ObjectiveOutcome.rejeitados[*]["tipo"]` para que o CLI possa contar e
+#: agrupar sem reconhecer texto em português.
+REJECT_EVIDENCE_UNRESOLVED = "evidencia_nao_resolvida"
+REJECT_EVIDENCE_NOT_CODE = "evidencia_nao_codigo"
+REJECT_EVIDENCE_OUT_OF_SNAPSHOT = "evidencia_fora_do_snapshot"
+
+#: Extensões de DOCUMENTO. Citação para um destes arquivos nunca sustenta
+#: afirmação sobre o sistema (§5.4, F10): documento é intenção declarada, não
+#: comportamento implementado. Espelha `analysis.inventory._DOC_EXTENSIONS`
+#: (que classifica `FileClass.DOC`) e a acrescenta — a duplicação é deliberada
+#: para não importar `inventory` aqui; a divergência é detectável por teste.
+DOC_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".md", ".markdown", ".mdx", ".rst", ".adoc", ".asciidoc", ".txt", ".text",
+        ".rtf", ".docx", ".doc", ".pdf", ".org", ".wiki", ".textile", ".tex",
+    }
+)
 
 
 #: Autoria da REVISÃO e de qualquer mudança de natureza. Origem `pipeline`
@@ -357,6 +407,222 @@ _CLAUSE_END = re.compile(r"\s+(?:exceto|salvo|a menos que|caso contrario|porem|m
 _NAMED_PREFIX = re.compile(r"^\s*([^:\n]{3,80}?)\s*:\s*(\S.*)$", re.DOTALL)
 _BULLET = re.compile(r"^\s*(?:[-*•—]|\d+[.)])\s*")
 _ASSERT_LINE = re.compile(r"\b(assert|expect|should|it\(|test)", re.IGNORECASE)
+
+
+# --------------------------------------------------------------------------
+# Evidencia e CODIGO — nunca documento, comentario ou docstring (§5.4, F10)
+# --------------------------------------------------------------------------
+#
+# A regra nao e estilistica: um comentario afirma o que alguem QUIS que o
+# codigo fizesse; so o codigo executavel afirma o que ele FAZ. Aceitar
+# comentario como sustentacao transformaria a intencao do autor em fato
+# verificado — que e exatamente o erro que o §5.4 nomeia.
+#
+# `analysis.verification.classify_content_kind` ja detecta parte disso
+# (extensao de documento, linhas todas iniciadas por `#`/`//`, docstring
+# Python, bloco iniciado por `/*`). O que falta, e mora aqui, e a cobertura
+# LANGUAGE-AGNOSTIC por familia de sintaxe — necessaria porque a analise
+# precisa valer para mainframe (COBOL, JCL), Sybase/T-SQL, Java 7 a 25, Go,
+# C++, Rust e o que vier: o comentario de cada uma tem forma diferente, e uma
+# citacao inteiramente comentada nao pode passar so porque a linguagem nao
+# estava numa lista de quatro nomes.
+#
+# O criterio e MECANICO: remove-se comentario e literal de documentacao; se o
+# que sobra e vazio, a citacao nao e codigo.
+
+#: Familia de sintaxe -> como o comentario se escreve nela.
+#: `line`: prefixos de comentario ate o fim da linha.
+#: `block`: pares (abre, fecha).
+#: `strings`: delimitadores de literal — existem para que `"http://x"` e
+#: `'--'` NAO sejam lidos como inicio de comentario (o erro classico deste
+#: tipo de varredura).
+#: `triple`: literal triplo do Python, que tambem serve de docstring.
+_COMMENT_FAMILIES: Mapping[str, Mapping[str, Any]] = {
+    # C, C++, C#, Java, Go, Rust, Kotlin, Scala, Swift, JS/TS, PHP, Dart...
+    "c_like": {"line": ("//",), "block": (("/*", "*/"),), "strings": ('"', "'", "`"), "triple": False},
+    "python": {"line": ("#",), "block": (), "strings": ('"', "'"), "triple": True},
+    # Shell, Ruby, Perl, YAML, TOML, R, Makefile, Terraform, PowerShell...
+    "hash": {"line": ("#",), "block": (("<#", "#>"),), "strings": ('"', "'"), "triple": False},
+    # SQL ANSI, T-SQL/Sybase, PL/SQL, MySQL.
+    "sql": {"line": ("--", "#"), "block": (("/*", "*/"),), "strings": ("'", '"'), "triple": False},
+    # COBOL: `*` (ou `/`) na COLUNA 7 no formato fixo; `*>` no formato livre.
+    "cobol": {"line": ("*>",), "block": (), "strings": ("'", '"'), "triple": False, "column7": True},
+    # JCL: `//*` e comentario; `/*` e fim de fluxo de dados (tambem nao e regra).
+    "jcl": {"line": ("//*", "/*"), "block": (), "strings": ("'",), "triple": False},
+    "xml": {"line": (), "block": (("<!--", "-->"),), "strings": ('"', "'"), "triple": False},
+    "lisp": {"line": (";",), "block": (("#|", "|#"),), "strings": ('"',), "triple": False},
+    # Desconhecida: UNIAO das formas. E o lado seguro — reconhecer comentario a
+    # mais so REJEITA evidencia (lacuna declarada); reconhecer de menos
+    # aceitaria comentario como sustentacao, que e o dano irreversivel.
+    "generic": {
+        "line": ("//", "#", "--", ";", "*>", "%", "!"),
+        "block": (("/*", "*/"), ("<!--", "-->")),
+        "strings": ('"', "'", "`"),
+        "triple": True,
+    },
+}
+
+#: Extensao -> familia de comentario.
+_EXT_COMMENT_FAMILY: Mapping[str, str] = {
+    **{e: "c_like" for e in (
+        ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".cs", ".java",
+        ".go", ".rs", ".kt", ".kts", ".scala", ".swift", ".js", ".jsx", ".mjs",
+        ".cjs", ".ts", ".tsx", ".php", ".m", ".mm", ".groovy", ".dart", ".proto",
+        ".gradle", ".json5", ".sol", ".vala", ".pas", ".d",
+    )},
+    **{e: "python" for e in (".py", ".pyw", ".pyi")},
+    **{e: "hash" for e in (
+        ".sh", ".bash", ".zsh", ".ksh", ".rb", ".rake", ".pl", ".pm", ".yaml",
+        ".yml", ".toml", ".r", ".tf", ".tfvars", ".ps1", ".psm1", ".cmake",
+        ".mk", ".dockerfile", ".ini", ".cfg", ".conf", ".properties", ".nim",
+    )},
+    **{e: "sql" for e in (".sql", ".pls", ".plsql", ".tsql", ".ddl", ".dml", ".pkb", ".pks")},
+    **{e: "cobol" for e in (".cob", ".cbl", ".cpy", ".cobol", ".ccp", ".cblle")},
+    **{e: "jcl" for e in (".jcl", ".prc", ".proc")},
+    **{e: "xml" for e in (".xml", ".xsd", ".xsl", ".xslt", ".html", ".htm", ".svg", ".wsdl")},
+    **{e: "lisp" for e in (".lisp", ".el", ".clj", ".cljs", ".scm", ".rkt")},
+}
+
+#: Nome de linguagem -> familia (o `language` que `LocationResult` carrega, e o
+#: que `analysis.inventory.Language` usa).
+_NAME_COMMENT_FAMILY: Mapping[str, str] = {
+    "python": "python", "java": "c_like", "javascript": "c_like",
+    "typescript": "c_like", "go": "c_like", "golang": "c_like", "c": "c_like",
+    "cpp": "c_like", "c++": "c_like", "csharp": "c_like", "c#": "c_like",
+    "rust": "c_like", "kotlin": "c_like", "scala": "c_like", "swift": "c_like",
+    "php": "c_like", "dart": "c_like", "groovy": "c_like",
+    "shell": "hash", "bash": "hash", "ruby": "hash", "perl": "hash",
+    "yaml": "hash", "toml": "hash", "r": "hash", "terraform": "hash",
+    "powershell": "hash", "dockerfile": "hash", "makefile": "hash",
+    "sql": "sql", "tsql": "sql", "plsql": "sql", "sybase": "sql",
+    "cobol": "cobol", "jcl": "jcl",
+    "xml": "xml", "html": "xml",
+    "lisp": "lisp", "clojure": "lisp", "elisp": "lisp",
+}
+
+#: Abertura de literal triplo do Python, com prefixo (`r`, `b`, `f`, `rb`...).
+_TRIPLE_OPEN = re.compile(r'[rRbBuUfF]{0,2}("""|\'\'\')')
+
+
+def _comment_family(language: str) -> str:
+    """Familia de sintaxe de comentario de uma linguagem, extensao ou caminho.
+
+    Aceita as tres formas porque quem chama tem uma delas em maos:
+    `LocationResult.language` (nome), o caminho citado (extensao) ou a propria
+    familia. Desconhecido cai em `generic` — a uniao das formas, que erra para
+    o lado de REJEITAR evidencia em vez de aceitar comentario como codigo.
+    """
+    raw = str(language or "").strip().lower()
+    if raw in _COMMENT_FAMILIES:
+        return raw
+    if raw in _NAME_COMMENT_FAMILY:
+        return _NAME_COMMENT_FAMILY[raw]
+    ext = os.path.splitext(raw)[1] if ("." in raw) else ""
+    if not ext and raw:
+        ext = "." + raw
+    return _EXT_COMMENT_FAMILY.get(ext, "generic")
+
+
+def _strip_cobol_indicator(text: str) -> str:
+    """Remove a linha cujo INDICADOR (coluna 7) e `*` ou `/` — comentario COBOL.
+
+    Formato fixo: colunas 1-6 sao numeracao de sequencia e a 7 e o indicador.
+    Indice 6 (0-based) e, portanto, a coluna 7.
+    """
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        terminator = line[len(body):]
+        if len(body) > 6 and body[6] in "*/":
+            out.append(terminator)
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def strip_comments(text: str, language: str = "") -> str:
+    """Texto SEM comentario nem literal de documentacao, preservando o resto.
+
+    Varredura com estado (codigo / literal / comentario de linha / comentario
+    de bloco): e o estado de literal que impede `"// nao e comentario"` e
+    `'--'` de serem lidos como comentario — sem ele, uma linha de codigo com
+    URL viraria "comentario" e a evidencia seria rejeitada por engano.
+    """
+    src = text or ""
+    if not src:
+        return ""
+    family = _comment_family(language)
+    rules = _COMMENT_FAMILIES[family]
+    if rules.get("column7"):
+        src = _strip_cobol_indicator(src)
+
+    line_tokens: tuple = tuple(sorted(rules["line"], key=len, reverse=True))
+    blocks: tuple = tuple(rules["block"])
+    quotes: tuple = tuple(rules["strings"])
+    triple = bool(rules["triple"])
+
+    out: list[str] = []
+    i, n = 0, len(src)
+    while i < n:
+        token = next((t for t in line_tokens if src.startswith(t, i)), None)
+        if token is not None:
+            end = src.find("\n", i)
+            i = n if end < 0 else end  # o `\n` fica: linhas nao se fundem
+            continue
+        block = next((b for b in blocks if src.startswith(b[0], i)), None)
+        if block is not None:
+            end = src.find(block[1], i + len(block[0]))
+            i = n if end < 0 else end + len(block[1])
+            continue
+        if triple:
+            match = _TRIPLE_OPEN.match(src, i)
+            if match is not None:
+                fence = match.group(1)
+                end = src.find(fence, match.end())
+                i = n if end < 0 else end + len(fence)
+                continue
+        if src[i] in quotes:
+            quote = src[i]
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == quote:
+                    j += 1
+                    break
+                if src[j] == "\n":  # literal nao fechado: nao engolir o resto
+                    break
+                j += 1
+            out.append(src[i:j])
+            i = j
+            continue
+        out.append(src[i])
+        i += 1
+    return "".join(out)
+
+
+def is_comment_only(text: str, language: str = "") -> bool:
+    """O trecho e SO comentario/documentacao/vazio? Entao nao sustenta nada.
+
+    `language` aceita nome de linguagem, extensao ou caminho (ver
+    `_comment_family`). Trecho vazio conta como comentario-only: nao ha codigo
+    citado, e "citou o nada" nunca pode valer como sustentacao.
+    """
+    if not str(text or "").strip():
+        return True
+    return not strip_comments(text, language).strip()
+
+
+def is_doc_path(path: str) -> bool:
+    """O caminho citado e DOCUMENTO (§5.4, F10)?
+
+    Documento nunca sustenta afirmacao sobre o sistema: ele registra intencao.
+    A checagem e por extensao porque o localizador e o que existe aqui — a
+    classificacao por conteudo de `analysis.inventory` roda antes, na analise,
+    e nao e reimplementada.
+    """
+    return os.path.splitext(str(path or "").strip().lower())[1] in DOC_EXTENSIONS
 
 
 # --------------------------------------------------------------------------
@@ -2351,6 +2617,26 @@ class ObjectiveOutcome:
     capability_id: str
     subject_id: str | None
     state: str
+    #: `ObjectiveKind` do objetivo (`capability`/`orphan_group`/`discovery`).
+    #: O CLI precisa dele para nao contar objetivo de DESCOBERTA junto com
+    #: objetivo de capacidade: no primeiro nao ha verificacao mecanica
+    #: possivel, entao "0 supported" e o resultado CORRETO, nao uma falha.
+    kind: str = ""
+    #: Claims deste objetivo cuja citacao RESOLVEU no snapshot e apontava
+    #: codigo (nem documento, nem comentario/docstring).
+    claims_com_evidencia_resolvida: int = 0
+    #: Claims que nao declararam nenhuma citacao. Lacuna declarada, nao erro.
+    claims_sem_evidencia: int = 0
+    #: Citacoes ACEITAS nesta integracao (`{path, line_start, line_end,
+    #: content_kind}`), deduplicadas. Existem por uma razao operacional
+    #: precisa: `runtime.state.apply_result` conta `evidence_accepted` a partir
+    #: de `evidence_refs` do delta, e `Progress.has_progress` decide se a
+    #: cadeia continua. Sem elas, uma rodada de DESCOBERTA que leu arquivos e
+    #: citou codigo real — mas cujo campo do contrato ja estava preenchido —
+    #: era classificada `no_progress` e a cadeia parava em cima de trabalho
+    #: feito (§7.3). Sao as MESMAS faixas que viraram linha de `evidence` no
+    #: banco: citacao recusada pelo portao nunca entra aqui.
+    evidence_refs: list[dict[str, Any]] = field(default_factory=list)
     unmet: list[str] = field(default_factory=list)
     lacunas: list[dict[str, Any]] = field(default_factory=list)
     fatos: list[FactWrite] = field(default_factory=list)
@@ -2403,6 +2689,10 @@ class ObjectiveOutcome:
             "objective_id": self.objective_id,
             "capability_id": self.capability_id,
             "subject_id": self.subject_id,
+            "kind": self.kind,
+            "claims_com_evidencia_resolvida": self.claims_com_evidencia_resolvida,
+            "claims_sem_evidencia": self.claims_sem_evidencia,
+            "evidence_refs": [dict(e) for e in self.evidence_refs],
             "task_id": self.task_id,
             "execution_id": self.execution_id,
             "integration_key": self.integration_key,
@@ -2476,6 +2766,175 @@ class IntegrationReport:
             "campos_nao_previstos": list(self.campos_nao_previstos),
             "resultados_rejeitados": list(self.resultados_rejeitados),
         }
+
+
+def _objective_kind(objective: Any) -> str:
+    """`kind` do objetivo como STRING, venha ele como enum ou como texto."""
+    kind = getattr(objective, "kind", "")
+    return str(getattr(kind, "value", kind) or "")
+
+
+def _is_discovery(objective: Any) -> bool:
+    """Objetivo de DESCOBERTA (modulo sem extrator)?
+
+    O que muda para ele, e so para ele: (1) nao existe gramatica extraida
+    contra a qual conferir a afirmacao, entao o teto epistemico e `inferred`
+    (`_cap_discovery_verdict`); (2) a entidade que nasce dele e uma AFIRMACAO
+    do agente, entao entra com ciclo de vida nao confirmado (`proposed`) e so
+    existe se houver evidencia de codigo resolvida; (3) claim sem nenhuma
+    evidencia de codigo valida e RECUSADO em vez de virar fato `unresolved` —
+    num objetivo de descoberta, afirmacao sem citacao e so opiniao do modelo.
+    """
+    return _objective_kind(objective) == DISCOVERY_KIND
+
+
+@dataclass(frozen=True)
+class _EvidenceGate:
+    """Veredito do portao de evidencia de UM claim (§5.4, F10).
+
+    `locations` sao as citacoes que RESOLVERAM apontando codigo. `rejeicao` e
+    o diagnostico TIPADO quando nenhuma resolveu — nunca `None` junto de
+    `locations` vazio e `declarou=True`.
+    """
+
+    locations: tuple[LocationResult, ...] = ()
+    problemas: tuple[Mapping[str, Any], ...] = ()
+    declarou: bool = False
+
+    @property
+    def resolvida(self) -> bool:
+        return bool(self.locations)
+
+
+def _evidence_problem(
+    tipo: str, path: str, start: int, end: int, motivo: str
+) -> dict[str, Any]:
+    """Diagnostico de UMA citacao recusada — sempre com path e linhas."""
+    return {
+        "tipo": tipo,
+        "path": path,
+        "line_start": int(start),
+        "line_end": int(end),
+        "motivo": motivo,
+    }
+
+
+def _location_is_code(loc: LocationResult) -> tuple[bool, str]:
+    """A faixa RESOLVIDA e codigo? `(ok, motivo da recusa)`.
+
+    Duas recusas distintas, ambas mecanicas: caminho de documento (extensao) e
+    faixa cujo texto, removidos comentario e literal de documentacao, fica
+    vazia. A segunda usa `is_comment_only`, que cobre familia por familia
+    (C-like, Python, hash, SQL/Sybase, COBOL coluna 7 e `*>`, JCL `//*`, XML)
+    e cai em `generic` no desconhecido.
+    """
+    if is_doc_path(loc.path):
+        return False, (
+            f"{loc.path} e arquivo de documentacao: documento registra intencao, "
+            "nunca comportamento implementado (§5.4, F10)"
+        )
+    if is_comment_only(loc.snippet, loc.language or loc.path):
+        return False, (
+            f"faixa {loc.start_line}..{loc.end_line} de {loc.path} contem apenas "
+            "comentario/docstring: removido o comentario nao sobra codigo — "
+            "comentario afirma intencao do autor, nao comportamento do sistema"
+        )
+    return True, ""
+
+
+def _code_evidence(
+    claim: Claim, verdict: Verdict, versions: "_SourceVersions"
+) -> _EvidenceGate:
+    """Citacoes do claim que sustentam: resolvidas, no snapshot e em CODIGO.
+
+    Reaproveita `Verdict.locations` (calculadas por `verify_claim` com o mesmo
+    `check_location`) e so recalcula quando o veredito nao as traz — resolver
+    duas vezes com criterios diferentes seria ter dois conceitos de "resolve".
+    """
+    refs = list(claim.evidence_refs or ())
+    if not refs:
+        return _EvidenceGate(declarou=False)
+
+    locs = list(verdict.locations or ())
+    if len(locs) != len(refs):
+        locs = [check_location(ref, versions.snapshot) for ref in refs]
+
+    boas: list[LocationResult] = []
+    problemas: list[Mapping[str, Any]] = []
+    for ref, loc in zip(refs, locs):
+        if is_doc_path(ref.path):
+            problemas.append(
+                _evidence_problem(
+                    REJECT_EVIDENCE_NOT_CODE,
+                    ref.path,
+                    ref.start_line,
+                    ref.end_line,
+                    f"{ref.path} e arquivo de documentacao (§5.4, F10)",
+                )
+            )
+            continue
+        if not versions.in_snapshot(ref.path):
+            problemas.append(
+                _evidence_problem(
+                    REJECT_EVIDENCE_OUT_OF_SNAPSHOT,
+                    ref.path,
+                    ref.start_line,
+                    ref.end_line,
+                    f"{ref.path} nao esta no snapshot desta integracao",
+                )
+            )
+            continue
+        if loc is None or not loc.ok:
+            problemas.append(
+                _evidence_problem(
+                    REJECT_EVIDENCE_UNRESOLVED,
+                    ref.path,
+                    ref.start_line,
+                    ref.end_line,
+                    (loc.reason if loc is not None else "citacao sem resultado de localizacao")
+                    or "faixa nao resolve no snapshot",
+                )
+            )
+            continue
+        ok, motivo = _location_is_code(loc)
+        if not ok:
+            problemas.append(
+                _evidence_problem(
+                    REJECT_EVIDENCE_NOT_CODE, ref.path, ref.start_line, ref.end_line, motivo
+                )
+            )
+            continue
+        boas.append(loc)
+    return _EvidenceGate(
+        locations=tuple(boas), problemas=tuple(problemas), declarou=True
+    )
+
+
+def _cap_discovery_verdict(verdict: Verdict) -> Verdict:
+    """Teto epistemico do objetivo de descoberta: NUNCA `supported`.
+
+    Num modulo sem extrator nao existe gramatica extraida (simbolo, aresta,
+    contrato) contra a qual conferir a afirmacao — o que existe e o texto do
+    arquivo, lido pelo modelo. Uma checagem lexica que "passe" ali nao e
+    verificacao mecanica do sistema, e por isso o resultado maximo e
+    `inferred`: afirmacao DO AGENTE, com proveniencia e com a citacao
+    resolvida anexada, jamais sustentacao registrada pelo pipeline.
+    """
+    if verdict.epistemic is not EpistemicStatus.SUPPORTED:
+        return verdict
+    return replace(
+        verdict,
+        epistemic=EpistemicStatus.INFERRED,
+        nature=None,
+        support_recorded_by=None,
+        external_behavior_supported=False,
+        reasons=tuple(verdict.reasons)
+        + (
+            "objetivo de descoberta (modulo sem extrator): nao ha gramatica "
+            "extraida para verificacao mecanica — teto `inferred`, afirmacao do "
+            "agente com proveniencia (§5.3)",
+        ),
+    )
 
 
 def _nature_for(claim: Claim, verdict: Verdict, supported: bool) -> FactNature:
@@ -2559,6 +3018,10 @@ class _SourceVersions:
     def __init__(self, repo: Any, namespace: str, snapshot: Snapshot) -> None:
         self.repo = repo
         self.namespace = namespace
+        #: O snapshot inteiro (nao so o mapa de arquivos): o portao de
+        #: evidencia (`_code_evidence`) precisa RESOLVER faixa de linhas
+        #: (`check_location`), nao apenas saber que o caminho existe.
+        self.snapshot = snapshot
         self.files = snapshot.file_map()
         self.cache: dict[str, str | None] = {}
 
@@ -2737,6 +3200,10 @@ def integrate(
             if escopo:
                 escopos[verdict.claim_id] = escopo
         verdicts = guarded
+        if _is_discovery(objective):
+            # Antes do resumo E antes da gravacao: relatorio e banco contam a
+            # mesma historia (mesmo motivo do achado nº1 acima).
+            verdicts = [_cap_discovery_verdict(v) for v in verdicts]
         all_verdicts.extend(verdicts)
         prepared.append(
             {
@@ -2931,6 +3398,9 @@ def _capability_subject(
     capability_entity_map: Mapping[str, str],
     create_missing: bool,
     outcome: ObjectiveOutcome,
+    discovery: bool = False,
+    support_evidence: Sequence[str] = (),
+    asserted_by: str = "",
 ) -> str | None:
     """Entidade à qual os fatos deste objetivo se prendem.
 
@@ -2972,7 +3442,31 @@ def _capability_subject(
         )
         return None
 
+    if discovery and not support_evidence:
+        # F10/§5.4: entidade tecnica nao nasce de afirmacao sem lastro. O
+        # analogo em `ingestion.correlate.CREATABLE_TYPES` e mais forte (texto
+        # de documento NUNCA cria `Capability`, com ou sem citacao); aqui a
+        # origem e analise de codigo, e o que autoriza a criacao e a citacao
+        # RESOLVIDA no snapshot — sem nenhuma, nada e criado.
+        outcome.bloqueios.append(
+            f"objetivo de descoberta {objective.objective_id!r} sem nenhuma citacao de "
+            "codigo resolvida: nenhuma entidade criada (afirmacao de agente sem "
+            "evidencia no snapshot nao cria entidade tecnica — §5.4, F10)"
+        )
+        return None
+
     stable_key = f"cap:{objective.capability_id or objective.objective_id}"
+    attributes: dict[str, Any] = {
+        "objective_id": objective.objective_id,
+        "origem": "descoberta" if discovery else "integracao",
+    }
+    if discovery:
+        # `EntityDraft` nao tem campo de autoria (autoria e eixo de FATO e de
+        # RELACAO). Registrar o agente aqui e o que preserva a proveniencia da
+        # DESCOBERTA: a entidade existe porque um agente afirmou, e isso fica
+        # legivel na propria entidade, nao so nos fatos pendurados nela.
+        attributes["asserted_by"] = asserted_by or DEFAULT_ASSERTED_BY
+        attributes["descoberta_por_analise_de_codigo"] = True
     write = rev.put_entity(
         EntityDraft(
             namespace=namespace,
@@ -2983,11 +3477,27 @@ def _capability_subject(
             # o id de uma entidade de outro namespace seria `IdentityConflict`
             # (e, sem a checagem, seria contaminação silenciosa).
             entity_id=(objective.capability_id or None) if not existing else None,
-            attributes={"objective_id": objective.objective_id, "origem": "integracao"},
+            attributes=attributes,
+            # Descoberta NAO e confirmacao: a entidade nasce `proposed` e so
+            # vira `current` por decisao humana ou por analise estrutural que a
+            # reafirme. `current` aqui faria a consulta padrao trata-la como
+            # conhecimento vigente do sistema (`DEFAULT_LIFECYCLE`).
+            lifecycle_status=(
+                LifecycleStatus.PROPOSED if discovery else LifecycleStatus.CURRENT
+            ),
+            evidence_refs=tuple(support_evidence),
         )
     )
     outcome.entidades.append(
-        {"entity_id": write.target_id, "tipo": EntityType.CAPABILITY.value, "novo": write.changed}
+        {
+            "entity_id": write.target_id,
+            "tipo": EntityType.CAPABILITY.value,
+            "novo": write.changed,
+            "lifecycle": (
+                LifecycleStatus.PROPOSED.value if discovery else LifecycleStatus.CURRENT.value
+            ),
+            "asserted_by": attributes.get("asserted_by", ""),
+        }
     )
     return write.target_id
 
@@ -3003,6 +3513,8 @@ def _rule_entity(
     verdict: Verdict,
     outcome: ObjectiveOutcome,
     statement: str = "",
+    discovery: bool = False,
+    asserted_by: str = "",
 ) -> str:
     """`BusinessRule`/`Flow` nomeada, com `implements` para a capacidade.
 
@@ -3020,6 +3532,10 @@ def _rule_entity(
     entity_type = RULE_ENTITY_TYPE.get(campo, EntityType.BUSINESS_RULE)
     stable_key = f"{entity_type.value.lower()}:{objective.capability_id or objective.objective_id}:{_slug(subject_name)}"
     aliases = id_mod.explicit_id_aliases(subject_name, statement)
+    attributes: dict[str, Any] = {"campo": campo, "objective_id": objective.objective_id}
+    if discovery:
+        attributes["origem"] = "descoberta"
+        attributes["asserted_by"] = asserted_by or verdict.asserted_by or DEFAULT_ASSERTED_BY
     write = rev.put_entity(
         EntityDraft(
             namespace=namespace,
@@ -3027,8 +3543,11 @@ def _rule_entity(
             stable_key=stable_key,
             title=subject_name,
             aliases=aliases,
-            attributes={"campo": campo, "objective_id": objective.objective_id},
+            attributes=attributes,
             evidence_refs=tuple(evidence_ids),
+            lifecycle_status=(
+                LifecycleStatus.PROPOSED if discovery else LifecycleStatus.CURRENT
+            ),
         )
     )
     outcome.entidades.append(
@@ -3038,6 +3557,10 @@ def _rule_entity(
             "novo": write.changed,
             "titulo": subject_name,
             "aliases": [a.alias for a in aliases],
+            "lifecycle": (
+                LifecycleStatus.PROPOSED.value if discovery else LifecycleStatus.CURRENT.value
+            ),
+            "asserted_by": attributes.get("asserted_by", ""),
         }
     )
 
@@ -3226,11 +3749,13 @@ def _write_objective(
 ) -> ObjectiveOutcome:
     """Grava os fatos de UM objetivo e recalcula seu estado (§6.6)."""
     state = objective.evaluate()
+    discovery = _is_discovery(objective)
     outcome = ObjectiveOutcome(
         objective_id=objective.objective_id,
         capability_id=objective.capability_id,
         subject_id=None,
         state=state.value,
+        kind=_objective_kind(objective),
         unmet=objective.unmet_obligations(),
         lacunas=_lacunas_of(objective, result.output, verdicts, claims),
         inconsistencias=[i.as_dict() for i in inconsistencies],
@@ -3248,17 +3773,61 @@ def _write_objective(
         resultados_rejeitados=[dict(r) for r in rejeicoes],
     )
 
+    # PORTAO DE EVIDENCIA — roda ANTES de qualquer escrita, por dois motivos
+    # que não são de estilo:
+    #
+    # 1. a entidade de DESCOBERTA só pode nascer se sobrar alguma citação de
+    #    código resolvida, e isso só se sabe depois de examinar TODOS os claims;
+    # 2. a recusa de um claim precisa ser registrada mesmo quando a entidade
+    #    não chega a ser criada — do contrário "nada foi criado" apareceria sem
+    #    dizer QUAIS citações caíram e por quê, que é o silêncio que o §6.6
+    #    proíbe.
+    aceitos: list[tuple[Claim, Verdict, _EvidenceGate]] = []
+    for verdict in verdicts:
+        claim = claims.get(verdict.claim_id)
+        if claim is None:
+            continue
+        gate = _code_evidence(claim, verdict, versions)
+        if gate.resolvida:
+            outcome.claims_com_evidencia_resolvida += 1
+        elif not gate.declarou:
+            outcome.claims_sem_evidencia += 1
+        recusa = _gate_rejection(claim, gate, discovery)
+        if recusa is not None:
+            outcome.rejeitados.append(recusa)
+            outcome.bloqueios.append(f"{claim.claim_id}: {recusa['motivo']}")
+            continue
+        aceitos.append((claim, verdict, gate))
+
+    outcome.evidence_refs = _accepted_evidence_refs(aceitos)
+
+    # Entidade de DESCOBERTA so nasce com evidencia de codigo RESOLVIDA. A
+    # regra F10/§5.4 de `ingestion.correlate.CREATABLE_TYPES` diz que
+    # `Capability` nao e criavel a partir do TEXTO de um documento; aqui a
+    # origem e outra — analise do proprio codigo, com citacao que resolve no
+    # snapshot corrente. E a citacao resolvida (nao a origem declarada) que
+    # separa os dois casos.
+    support_evidence: list[str] = (
+        _support_evidence_ids(rev, namespace, versions, aceitos) if discovery else []
+    )
+
     capability_subject = _capability_subject(
-        rev, repo, namespace, objective, capability_entity_map, create_missing_capability, outcome
+        rev,
+        repo,
+        namespace,
+        objective,
+        capability_entity_map,
+        create_missing_capability,
+        outcome,
+        discovery=discovery,
+        support_evidence=support_evidence,
+        asserted_by=result.asserted_by or DEFAULT_ASSERTED_BY,
     )
     outcome.subject_id = capability_subject
     if capability_subject is None:
         return outcome
 
-    for verdict in verdicts:
-        claim = claims.get(verdict.claim_id)
-        if claim is None:
-            continue
+    for claim, verdict, _gate in aceitos:
         _write_claim(
             rev=rev,
             namespace=namespace,
@@ -3270,8 +3839,118 @@ def _write_objective(
             capability_subject=capability_subject,
             outcome=outcome,
             escopo_sustentado=(escopos or {}).get(claim.claim_id, ""),
+            discovery=discovery,
         )
     return outcome
+
+
+def _accepted_evidence_refs(
+    aceitos: Sequence[tuple[Claim, Verdict, "_EvidenceGate"]]
+) -> list[dict[str, Any]]:
+    """Citações aceitas, deduplicadas por `(path, faixa)` e em ordem estável.
+
+    Ordem estável (primeira aparição) porque este dicionário viaja para
+    `runtime.state`, onde vira chave de "evidência nova": reordenar a lista
+    não pode mudar o que conta como progresso.
+    """
+    out: list[dict[str, Any]] = []
+    vistas: set[tuple[str, int, int]] = set()
+    for _claim, _verdict, gate in aceitos:
+        for loc in gate.locations:
+            chave = (loc.path, int(loc.start_line), int(loc.end_line))
+            if chave in vistas:
+                continue
+            vistas.add(chave)
+            out.append(
+                {
+                    "path": loc.path,
+                    "line_start": int(loc.start_line),
+                    "line_end": int(loc.end_line),
+                    "content_kind": loc.content_kind.value,
+                }
+            )
+    return out
+
+
+def _gate_rejection(
+    claim: Claim, gate: _EvidenceGate, discovery: bool
+) -> dict[str, Any] | None:
+    """Recusa TIPADA do claim, ou `None` quando ele pode ser gravado.
+
+    Três recusas distintas, para que o operador saiba qual regra caiu sem ler
+    prosa (os códigos são estáveis e vão em `rejeitados[*]["tipo"]`):
+
+    * `evidencia_fora_do_snapshot` — citação para arquivo que não está neste
+      snapshot é prova de OUTRO escopo (o repositório vizinho no mesmo store,
+      ou uma árvore anterior); gravar apontaria conhecimento deste namespace
+      para evidência que ele não pode reabrir;
+    * `evidencia_nao_resolvida` — o caminho existe, a FAIXA não resolve (linha
+      além do fim, conteúdo mudou sob a citação). Aceitar em silêncio seria
+      gravar uma referência que nunca mais volta a ser verificável;
+    * `evidencia_nao_codigo` — documento (.md/.rst/...) ou faixa que, removido
+      o comentário/docstring, não tem código. Comentário afirma a intenção do
+      autor; só o código afirma o comportamento do sistema (§5.4, F10).
+
+    Claim SEM nenhuma citação: em objetivo de capacidade continua virando fato
+    `unresolved` (invariante 4 — ausência de prova é lacuna DECLARADA, não
+    descarte); em objetivo de DESCOBERTA é recusado, porque ali a afirmação
+    nasce da leitura livre do modelo e sem citação nada a distingue de opinião.
+    """
+    campo = claim.scope.rsplit(":", 1)[-1] if ":" in claim.scope else ""
+    if gate.resolvida:
+        return None
+    if gate.declarou:
+        problemas = list(gate.problemas)
+        return {
+            "claim_id": claim.claim_id,
+            "campo": campo,
+            "tipo": str(problemas[0]["tipo"]) if problemas else REJECT_EVIDENCE_UNRESOLVED,
+            "tipos": sorted({str(pr["tipo"]) for pr in problemas}),
+            "evidencias": problemas,
+            "motivo": "; ".join(str(pr["motivo"]) for pr in problemas)[:400],
+        }
+    if discovery:
+        return {
+            "claim_id": claim.claim_id,
+            "campo": campo,
+            "tipo": REJECT_EVIDENCE_UNRESOLVED,
+            "tipos": [REJECT_EVIDENCE_UNRESOLVED],
+            "evidencias": [],
+            "motivo": (
+                "objetivo de descoberta: afirmacao sem nenhuma citacao de codigo — "
+                "leitura livre do modelo sem path/linhas nao entra no corpus"
+            ),
+        }
+    return None
+
+
+def _support_evidence_ids(
+    rev: Any,
+    namespace: str,
+    versions: "_SourceVersions",
+    aceitos: Sequence[tuple[Claim, Verdict, "_EvidenceGate"]],
+) -> list[str]:
+    """Ids de evidencia de CODIGO deste objetivo, em ordem estavel.
+
+    Sao as mesmas linhas que `_record_evidence` gravaria por claim (mesmo
+    `evidence_id` derivado do localizador, logo `add_evidence` e idempotente):
+    aqui elas so sao antecipadas porque a ENTIDADE de descoberta precisa
+    nascer ja apontando a sustentacao — criar primeiro e prender evidencia
+    depois deixaria uma entidade sem lastro visivel na mesma revisao.
+    """
+    ids: list[str] = []
+    for claim, _verdict, gate in aceitos:
+        if not gate.resolvida:
+            continue
+        for loc in gate.locations:
+            svid = versions.get(loc.path)
+            evidence = _evidence_for_location(namespace, svid, loc, claim.symbol)
+            if evidence is None:
+                continue
+            eid = rev.add_evidence(evidence)
+            if eid not in ids:
+                ids.append(eid)
+    return ids
 
 
 def _record_evidence(
@@ -3307,26 +3986,15 @@ def _write_claim(
     capability_subject: str,
     outcome: ObjectiveOutcome,
     escopo_sustentado: str = "",
+    discovery: bool = False,
 ) -> None:
-    """Um claim verificado -> um fato, com o `epistemic` do VEREDITO."""
-    campo = claim.scope.rsplit(":", 1)[-1] if ":" in claim.scope else ""
+    """Um claim ACEITO pelo portão de evidência -> um fato, com o `epistemic`
+    do VEREDITO.
 
-    # Achado nº5: citação para arquivo que não está no snapshot corrente é prova
-    # de OUTRO escopo (o repositório vizinho no mesmo store, ou uma árvore
-    # anterior). Gravar o fato aqui apontaria conhecimento deste namespace para
-    # evidência que ele não pode reabrir. Claim SEM citação continua virando
-    # fato `unresolved` — ausência de prova é lacuna declarada (invariante 4);
-    # prova de fora do escopo é incoerência, e incoerência é recusada.
-    if claim.evidence_refs and not any(
-        versions.in_snapshot(ref.path) for ref in claim.evidence_refs
-    ):
-        motivo = (
-            "todas as citações apontam para fora do snapshot desta integração: "
-            + ", ".join(sorted({ref.path for ref in claim.evidence_refs}))[:200]
-        )
-        outcome.rejeitados.append({"claim_id": claim.claim_id, "campo": campo, "motivo": motivo})
-        outcome.bloqueios.append(f"{claim.claim_id}: {motivo}")
-        return
+    O portão (`_gate_rejection`, chamado por `_write_objective`) já recusou o
+    que não podia ser gravado: aqui não há mais decisão sobre citação.
+    """
+    campo = claim.scope.rsplit(":", 1)[-1] if ":" in claim.scope else ""
 
     evidence_ids, source_version_id = _record_evidence(
         rev, namespace, versions, verdict, claim.symbol
@@ -3335,10 +4003,15 @@ def _write_claim(
     subject_id = capability_subject
     subject_name = _subject_name_of(claim, result.output, campo)
     entity_id: str | None = None
-    if subject_name and campo in RULE_ENTITY_TYPE:
+    # Regra/fluxo DESCOBERTO so vira entidade com evidencia de codigo
+    # resolvida (mesma porta da capacidade acima): sem lastro, a afirmacao
+    # continua sendo um fato preso a capacidade, nunca uma entidade nova.
+    if subject_name and campo in RULE_ENTITY_TYPE and not (discovery and not evidence_ids):
         entity_id = _rule_entity(
             rev, namespace, objective, campo, subject_name, capability_subject,
             evidence_ids, verdict, outcome, claim.statement,
+            discovery=discovery,
+            asserted_by=result.asserted_by or DEFAULT_ASSERTED_BY,
         )
         subject_id = entity_id
 

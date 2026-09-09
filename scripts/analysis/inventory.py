@@ -65,7 +65,15 @@ class FileClass(str, enum.Enum):
 
 
 class Language(str, enum.Enum):
-    """Só populado para `FileClass.CODE` (§6.1 item 2: "por arquivo code")."""
+    """Linguagem de um `FileClass.CODE`.
+
+    O conjunto é AMPLO de propósito. Um repositório COBOL/JCL, Sybase, Delphi
+    ou ABAP não pode cair em "não reconhecido" e sumir do plano: linguagem sem
+    extrator continua sendo código, e é `investigation.plan()` que abre
+    objetivo de DESCOBERTA para ela. `UNKNOWN` é o piso — texto que nenhuma
+    extensão mapeou continua sendo candidato a código, com limitação
+    registrada, nunca descartado.
+    """
 
     PYTHON = "python"
     JAVA = "java"
@@ -77,7 +85,68 @@ class Language(str, enum.Enum):
     XML = "xml"
     TOML = "toml"
     SHELL = "shell"
+    # -- mainframe / legado corporativo
+    COBOL = "cobol"
+    JCL = "jcl"
+    PLI = "pli"
+    ASSEMBLER = "assembler"
+    REXX = "rexx"
+    ABAP = "abap"
+    NATURAL = "natural"
+    # -- compiladas / gerenciadas
+    GO = "go"
+    RUST = "rust"
+    C = "c"
+    CPP = "cpp"
+    CSHARP = "csharp"
+    KOTLIN = "kotlin"
+    SCALA = "scala"
+    SWIFT = "swift"
+    OBJC = "objc"
+    DART = "dart"
+    PASCAL = "pascal"
+    ADA = "ada"
+    FORTRAN = "fortran"
+    VBNET = "vbnet"
+    FSHARP = "fsharp"
+    NIM = "nim"
+    ZIG = "zig"
+    # -- dinâmicas / script
+    PHP = "php"
+    RUBY = "ruby"
+    PERL = "perl"
+    LUA = "lua"
+    R = "r"
+    JULIA = "julia"
+    GROOVY = "groovy"
+    POWERSHELL = "powershell"
+    BATCH = "batch"
+    MATLAB = "matlab"
+    TCL = "tcl"
+    # -- funcionais
+    HASKELL = "haskell"
+    ELIXIR = "elixir"
+    ERLANG = "erlang"
+    CLOJURE = "clojure"
+    OCAML = "ocaml"
+    LISP = "lisp"
+    SCHEME = "scheme"
+    # -- front-end / marcação executável
+    HTML = "html"
+    CSS = "css"
+    VUE = "vue"
+    SVELTE = "svelte"
+    # -- infra como código / esquemas
+    TERRAFORM = "terraform"
+    PROTOBUF = "protobuf"
+    GRAPHQL = "graphql"
+    SOLIDITY = "solidity"
+    MAKE = "make"
+    GRADLE = "gradle"
+    DOCKERFILE = "dockerfile"
+    # -- pisos
     OUTRO = "outro"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -260,22 +329,107 @@ _MIGRATION_CONTENT_MARKERS = (
     (b"migrations.Migration",),             # Django
 )
 
+#: Extensão -> linguagem. Mapa ÚNICO e amplo: não existe mais uma lista
+#: separada de "outras extensões de código sem adaptador dedicado" — ter
+#: extrator e ser código são coisas independentes, e confundi-las é o que
+#: fazia um repositório COBOL ou Delphi virar `UNSUPPORTED`.
 _LANGUAGE_BY_EXT: dict[str, Language] = {
-    ".py": Language.PYTHON,
+    # Python / JVM / JS
+    ".py": Language.PYTHON, ".pyi": Language.PYTHON, ".pyw": Language.PYTHON,
     ".java": Language.JAVA,
     ".js": Language.JAVASCRIPT, ".jsx": Language.JAVASCRIPT,
     ".mjs": Language.JAVASCRIPT, ".cjs": Language.JAVASCRIPT,
     ".ts": Language.TYPESCRIPT, ".tsx": Language.TYPESCRIPT,
-    ".sql": Language.SQL,
-    ".json": Language.JSON,
+    ".mts": Language.TYPESCRIPT, ".cts": Language.TYPESCRIPT,
+    ".kt": Language.KOTLIN, ".kts": Language.KOTLIN,
+    ".scala": Language.SCALA, ".sc": Language.SCALA,
+    ".groovy": Language.GROOVY, ".gvy": Language.GROOVY,
+    # SQL e dialetos de banco (Sybase/T-SQL/PL-SQL: procedure, trigger, view)
+    ".sql": Language.SQL, ".ddl": Language.SQL, ".dml": Language.SQL,
+    ".prc": Language.SQL, ".sp": Language.SQL, ".trg": Language.SQL,
+    ".vw": Language.SQL, ".viw": Language.SQL, ".fnc": Language.SQL,
+    ".pks": Language.SQL, ".pkb": Language.SQL, ".pls": Language.SQL,
+    ".plsql": Language.SQL, ".tsql": Language.SQL,
+    # Mainframe
+    ".cbl": Language.COBOL, ".cob": Language.COBOL, ".cobol": Language.COBOL,
+    ".cpy": Language.COBOL, ".ccp": Language.COBOL,
+    ".jcl": Language.JCL, ".proc": Language.JCL, ".prm": Language.JCL,
+    ".pli": Language.PLI, ".pl1": Language.PLI,
+    ".asm": Language.ASSEMBLER, ".s": Language.ASSEMBLER, ".mac": Language.ASSEMBLER,
+    ".rexx": Language.REXX, ".rex": Language.REXX,
+    ".abap": Language.ABAP,
+    ".nsp": Language.NATURAL, ".nsn": Language.NATURAL,
+    # C / C++ / Rust / Go / .NET
+    ".c": Language.C, ".h": Language.C,
+    ".cc": Language.CPP, ".cpp": Language.CPP, ".cxx": Language.CPP,
+    ".hpp": Language.CPP, ".hxx": Language.CPP, ".hh": Language.CPP, ".ipp": Language.CPP,
+    ".rs": Language.RUST,
+    ".go": Language.GO,
+    ".cs": Language.CSHARP, ".csx": Language.CSHARP,
+    ".vb": Language.VBNET, ".bas": Language.VBNET, ".cls": Language.VBNET,
+    ".frm": Language.VBNET, ".vbs": Language.VBNET,
+    ".fs": Language.FSHARP, ".fsx": Language.FSHARP, ".fsi": Language.FSHARP,
+    # Delphi / Pascal / Ada / Fortran
+    ".pas": Language.PASCAL, ".dpr": Language.PASCAL, ".dfm": Language.PASCAL,
+    ".pp": Language.PASCAL, ".lpr": Language.PASCAL, ".dpk": Language.PASCAL,
+    ".ada": Language.ADA, ".adb": Language.ADA, ".ads": Language.ADA,
+    ".f": Language.FORTRAN, ".f77": Language.FORTRAN, ".f90": Language.FORTRAN,
+    ".f95": Language.FORTRAN, ".for": Language.FORTRAN,
+    # Apple / mobile
+    ".swift": Language.SWIFT,
+    ".m": Language.OBJC, ".mm": Language.OBJC,
+    ".dart": Language.DART,
+    # Dinâmicas
+    ".php": Language.PHP, ".phtml": Language.PHP, ".php5": Language.PHP,
+    ".rb": Language.RUBY, ".rake": Language.RUBY, ".gemspec": Language.RUBY,
+    ".erb": Language.RUBY,
+    ".pl": Language.PERL, ".pm": Language.PERL, ".t": Language.PERL,
+    ".lua": Language.LUA,
+    ".r": Language.R,
+    ".jl": Language.JULIA,
+    ".tcl": Language.TCL,
+    ".mat": Language.MATLAB,
+    # Funcionais
+    ".hs": Language.HASKELL, ".lhs": Language.HASKELL,
+    ".ex": Language.ELIXIR, ".exs": Language.ELIXIR,
+    ".erl": Language.ERLANG, ".hrl": Language.ERLANG,
+    ".clj": Language.CLOJURE, ".cljs": Language.CLOJURE, ".cljc": Language.CLOJURE,
+    ".ml": Language.OCAML, ".mli": Language.OCAML,
+    ".lisp": Language.LISP, ".el": Language.LISP,
+    ".scm": Language.SCHEME, ".ss": Language.SCHEME,
+    ".nim": Language.NIM,
+    ".zig": Language.ZIG,
+    # Shell / Windows
+    ".sh": Language.SHELL, ".bash": Language.SHELL, ".zsh": Language.SHELL,
+    ".ksh": Language.SHELL, ".csh": Language.SHELL,
+    ".ps1": Language.POWERSHELL, ".psm1": Language.POWERSHELL, ".psd1": Language.POWERSHELL,
+    ".bat": Language.BATCH, ".cmd": Language.BATCH,
+    # Front-end
+    ".html": Language.HTML, ".htm": Language.HTML,
+    ".css": Language.CSS, ".scss": Language.CSS, ".less": Language.CSS,
+    ".vue": Language.VUE,
+    ".svelte": Language.SVELTE,
+    # Infra / esquemas
+    ".tf": Language.TERRAFORM, ".tfvars": Language.TERRAFORM,
+    ".proto": Language.PROTOBUF,
+    ".graphql": Language.GRAPHQL, ".gql": Language.GRAPHQL,
+    ".sol": Language.SOLIDITY,
+    ".mk": Language.MAKE,
+    ".gradle": Language.GRADLE,
+    # Estruturados
+    ".json": Language.JSON, ".jsonc": Language.JSON,
     ".yaml": Language.YAML, ".yml": Language.YAML,
-    ".xml": Language.XML,
+    ".xml": Language.XML, ".xsd": Language.XML, ".xsl": Language.XML, ".wsdl": Language.XML,
     ".toml": Language.TOML,
-    ".sh": Language.SHELL, ".bash": Language.SHELL,
 }
-_OTHER_CODE_EXTENSIONS = {
-    ".go", ".rb", ".php", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".rs",
-    ".kt", ".kts", ".swift", ".scala", ".ps1", ".psm1", ".groovy", ".lua", ".pl", ".r",
+
+#: Arquivos SEM extensão que são documento por convenção universal. Existem
+#: para que `LICENSE`/`CHANGELOG` não entrem como código candidato — a regra
+#: geral (texto não mapeado É código) precisa dessa exceção NOMEADA, não de um
+#: filtro silencioso por heurística de conteúdo.
+_EXTENSIONLESS_DOC_NAMES = {
+    "license", "licence", "copying", "notice", "authors", "contributors",
+    "changelog", "changes", "readme", "todo", "codeowners",
 }
 
 
@@ -340,18 +494,27 @@ def _classify(snapshot: Snapshot, path: str) -> FileClassification:
     if ext in _LANGUAGE_BY_EXT:
         return FileClassification(path, FileClass.CODE, _LANGUAGE_BY_EXT[ext], True, f"extensão de linguagem/formato estruturado reconhecida ({ext})")
 
-    if ext in _OTHER_CODE_EXTENSIONS:
-        return FileClassification(path, FileClass.CODE, Language.OUTRO, True, f"extensão de linguagem de programação sem adaptador dedicado ({ext})")
-
     if not ext:
         shebang_lang = _shebang_language(prefix)
         if shebang_lang is not None:
             return FileClassification(path, FileClass.CODE, shebang_lang, True, "shebang de interpretador reconhecido, sem extensão")
+        if lower_name in _EXTENSIONLESS_DOC_NAMES:
+            return FileClassification(
+                path, FileClass.DOC, None, False,
+                f"nome de documento por convenção sem extensão ({name}) — texto livre não "
+                "sustenta comportamento implementado (§5.4)",
+            )
 
+    # Piso: texto não-binário que nenhuma extensão mapeou. NÃO é descartado —
+    # entra como CÓDIGO com linguagem `unknown` e continua gerando `Limitation`
+    # (o registro explícito de que a linguagem não foi reconhecida). É isto que
+    # permite a `investigation.plan()` abrir objetivo de DESCOBERTA sobre ele:
+    # o modelo lê o arquivo mesmo quando nenhum classificador o entende.
     return FileClassification(
-        path, FileClass.UNSUPPORTED, None, True,
+        path, FileClass.CODE, Language.UNKNOWN, True,
         f"extensão/conteúdo não reconhecidos por nenhum classificador (ext={ext or '(nenhuma)'}): "
-        "gera limitação explícita, não é ignorado (§6.2)",
+        "admitido como código de linguagem 'unknown' e encaminhado a objetivo de descoberta; "
+        "a limitação é registrada, o arquivo não é ignorado (§6.2)",
     )
 
 
@@ -414,7 +577,12 @@ def build(
 
         classification = _classify(snapshot, entry.path)
         files.append(classification)
-        if classification.file_class is FileClass.UNSUPPORTED:
+        if classification.file_class is FileClass.UNSUPPORTED or (
+            classification.language is Language.UNKNOWN
+        ):
+            # Linguagem não reconhecida continua sendo limitação DECLARADA
+            # mesmo agora que o arquivo entra como código: o que mudou foi o
+            # destino (descoberta em vez de descarte), não o registro.
             limitations.append(Limitation(path=entry.path, detalhe=classification.reason))
 
     exclusions_list = [
