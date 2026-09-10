@@ -11,7 +11,7 @@ from wiki_ai.knowledge.gaps import GAP_KIND
 from wiki_ai.knowledge.model import Confidence, EpistemicStatus
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import ENTITY_KIND_VALUES, EntityKind
-from wiki_ai.repository.harness import RepositoryHarness
+from wiki_ai.repository.harness import RepositoryHarness, ScopeFocus
 from wiki_ai.investigation.orchestrator import ABORT_SNAPSHOT_CHANGED, Investigator
 
 CONTROLLER = "src/main/java/com/acme/order/OrderController.java"
@@ -451,8 +451,10 @@ def test_a_snapshot_changed_mid_run_aborts_with_a_reason(tmp_path: Path) -> None
     snapshot = java_repo(root)
     moving = {"snapshot": snapshot}
 
-    def harness_factory(_: object) -> RepositoryHarness:
-        return RepositoryHarness(moving["snapshot"])
+    def harness_factory(
+        _: object, focus: ScopeFocus | None = None
+    ) -> RepositoryHarness:
+        return RepositoryHarness(moving["snapshot"], None, focus)
 
     def mutate(index: int) -> None:
         if index == 0:

@@ -19,7 +19,7 @@ from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind
 from wiki_ai.repository import schemas
-from wiki_ai.repository.harness import RepositoryHarness, ToolError
+from wiki_ai.repository.harness import RepositoryHarness, ScopeFocus, ToolError
 from wiki_ai.repository.snapshot import RepositorySnapshot
 from wiki_ai.repository.symbols import find_symbols
 
@@ -52,6 +52,7 @@ __all__ = [
     "RoundReport",
     "Investigator",
     "SessionProvider",
+    "HarnessFactory",
     "DEFAULT_ROUND_BUDGET",
     "DEFAULT_TOTAL_TOOL_CALLS",
 ]
@@ -68,6 +69,19 @@ ABORT_SNAPSHOT_CHANGED = "snapshot_changed_during_run"
 @runtime_checkable
 class SessionProvider(Protocol):
     def run(self, session: AgentSession) -> AgentRun: ...
+
+
+@runtime_checkable
+class HarnessFactory(Protocol):
+    def __call__(
+        self, snapshot: RepositorySnapshot, focus: ScopeFocus | None = None
+    ) -> RepositoryHarness: ...
+
+
+def _default_harness(
+    snapshot: RepositorySnapshot, focus: ScopeFocus | None = None
+) -> RepositoryHarness:
+    return RepositoryHarness(snapshot, None, focus)
 
 
 @dataclass(frozen=True)
@@ -142,7 +156,7 @@ class _HarnessBridge:
 class Investigator:
     def __init__(
         self,
-        harness_factory: Callable[[RepositorySnapshot], RepositoryHarness] | None = None,
+        harness_factory: HarnessFactory | None = None,
         clock: Callable[[], float] | None = None,
         round_budget: int = DEFAULT_ROUND_BUDGET,
         total_tool_calls: int = DEFAULT_TOTAL_TOOL_CALLS,
@@ -151,7 +165,7 @@ class Investigator:
         max_state_chars: int = STATE_CHARS,
         strategy: Strategy | None = None,
     ) -> None:
-        self._harness_factory = harness_factory or RepositoryHarness
+        self._harness_factory = harness_factory or _default_harness
         self._clock = clock or time.monotonic
         self._round_budget = round_budget
         self._total_tool_calls = total_tool_calls
@@ -160,20 +174,26 @@ class Investigator:
         self._max_state_chars = max_state_chars
         self._strategy = strategy or default_strategy(total_tool_calls)
 
+    def _build_harness(
+        self, snapshot: RepositorySnapshot, focus: ScopeFocus | None
+    ) -> RepositoryHarness:
+        return self._harness_factory(snapshot, focus)
+
     def run(
         self,
-        objective: str,
+        objective: str | Objective,
         snapshot: RepositorySnapshot,
         knowledge: KnowledgeRepository,
         provider: SessionProvider,
         namespace: str,
     ) -> InvestigationOutcomeData:
-        parsed = _parse_objective(objective)
-        harness = self._harness_factory(snapshot)
+        parsed = _resolve_objective(objective)
+        focus = _focus_of(parsed)
+        harness = self._build_harness(snapshot, focus)
         registry = CaptureRegistry()
         task = _lease_task(parsed, snapshot, self._clock)
         state = coverage.initial_state(
-            files_total=len(snapshot.files),
+            files_total=_focused_total(snapshot, focus),
             entrypoints=_discover_entrypoints(snapshot),
             integrations=_discover_integrations(harness),
         )
@@ -191,6 +211,8 @@ class Investigator:
         )
         executed: list[dict[str, Any]] = []
         analyzed: set[str] = set()
+        files_read: list[str] = []
+        outside = 0
 
         while True:
             remaining = self._total_tool_calls - totals["tool_calls"]
@@ -211,6 +233,7 @@ class Investigator:
                 continue
             step_calls = 0
             step_rounds = 0
+            step_focus = _focus_of(step.objective) or focus
             executed.append(
                 {
                     "phase": step.phase.value,
@@ -223,7 +246,7 @@ class Investigator:
                 remaining = self._total_tool_calls - totals["tool_calls"]
                 if remaining <= 0:
                     break
-                harness = self._harness_factory(snapshot)
+                harness = self._build_harness(snapshot, step_focus)
                 if snapshot.digest != harness.snapshot.digest:
                     abort_reason = ABORT_SNAPSHOT_CHANGED
                     break
@@ -248,6 +271,7 @@ class Investigator:
                     round_number,
                     coverage.sections_of(state, step.subject) or step.sections,
                     step.subject,
+                    step_focus,
                 )
                 run, failure = _invoke(provider, session)
                 if failure is not None:
@@ -259,7 +283,12 @@ class Investigator:
                     continue
                 totals["tool_calls"] += run.usage.tool_calls
                 step_calls += max(1, run.usage.tool_calls)
-                if self._harness_factory(snapshot).snapshot.digest != snapshot.digest:
+                stats = harness.stats()
+                outside += stats.outside_focus_reads
+                for path in stats.files_read:
+                    if path not in files_read:
+                        files_read.append(path)
+                if self._build_harness(snapshot, step_focus).snapshot.digest != snapshot.digest:
                     abort_reason = ABORT_SNAPSHOT_CHANGED
                     break
                 findings, rejected = parse_findings(run.findings)
@@ -342,6 +371,9 @@ class Investigator:
             "task_state": task.state.value,
             "steps": executed,
             "flows": flows,
+            "focus_paths": list(focus.paths) if focus is not None else [],
+            "outside_focus_reads": outside,
+            "files_read": files_read,
         }
         if abort_reason:
             details["aborted"] = abort_reason
@@ -411,11 +443,26 @@ def _merge(
     )
 
 
-def _parse_objective(objective: str) -> Objective:
+def _resolve_objective(objective: str | Objective) -> Objective:
+    if isinstance(objective, Objective):
+        return objective
     try:
         return parse(objective)
     except ObjectiveError:
         raise
+
+
+def _focus_of(objective: Objective) -> ScopeFocus | None:
+    paths = objective.scope.paths
+    if not paths:
+        return None
+    return ScopeFocus(paths=paths)
+
+
+def _focused_total(snapshot: RepositorySnapshot, focus: ScopeFocus | None) -> int:
+    if focus is None:
+        return len(snapshot.files)
+    return sum(1 for record in snapshot.files if focus.contains(record.path))
 
 
 def _lease_task(
@@ -455,6 +502,7 @@ def _build_session(
     round_number: int,
     open_sections: Sequence[str] = (),
     subject: str = "",
+    focus: ScopeFocus | None = None,
 ) -> AgentSession:
     specs = {
         spec.name: ToolSpec(
@@ -466,7 +514,13 @@ def _build_session(
         for spec in harness.specs()
     }
     text = briefing.build(
-        objective, state, tuple(sorted(specs)), round_number, open_sections, subject
+        objective,
+        state,
+        tuple(sorted(specs)),
+        round_number,
+        open_sections,
+        subject,
+        focus.paths if focus is not None else (),
     )
     return AgentSession(
         objective=text,

@@ -9,6 +9,8 @@ from wiki_ai.investigation.compaction import InvestigationState, render
 from wiki_ai.investigation.objective import Objective, ObjectiveKind
 
 __all__ = [
+    "FOCUS_FRAMING",
+    "REPOSITORY_FOCUS",
     "METHOD_STEPS",
     "EVIDENCE_RULES",
     "SECTION_QUESTIONS",
@@ -69,6 +71,16 @@ EVIDENCE_RULES: tuple[str, ...] = (
 
 _HEADING = "Objective"
 
+REPOSITORY_FOCUS = "the whole repository"
+
+FOCUS_FRAMING = (
+    "repo.inventory, repo.search, repo.symbol, repo.dependencies, repo.tests and "
+    "repo.config answer only inside this focus; pass scope=repository on those tools "
+    "to widen a single call. repo.read, repo.references and evidence.capture reach "
+    "any path in the snapshot, so following a call chain outside the focus is "
+    "legitimate and is counted."
+)
+
 
 def allowed_finding_types() -> tuple[str, ...]:
     lines: list[str] = []
@@ -105,12 +117,18 @@ def build(
     round_number: int,
     open_sections: Sequence[str] = (),
     subject: str = "",
+    focus_paths: Sequence[str] = (),
 ) -> str:
+    focused = tuple(str(item) for item in focus_paths if str(item).strip())
     blocks: list[str] = [
         f"{_HEADING}: {objective.goal}",
         f"Kind: {objective.kind.value}",
         f"Scope: {objective.scope.describe()}",
         f"Round: {round_number}",
+        "Focus:\n"
+        + (_bullets(focused) if focused else f"- {REPOSITORY_FOCUS}")
+        + "\n"
+        + FOCUS_FRAMING,
     ]
     if objective.constraints:
         blocks.append("Constraints:\n" + _bullets(objective.constraints))

@@ -8,6 +8,7 @@ import pytest
 from tests.investigation.fake_provider import FakeProvider, Script
 from tests.repository.fixtures_repos import java_repo, snapshot_of, write
 
+from wiki_ai.agent.protocol import ToolCall
 from wiki_ai.knowledge.gaps import GAP_KIND
 from wiki_ai.knowledge.gate import KnowledgeRule
 from wiki_ai.knowledge.gate import check as knowledge_gate
@@ -23,7 +24,7 @@ from wiki_ai.investigation.update import (
     impacted_evidence,
     plan_reinvestigation,
 )
-from wiki_ai.investigation.objective import ObjectiveKind
+from wiki_ai.investigation.objective import Objective, ObjectiveKind
 from wiki_ai.repository.snapshot import diff
 
 BASE = "src/main/java/com/acme/order"
@@ -400,3 +401,68 @@ def test_a_repository_without_prior_knowledge_invalidates_nothing(tmp_path: Path
         assert outcome.skipped_reason == SKIPPED_NO_PROVIDER
         found = knowledge_gate(knowledge, {NAMESPACE: current.digest})
         assert BLOCKING_RULES.isdisjoint({item.rule for item in found})
+
+
+def test_the_update_hands_the_ready_objective_to_the_investigator(analysed) -> None:
+    root, previous, knowledge = analysed
+    current = change_service(root)
+    received: list[Any] = []
+
+    class _Recording:
+        def run(self, objective, snapshot, store, provider, namespace):
+            received.append(objective)
+            return Investigator().run(objective, snapshot, store, provider, namespace)
+
+    provider = FakeProvider(scripts=[reinvestigation_script(10, 15)])
+    outcome = UpdateEngine(_Recording()).run(
+        previous, current, knowledge, provider, NAMESPACE
+    )
+    assert len(received) == 1
+    planned = plan_reinvestigation(outcome.invalidated, diff(previous, current))
+    assert isinstance(received[0], Objective)
+    assert received[0].hash == planned.hash
+    assert received[0].scope.paths == (SERVICE,)
+
+
+def test_the_reinvestigation_reports_the_focus_it_ran_under(analysed) -> None:
+    root, previous, knowledge = analysed
+    current = change_service(root)
+    provider = FakeProvider(scripts=[reinvestigation_script(10, 15)])
+    outcome = UpdateEngine().run(previous, current, knowledge, provider, NAMESPACE)
+    assert outcome.reinvestigation is not None
+    details = outcome.reinvestigation.details
+    assert details["focus_paths"] == [SERVICE]
+    assert details["outside_focus_reads"] == 0
+    assert details["files_read"] == [SERVICE]
+
+
+class _SearchingProvider(FakeProvider):
+    searched: list[dict[str, Any]]
+
+    def __init__(self, scripts: list[Script]) -> None:
+        super().__init__(scripts=scripts)
+        self.searched = []
+
+    def run(self, session):
+        for arguments in (
+            {"pattern": "place"},
+            {"pattern": "place", "scope": "repository"},
+        ):
+            result = session.invoke(
+                ToolCall(name="repo.search", arguments=arguments)
+            )
+            self.searched.append(dict(result.payload))
+        return super().run(session)
+
+
+def test_an_unscoped_search_during_the_update_sees_only_the_changed_file(
+    analysed,
+) -> None:
+    root, previous, knowledge = analysed
+    current = change_service(root)
+    provider = _SearchingProvider(scripts=[reinvestigation_script(10, 15)])
+    UpdateEngine().run(previous, current, knowledge, provider, NAMESPACE)
+    focused, widened = provider.searched[0], provider.searched[1]
+    assert set(focused["paths"]) == {SERVICE}
+    assert CONTROLLER in widened["paths"]
+    assert "Focus:" + chr(10) + "- " + SERVICE in provider.seen_objectives[0]

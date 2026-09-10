@@ -122,7 +122,7 @@ class UpdateOutcome:
 class ScopedInvestigator(Protocol):
     def run(
         self,
-        objective: str,
+        objective: str | Objective,
         snapshot: RepositorySnapshot,
         knowledge: KnowledgeRepository,
         provider: SessionProvider,
@@ -333,7 +333,7 @@ class UpdateEngine:
             )
         objective = plan_reinvestigation(report, changes)
         outcome = self._investigator.run(
-            objective.text,
+            objective,
             current_snapshot,
             knowledge,
             provider,

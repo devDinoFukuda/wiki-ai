@@ -20,7 +20,7 @@ from wiki_ai.agent.session import AgentRun, AgentSession
 from wiki_ai.app import api
 from wiki_ai.app.commands import EXIT_BLOCKED, EXIT_OK, main
 from wiki_ai.app.session import Session
-from wiki_ai.app.wiring import Wiring
+from wiki_ai.app.wiring import DETAIL_KEYS, Wiring
 from wiki_ai.ingestion import pipeline
 from wiki_ai.ingestion.harness import DocumentHarness
 from wiki_ai.ingestion.integration import PROVIDER_UNAVAILABLE as SKIPPED_NO_PROVIDER
@@ -302,7 +302,7 @@ def test_analyze_populates_knowledge_with_supported_evidence(repo: Path) -> None
     assert report.status == "ok"
     assert report.details["entities_written"] > 0
     assert report.details["evidence_written"] > 0
-    assert set(report.details["details"]) <= {"rounds", "tool_calls", "coverage"}
+    assert set(report.details["details"]) <= set(DETAIL_KEYS)
     with Session.open(repo).open_knowledge() as knowledge:
         supported = [
             entity
@@ -547,3 +547,44 @@ def test_the_command_line_reports_an_update_with_clean_json(repo: Path) -> None:
     text = json.dumps([payload, status_payload], ensure_ascii=False).lower()
     for word in FORBIDDEN:
         assert word not in text
+
+
+class _FocusProbingProvider(FakeProvider):
+    searched: list[dict[str, Any]]
+
+    def __init__(self, scripts: list[Script]) -> None:
+        super().__init__(scripts=scripts)
+        self.searched = []
+
+    def connect(self) -> None:
+        return None
+
+    def capabilities(self) -> AgentCapabilities:
+        return AgentCapabilities(tools=("repo.search", "repo.read", "evidence.capture"))
+
+    def cancel(self) -> None:
+        return None
+
+    def run(self, session: AgentSession) -> AgentRun:
+        if not self.searched:
+            result = session.invoke(
+                ToolCall(name="repo.search", arguments={"pattern": "place"})
+            )
+            self.searched.append(dict(result.payload))
+            session.invoke(ToolCall(name="repo.read", arguments={"path": CONTROLLER}))
+        return super().run(session)
+
+
+def test_an_update_focuses_the_reinvestigation_on_the_changed_path(repo: Path) -> None:
+    api.analyze(repo, OBJECTIVE, registry=_registry())
+    (repo / SERVICE).write_text(_CHANGED_SERVICE, encoding="utf-8")
+    provider = _FocusProbingProvider(scripts=[_update_script()])
+    registry = ProviderRegistry()
+    registry.register("scripted", lambda: provider)
+    report = api.analyze(repo, OBJECTIVE, registry=registry)
+    assert report.status == "ok"
+    assert set(provider.searched[0]["paths"]) == {SERVICE}
+    reinvestigated = report.details["reinvestigated"]["details"]
+    assert reinvestigated["focus_paths"] == [SERVICE]
+    assert reinvestigated["outside_focus_reads"] == 1
+    assert set(reinvestigated["files_read"]) == {SERVICE, CONTROLLER}

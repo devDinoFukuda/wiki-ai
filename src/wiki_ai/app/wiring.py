@@ -38,7 +38,14 @@ __all__ = [
     "default_wiring",
 ]
 
-DETAIL_KEYS = ("rounds", "tool_calls", "coverage")
+DETAIL_KEYS = (
+    "rounds",
+    "tool_calls",
+    "coverage",
+    "focus_paths",
+    "outside_focus_reads",
+    "files_read",
+)
 
 
 def _summary(details: Mapping[str, Any]) -> dict[str, Any]:

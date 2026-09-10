@@ -44,6 +44,7 @@ TOOL_NAMES: tuple[str, ...] = (
 )
 
 _STRING = {"type": "string"}
+_SCOPE = {"type": "string", "enum": ["focus", "repository"]}
 _BOOLEAN = {"type": "boolean"}
 _STRING_ARRAY = {"type": "array", "items": {"type": "string"}}
 
@@ -182,13 +183,14 @@ def build_specs(max_results_ceiling: int, max_bytes_ceiling: int) -> tuple[ToolS
     return (
         ToolSpec(
             name=TOOL_INVENTORY,
-            description="List snapshot files with size, language hint, classification, ignored and generated flags, and content hash.",
+            description="List snapshot files with size, language hint, classification, ignored and generated flags, and content hash. Restricted to the declared focus paths unless scope is repository.",
             input_schema=_object(
                 {
                     "classification": _STRING,
                     "language_hint": _STRING,
                     "path_prefix": _STRING,
                     "include_ignored": _BOOLEAN,
+                    "scope": _SCOPE,
                     "max_results": results,
                 }
             ),
@@ -206,7 +208,7 @@ def build_specs(max_results_ceiling: int, max_bytes_ceiling: int) -> tuple[ToolS
         ),
         ToolSpec(
             name=TOOL_SEARCH,
-            description="Search snapshot content by literal text or controlled regular expression, filtered by glob or extension.",
+            description="Search snapshot content by literal text or controlled regular expression, filtered by glob or extension. Restricted to the declared focus paths unless scope is repository.",
             input_schema=_object(
                 {
                     "pattern": _STRING,
@@ -214,6 +216,7 @@ def build_specs(max_results_ceiling: int, max_bytes_ceiling: int) -> tuple[ToolS
                     "ignore_case": _BOOLEAN,
                     "globs": _STRING_ARRAY,
                     "extensions": _STRING_ARRAY,
+                    "scope": _SCOPE,
                     "max_results": results,
                     "max_file_bytes": byte_budget,
                 },
@@ -257,12 +260,13 @@ def build_specs(max_results_ceiling: int, max_bytes_ceiling: int) -> tuple[ToolS
         ),
         ToolSpec(
             name=TOOL_SYMBOL,
-            description="Return definition-like symbols found by language heuristics with a universal fallback, never failing on an unknown language.",
+            description="Return definition-like symbols found by language heuristics with a universal fallback, never failing on an unknown language. Restricted to the declared focus paths unless scope is repository.",
             input_schema=_object(
                 {
                     "path": _STRING,
                     "name": _STRING,
                     "kinds": _STRING_ARRAY,
+                    "scope": _SCOPE,
                     "max_results": results,
                 }
             ),
@@ -298,11 +302,12 @@ def build_specs(max_results_ceiling: int, max_bytes_ceiling: int) -> tuple[ToolS
         ),
         ToolSpec(
             name=TOOL_DEPENDENCIES,
-            description="Report imports classified as internal or external, manifest packages, literal http endpoints and messaging hints, each with path and line.",
+            description="Report imports classified as internal or external through import_scope, manifest packages, literal http endpoints and messaging hints, each with path and line. Restricted to the declared focus paths unless scope is repository.",
             input_schema=_object(
                 {
                     "path_prefix": _STRING,
-                    "scope": _STRING,
+                    "import_scope": _STRING,
+                    "scope": _SCOPE,
                     "max_results": results,
                 }
             ),
@@ -320,9 +325,10 @@ def build_specs(max_results_ceiling: int, max_bytes_ceiling: int) -> tuple[ToolS
         ),
         ToolSpec(
             name=TOOL_TESTS,
-            description="Discover test files related to a path or symbol by mirrored naming and by references inside files classified as test.",
+            description="Discover test files related to a path or symbol by mirrored naming and by references inside files classified as test. Restricted to the declared focus paths unless scope is repository.",
             input_schema=_object(
-                {"path_or_symbol": _STRING, "limit": results}, ("path_or_symbol",)
+                {"path_or_symbol": _STRING, "scope": _SCOPE, "limit": results},
+                ("path_or_symbol",),
             ),
             output_schema=_object(
                 {
@@ -335,9 +341,10 @@ def build_specs(max_results_ceiling: int, max_bytes_ceiling: int) -> tuple[ToolS
         ),
         ToolSpec(
             name=TOOL_CONFIG,
-            description="Find configuration declarations in env, properties, yaml, json, toml, ini and xml files plus code usages that read them.",
+            description="Find configuration declarations in env, properties, yaml, json, toml, ini and xml files plus code usages that read them. Restricted to the declared focus paths unless scope is repository.",
             input_schema=_object(
-                {"key_or_usage": _STRING, "limit": results}, ("key_or_usage",)
+                {"key_or_usage": _STRING, "scope": _SCOPE, "limit": results},
+                ("key_or_usage",),
             ),
             output_schema=_object(
                 {
