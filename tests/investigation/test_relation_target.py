@@ -5,7 +5,7 @@ from pathlib import Path
 from tests.investigation.fixtures_snapshots import java_repo
 
 from wiki_ai.knowledge.gaps import GAP_KIND
-from wiki_ai.knowledge.identity import contextual_key
+from wiki_ai.knowledge.identity import contextual_key, excerpt_digest
 from wiki_ai.knowledge.model import Confidence, EntityId
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -303,3 +303,23 @@ def test_a_persisted_entity_in_the_same_namespace_resolves_the_target(
         relation = knowledge.find_relations(RelationKind.SUPERSEDES.value)[0]
         assert relation.target_id == rule_id("Ordering")
         assert result.unresolved_relations == ()
+
+
+def test_relation_evidence_persists_the_excerpt_of_its_capture(
+    tmp_path: Path,
+) -> None:
+    claim = RelationClaim(
+        kind=RelationKind.CALLS,
+        target_subject="OrderRepository save",
+        target_type=EntityKind.OPERATION,
+        evidence=(WIRING_REF,),
+    )
+    findings = [calls_repository(claim), repository_save()]
+    with knowledge_at(tmp_path) as knowledge:
+        normalized(tmp_path, findings, knowledge)
+        relation = relation_of(knowledge)
+        linked = knowledge.evidence_for_relation(relation.id)
+        assert linked
+        for evidence in linked:
+            assert evidence.excerpt
+            assert excerpt_digest(evidence.excerpt) == evidence.excerpt_hash

@@ -17,6 +17,7 @@ __all__ = [
     "QueryToolSpec",
     "QueryLimits",
     "KnowledgeQueryHarness",
+    "MAX_EXCERPT_CHARS",
     "TOOL_SEARCH",
     "TOOL_ENTITY",
     "TOOL_NEIGHBORS",
@@ -58,6 +59,7 @@ TOOL_NAMES: tuple[str, ...] = (
 RULE_KIND = "business_rule"
 MAX_ATTRIBUTE_CHARS = 400
 MAX_SUMMARY_CHARS = 240
+MAX_EXCERPT_CHARS = 1200
 
 
 class QueryToolError(Exception):
@@ -299,7 +301,9 @@ def build_specs(limits: QueryLimits) -> tuple[QueryToolSpec, ...]:
             name=TOOL_EVIDENCE,
             description=(
                 "List the evidences that sustain one entity: evidence identifier, "
-                "source, version hash and where the excerpt lives. Cite these "
+                "source, version hash, where the excerpt lives and the excerpt "
+                "text itself. Read the excerpt before writing a claim: the wording "
+                "of a claim is only sustained by what the excerpt says. Cite these "
                 "identifiers in every claim."
             ),
             input_schema={
@@ -323,6 +327,7 @@ def build_specs(limits: QueryLimits) -> tuple[QueryToolSpec, ...]:
                                 "version_hash": {"type": "string"},
                                 "where": {"type": "string"},
                                 "locator_kind": {"type": "string"},
+                                "excerpt": {"type": "string"},
                             },
                         },
                     },
@@ -652,6 +657,15 @@ class KnowledgeQueryHarness:
                     return True
         return False
 
+    def evidence_without_excerpt(self, evidence_ids: Sequence[str]) -> tuple[str, ...]:
+        empty: list[str] = []
+        for identifier in evidence_ids:
+            evidence = self.evidence_by_id(identifier)
+            if evidence is None or not evidence.excerpt.strip():
+                if str(identifier) not in empty:
+                    empty.append(str(identifier))
+        return tuple(empty)
+
     def grounding_vocabulary(
         self, entity_ids: Sequence[str], evidence_ids: Sequence[str]
     ) -> frozenset[str]:
@@ -660,27 +674,16 @@ class KnowledgeQueryHarness:
             evidence = self.evidence_by_id(identifier)
             if evidence is None:
                 continue
-            vocabulary |= excerpt_vocabulary(where_of(evidence.locator))
-            vocabulary |= excerpt_vocabulary(evidence.source_id)
+            vocabulary |= excerpt_vocabulary(evidence.excerpt)
         for identifier in entity_ids:
             entity = self.entity_by_id(identifier)
             if entity is None:
                 continue
             vocabulary |= excerpt_vocabulary(entity.name)
             vocabulary |= excerpt_vocabulary(entity.kind)
-            for key, value in entity.attributes.items():
-                vocabulary |= excerpt_vocabulary(str(key))
-                vocabulary |= excerpt_vocabulary(_flatten(value))
-            for relation in self._knowledge.relations_of(entity.id):
-                vocabulary |= excerpt_vocabulary(relation.kind)
-                other = (
-                    relation.target_id
-                    if relation.source_id == entity.id
-                    else relation.source_id
-                )
-                neighbour = self._knowledge.get_entity(other)
-                if neighbour is not None:
-                    vocabulary |= excerpt_vocabulary(neighbour.name)
+            statement = entity.attributes.get("statement")
+            if statement is not None:
+                vocabulary |= excerpt_vocabulary(_flatten(statement))
         return frozenset(vocabulary)
 
     def _known(self, entity_id: Any) -> EntityId:
@@ -756,6 +759,7 @@ class KnowledgeQueryHarness:
                 "version_hash": evidence.version_hash,
                 "where": where_of(evidence.locator),
                 "locator_kind": evidence.locator.kind,
+                "excerpt": _text(evidence.excerpt, MAX_EXCERPT_CHARS),
             }
             for evidence in found[:limit]
         ]

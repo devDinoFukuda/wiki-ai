@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, ClassVar, Iterable, Mapping, Sequence
 
 from .errors import LocatorInvalid, UnsupportedEvidence
-from .identity import content_hash, evidence_id
+from .identity import evidence_id, excerpt_digest
 from .model import Evidence, Locator
 
 
@@ -237,8 +237,9 @@ def make_evidence(
         source_id=source_id,
         version_hash=version_hash,
         locator=locator,
-        excerpt_hash=content_hash(excerpt),
+        excerpt_hash=excerpt_digest(excerpt),
         captured_at=captured_at,
+        excerpt=excerpt,
     )
 
 

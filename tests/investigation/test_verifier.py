@@ -5,10 +5,11 @@ from pathlib import Path
 
 from tests.investigation.fixtures_snapshots import java_repo, snapshot_of, write
 
+from wiki_ai.knowledge.identity import excerpt_digest
 from wiki_ai.knowledge.model import Confidence
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
 from wiki_ai.repository.evidence import capture
-from wiki_ai.investigation.evidence import CaptureRegistry
+from wiki_ai.investigation.evidence import CaptureRegistry, to_knowledge
 from wiki_ai.investigation.finding import EvidenceRef, Finding, RelationClaim
 from wiki_ai.investigation.verifier import Rejection, verify
 
@@ -312,3 +313,18 @@ def test_invariant_needs_its_statement_terms_in_executable_code(
     )
     report = verify([finding], registry_with(item), snapshot)
     assert report.verified[0].confidence is Confidence.INFERRED
+
+
+def test_the_verifier_grounds_on_the_same_excerpt_the_evidence_persists(
+    tmp_path: Path,
+) -> None:
+    snapshot = java_repo(tmp_path)
+    item = capture(snapshot, SERVICE, 10, 12, symbol="place")
+    registry = registry_with(item)
+    finding = place_finding(evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),))
+    report = verify([finding], registry, snapshot)
+    resolved = report.verified[0].evidence[0]
+    _version, evidence = to_knowledge(resolved.capture, snapshot, "acme", "2026-01-01T00:00:00Z")
+    assert evidence.excerpt == resolved.capture.excerpt
+    assert evidence.excerpt
+    assert excerpt_digest(evidence.excerpt) == evidence.excerpt_hash

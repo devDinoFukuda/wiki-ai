@@ -30,6 +30,10 @@ def content_hash(payload: bytes | str) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def excerpt_digest(text: str) -> str:
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
 def canonical_json(payload: Any) -> str:
     return json.dumps(
         payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str

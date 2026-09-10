@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Mapping, Sequence
 from .errors import InvalidKind, PayloadInvalid
 from .identity import (
     canonical_name,
+    excerpt_digest,
     contextual_key,
     entity_id,
     relation_id,
@@ -255,6 +256,7 @@ class Evidence:
     locator: Locator
     excerpt_hash: str
     captured_at: str
+    excerpt: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _required_text(self.id, "Evidence.id"))
@@ -270,10 +272,35 @@ class Evidence:
             raise PayloadInvalid(
                 f"Evidence.locator deve ser Locator, recebido {type(self.locator).__name__}"
             )
+        if self.excerpt and excerpt_digest(self.excerpt) != self.excerpt_hash:
+            raise PayloadInvalid("Evidence.excerpt não corresponde a excerpt_hash")
 
     @property
     def source_version_key(self) -> str:
         return source_version_id(self.source_id, self.version_hash)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "source_id": self.source_id,
+            "version_hash": self.version_hash,
+            "locator": self.locator.to_dict(),
+            "excerpt_hash": self.excerpt_hash,
+            "captured_at": self.captured_at,
+            "excerpt": self.excerpt,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], locator: Locator) -> "Evidence":
+        return cls(
+            id=str(data["id"]),
+            source_id=str(data["source_id"]),
+            version_hash=str(data["version_hash"]),
+            locator=locator,
+            excerpt_hash=str(data["excerpt_hash"]),
+            captured_at=str(data["captured_at"]),
+            excerpt=str(data.get("excerpt") or ""),
+        )
 
 
 @dataclass(frozen=True)

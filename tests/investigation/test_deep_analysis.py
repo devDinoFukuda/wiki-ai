@@ -8,6 +8,7 @@ from tests.investigation.fixtures_snapshots import java_repo, mainframe_repo
 
 from wiki_ai.knowledge.evidence import CodeContent, CodeLocator
 from wiki_ai.knowledge.gaps import GAP_KIND, is_blocking, is_open
+from wiki_ai.knowledge.identity import excerpt_digest
 from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
@@ -780,3 +781,62 @@ def test_the_relations_needed_by_the_diagrams_reach_the_graph(tmp_path: Path) ->
         assert RelationKind.PUBLISHES.value in kinds
         assert knowledge.find_entities(EntityKind.FLOW.value)
         assert knowledge.find_entities(EntityKind.FLOW_STEP.value)
+
+
+def test_java_every_persisted_evidence_carries_the_excerpt_of_its_capture(
+    tmp_path: Path,
+) -> None:
+    with knowledge_at(tmp_path) as knowledge:
+        _outcome, provider = run_java(tmp_path, knowledge)
+        captured = {
+            str(item["excerpt_sha256"]): str(item["excerpt"])
+            for item in provider.captures
+        }
+        seen = 0
+        for evidence_id, _key in knowledge.all_evidence_keys():
+            evidence = knowledge.get_evidence(evidence_id)
+            assert evidence is not None
+            assert evidence.excerpt
+            assert excerpt_digest(evidence.excerpt) == evidence.excerpt_hash
+            assert evidence.excerpt == captured[evidence.excerpt_hash]
+            seen += 1
+        assert seen
+
+
+def test_java_the_evidence_of_every_entity_keeps_its_excerpt(
+    tmp_path: Path,
+) -> None:
+    with knowledge_at(tmp_path) as knowledge:
+        run_java(tmp_path, knowledge)
+        holders = [
+            entity
+            for entity in knowledge.find_entities()
+            if knowledge.evidence_for(entity.id)
+        ]
+        assert holders
+        for entity in holders:
+            for evidence in knowledge.evidence_for(entity.id):
+                assert evidence.excerpt
+                assert excerpt_digest(evidence.excerpt) == evidence.excerpt_hash
+
+
+def test_java_the_flow_steps_inherit_the_excerpt_of_the_original_evidence(
+    tmp_path: Path,
+) -> None:
+    with knowledge_at(tmp_path) as knowledge:
+        run_java(tmp_path, knowledge)
+        steps = [
+            step
+            for step in knowledge.find_entities(EntityKind.FLOW_STEP.value)
+            if step.confidence is Confidence.SUPPORTED
+        ]
+        assert steps
+        for step in steps:
+            inherited = knowledge.evidence_for(step.id)
+            assert inherited
+            for evidence in inherited:
+                origin = knowledge.get_evidence(evidence.id)
+                assert origin is not None
+                assert evidence.excerpt == origin.excerpt
+                assert evidence.excerpt
+                assert excerpt_digest(evidence.excerpt) == evidence.excerpt_hash

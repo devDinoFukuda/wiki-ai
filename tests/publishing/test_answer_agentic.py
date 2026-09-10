@@ -244,7 +244,7 @@ def test_a_claim_citing_a_forged_evidence_is_discarded(graph):
                         "evidence_ids": [forged],
                     },
                     {
-                        "statement": "A capability Renovacao chama a Billing API",
+                        "statement": "A Renovacao existe",
                         "entity_ids": [_capability_id(graph)],
                         "evidence_ids": [_capability_evidence(graph)],
                     },
@@ -329,15 +329,18 @@ def test_evidence_of_another_entity_does_not_sustain_the_claim(harness, graph):
     assert claim.rejected_evidence_ids == (_rule_evidence(graph),)
 
 
-def test_the_same_evidence_sustains_the_entity_it_is_linked_to(harness, graph):
+def test_the_same_evidence_sustains_the_entity_it_is_linked_to(
+    grounded_harness, grounded
+):
     claim = _validate_one(
-        harness,
-        "A capability Renovacao chama a Billing API",
-        [_capability_id(graph)],
-        [_capability_evidence(graph)],
+        grounded_harness,
+        "A Renovacao chama o billing_api ao cobrar o contrato",
+        [grounded.id("capability").value],
+        [grounded.evidence_id("capability")],
     )
     assert claim.verdict is ClaimVerdict.VALID
     assert claim.reason is RejectionReason.NONE
+    assert claim.missing_terms == ()
 
 
 def test_a_claim_the_evidence_does_not_sustain_is_rejected(harness, graph):
@@ -639,7 +642,7 @@ def test_source_tool_reports_the_captured_versions(harness):
     assert all(item["version_hash"] for item in payload["sources"])
 
 
-def test_evidence_tool_never_returns_the_excerpt_body(harness, graph):
+def test_evidence_tool_returns_the_excerpt_and_its_provenance(harness, graph):
     payload = harness.invoke("knowledge.evidence", {"entity_id": _capability_id(graph)})
     entry = payload["evidence"][0]
     assert set(entry) == {
@@ -648,8 +651,12 @@ def test_evidence_tool_never_returns_the_excerpt_body(harness, graph):
         "version_hash",
         "where",
         "locator_kind",
+        "excerpt",
     }
     assert "src/renewal.py" in entry["where"]
+    stored = graph.repository.get_evidence(entry["evidence_id"])
+    assert entry["excerpt"] == stored.excerpt
+    assert entry["excerpt"]
 
 
 def test_the_harness_records_which_entities_were_visited(harness, graph):

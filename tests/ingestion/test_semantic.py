@@ -14,8 +14,14 @@ from wiki_ai.ingestion.semantic import (
     document_finding_schema,
 )
 from wiki_ai.ingestion.source import SourceKind
-from wiki_ai.knowledge.evidence import DiagramLocator, SpreadsheetLocator, TranscriptLocator
+from wiki_ai.knowledge.evidence import (
+    DiagramLocator,
+    SpreadsheetLocator,
+    TranscriptLocator,
+    excerpt_digest,
+)
 from wiki_ai.knowledge.gaps import GAP_KIND, questions
+from wiki_ai.knowledge.gate import KnowledgeRule, check as knowledge_gate
 from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.repository import NAMESPACE_ATTRIBUTE, KnowledgeRepository
 
@@ -1092,3 +1098,82 @@ def test_every_entity_ingestion_writes_carries_its_namespace(
         assert entity.attributes[NAMESPACE_ATTRIBUTE] == "reuniao"
     assert knowledge.entities_named("reuniao", "politica de cobranca")
     assert knowledge.entities_named("outro", "politica de cobranca") == ()
+
+
+def test_every_persisted_evidence_carries_a_real_excerpt_and_passes_the_gate(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+
+    def build(payloads: Payloads) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "type": "decision_record",
+                "subject": "corte no dia 5",
+                "statement": "Decidimos manter o corte no dia 5",
+                "owner": "speaker:Ana",
+                "evidence": evidence_of(payloads, 0),
+                "relations": [
+                    {
+                        "kind": "declares",
+                        "target_subject": "limite de 500 documentado",
+                        "target_type": "business_rule",
+                        "target_owner": "speaker:Bruno",
+                        "evidence": evidence_of(payloads, 2),
+                    }
+                ],
+            },
+            {
+                "type": "business_rule",
+                "subject": "limite de 500 documentado",
+                "statement": "Preciso do limite de 500 documentado",
+                "owner": "speaker:Bruno",
+                "conditions": ["limite de 500"],
+                "effects": ["documentado"],
+                "evidence": evidence_of(payloads, 1),
+            },
+        ]
+
+    provider = FakeProvider(
+        scripts=[
+            Script(
+                steps=(
+                    ("evidence.capture", {"block_ids": [ana]}),
+                    ("evidence.capture", {"block_ids": [bruno]}),
+                    ("evidence.capture", {"block_ids": [ana, bruno]}),
+                ),
+                build_findings=build,
+            )
+        ]
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    assert outcome.entities_written >= 2
+    assert outcome.relations_written == 1
+
+    checked_entities = [
+        entity for entity in knowledge.find_entities() if entity.kind != GAP_KIND
+    ]
+    assert checked_entities
+    entity_evidence_seen = 0
+    for entity in checked_entities:
+        for item in knowledge.evidence_for(entity.id):
+            entity_evidence_seen += 1
+            assert item.excerpt
+            assert excerpt_digest(item.excerpt) == item.excerpt_hash
+    assert entity_evidence_seen
+
+    relation = knowledge.find_relations("declares")[0]
+    assert relation.confidence is Confidence.SUPPORTED
+    relation_evidence = knowledge.evidence_for_relation(relation.id)
+    assert relation_evidence
+    for item in relation_evidence:
+        assert item.excerpt
+        assert excerpt_digest(item.excerpt) == item.excerpt_hash
+
+    violations = knowledge_gate(knowledge)
+    assert not any(
+        violation.rule is KnowledgeRule.EVIDENCE_WITHOUT_EXCERPT
+        for violation in violations
+    )

@@ -38,6 +38,7 @@ class KnowledgeRule(Enum):
     EVIDENCE_DOES_NOT_RESOLVE = "evidence_does_not_resolve"
     SOURCE_HASH_DIVERGES = "source_hash_diverges"
     OBSOLETE_WITHOUT_INVALIDATION = "obsolete_without_invalidation"
+    EVIDENCE_WITHOUT_EXCERPT = "evidence_without_excerpt"
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ def check(
     found: list[KnowledgeViolation] = []
     found.extend(_supported_without_evidence(repository))
     found.extend(_unresolvable_evidence(repository))
+    found.extend(_evidence_without_excerpt(repository))
     diverged = _diverged_versions(repository, current_versions or {})
     found.extend(_hash_divergence(repository, diverged))
     found.extend(_missing_invalidation(repository, diverged))
@@ -96,6 +98,50 @@ def _supported_without_evidence(
                 ),
             )
         )
+    return found
+
+
+def _evidence_without_excerpt(
+    repository: KnowledgeRepository,
+) -> list[KnowledgeViolation]:
+    found: list[KnowledgeViolation] = []
+    seen: set[str] = set()
+    for entity in repository.find_entities():
+        if entity.confidence is not Confidence.SUPPORTED:
+            continue
+        for item in repository.evidence_for(entity.id):
+            if item.excerpt or item.id in seen:
+                continue
+            seen.add(item.id)
+            found.append(
+                KnowledgeViolation(
+                    rule=KnowledgeRule.EVIDENCE_WITHOUT_EXCERPT,
+                    target_kind=EVIDENCE_TARGET,
+                    target_id=item.id,
+                    detail=(
+                        f"evidência de {entity.kind} {entity.name} supported "
+                        "sem excerpt persistido"
+                    ),
+                )
+            )
+    for relation in repository.find_relations():
+        if relation.confidence is not Confidence.SUPPORTED:
+            continue
+        for item in repository.evidence_for_relation(relation.id):
+            if item.excerpt or item.id in seen:
+                continue
+            seen.add(item.id)
+            found.append(
+                KnowledgeViolation(
+                    rule=KnowledgeRule.EVIDENCE_WITHOUT_EXCERPT,
+                    target_kind=EVIDENCE_TARGET,
+                    target_id=item.id,
+                    detail=(
+                        f"evidência de relação {relation.kind} supported "
+                        "sem excerpt persistido"
+                    ),
+                )
+            )
     return found
 
 

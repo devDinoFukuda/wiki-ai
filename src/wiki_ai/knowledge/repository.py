@@ -40,6 +40,9 @@ ADDITIVE_ENTITY_COLUMNS: tuple[tuple[str, str], ...] = (
     ("namespace", "TEXT NOT NULL DEFAULT ''"),
     ("canonical", "TEXT NOT NULL DEFAULT ''"),
 )
+ADDITIVE_EVIDENCE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("excerpt", "TEXT NOT NULL DEFAULT ''"),
+)
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -102,7 +105,8 @@ CREATE TABLE IF NOT EXISTS evidence (
     locator_json       TEXT NOT NULL,
     excerpt_hash       TEXT NOT NULL,
     captured_at        TEXT NOT NULL,
-    revision_id        TEXT NOT NULL REFERENCES revisions(revision_id)
+    revision_id        TEXT NOT NULL REFERENCES revisions(revision_id),
+    excerpt            TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS evidence_links (
@@ -141,7 +145,8 @@ CREATE INDEX IF NOT EXISTS ix_srcver_source    ON source_versions(source_id);
 
 ENTITY_COLUMNS = "entity_id, kind, name, attributes_json, state, confidence, owner_id"
 EVIDENCE_COLUMNS = (
-    "e.evidence_id, e.source_id, e.version_hash, e.locator_json, e.excerpt_hash, e.captured_at"
+    "e.evidence_id, e.source_id, e.version_hash, e.locator_json, e.excerpt_hash, "
+    "e.captured_at, e.excerpt"
 )
 SOURCE_VERSION_COLUMNS = "source_id, version_hash, locator_root, captured_at"
 RELATION_COLUMNS = "relation_id, kind, source_id, target_id, attributes_json, confidence"
@@ -215,14 +220,21 @@ def connect(path: str, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
     return conn
 
 
-def _apply_additive_columns(conn: sqlite3.Connection) -> None:
+def _add_missing_columns(
+    conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]
+) -> None:
     present = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(entities)").fetchall()
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
     }
-    for column, definition in ADDITIVE_ENTITY_COLUMNS:
+    for column, definition in columns:
         if column in present:
             continue
-        conn.execute(f"ALTER TABLE entities ADD COLUMN {column} {definition}")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _apply_additive_columns(conn: sqlite3.Connection) -> None:
+    _add_missing_columns(conn, "entities", ADDITIVE_ENTITY_COLUMNS)
+    _add_missing_columns(conn, "evidence", ADDITIVE_EVIDENCE_COLUMNS)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS ix_entities_named ON entities(namespace, canonical)"
     )
@@ -397,10 +409,11 @@ class RevisionTransaction:
             )
         self._conn.execute(
             "INSERT INTO evidence(evidence_id, source_id, version_hash, "
-            "source_version_key, locator_json, excerpt_hash, captured_at, revision_id) "
-            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET "
+            "source_version_key, locator_json, excerpt_hash, captured_at, revision_id, "
+            "excerpt) "
+            "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET "
             "excerpt_hash=excluded.excerpt_hash, captured_at=excluded.captured_at, "
-            "revision_id=excluded.revision_id",
+            "revision_id=excluded.revision_id, excerpt=excluded.excerpt",
             (
                 evidence.id,
                 evidence.source_id,
@@ -410,6 +423,7 @@ class RevisionTransaction:
                 evidence.excerpt_hash,
                 evidence.captured_at,
                 self._revision.id,
+                evidence.excerpt,
             ),
         )
         for entity in entity_ids:
@@ -743,4 +757,5 @@ class KnowledgeRepository:
             locator=locator_from_dict(json.loads(str(row[3]))),
             excerpt_hash=str(row[4]),
             captured_at=str(row[5]),
+            excerpt=str(row[6] or ""),
         )

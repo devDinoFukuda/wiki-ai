@@ -6,6 +6,7 @@ from typing import Any, Mapping
 import pytest
 
 from wiki_ai.knowledge.evidence import CodeContent, CodeLocator
+from wiki_ai.knowledge.identity import excerpt_digest
 from wiki_ai.knowledge.model import (
     Confidence,
     Entity,
@@ -52,13 +53,15 @@ def evidence_at(path: str, start: int, end: int) -> Evidence:
     locator = CodeLocator(
         path=path, line_start=start, line_end=end, content=CodeContent.EXECUTABLE
     )
+    excerpt = f"public void handle() {{ /* {path}:{start}-{end} */ }}"
     return Evidence(
         id=f"ev_{path}_{start}_{end}".replace("/", "_").replace(".", "_"),
         source_id=NAMESPACE,
         version_hash=DIGEST,
         locator=locator,
-        excerpt_hash="e" * 64,
+        excerpt_hash=excerpt_digest(excerpt),
         captured_at=STAMP,
+        excerpt=excerpt,
     )
 
 

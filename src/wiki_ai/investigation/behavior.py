@@ -9,7 +9,6 @@ from wiki_ai.knowledge.model import (
     Entity,
     EntityId,
     KnowledgeState,
-    Evidence,
     Relation,
 )
 from wiki_ai.knowledge.query import KnowledgeQuery
@@ -305,18 +304,7 @@ def _inherit(
         stored = query.repository.get_evidence(evidence_id)
         if stored is None:
             continue
-        transaction.put_evidence(_same(stored), entity_ids=(holder,))
-
-
-def _same(evidence: Evidence) -> Evidence:
-    return Evidence(
-        id=evidence.id,
-        source_id=evidence.source_id,
-        version_hash=evidence.version_hash,
-        locator=evidence.locator,
-        excerpt_hash=evidence.excerpt_hash,
-        captured_at=evidence.captured_at,
-    )
+        transaction.put_evidence(stored, entity_ids=(holder,))
 
 
 def _pair_ok(

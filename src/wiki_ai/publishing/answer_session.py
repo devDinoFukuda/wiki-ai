@@ -53,8 +53,8 @@ METHOD_STEPS: tuple[str, ...] = (
     f"one with {TOOL_ENTITY}",
     "follow the typed relations out of those entities until the question is decided "
     "by what the knowledge holds, not by what you expect a system like this to do",
-    f"read the evidence that sustains every entity you rely on with {TOOL_EVIDENCE} "
-    "and keep the evidence identifiers",
+    f"read the evidence that sustains every entity you rely on with {TOOL_EVIDENCE}, "
+    "read the excerpt text it returns and keep the evidence identifiers",
     "answer only with what the evidence sustains; an entity without evidence is not "
     "an answer, it is a lead",
     f"list everything the knowledge leaves open as unresolved, including the gaps "
@@ -73,6 +73,9 @@ ANSWER_RULES: tuple[str, ...] = (
     "an evidence identifier only counts when it is attached to one of the entities "
     "or relations the same claim cites; evidence borrowed from another entity is "
     "refused",
+    "the wording of a claim is checked against the excerpt text of the evidence it "
+    "cites, so read the excerpt before writing the claim and stay inside what it "
+    "says",
     "the wording of a claim must be sustained by what its evidence and its entities "
     "actually say; wording the knowledge does not carry is refused",
     "the free answer text is a draft kept only for audit: the delivered answer is "
@@ -95,6 +98,7 @@ class RejectionReason(Enum):
     UNKNOWN_ENTITY = "unknown_entity"
     UNKNOWN_EVIDENCE = "unknown_evidence"
     EVIDENCE_NOT_LINKED = "evidence_not_linked"
+    EVIDENCE_WITHOUT_EXCERPT = "evidence_without_excerpt"
     NOT_GROUNDED = "claim_not_grounded"
 
 
@@ -359,6 +363,16 @@ def _validate_claim(
             confidence,
             RejectionReason.EVIDENCE_NOT_LINKED,
             rejected_evidence_ids=unlinked,
+        )
+    without_excerpt = harness.evidence_without_excerpt(evidence_ids)
+    if without_excerpt:
+        return _rejected(
+            statement,
+            entity_ids,
+            evidence_ids,
+            confidence,
+            RejectionReason.EVIDENCE_WITHOUT_EXCERPT,
+            rejected_evidence_ids=without_excerpt,
         )
     vocabulary = harness.grounding_vocabulary(entity_ids, evidence_ids)
     grounding = check_component(CLAIM_COMPONENT, statement, vocabulary)
