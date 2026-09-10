@@ -72,7 +72,7 @@ def _iter_files(paths: Iterable[Path]) -> Iterator[Path]:
 
 def _markers(path: str, line_number: int, text: str) -> list[HygieneViolation]:
     found: list[HygieneViolation] = []
-    for match in _MARKER_PATTERN.finditer(text.upper()):
+    for match in _MARKER_PATTERN.finditer(text):
         found.append(
             HygieneViolation(path, line_number, HygieneKind.MARKER, match.group(1))
         )

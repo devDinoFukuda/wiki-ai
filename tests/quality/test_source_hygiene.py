@@ -66,6 +66,29 @@ def test_scan_detects_markers_and_directives(tmp_path: Path) -> None:
     assert _kinds(violations, HygieneKind.DIRECTIVE)
 
 
+def test_portuguese_word_todo_in_string_is_not_a_marker(tmp_path: Path) -> None:
+    target = tmp_path / "sample.py"
+    target.write_text(
+        'value = "todo pedido colocado"\nother = "Todo cliente"\n',
+        encoding="utf-8",
+    )
+    violations = scan([tmp_path])
+    assert not _kinds(violations, HygieneKind.MARKER), _format(violations)
+
+
+def test_uppercase_todo_marker_is_still_detected(tmp_path: Path) -> None:
+    target = tmp_path / "sample.py"
+    marker = MARKER_WORDS[0]
+    target.write_text(
+        f'value = "{marker} fix this"\nother = 1  '
+        + chr(35)
+        + f" {marker} cleanup\n",
+        encoding="utf-8",
+    )
+    found = _kinds(scan([tmp_path]), HygieneKind.MARKER)
+    assert [item.line for item in found] == [1, 2]
+
+
 def test_sql_pragma_in_string_literal_is_not_a_directive(tmp_path: Path) -> None:
     target = tmp_path / "sample.py"
     target.write_text(

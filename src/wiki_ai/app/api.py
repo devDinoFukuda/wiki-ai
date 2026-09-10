@@ -14,6 +14,7 @@ from wiki_ai.app.ports import CapabilityUnavailable
 from wiki_ai.app.session import Session, detect_outdated_store
 from wiki_ai.app.wiring import Wiring, default_wiring
 from wiki_ai.ingestion.source import SourceKind
+from wiki_ai.knowledge.correlation import correlate
 from wiki_ai.knowledge.model import SourceVersion
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.publishing.pipeline import PublicationBlocked
@@ -41,6 +42,7 @@ __all__ = [
     "DEFAULT_OBJECTIVE",
     "UP_TO_DATE",
     "SOURCE_KIND_BY_EXTENSION",
+    "CORRELATION_DETAIL",
     "source_kind_for",
     "snake_case",
     "version",
@@ -59,6 +61,7 @@ UP_TO_DATE = "up_to_date"
 PROVIDER_ACTION = "configure a supported provider"
 PROVIDER_UNAVAILABLE = "agent_provider_unavailable"
 PARTIAL_DIAGNOSTIC = "source_partially_interpreted"
+CORRELATION_DETAIL = "correlation"
 _HASH_CHUNK = 65536
 _NON_WORD = re.compile(r"[^a-z0-9]+")
 
@@ -330,6 +333,19 @@ def _knowledge_counts(knowledge: KnowledgeRepository) -> tuple[int, int, int, in
     )
 
 
+def _wrote_entities(reinvestigated: Mapping[str, Any] | None) -> bool:
+    if reinvestigated is None:
+        return False
+    return int(reinvestigated.get("entities_written", 0)) > 0
+
+
+def _correlated(
+    knowledge: KnowledgeRepository, namespace: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    payload[CORRELATION_DETAIL] = correlate(knowledge, namespace).to_dict()
+    return payload
+
+
 def _composition(wiring: Wiring | None, registry: ProviderRegistry | None) -> Wiring:
     if wiring is not None:
         return wiring
@@ -358,8 +374,10 @@ def _update_report(
         )
     with session.open_knowledge() as knowledge:
         outcome = runner.run(previous, snapshot, knowledge, provider, session.namespace)
+        payload = outcome.to_dict()
+        if _wrote_entities(outcome.reinvestigated):
+            payload = _correlated(knowledge, session.namespace, payload)
     session.save_snapshot(snapshot)
-    payload = outcome.to_dict()
     if provider is None:
         return AnalyzeReport(
             status="blocked",
@@ -424,11 +442,14 @@ def analyze(
         )
     with session.open_knowledge() as knowledge:
         outcome = runner.run(goal, snapshot, knowledge, provider, session.namespace)
+        payload = outcome.to_dict()
+        if outcome.entities_written:
+            payload = _correlated(knowledge, session.namespace, payload)
     return AnalyzeReport(
         status="ok",
         snapshot_digest=snapshot.digest,
         analyzable_files=analyzable,
-        details=outcome.to_dict(),
+        details=payload,
     )
 
 
@@ -472,6 +493,9 @@ def ingest(
             )
         outcome = runner.run(source, "", knowledge, session.namespace)
         registered = bool(knowledge.source_versions(outcome.source_id))
+        payload = outcome.to_dict()
+        if outcome.entities_written:
+            payload = _correlated(knowledge, session.namespace, payload)
     partial = PARTIAL_DIAGNOSTIC in outcome.diagnostics
     return IngestReport(
         status="partial" if partial else "ok",
@@ -480,7 +504,7 @@ def ingest(
         version_hash=outcome.version_hash,
         registered=registered,
         reason=PARTIAL_DIAGNOSTIC if partial else "",
-        details=outcome.to_dict(),
+        details=payload,
     )
 
 

@@ -168,6 +168,7 @@ def normalize(
         relation_ids.update(
             _write_relations(
                 transaction,
+                knowledge,
                 by_key,
                 entity_ids,
                 subject_index,
@@ -222,6 +223,7 @@ def _link_evidence(
 
 def _write_relations(
     transaction: RevisionTransaction,
+    knowledge: KnowledgeRepository,
     by_key: Mapping[str, VerifiedFinding],
     entity_ids: dict[str, EntityId],
     subject_index: Mapping[str, str],
@@ -248,9 +250,13 @@ def _write_relations(
                         confidence=Confidence.UNRESOLVED,
                         source_versions=(version.key,),
                     )
-                    transaction.put_entity(placeholder)
+                    known = knowledge.get_entity(placeholder.id)
+                    if known is None:
+                        transaction.put_entity(placeholder)
+                        unresolved.append(claim.target_subject)
                     entity_ids[target_key] = placeholder.id
-                unresolved.append(claim.target_subject)
+                else:
+                    unresolved.append(claim.target_subject)
             source_kind = item.finding.type
             target_kind_value = target_key.split("::", 1)[0]
             try:
