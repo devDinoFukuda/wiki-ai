@@ -32,9 +32,9 @@
 
 | Comando | Quando usar | O que faz (1 linha) | Campos principais da saída JSON | Exit codes | Como saber que terminou |
 |---|---|---|---|---|---|
-| `wiki-ai analyze <repo> [--objective TXT]` | Primeira análise ou após mudanças no repo | Tira snapshot, compara com o anterior e roda investigação (nova ou incremental) | `status`, `snapshot_digest`, `analyzable_files`, `reason` (`up_to_date` se nada mudou), `details` | 0 ok / 1 erro / 2 bloqueado | JSON impresso em stdout com `status` |
-| `wiki-ai ingest <source> --repo <repo>` | Adicionar uma fonte externa (doc, planilha, transcrição, diagrama) | Detecta o formato, extrai blocos e grava `SourceVersion` no knowledge store | `status` (`ok`/`partial`/`blocked`), `source`, `kind`, `version_hash`, `registered` | 0/1/2 | `registered: true` e `status` no JSON |
-| `wiki-ai ask "<pergunta>" --repo <repo>` | Consultar a base já investigada | Roda `Answerer` sobre o `KnowledgeRepository`; bloqueia se a base estiver vazia | `status`, `answer`, `evidence_ids`, `entity_ids`, `unresolved` | 0/1/2 | `status: "ok"` com `answer` preenchido |
+| `wiki-ai analyze <repo> [--objective TXT]` | Primeira análise ou após mudanças no repo | Tira snapshot, compara com o anterior e roda investigação (nova ou incremental) | `status`, `snapshot_digest`, `analyzable_files`, `analysis_status`, `reason` (`up_to_date` se nada mudou), `details` | 0 ok / 1 erro / 2 bloqueado | JSON impresso em stdout com `status` |
+| `wiki-ai ingest <source> --repo <repo>` | Adicionar uma fonte externa (doc, planilha, transcrição, diagrama) | Detecta o formato, extrai blocos e grava `SourceVersion` no knowledge store | `status` (`ok`/`partial`/`blocked`), `source`, `kind`, `version_hash`, `registered`, `ingestion_status` | 0/1/2 | `registered: true` e `status` no JSON |
+| `wiki-ai ask "<pergunta>" --repo <repo>` | Consultar a base já investigada | Roda `Answerer` sobre o `KnowledgeRepository`; bloqueia se a base estiver vazia | `status`, `answer`, `mode`, `evidence_ids`, `entity_ids`, `unresolved` | 0/1/2 | `status: "ok"` com `answer` preenchido |
 | `wiki-ai publish --repo <repo>` | Gerar os documentos DOCX para publicação | Planeja documentos, monta narrativa, renderiza DOCX, valida pacote e promove release | `status`, `publication_id`, `artifacts`, `manifest_hash` | 0/1/2 | `status: "ok"` e `publication_id` presente |
 | `wiki-ai status --repo <repo>` | Ver estado atual sem alterar nada | Lê contadores do knowledge store e da última publicação | `entities`, `relations`, `evidence`, `sources`, `pending_update`, `last_publication`, `provider_available` | 0 (sempre `ok`) | Sempre retorna; `pending_update: true` indica que `analyze` deve rodar de novo |
 | `wiki-ai inspect [<repo>]` | Ver inventário de arquivos sem tocar no knowledge store | Faz snapshot + inventário (classificação/linguagem), sem investigar | `total_files`, `analyzable_files`, `by_classification`, `by_language` | 0/1/2 | JSON com `total_files` |
@@ -50,16 +50,46 @@ Exit codes (`app/commands.py`): `EXIT_OK=0`, `EXIT_ERROR=1` (payload `status:"er
 | Execução repetida sem mudanças | `analyze`, condição `previous.digest == snapshot.digest` | Retorna `status:"ok"`, `reason:"up_to_date"`, sem rodar o agente |
 | Execução após mudanças no repo | `analyze`, `diff(previous, snapshot).is_empty()` falso | Roda `_update_report` → `UpdateEngine` (investigação incremental sobre o diff), invalida conhecimento afetado |
 
+### Estados tipados de saída
+
+Evidência: `app/ports.py::OutcomeStatus`, `app/session.py::AnalysisStatus`, `investigation/orchestrator.py::InvestigationStatus`, `ingestion/outcome.py::IngestionStatus`, `publishing/answer.py::AnswerMode`.
+
+| Comando | Campo | Valores | Evidência |
+|---|---|---|---|
+| `analyze` | `status` | `ok`, `partial`, `blocked`, `error` | `app/api.py::REPORT_STATUS_BY_OUTCOME` (mapeia `OutcomeStatus` do runner) |
+| `analyze` | `analysis_status` | `never`, `complete`, `partial`, `blocked`, `failed` | `app/api.py::ANALYSIS_STATUS_BY_OUTCOME`, `app/session.py::AnalysisStatus` |
+| `ingest` | `status` | `ok`, `partial`, `blocked` | `app/api.py::REPORT_STATUS_BY_OUTCOME` |
+| `ingest` | `ingestion_status` | `complete`, `structural_only`, `partial`, `blocked`, `failed` | `app/ports.py::OutcomeStatus`; `structural_only` quando não há provider de agente (`ingest`, `STRUCTURAL_ONLY`) |
+| `ask` | `mode` | `agentic`, `deterministic_fallback` | `publishing/answer.py::AnswerMode` |
+| `ask` | `reason` | texto livre (ex.: `knowledge_empty`) | `app/api.py::AskReport` |
+
+Como interpretar cada estado / o que fazer:
+
+| Estado | Significa | O que fazer |
+|---|---|---|
+| `status: ok` | Execução completa sem lacunas | Nenhuma ação — resultado utilizável |
+| `status: partial` | Execução concluiu mas com lacunas (gaps) reportadas em `details`/`diagnostics` | Ler `details`/`reason`; decidir se as lacunas são aceitáveis ou exigem nova fonte/execução |
+| `status: blocked` | Pré-condição ausente (provider, biblioteca, base vazia) | Ler `reason`/`action` no JSON e resolver a causa (ex.: instalar dependência, configurar provider) antes de repetir |
+| `status: error` | Falha de execução (`OutcomeStatus.FAILED`) | Investigar a causa raiz (log/exceção); execução não produziu resultado confiável |
+| `analysis_status: never` | Repositório nunca foi analisado com sucesso | Rodar `wiki-ai analyze` |
+| `analysis_status: complete` | Última análise concluiu sem bloqueios/lacunas para o `analyzed_digest` atual | `reason: up_to_date` em execuções repetidas sem mudanças |
+| `analysis_status: partial`/`blocked`/`failed` | Análise não concluiu integralmente; `analyzed_digest` não avança para o novo snapshot | Resolver a causa (`reason`/`action`) e rodar `analyze` novamente — só `complete` avança `analyzed_digest` |
+| `ingestion_status: structural_only` | Extração estrutural ocorreu, mas sem investigação semântica (sem provider de agente) | Configurar um provider para enriquecimento semântico, se necessário |
+| `mode: agentic` | `ask` usou o agente para responder | — |
+| `mode: deterministic_fallback` | `ask` respondeu sem agente, só com dados determinísticos do knowledge store | Configurar provider para respostas mais completas, se necessário |
+
+`up_to_date` (`reason` de `analyze`) só é retornado quando o `analysis_status` da última execução é `complete` para o mesmo `snapshot_digest` (`app/session.py::AnalysisState.is_current_for`) — uma análise `partial`/`blocked`/`failed` não marca o repositório como atualizado, mesmo sem mudanças no digest.
+
 ## 5. Formatos de fonte suportados
 
-Evidência: `ingestion/adapters/registry.py::EXTENSION_KINDS`, `ingestion/adapters/pdf.py`, `ingestion/adapters/blocks.py::IMAGE_GAP_CODE`.
+Evidência: `ingestion/adapters/registry.py::EXTENSION_KINDS`, `ingestion/adapters/pdf.py`, `ingestion/adapters/blocks.py::IMAGE_GAP_CODE`, `ingestion/outcome.py`.
 
 | Formato | Extensões | O que é extraído | Locator | Limitações |
 |---|---|---|---|---|
 | DOCX | `.docx`, `.docm` | Títulos, parágrafos, listas, tabelas (via `adapters/docx.py`) | posição no documento | — |
 | XLSX | `.xlsx`, `.xlsm` | Células e folhas (via `adapters/xlsx.py`) | referência de célula (`cellref.py`) | — |
 | Draw.io | `.drawio`, e PNG/SVG embutidos (`*.drawio.png/svg`) | Nós e relações do diagrama | id do nó/aresta | — |
-| PDF | `.pdf` | Texto extraído por streams (`PdfTextExtractor`) | página/posição | Sem OCR (`OCR_UNAVAILABLE`); páginas só-imagem geram gap (`NO_TEXT_LAYER`, `IMAGE_GAP_CODE`); documentos malformados retornam `MALFORMED_DOCUMENT` |
+| PDF | `.pdf` | Texto extraído por página via `pypdf` (`LibraryTextExtractor`) | página/posição | Requer `pip install "wiki-ai[pdf]"`; sem a biblioteca → `blocked` `pdf_library_unavailable` (`StructuralFault.PDF_LIBRARY_UNAVAILABLE`, em `BLOCKING_FAULTS`); páginas sem texto → `partial` `image_content_not_interpreted` (`Gap.IMAGE_CONTENT_NOT_INTERPRETED`, em `PARTIAL_GAPS`; OCR não incluído); documentos malformados → `failed` `malformed_document` (`StructuralFault.MALFORMED_DOCUMENT`, fora de `BLOCKING_FAULTS` — `ingestion/integration.py::derive_status`) |
 | Transcrição | `.vtt`, `.srt`, `.txt` (se detectado como fala) | Falas por locutor/timestamp (heurística `_SPEAKER_LINE`, `_looks_srt`, `_looks_transcript`) | timestamp/locutor | Detecção heurística — texto livre sem marcação de locutor pode não ser reconhecido como transcrição |
 | Markdown | `.md`, `.markdown` | Seções e blocos de texto | posição no documento | — |
 | HTML | `.html`, `.htm` | Estrutura textual | posição no DOM | — |
@@ -79,7 +109,30 @@ Store, leases e bindings internos (`knowledge/repository.py`, `repository/snapsh
 | `<repo>/.wiki-ai/publications/releases/<publication_id>/` | Release publicada: arquivos `.docx` + `manifest.json` | `publishing/release.py` (`RELEASES_DIRNAME`), `publishing/pipeline.py::Publisher.run` |
 | `<repo>/.wiki-ai/publications/current` | Ponteiro para a release atual | `publishing/release.py::current` |
 
-Se `WIKI_AI_HOME` estiver definida, tudo acima fica em `<WIKI_AI_HOME>/<identity>/` em vez de `<repo>/.wiki-ai/` (`app/session.py::state_dir_for`).
+Se `WIKI_AI_HOME` estiver definida, tudo acima fica em `<WIKI_AI_HOME>/<identity>/` em vez de `<repo>/.wiki-ai/` (`app/session.py::state_dir_for`, `HOME_VARIABLE = "WIKI_AI_HOME"`).
+
+### Snapshot imutável
+
+Evidência: `repository/store.py::SnapshotStore`.
+
+| Aspecto | Evidência | Detalhe |
+|---|---|---|
+| Blobs content-addressed | `store.py::SnapshotStore.put`, `_blob_path` | Cada arquivo do snapshot é gravado em `.wiki-ai/snapshots/blobs/<sha256[:2]>/<sha256>` (`BLOBS_DIRECTORY = "blobs"`); escrita atômica via arquivo `.pending` + `os.replace` |
+| Manifesto por digest | `store.py::_manifest_path`, `_write_manifest` | `.wiki-ai/snapshots/<digest>/manifest.json` (`MANIFEST_NAME = "manifest.json"`) lista os blobs que compõem aquele snapshot |
+| Leitura sempre pelo snapshot | `store.py::SnapshotStore.open`, `.materialize` | O agente e os runners leem o conteúdo dos arquivos a partir do blob armazenado (`open(sha256)`), nunca do working tree diretamente — o snapshot já tirado é a fonte imutável para toda a investigação |
+| Criação automática do `.gitignore` | `app/session.py::Session.prepare`, `write_ignore` | Ao abrir uma sessão, se `<state_dir>/.gitignore` não existir, é criado com `IGNORE_CONTENT = "*\n"` (ignora todo `.wiki-ai/` do controle de versão do repositório) |
+| Localização alternativa do estado | `app/session.py::HOME_VARIABLE = "WIKI_AI_HOME"`, `state_dir_for` | Se a variável de ambiente `WIKI_AI_HOME` estiver definida (e não vazia), todo o estado (`state.db`, `snapshots/`, `publications/`) fica em `<WIKI_AI_HOME>/<identity>/` em vez de `<repo>/.wiki-ai/` |
+
+### Detecção de store antigo
+
+Evidência: `app/session.py::detect_outdated_store`, `_codescan_signature`, `_docx_signature`; `app/api.py::_checked_root` (usado por `inspect`, `analyze`, `ingest`, `ask`, `publish`).
+
+| Assinatura | Condição inequívoca | Evidência |
+|---|---|---|
+| `.codescan` | Diretório `<repo>/.codescan/` existe **e** contém `state.db` ou `manifest.json` (`CODESCAN_FILES`) | `_codescan_signature` |
+| `wiki-docx` | Diretório `<repo>/wiki-docx/` existe **e** os diretórios companheiros `raw/` e `wiki/` (`COMPANION_DIRECTORIES`) também existem em `<repo>` | `_docx_signature` |
+
+Quando qualquer assinatura é encontrada, `_checked_root` levanta `OutdatedStore(markers)` e o comando não prossegue — só a presença de arquivo/diretório isolado (sem a combinação exigida) não é suficiente para classificar o repositório como store antigo.
 
 ## 7. Publicação SharePoint/Copilot Studio
 
@@ -97,6 +150,9 @@ Se `WIKI_AI_HOME` estiver definida, tudo acima fica em `<WIKI_AI_HOME>/<identity
 | `python -m pytest tests` | Antes de qualquer commit/PR | Suíte de testes completa (`pyproject.toml::[tool.pytest.ini_options]`, `testpaths = ["tests"]`) |
 | Gate de higiene (`quality/source_hygiene.py::scan`) | CI/local | Zero comentários (`#`, `//`, `/* */`, `<!-- -->`), zero docstrings, zero marcadores (`TODO`, `FIXME`, `HACK`, `NOTE`, `XXX`) e diretivas de supressão (`type: ignore`, `noqa`, `pragma`, `pylint:`, `fmt:`) em código Python/JS/TS/Java/Go/C/C#/HTML/XML |
 | Gate de arquitetura (`quality/architecture.py::check`) | CI/local | Ver regras abaixo |
+| Gate de código morto (`quality/dead_code.py::check`) | CI/local | Símbolo (função/método/classe/constante/membro de enum) definido em `src/wiki_ai/` sem uso fora da sua própria definição (`_external_uses`); exceções: métodos que sobrescrevem base (`_overridden_methods`), membros de enum construídos por valor (`_enum_classes_built_by_value`), nomes referenciados por teste que casam com `public_api` de `vocabulary.json`, e símbolos listados em `dead_code_allow` (`symbol` + `reason` obrigatórios) |
+| Benchmark semântico (`tests/benchmark/runner.py`) | Validar qualidade de investigação por provider/repositório | `python -m tests.benchmark.runner --provider all --repo all --out <json>` — roda `analyze` sobre corpora de verdade conhecida e mede com `metrics.evaluate` (`BenchmarkReport`/`MetricScore`); exit `3` (`EXIT_SKIPPED`) quando o binário do provider está ausente (`SKIP_REASON = "provider_binary_unavailable"`), exit `1` em erro, exit `0` ao concluir |
+| Conformidade entre providers (`tests/benchmark/conformance.py`) | Validar que providers produzem conhecimento equivalente | `python -m tests.benchmark.conformance --repo all --out <json>` — roda `analyze` com `claude` e `codex` (`PAIR`) sobre o mesmo repositório e compara `KnowledgeShape` (`compare_shapes`/`compare_metrics`); mesmos exit codes de `runner.py` (`3` sem binário, `1` erro, `0` ok) |
 
 ### Regras do gate de arquitetura
 
@@ -112,4 +168,4 @@ Se `WIKI_AI_HOME` estiver definida, tudo acima fica em `<WIKI_AI_HOME>/<identity
 | Comandos removidos ausentes | `REMOVED_COMMAND` | `promote`, `compile`, `docx`, `finish`, `ingest-legacy`, `migrate`, `code`, `index`, `search`, `get`, `audit`, `lint`, `check`, `engines`, `store` não podem ser subcomandos nem console scripts |
 | Único entrypoint | `MULTIPLE_ENTRYPOINTS` | Apenas o console script `wiki-ai` é permitido em `pyproject.toml`; apenas um `__main__.py` no pacote |
 
-Execução: `check(src_root, repo_root)` (`quality/architecture.py`) e `scan(paths)` (`quality/source_hygiene.py`) retornam listas de violações vazias quando o repositório está em conformidade.
+Execução: `check(src_root, repo_root)` (`quality/architecture.py`), `scan(paths)` (`quality/source_hygiene.py`) e `check(src_root, tests_root)` (`quality/dead_code.py`) retornam listas vazias quando o repositório está em conformidade.
