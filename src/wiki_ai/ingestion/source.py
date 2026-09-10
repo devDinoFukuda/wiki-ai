@@ -130,7 +130,7 @@ SUSPICIOUS_METADATA_KEYS: frozenset[str] = frozenset(
         "budget",
         "command",
         "commands",
-        "epistemic_status",
+        "knowledge_state",
         "exec",
         "execute",
         "instruction",

@@ -6,7 +6,7 @@ from wiki_ai.knowledge import (
     CodeLocator,
     Confidence,
     Entity,
-    EpistemicStatus,
+    KnowledgeState,
     KnowledgeRepository,
     Relation,
     SourceVersion,
@@ -48,7 +48,7 @@ def rule(name: str, version: SourceVersion) -> Entity:
             "conditions": ["always"],
             "effects": ["happens"],
         },
-        epistemic=EpistemicStatus.IMPLEMENTED,
+        state=KnowledgeState.IMPLEMENTED,
         confidence=Confidence.SUPPORTED,
         source_versions=(version.key,),
     )
@@ -125,10 +125,10 @@ def test_apply_targeted_demotes_only_the_named_entity(loaded):
     assert repository.get_entity(intact.id).confidence is Confidence.SUPPORTED
 
 
-def test_apply_targeted_preserves_the_epistemic_axis(loaded):
+def test_apply_targeted_preserves_the_state_axis(loaded):
     repository, previous, changed, _intact, changed_evidence, _other = loaded
     applied_update(repository, previous, changed, changed_evidence)
-    assert repository.get_entity(changed.id).epistemic is EpistemicStatus.IMPLEMENTED
+    assert repository.get_entity(changed.id).state is KnowledgeState.IMPLEMENTED
 
 
 def test_apply_targeted_marks_historical_when_asked(loaded):
@@ -137,7 +137,7 @@ def test_apply_targeted_marks_historical_when_asked(loaded):
         repository, previous, changed, changed_evidence, historical=(changed.id.value,)
     )
     stored = repository.get_entity(changed.id)
-    assert stored.epistemic is EpistemicStatus.HISTORICAL
+    assert stored.state is KnowledgeState.HISTORICAL
     assert stored.confidence is Confidence.UNRESOLVED
 
 

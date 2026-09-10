@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from .errors import GapNotFound
-from .model import Confidence, Entity, EntityId, EpistemicStatus, Relation
+from .model import Confidence, Entity, EntityId, KnowledgeState, Relation
 from .repository import KnowledgeRepository, RevisionTransaction
 from .taxonomy import EntityKind, RelationKind
 
@@ -36,7 +36,7 @@ def make_gap(
         name=question,
         stable_key=gap_key(question, about),
         attributes=payload,
-        epistemic=EpistemicStatus.DECLARED,
+        state=KnowledgeState.DECLARED,
         confidence=Confidence.UNRESOLVED,
     )
 
@@ -76,7 +76,7 @@ def close_gap(
             kind=stored.kind,
             name=stored.name,
             attributes=payload,
-            epistemic=stored.epistemic,
+            state=stored.state,
             confidence=stored.confidence,
             source_versions=stored.source_versions,
         )

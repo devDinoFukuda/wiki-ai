@@ -6,7 +6,7 @@ from wiki_ai.knowledge import (
     Confidence,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     KnowledgeRepository,
     Relation,
     SourceVersion,
@@ -56,7 +56,7 @@ def test_supported_entity_without_evidence_is_a_violation(graph):
         kind="table",
         name="orphan",
         attributes={"schema": "public"},
-        epistemic=EpistemicStatus.DECLARED,
+        state=KnowledgeState.DECLARED,
         confidence=Confidence.SUPPORTED,
     )
     with repo.begin_revision("pipeline", "sem evidencia") as revision:

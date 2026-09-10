@@ -14,7 +14,7 @@ from wiki_ai.knowledge.correlation import (
 )
 from wiki_ai.knowledge.gaps import open_gaps
 from wiki_ai.knowledge.matching import score_names, singularize, tokens
-from wiki_ai.knowledge.model import Confidence, Entity, EpistemicStatus
+from wiki_ai.knowledge.model import Confidence, Entity, KnowledgeState
 from wiki_ai.knowledge.taxonomy import RelationKind
 
 from .inception_fixture import build
@@ -226,6 +226,6 @@ def _decision(key: str, decided_at: str) -> Entity:
             "decision": "migrar renovacao para Salesforce",
             "decided_at": decided_at,
         },
-        epistemic=EpistemicStatus.PROPOSED,
+        state=KnowledgeState.PROPOSED,
         confidence=Confidence.INFERRED,
     )

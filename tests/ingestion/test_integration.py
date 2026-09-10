@@ -12,7 +12,7 @@ from wiki_ai.ingestion.integration import (
     VERSION_MISMATCH,
     IngestionEngine,
 )
-from wiki_ai.knowledge.model import EpistemicStatus
+from wiki_ai.knowledge.model import KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
 
 from tests.ingestion import fixtures
@@ -80,7 +80,7 @@ def test_a_provider_turns_blocks_into_entities(
     assert outcome.entities_written == 1
     assert PROVIDER_UNAVAILABLE not in outcome.diagnostics
     decision = knowledge.find_entities("decision_record")[0]
-    assert decision.epistemic is EpistemicStatus.DECLARED
+    assert decision.state is KnowledgeState.DECLARED
 
 
 def test_reingesting_the_same_source_does_not_duplicate(

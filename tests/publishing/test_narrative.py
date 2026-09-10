@@ -56,7 +56,7 @@ def test_body_has_no_internal_identifiers(query):
             assert not _INTERNAL_ID.search(_body_text(document))
 
 
-def test_assertions_carry_epistemic_language(query):
+def test_assertions_carry_state_language(query):
     document = _capability_named(query, "Renovacao")
     rendered = _body_text(document)
     assert "implementado" in rendered

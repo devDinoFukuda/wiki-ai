@@ -19,7 +19,7 @@ from .content import (
     diagram_block,
     edge_cases,
     empty_profile,
-    epistemic_phrase,
+    state_phrase,
     evidence_ids,
     flow_block,
     gap_section,
@@ -47,7 +47,7 @@ from .model import (
     NarrativeDocument,
 )
 
-__all__ = ["NarrativeBuilder", "NarrativeEnricher", "epistemic_phrase", "trace_entries"]
+__all__ = ["NarrativeBuilder", "NarrativeEnricher", "state_phrase", "trace_entries"]
 
 
 class NarrativeBuilder:
@@ -159,7 +159,7 @@ class NarrativeBuilder:
                 Assertion(
                     text=text,
                     stance=AssertionStance.OPEN,
-                    qualifier=epistemic_phrase(entity),
+                    qualifier=state_phrase(entity),
                 )
             )
         return tuple(found)
@@ -203,7 +203,7 @@ class NarrativeBuilder:
                             "sistema analisado"
                         ),
                         stance=stance(capability),
-                        qualifier=epistemic_phrase(capability),
+                        qualifier=state_phrase(capability),
                     ),
                 ),
             )
@@ -317,7 +317,7 @@ class NarrativeBuilder:
                     Assertion(
                         text=f"O sistema {system.name} reúne as capacidades descritas a seguir",
                         stance=stance(system),
-                        qualifier=epistemic_phrase(system),
+                        qualifier=state_phrase(system),
                     ),
                 ),
             )
@@ -410,7 +410,7 @@ class NarrativeBuilder:
         for entity in entries:
             if stance(entity) is not AssertionStance.FACT:
                 continue
-            rows.append((entity.name, epistemic_phrase(entity), statement_of(entity)))
+            rows.append((entity.name, state_phrase(entity), statement_of(entity)))
         body.append(
             table(2, rows)
             if len(rows) > 1
@@ -524,7 +524,7 @@ class NarrativeBuilder:
                             f"Esta mudança propõe {statement_of(change)}"
                         ),
                         stance=stance(change),
-                        qualifier=epistemic_phrase(change),
+                        qualifier=state_phrase(change),
                     ),
                 ),
             )

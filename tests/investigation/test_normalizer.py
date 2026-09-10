@@ -6,7 +6,7 @@ from tests.repository.fixtures_repos import java_repo
 
 from wiki_ai.knowledge.evidence import CodeLocator
 from wiki_ai.knowledge.gaps import GAP_KIND, open_gaps
-from wiki_ai.knowledge.model import Confidence, EntityId, EpistemicStatus
+from wiki_ai.knowledge.model import Confidence, EntityId, KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
 from wiki_ai.repository.evidence import capture
@@ -65,7 +65,7 @@ def test_findings_become_entities_relations_and_evidence(tmp_path: Path) -> None
         capability = knowledge.find_entities(EntityKind.CAPABILITY.value)[0]
         assert capability.name == "OrderService place"
         assert capability.confidence is Confidence.SUPPORTED
-        assert capability.epistemic is EpistemicStatus.IMPLEMENTED
+        assert capability.state is KnowledgeState.IMPLEMENTED
         evidence = knowledge.evidence_for(capability.id)
         assert len(evidence) == 1
         assert isinstance(evidence[0].locator, CodeLocator)
@@ -175,7 +175,7 @@ def test_unresolved_findings_are_stored_as_declared_not_implemented(
             if item.name == "OrderService cancel"
         ][0]
         assert entity.confidence is Confidence.UNRESOLVED
-        assert entity.epistemic is EpistemicStatus.DECLARED
+        assert entity.state is KnowledgeState.DECLARED
 
 
 def test_an_invalid_relation_pair_is_reported_not_written(tmp_path: Path) -> None:

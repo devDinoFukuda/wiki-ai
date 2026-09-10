@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Mapping, Sequence
 
 from wiki_ai.knowledge.errors import KnowledgeError
-from wiki_ai.knowledge.model import Confidence, EpistemicStatus
+from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.taxonomy import (
     ENTITY_KIND_VALUES,
     RELATION_KIND_VALUES,
@@ -32,7 +32,7 @@ __all__ = [
     "document_finding_schema",
     "parse_finding",
     "parse_findings",
-    "epistemic_for",
+    "state_for",
     "verify",
 ]
 
@@ -146,7 +146,7 @@ class Rejection(str, Enum):
 class VerifiedDocumentFinding:
     finding: DocumentFinding
     confidence: Confidence
-    epistemic: EpistemicStatus
+    state: KnowledgeState
     captures: tuple[DocumentEvidenceCapture, ...] = ()
     rejections: tuple[Rejection, ...] = ()
     reasons: tuple[str, ...] = ()
@@ -164,7 +164,7 @@ class VerifiedDocumentFinding:
             "type": self.finding.type.value,
             "subject": self.finding.subject,
             "confidence": self.confidence.value,
-            "epistemic": self.epistemic.value,
+            "state": self.state.value,
             "captures": [item.capture_id for item in self.captures],
             "rejections": [item.value for item in self.rejections],
             "reasons": list(self.reasons),
@@ -326,10 +326,10 @@ def parse_findings(
     return tuple(accepted), tuple(rejected)
 
 
-def epistemic_for(finding: DocumentFinding) -> EpistemicStatus:
+def state_for(finding: DocumentFinding) -> KnowledgeState:
     if finding.proposed or finding.type in (EntityKind.PROPOSAL, EntityKind.INITIATIVE):
-        return EpistemicStatus.PROPOSED
-    return EpistemicStatus.DECLARED
+        return KnowledgeState.PROPOSED
+    return KnowledgeState.DECLARED
 
 
 def _terms(text: str) -> set[str]:
@@ -408,7 +408,7 @@ def verify(
         item = VerifiedDocumentFinding(
             finding=finding,
             confidence=confidence,
-            epistemic=epistemic_for(finding),
+            state=state_for(finding),
             captures=tuple(captures),
             rejections=tuple(dict.fromkeys(rejections)),
             reasons=tuple(dict.fromkeys(reasons)),

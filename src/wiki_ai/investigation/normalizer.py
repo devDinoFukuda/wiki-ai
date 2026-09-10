@@ -9,7 +9,7 @@ from wiki_ai.knowledge.model import (
     Confidence,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     Evidence,
     Relation,
     SourceVersion,
@@ -31,11 +31,11 @@ __all__ = [
 
 AUTHOR = "investigation"
 
-_EPISTEMIC_BY_CONFIDENCE: Mapping[Confidence, EpistemicStatus] = {
-    Confidence.SUPPORTED: EpistemicStatus.IMPLEMENTED,
-    Confidence.INFERRED: EpistemicStatus.IMPLEMENTED,
-    Confidence.CONTRADICTED: EpistemicStatus.DECLARED,
-    Confidence.UNRESOLVED: EpistemicStatus.DECLARED,
+_STATE_BY_CONFIDENCE: Mapping[Confidence, KnowledgeState] = {
+    Confidence.SUPPORTED: KnowledgeState.IMPLEMENTED,
+    Confidence.INFERRED: KnowledgeState.IMPLEMENTED,
+    Confidence.CONTRADICTED: KnowledgeState.DECLARED,
+    Confidence.UNRESOLVED: KnowledgeState.DECLARED,
 }
 
 _DEFAULT_TARGET_KIND: Mapping[str, EntityKind] = {
@@ -105,7 +105,7 @@ def entity_of(item: VerifiedFinding, source_version_key: str) -> Entity:
         name=item.finding.subject,
         stable_key=item.stable_key,
         attributes=_attribute_payload(item),
-        epistemic=_EPISTEMIC_BY_CONFIDENCE[item.confidence],
+        state=_STATE_BY_CONFIDENCE[item.confidence],
         confidence=item.confidence,
         source_versions=(source_version_key,),
     )
@@ -246,7 +246,7 @@ def _write_relations(
                         name=claim.target_subject,
                         stable_key=target_key,
                         attributes=_placeholder_attributes(kind, claim.target_subject),
-                        epistemic=EpistemicStatus.DECLARED,
+                        state=KnowledgeState.DECLARED,
                         confidence=Confidence.UNRESOLVED,
                         source_versions=(version.key,),
                     )

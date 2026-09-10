@@ -6,7 +6,7 @@ from wiki_ai.knowledge import (
     CodeLocator,
     Confidence,
     Entity,
-    EpistemicStatus,
+    KnowledgeState,
     KnowledgeRepository,
     SourceVersion,
     invalidate,
@@ -40,14 +40,14 @@ def loaded(tmp_path):
     dependent = Entity.create(
         kind="capability",
         name="Pedido",
-        epistemic=EpistemicStatus.IMPLEMENTED,
+        state=KnowledgeState.IMPLEMENTED,
         confidence=Confidence.SUPPORTED,
         source_versions=(first.key,),
     )
     untouched = Entity.create(
         kind="capability",
         name="Catálogo",
-        epistemic=EpistemicStatus.DECLARED,
+        state=KnowledgeState.DECLARED,
         confidence=Confidence.SUPPORTED,
         source_versions=(other.key,),
     )
@@ -87,10 +87,10 @@ def test_invalidate_marks_dependent_entity_unresolved(loaded):
     assert dependent.id.value in result.entities
 
 
-def test_invalidate_preserves_the_epistemic_axis(loaded):
+def test_invalidate_preserves_the_state_axis(loaded):
     repo, _first, _other, dependent, _untouched, _ev = loaded
     invalidate(repo, [version_of("v2")], author="pipeline")
-    assert repo.get_entity(dependent.id).epistemic is EpistemicStatus.IMPLEMENTED
+    assert repo.get_entity(dependent.id).state is KnowledgeState.IMPLEMENTED
 
 
 def test_invalidate_does_not_delete_anything(loaded):
@@ -149,7 +149,7 @@ def test_historical_entities_are_not_revalidated(tmp_path):
     past = Entity.create(
         kind="capability",
         name="Fluxo antigo",
-        epistemic=EpistemicStatus.HISTORICAL,
+        state=KnowledgeState.HISTORICAL,
         confidence=Confidence.SUPPORTED,
         source_versions=(version.key,),
     )

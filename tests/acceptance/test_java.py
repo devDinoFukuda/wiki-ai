@@ -22,7 +22,7 @@ from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.app import api
 from wiki_ai.app.session import Session
 from wiki_ai.knowledge.evidence import CodeContent, CodeLocator
-from wiki_ai.knowledge.model import Confidence, EpistemicStatus
+from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.taxonomy import EntityKind
 from wiki_ai.publishing.release import RELEASES_DIRNAME
@@ -109,7 +109,7 @@ def test_the_business_rules_are_reconstructed_with_conditions_and_effects(
         assert rule.attributes["effects"] == [
             "OrderRepository save receives the reference"
         ]
-        assert rule.epistemic is EpistemicStatus.IMPLEMENTED
+        assert rule.state is KnowledgeState.IMPLEMENTED
         assert knowledge.evidence_for(rule.id)
 
 

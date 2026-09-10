@@ -16,7 +16,7 @@ from wiki_ai.ingestion.semantic import (
 from wiki_ai.ingestion.source import SourceKind
 from wiki_ai.knowledge.evidence import DiagramLocator, SpreadsheetLocator, TranscriptLocator
 from wiki_ai.knowledge.gaps import GAP_KIND, questions
-from wiki_ai.knowledge.model import Confidence, EpistemicStatus
+from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
 
 from tests.ingestion import fixtures
@@ -94,12 +94,12 @@ def test_transcript_yields_declared_and_supported_findings(
     assert outcome.evidence_written == 2
 
     decision = _entities(knowledge, "decision_record")[0]
-    assert decision.epistemic is EpistemicStatus.DECLARED
+    assert decision.state is KnowledgeState.DECLARED
     assert decision.confidence is Confidence.SUPPORTED
     requirement = _entities(knowledge, "requirement")[0]
-    assert requirement.epistemic is EpistemicStatus.DECLARED
+    assert requirement.state is KnowledgeState.DECLARED
     proposal = _entities(knowledge, "proposal")[0]
-    assert proposal.epistemic is EpistemicStatus.PROPOSED
+    assert proposal.state is KnowledgeState.PROPOSED
 
     evidence = knowledge.evidence_for(decision.id)
     assert len(evidence) == 1
@@ -149,7 +149,7 @@ def test_spreadsheet_rule_matrix_becomes_a_business_rule(
     rule = _entities(knowledge, "business_rule")[0]
     assert rule.name == "Desconto A"
     assert rule.confidence is Confidence.SUPPORTED
-    assert rule.epistemic is EpistemicStatus.DECLARED
+    assert rule.state is KnowledgeState.DECLARED
     assert list(rule.attributes["conditions"]) == ["valor > 100", "limite 100"]
     assert list(rule.attributes["effects"]) == ["aplicar"]
 
@@ -210,7 +210,7 @@ def test_diagram_yields_modules_and_a_calls_relation(
     assert outcome.relations_written == 1
 
     module = _entities(knowledge, "module")[0]
-    assert module.epistemic is EpistemicStatus.DECLARED
+    assert module.state is KnowledgeState.DECLARED
     relation = knowledge.find_relations("calls")[0]
     assert relation.source_id == module.id
 
@@ -252,7 +252,7 @@ def test_document_yields_a_requirement_with_a_document_locator(
     outcome = _investigator().run(ingested, knowledge, provider, "regras")
     assert outcome.entities_written == 1
     requirement = _entities(knowledge, "requirement")[0]
-    assert requirement.epistemic is EpistemicStatus.DECLARED
+    assert requirement.state is KnowledgeState.DECLARED
     assert requirement.confidence is Confidence.SUPPORTED
     locator = knowledge.evidence_for(requirement.id)[0].locator
     assert locator.kind == "document"
@@ -386,7 +386,7 @@ def test_a_document_never_produces_implemented_knowledge(
                 "statement": "O faturamento roda no dia 5",
                 "conditions": ["dia 5"],
                 "effects": ["faturamento roda"],
-                "attributes": {"epistemic": "implemented"},
+                "attributes": {"state": "implemented"},
                 "evidence": evidence_of(payloads),
             }
         ]
@@ -401,7 +401,7 @@ def test_a_document_never_produces_implemented_knowledge(
     )
     _investigator().run(ingested, knowledge, provider, "regras")
     for entity in knowledge.find_entities():
-        assert entity.epistemic is not EpistemicStatus.IMPLEMENTED
+        assert entity.state is not KnowledgeState.IMPLEMENTED
 
 
 def test_a_type_outside_the_source_kind_is_rejected(
@@ -508,7 +508,7 @@ def test_a_finding_contradicting_the_hint_prevails(
     _investigator().run(ingested, knowledge, provider, "reuniao")
     assert _entities(knowledge, "decision_record") == []
     proposal = _entities(knowledge, "proposal")[0]
-    assert proposal.epistemic is EpistemicStatus.PROPOSED
+    assert proposal.state is KnowledgeState.PROPOSED
 
 
 def test_the_briefing_and_schema_are_specific_to_the_source_kind(

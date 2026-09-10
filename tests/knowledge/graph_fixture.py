@@ -10,7 +10,7 @@ from wiki_ai.knowledge import (
     DocumentLocator,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     KnowledgeRepository,
     Relation,
     SourceVersion,
@@ -82,7 +82,7 @@ def entity(
     kind: str,
     name: str,
     attributes: Mapping[str, Any] | None = None,
-    epistemic: EpistemicStatus = EpistemicStatus.IMPLEMENTED,
+    state: KnowledgeState = KnowledgeState.IMPLEMENTED,
     confidence: Confidence = Confidence.INFERRED,
 ) -> Entity:
     return Entity.create(
@@ -90,7 +90,7 @@ def entity(
         name=name,
         stable_key=key,
         attributes=dict(attributes or {}),
-        epistemic=epistemic,
+        state=state,
         confidence=confidence,
     )
 
@@ -152,7 +152,7 @@ def catalog() -> dict[str, Entity]:
             "test_scenario",
             "Renovacao feliz",
             {"scenario": "cliente adimplente renova"},
-            epistemic=EpistemicStatus.IMPLEMENTED,
+            state=KnowledgeState.IMPLEMENTED,
         ),
         "edge_case": entity(
             "edge/no-history",
@@ -169,49 +169,49 @@ def catalog() -> dict[str, Entity]:
             "requirement",
             "Renovacao automatica",
             {"statement": "sistema deve renovar automaticamente"},
-            epistemic=EpistemicStatus.DECLARED,
+            state=KnowledgeState.DECLARED,
         ),
         "capability_declared": entity(
             "cap/auto-renewal",
             "capability",
             "Renovacao automatica",
-            epistemic=EpistemicStatus.DECLARED,
+            state=KnowledgeState.DECLARED,
         ),
         "proposal": entity(
             "prop/salesforce",
             "proposal",
             "Migrar renovacao para Salesforce",
             {"statement": "mover renovacao para Salesforce"},
-            epistemic=EpistemicStatus.PROPOSED,
+            state=KnowledgeState.PROPOSED,
         ),
         "proposal_old": entity(
             "prop/inhouse",
             "proposal",
             "Manter renovacao interna",
             {"statement": "manter renovacao interna"},
-            epistemic=EpistemicStatus.HISTORICAL,
+            state=KnowledgeState.HISTORICAL,
         ),
         "decision": entity(
             "adr/001",
             "decision_record",
             "ADR 001",
             {"decision": "adotar Salesforce"},
-            epistemic=EpistemicStatus.PROPOSED,
+            state=KnowledgeState.PROPOSED,
         ),
         "source_a": entity(
             "src/manual-a", "source", "Manual v1", {"origin": "sharepoint"},
-            epistemic=EpistemicStatus.DECLARED,
+            state=KnowledgeState.DECLARED,
         ),
         "source_b": entity(
             "src/manual-b", "source", "Manual v2", {"origin": "sharepoint"},
-            epistemic=EpistemicStatus.DECLARED,
+            state=KnowledgeState.DECLARED,
         ),
         "gap": entity(
             "gap/renewal-window",
             "gap",
             "Qual a janela de renovacao?",
             {"question": "Qual a janela de renovacao?", "blocking": True, "status": "open"},
-            epistemic=EpistemicStatus.DECLARED,
+            state=KnowledgeState.DECLARED,
             confidence=Confidence.UNRESOLVED,
         ),
         "gap_soft": entity(
@@ -219,7 +219,7 @@ def catalog() -> dict[str, Entity]:
             "gap",
             "Quem e o dono?",
             {"question": "Quem e o dono?", "blocking": False, "status": "open"},
-            epistemic=EpistemicStatus.DECLARED,
+            state=KnowledgeState.DECLARED,
             confidence=Confidence.UNRESOLVED,
         ),
         "dependency": entity(

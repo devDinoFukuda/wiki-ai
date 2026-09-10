@@ -12,7 +12,7 @@ from wiki_ai.agent.protocol import ToolCall
 from wiki_ai.knowledge.gaps import GAP_KIND
 from wiki_ai.knowledge.gate import KnowledgeRule
 from wiki_ai.knowledge.gate import check as knowledge_gate
-from wiki_ai.knowledge.model import Confidence, EpistemicStatus
+from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind
 from wiki_ai.investigation.orchestrator import Investigator
@@ -196,7 +196,7 @@ def test_only_the_changed_file_entities_lose_supported(analysed) -> None:
         assert entity_named(knowledge, kind, name).confidence is Confidence.SUPPORTED
 
 
-def test_invalidation_keeps_the_epistemic_axis_and_deletes_nothing(analysed) -> None:
+def test_invalidation_keeps_the_state_axis_and_deletes_nothing(analysed) -> None:
     root, previous, knowledge = analysed
     before_entities = knowledge.entity_count()
     current = change_service(root)
@@ -204,7 +204,7 @@ def test_invalidation_keeps_the_epistemic_axis_and_deletes_nothing(analysed) -> 
     rule = entity_named(
         knowledge, EntityKind.BUSINESS_RULE.value, "order reference is persisted"
     )
-    assert rule.epistemic is EpistemicStatus.IMPLEMENTED
+    assert rule.state is KnowledgeState.IMPLEMENTED
     assert knowledge.entity_count() >= before_entities
     assert knowledge.evidence_for(rule.id)
 
@@ -244,7 +244,7 @@ def test_removing_a_file_turns_its_entity_historical(analysed) -> None:
     integration = entity_named(
         knowledge, EntityKind.INTEGRATION.value, "orders kafka producer"
     )
-    assert integration.epistemic is EpistemicStatus.HISTORICAL
+    assert integration.state is KnowledgeState.HISTORICAL
     assert integration.confidence is Confidence.UNRESOLVED
 
 
@@ -255,7 +255,7 @@ def test_a_changed_file_never_turns_its_entity_historical(analysed) -> None:
     rule = entity_named(
         knowledge, EntityKind.BUSINESS_RULE.value, "order reference is persisted"
     )
-    assert rule.epistemic is EpistemicStatus.IMPLEMENTED
+    assert rule.state is KnowledgeState.IMPLEMENTED
 
 
 def test_plan_reinvestigation_is_targeted_and_scoped(analysed) -> None:

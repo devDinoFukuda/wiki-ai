@@ -120,7 +120,7 @@ def _entities(knowledge: KnowledgeRepository) -> list[dict[str, Any]]:
                 "kind": entity.kind,
                 "name": entity.name,
                 "confidence": entity.confidence.value,
-                "epistemic": entity.epistemic.value,
+                "state": entity.state.value,
                 "attributes": dict(entity.attributes),
                 "locators": sorted(
                     evidence.locator.to_dict()["path"]

@@ -8,7 +8,7 @@ from tests.repository.fixtures_repos import java_repo, mainframe_repo
 
 from wiki_ai.knowledge.evidence import CodeContent, CodeLocator
 from wiki_ai.knowledge.gaps import GAP_KIND, is_blocking, is_open
-from wiki_ai.knowledge.model import Confidence, EpistemicStatus
+from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -387,7 +387,7 @@ def test_java_reconstructs_the_rule_with_conditions_and_effects(
         assert rule.attributes["effects"] == [
             "OrderRepository save receives the reference"
         ]
-        assert rule.epistemic is EpistemicStatus.IMPLEMENTED
+        assert rule.state is KnowledgeState.IMPLEMENTED
         assert knowledge.evidence_for(rule.id)
 
 

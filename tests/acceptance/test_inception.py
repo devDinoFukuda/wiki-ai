@@ -32,7 +32,7 @@ from wiki_ai.knowledge.evidence import (
     SpreadsheetLocator,
     TranscriptLocator,
 )
-from wiki_ai.knowledge.model import EpistemicStatus
+from wiki_ai.knowledge.model import KnowledgeState
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
 
 QUESTION = "Quais sistemas, regras e integrações tornam a migração complexa?"
@@ -163,20 +163,20 @@ def test_the_ingested_entities_stay_declared_and_carry_their_own_provenance(
     inception: Path,
 ) -> None:
     expected = (
-        (EntityKind.PROPOSAL.value, DocumentLocator, EpistemicStatus.PROPOSED),
+        (EntityKind.PROPOSAL.value, DocumentLocator, KnowledgeState.PROPOSED),
         (
             EntityKind.DECISION_RECORD.value,
             TranscriptLocator,
-            EpistemicStatus.DECLARED,
+            KnowledgeState.DECLARED,
         ),
     )
     with Session.open(inception).open_knowledge() as knowledge:
-        for kind, locator_type, epistemic in expected:
+        for kind, locator_type, state in expected:
             entities = knowledge.find_entities(kind)
             assert entities, kind
             entity = entities[0]
-            assert entity.epistemic is epistemic
-            assert entity.epistemic is not EpistemicStatus.IMPLEMENTED
+            assert entity.state is state
+            assert entity.state is not KnowledgeState.IMPLEMENTED
             evidence = knowledge.evidence_for(entity.id)
             assert evidence, kind
             assert isinstance(evidence[0].locator, locator_type)

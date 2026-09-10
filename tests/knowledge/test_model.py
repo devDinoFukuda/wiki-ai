@@ -8,7 +8,7 @@ from wiki_ai.knowledge import (
     Confidence,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     InvalidKind,
     PayloadInvalid,
     Relation,
@@ -18,25 +18,25 @@ from wiki_ai.knowledge import (
 from wiki_ai.knowledge.model import validate_kind
 
 
-def test_epistemic_and_confidence_are_separate_axes():
-    epistemic = {status.value for status in EpistemicStatus}
+def test_state_and_confidence_are_separate_axes():
+    state = {status.value for status in KnowledgeState}
     confidence = {level.value for level in Confidence}
-    assert epistemic == {"implemented", "declared", "proposed", "historical"}
+    assert state == {"implemented", "declared", "proposed", "historical"}
     assert confidence == {"supported", "inferred", "unresolved", "contradicted"}
-    assert epistemic.isdisjoint(confidence)
+    assert state.isdisjoint(confidence)
 
 
 def test_entity_carries_both_axes_independently():
     entity = Entity.create(
         kind="capability",
         name="Emissão de boleto",
-        epistemic=EpistemicStatus.PROPOSED,
+        state=KnowledgeState.PROPOSED,
         confidence=Confidence.INFERRED,
     )
-    assert entity.epistemic is EpistemicStatus.PROPOSED
+    assert entity.state is KnowledgeState.PROPOSED
     assert entity.confidence is Confidence.INFERRED
     moved = entity.with_confidence(Confidence.UNRESOLVED)
-    assert moved.epistemic is EpistemicStatus.PROPOSED
+    assert moved.state is KnowledgeState.PROPOSED
     assert moved.confidence is Confidence.UNRESOLVED
     assert entity.confidence is Confidence.INFERRED
 

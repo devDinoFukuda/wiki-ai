@@ -9,7 +9,7 @@ from wiki_ai.knowledge.evidence import (
     SpreadsheetLocator,
     TranscriptLocator,
 )
-from wiki_ai.knowledge.model import Confidence, Entity, EpistemicStatus, Locator
+from wiki_ai.knowledge.model import Confidence, Entity, KnowledgeState, Locator
 from wiki_ai.knowledge.query import CapabilityProfile, KnowledgeQuery
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
 
@@ -27,7 +27,7 @@ __all__ = [
     "NARRATIVE_LIMIT",
     "EMPTY_NOTE",
     "NarrativeEnricher",
-    "epistemic_phrase",
+    "state_phrase",
     "stance",
     "statement_of",
     "describe",
@@ -54,43 +54,43 @@ __all__ = [
 
 NARRATIVE_LIMIT = 500
 
-_EPISTEMIC_PHRASES: dict[tuple[str, str], str] = {
-    (EpistemicStatus.IMPLEMENTED.value, Confidence.SUPPORTED.value): (
+_STATE_PHRASES: dict[tuple[str, str], str] = {
+    (KnowledgeState.IMPLEMENTED.value, Confidence.SUPPORTED.value): (
         "implementado e verificado no código"
     ),
-    (EpistemicStatus.IMPLEMENTED.value, Confidence.INFERRED.value): (
+    (KnowledgeState.IMPLEMENTED.value, Confidence.INFERRED.value): (
         "implementado, inferido a partir do código sem verificação direta"
     ),
-    (EpistemicStatus.IMPLEMENTED.value, Confidence.UNRESOLVED.value): (
+    (KnowledgeState.IMPLEMENTED.value, Confidence.UNRESOLVED.value): (
         "não resolvido"
     ),
-    (EpistemicStatus.IMPLEMENTED.value, Confidence.CONTRADICTED.value): (
+    (KnowledgeState.IMPLEMENTED.value, Confidence.CONTRADICTED.value): (
         "contraditório entre fontes"
     ),
-    (EpistemicStatus.DECLARED.value, Confidence.SUPPORTED.value): (
+    (KnowledgeState.DECLARED.value, Confidence.SUPPORTED.value): (
         "declarado em documento e confirmado pela fonte"
     ),
-    (EpistemicStatus.DECLARED.value, Confidence.INFERRED.value): (
+    (KnowledgeState.DECLARED.value, Confidence.INFERRED.value): (
         "declarado em documento, sem implementação encontrada"
     ),
-    (EpistemicStatus.DECLARED.value, Confidence.UNRESOLVED.value): "não resolvido",
-    (EpistemicStatus.DECLARED.value, Confidence.CONTRADICTED.value): (
+    (KnowledgeState.DECLARED.value, Confidence.UNRESOLVED.value): "não resolvido",
+    (KnowledgeState.DECLARED.value, Confidence.CONTRADICTED.value): (
         "contraditório entre fontes"
     ),
-    (EpistemicStatus.PROPOSED.value, Confidence.SUPPORTED.value): "proposto",
-    (EpistemicStatus.PROPOSED.value, Confidence.INFERRED.value): "proposto",
-    (EpistemicStatus.PROPOSED.value, Confidence.UNRESOLVED.value): "não resolvido",
-    (EpistemicStatus.PROPOSED.value, Confidence.CONTRADICTED.value): (
+    (KnowledgeState.PROPOSED.value, Confidence.SUPPORTED.value): "proposto",
+    (KnowledgeState.PROPOSED.value, Confidence.INFERRED.value): "proposto",
+    (KnowledgeState.PROPOSED.value, Confidence.UNRESOLVED.value): "não resolvido",
+    (KnowledgeState.PROPOSED.value, Confidence.CONTRADICTED.value): (
         "contraditório entre fontes"
     ),
-    (EpistemicStatus.HISTORICAL.value, Confidence.SUPPORTED.value): (
+    (KnowledgeState.HISTORICAL.value, Confidence.SUPPORTED.value): (
         "registro histórico, substituído por decisão posterior"
     ),
-    (EpistemicStatus.HISTORICAL.value, Confidence.INFERRED.value): (
+    (KnowledgeState.HISTORICAL.value, Confidence.INFERRED.value): (
         "registro histórico, substituído por decisão posterior"
     ),
-    (EpistemicStatus.HISTORICAL.value, Confidence.UNRESOLVED.value): "não resolvido",
-    (EpistemicStatus.HISTORICAL.value, Confidence.CONTRADICTED.value): (
+    (KnowledgeState.HISTORICAL.value, Confidence.UNRESOLVED.value): "não resolvido",
+    (KnowledgeState.HISTORICAL.value, Confidence.CONTRADICTED.value): (
         "contraditório entre fontes"
     ),
 }
@@ -116,8 +116,8 @@ class NarrativeEnricher(Protocol):
     ) -> Assertion: ...
 
 
-def epistemic_phrase(entity: Entity) -> str:
-    return _EPISTEMIC_PHRASES[(entity.epistemic.value, entity.confidence.value)]
+def state_phrase(entity: Entity) -> str:
+    return _STATE_PHRASES[(entity.state.value, entity.confidence.value)]
 
 
 def stance(entity: Entity) -> AssertionStance:
@@ -141,7 +141,7 @@ def describe(entity: Entity, prefix: str = "") -> Assertion:
     else:
         text = body
     return Assertion(
-        text=text, stance=stance(entity), qualifier=epistemic_phrase(entity)
+        text=text, stance=stance(entity), qualifier=state_phrase(entity)
     )
 
 
@@ -183,7 +183,7 @@ def trace_entries(
             kind, primary, detail = _locator_columns(evidence.locator)
             found.append(
                 TraceEntry(
-                    finding=f"{entity.name} — {epistemic_phrase(entity)}",
+                    finding=f"{entity.name} — {state_phrase(entity)}",
                     evidence=evidence.id,
                     source_version=f"{evidence.source_id}@{evidence.version_hash}",
                     locator_kind=kind,
@@ -308,7 +308,7 @@ def edge_cases(profile: CapabilityProfile, number: int) -> NarrativeBlock:
             text = entity.name
         facts.append(
             Assertion(
-                text=text, stance=AssertionStance.FACT, qualifier=epistemic_phrase(entity)
+                text=text, stance=AssertionStance.FACT, qualifier=state_phrase(entity)
             )
         )
     if not facts:
@@ -336,7 +336,7 @@ def flow_block(query: KnowledgeQuery, capability: Entity, number: int) -> Narrat
                 Assertion(
                     text=f"Passo {step.ordinal + 1}: {entity.name}",
                     stance=AssertionStance.FACT,
-                    qualifier=epistemic_phrase(entity),
+                    qualifier=state_phrase(entity),
                 )
             )
     if not facts:

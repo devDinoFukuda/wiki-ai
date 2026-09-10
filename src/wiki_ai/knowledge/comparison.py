@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from .model import Confidence, Entity, EntityId, EpistemicStatus
+from .model import Confidence, Entity, EntityId, KnowledgeState
 from .repository import KnowledgeRepository
 from .taxonomy import EntityKind, RelationKind
 
@@ -146,7 +146,7 @@ def has_implementation(repository: KnowledgeRepository, entity_id: EntityId) -> 
         implementor = repository.get_entity(relation.source_id)
         if (
             implementor is not None
-            and implementor.epistemic is EpistemicStatus.IMPLEMENTED
+            and implementor.state is KnowledgeState.IMPLEMENTED
         ):
             return True
     return False
@@ -163,7 +163,7 @@ def declared_not_implemented(
         if target is None or declarer is None:
             continue
         declarers_with_target.add(declarer.id.value)
-        if target.epistemic is EpistemicStatus.IMPLEMENTED:
+        if target.state is KnowledgeState.IMPLEMENTED:
             continue
         if has_implementation(repository, target.id):
             continue
@@ -192,7 +192,7 @@ def declared_not_implemented(
             )
     reported = {item.entity_id for item in found}
     for entity in repository.find_entities():
-        if entity.epistemic is not EpistemicStatus.DECLARED:
+        if entity.state is not KnowledgeState.DECLARED:
             continue
         if entity.kind in DECLARING_KINDS or entity.kind == EntityKind.GAP.value:
             continue
@@ -225,7 +225,7 @@ def _correlated_to_implementation(
                 else relation.source_id
             )
             other = repository.get_entity(other_id)
-            if other is not None and other.epistemic is EpistemicStatus.IMPLEMENTED:
+            if other is not None and other.state is KnowledgeState.IMPLEMENTED:
                 return True
     return False
 
@@ -239,7 +239,7 @@ def implemented_not_documented(
     }
     found: list[ComparisonFinding] = []
     for entity in repository.find_entities():
-        if entity.epistemic is not EpistemicStatus.IMPLEMENTED:
+        if entity.state is not KnowledgeState.IMPLEMENTED:
             continue
         if entity.id.value in documented:
             continue
@@ -257,7 +257,7 @@ def implemented_not_documented(
 
 def _is_current_behavior(entity: Entity) -> bool:
     return (
-        entity.epistemic is EpistemicStatus.IMPLEMENTED
+        entity.state is KnowledgeState.IMPLEMENTED
         and entity.confidence is Confidence.SUPPORTED
     )
 
@@ -271,7 +271,7 @@ def proposal_conflicts(
         target = repository.get_entity(relation.target_id)
         if proposal is None or target is None:
             continue
-        if target.epistemic is not EpistemicStatus.IMPLEMENTED:
+        if target.state is not KnowledgeState.IMPLEMENTED:
             continue
         found.append(
             _finding(
@@ -289,9 +289,9 @@ def proposal_conflicts(
         if left is None or right is None:
             continue
         for proposed, current in ((left, right), (right, left)):
-            if proposed.epistemic not in (
-                EpistemicStatus.PROPOSED,
-                EpistemicStatus.DECLARED,
+            if proposed.state not in (
+                KnowledgeState.PROPOSED,
+                KnowledgeState.DECLARED,
             ):
                 continue
             if not _is_current_behavior(current):

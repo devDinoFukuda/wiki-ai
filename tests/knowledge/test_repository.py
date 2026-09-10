@@ -12,7 +12,7 @@ from wiki_ai.knowledge import (
     DocumentLocator,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     FormatVersionMismatch,
     KnowledgeRepository,
     Relation,
@@ -220,7 +220,7 @@ def test_entity_roundtrips_with_attributes_and_source_versions(repository):
         name="Pedido",
         kind="capability",
         attributes={"owner": "squad-a", "critical": True},
-        epistemic=EpistemicStatus.DECLARED,
+        state=KnowledgeState.DECLARED,
         confidence=Confidence.INFERRED,
         source_versions=(version.key,),
     )
@@ -302,7 +302,7 @@ def test_implemented_and_supported_requires_executable_evidence(repository):
     entity = an_entity(
         name="Pedido",
         kind="capability",
-        epistemic=EpistemicStatus.IMPLEMENTED,
+        state=KnowledgeState.IMPLEMENTED,
         confidence=Confidence.SUPPORTED,
     )
     prose = make_evidence(
@@ -321,7 +321,7 @@ def test_implemented_and_supported_accepted_with_executable_evidence(repository)
     entity = an_entity(
         name="Pedido",
         kind="capability",
-        epistemic=EpistemicStatus.IMPLEMENTED,
+        state=KnowledgeState.IMPLEMENTED,
         confidence=Confidence.SUPPORTED,
     )
     with repository.begin_revision("pipeline", "com código") as revision:
@@ -336,12 +336,12 @@ def test_declared_entity_does_not_require_executable_evidence(repository):
         name="Requisito",
         kind="requirement",
         attributes={"statement": "requisito"},
-        epistemic=EpistemicStatus.DECLARED,
+        state=KnowledgeState.DECLARED,
         confidence=Confidence.INFERRED,
     )
     with repository.begin_revision("pipeline", "declarado") as revision:
         revision.put_entity(entity)
-    assert repository.get_entity(entity.id).epistemic is EpistemicStatus.DECLARED
+    assert repository.get_entity(entity.id).state is KnowledgeState.DECLARED
 
 
 def test_relation_to_missing_entity_rejected(repository):
@@ -490,13 +490,13 @@ def test_supported_relation_with_supported_endpoints_is_accepted(repository):
     left = an_entity(
         name="A",
         kind="capability",
-        epistemic=EpistemicStatus.IMPLEMENTED,
+        state=KnowledgeState.IMPLEMENTED,
         confidence=Confidence.SUPPORTED,
     )
     right = an_entity(
         name="B",
         kind="capability",
-        epistemic=EpistemicStatus.IMPLEMENTED,
+        state=KnowledgeState.IMPLEMENTED,
         confidence=Confidence.SUPPORTED,
     )
     relation = Relation.create(

@@ -24,7 +24,7 @@ from wiki_ai.app.wiring import DETAIL_KEYS, Wiring
 from wiki_ai.ingestion import pipeline
 from wiki_ai.ingestion.harness import DocumentHarness
 from wiki_ai.ingestion.integration import PROVIDER_UNAVAILABLE as SKIPPED_NO_PROVIDER
-from wiki_ai.knowledge.model import EpistemicStatus
+from wiki_ai.knowledge.model import KnowledgeState
 from wiki_ai.publishing.release import CURRENT_POINTER, RELEASES_DIRNAME
 
 BASE = "src/main/java/com/acme/order"
@@ -434,7 +434,7 @@ def test_ingest_of_a_transcript_writes_declared_entities_with_document_evidence(
     assert report.details["diagnostics"] == []
     with Session.open(repo).open_knowledge() as knowledge:
         decision = knowledge.find_entities("decision_record")[0]
-        assert decision.epistemic is EpistemicStatus.DECLARED
+        assert decision.state is KnowledgeState.DECLARED
         evidence = knowledge.evidence_for(decision.id)
         assert evidence
         assert evidence[0].version_hash == report.details["version_hash"]
@@ -449,7 +449,7 @@ def test_ingest_of_a_spreadsheet_range_writes_a_declared_rule(
     assert report.details["entities_written"] == 1
     with Session.open(repo).open_knowledge() as knowledge:
         rule = knowledge.find_entities("business_rule")[0]
-        assert rule.epistemic is EpistemicStatus.DECLARED
+        assert rule.state is KnowledgeState.DECLARED
         assert knowledge.evidence_for(rule.id)
 
 

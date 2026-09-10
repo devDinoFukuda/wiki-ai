@@ -8,7 +8,7 @@ from tests.repository.fixtures_repos import java_repo, mainframe_repo, snapshot_
 
 from wiki_ai.knowledge.evidence import CodeContent, CodeLocator
 from wiki_ai.knowledge.gaps import GAP_KIND
-from wiki_ai.knowledge.model import Confidence, EpistemicStatus
+from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import ENTITY_KIND_VALUES, EntityKind
 from wiki_ai.repository.harness import RepositoryHarness, ScopeFocus
@@ -144,7 +144,7 @@ def test_java_loop_writes_supported_knowledge_with_executable_evidence(
             for entity in knowledge.find_entities(EntityKind.CAPABILITY.value)
             if entity.name == "place order"
         ][0]
-        assert capability.epistemic is EpistemicStatus.IMPLEMENTED
+        assert capability.state is KnowledgeState.IMPLEMENTED
         evidence = knowledge.evidence_for(capability.id)
         assert isinstance(evidence[0].locator, CodeLocator)
         assert evidence[0].locator.content is CodeContent.EXECUTABLE

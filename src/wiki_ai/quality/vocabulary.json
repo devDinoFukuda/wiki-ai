@@ -83,5 +83,22 @@
   "allowed_console_scripts": [
     "wiki-ai"
   ],
-  "max_production_file_lines": 1000
+  "max_production_file_lines": 1000,
+  "public_api": [
+    "wiki_ai.quality.*",
+    "wiki_ai.app.ports",
+    "wiki_ai.agent.protocol",
+    "wiki_ai.agent.providers.*",
+    "wiki_ai.__main__"
+  ],
+  "dead_code_allow": [
+    {
+      "symbol": "wiki_ai.agent.providers.broker:daemon_threads",
+      "reason": "socketserver reads this class attribute"
+    },
+    {
+      "symbol": "wiki_ai.agent.providers.broker:allow_reuse_address",
+      "reason": "socketserver reads this class attribute"
+    }
+  ]
 }

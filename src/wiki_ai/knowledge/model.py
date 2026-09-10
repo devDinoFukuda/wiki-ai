@@ -29,7 +29,7 @@ def _required_text(value: str, label: str) -> str:
     return text
 
 
-class EpistemicStatus(str, Enum):
+class KnowledgeState(str, Enum):
     IMPLEMENTED = "implemented"
     DECLARED = "declared"
     PROPOSED = "proposed"
@@ -77,7 +77,7 @@ class Entity:
     kind: str
     name: str
     attributes: Mapping[str, Any] = field(default_factory=dict)
-    epistemic: EpistemicStatus = EpistemicStatus.DECLARED
+    state: KnowledgeState = KnowledgeState.DECLARED
     confidence: Confidence = Confidence.UNRESOLVED
     source_versions: tuple[str, ...] = ()
 
@@ -94,7 +94,7 @@ class Entity:
         name: str,
         stable_key: str | None = None,
         attributes: Mapping[str, Any] | None = None,
-        epistemic: EpistemicStatus = EpistemicStatus.DECLARED,
+        state: KnowledgeState = KnowledgeState.DECLARED,
         confidence: Confidence = Confidence.UNRESOLVED,
         source_versions: Sequence[str] = (),
     ) -> "Entity":
@@ -103,7 +103,7 @@ class Entity:
             kind=kind,
             name=name,
             attributes=dict(attributes or {}),
-            epistemic=epistemic,
+            state=state,
             confidence=confidence,
             source_versions=tuple(source_versions),
         )

@@ -25,7 +25,7 @@ from wiki_ai.app.session import Session
 from wiki_ai.knowledge import gate as knowledge_gate
 from wiki_ai.publishing import gate as publishing_gate
 from wiki_ai.publishing.release import RELEASES_DIRNAME
-from wiki_ai.quality import architecture, source_hygiene
+from wiki_ai.quality import architecture, dead_code, source_hygiene
 
 
 def _project_root() -> Path:
@@ -64,6 +64,12 @@ def test_the_architecture_gate_is_empty() -> None:
 
 def test_the_dead_code_gate_finds_no_unreachable_production_module() -> None:
     assert unreachable(source_root()) == ()
+
+
+def test_dead_code_gate() -> None:
+    root = _project_root()
+    found = dead_code.check(root / "src", root / "tests")
+    assert [str(item) for item in found] == []
 
 
 def test_every_declared_public_api_module_exists_and_is_out_of_the_call_graph() -> None:

@@ -14,7 +14,7 @@ from wiki_ai.knowledge.model import (
     Confidence,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     Relation,
     SourceVersion,
 )
@@ -30,7 +30,7 @@ from wiki_ai.ingestion.finding import (
     Rejection,
     VerifiedDocumentFinding,
     document_finding_schema,
-    epistemic_for,
+    state_for,
     parse_finding,
     parse_findings,
     verify,
@@ -60,7 +60,7 @@ __all__ = [
     "parse_finding",
     "parse_findings",
     "verify",
-    "epistemic_for",
+    "state_for",
     "SemanticInvestigator",
 ]
 
@@ -149,7 +149,7 @@ def _entity_of(
         name=item.finding.subject,
         stable_key=item.stable_key,
         attributes=payload,
-        epistemic=item.epistemic,
+        state=item.state,
         confidence=item.confidence,
         source_versions=(source_version_key,),
     )
@@ -415,7 +415,7 @@ class SemanticInvestigator:
                                 name: claim.target_subject
                                 for name in REQUIRED_ATTRIBUTES.get(kind, ())
                             },
-                            epistemic=EpistemicStatus.DECLARED,
+                            state=KnowledgeState.DECLARED,
                             confidence=Confidence.UNRESOLVED,
                             source_versions=(version.key,),
                         )

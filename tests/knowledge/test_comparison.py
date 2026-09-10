@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from wiki_ai.knowledge import Entity, EpistemicStatus, KnowledgeQuery, Relation
+from wiki_ai.knowledge import Entity, KnowledgeState, KnowledgeQuery, Relation
 from wiki_ai.knowledge.comparison import (
     DECISION_SUPERSEDES,
     DECLARED_NOT_IMPLEMENTED,
@@ -69,7 +69,7 @@ def test_declared_entity_already_implemented_is_not_reported(graph):
                 kind=stored.kind,
                 name=stored.name,
                 attributes=stored.attributes,
-                epistemic=EpistemicStatus.IMPLEMENTED,
+                state=KnowledgeState.IMPLEMENTED,
                 confidence=stored.confidence,
             )
         )

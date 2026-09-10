@@ -21,7 +21,7 @@ from .model import (
     Confidence,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     Evidence,
     Relation,
     Revision,
@@ -30,7 +30,7 @@ from .model import (
 )
 from .taxonomy import validate_attributes, validate_pair
 
-FORMAT_VERSION = "2"
+FORMAT_VERSION = "3"
 FORMAT_VERSION_KEY = "format_version"
 DATABASE_FILENAME = "state.db"
 
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS entities (
     kind            TEXT NOT NULL,
     name            TEXT NOT NULL,
     attributes_json TEXT NOT NULL DEFAULT '{}',
-    epistemic       TEXT NOT NULL,
+    state           TEXT NOT NULL,
     confidence      TEXT NOT NULL,
     revision_id     TEXT NOT NULL REFERENCES revisions(revision_id)
 );
@@ -127,7 +127,7 @@ CREATE INDEX IF NOT EXISTS ix_rellinks_rel     ON relation_evidence_links(relati
 CREATE INDEX IF NOT EXISTS ix_srcver_source    ON source_versions(source_id);
 """
 
-ENTITY_COLUMNS = "entity_id, kind, name, attributes_json, epistemic, confidence"
+ENTITY_COLUMNS = "entity_id, kind, name, attributes_json, state, confidence"
 EVIDENCE_COLUMNS = (
     "e.evidence_id, e.source_id, e.version_hash, e.locator_json, e.excerpt_hash, e.captured_at"
 )
@@ -291,17 +291,17 @@ class RevisionTransaction:
                     f"entidade {entity.id.value} cita source_version desconhecida: {key}"
                 )
         self._conn.execute(
-            "INSERT INTO entities(entity_id, kind, name, attributes_json, epistemic, "
+            "INSERT INTO entities(entity_id, kind, name, attributes_json, state, "
             "confidence, revision_id) VALUES (?,?,?,?,?,?,?) "
             "ON CONFLICT(entity_id) DO UPDATE SET kind=excluded.kind, name=excluded.name, "
-            "attributes_json=excluded.attributes_json, epistemic=excluded.epistemic, "
+            "attributes_json=excluded.attributes_json, state=excluded.state, "
             "confidence=excluded.confidence, revision_id=excluded.revision_id",
             (
                 entity.id.value,
                 entity.kind,
                 entity.name,
                 _dumps(entity.attributes),
-                entity.epistemic.value,
+                entity.state.value,
                 entity.confidence.value,
                 self._revision.id,
             ),
@@ -429,7 +429,7 @@ class RevisionTransaction:
             entity = self._repository.get_entity(EntityId(entity_id))
             if entity is None:
                 continue
-            if entity.epistemic is not EpistemicStatus.IMPLEMENTED:
+            if entity.state is not KnowledgeState.IMPLEMENTED:
                 continue
             if entity.confidence is not Confidence.SUPPORTED:
                 continue
@@ -650,7 +650,7 @@ class KnowledgeRepository:
             kind=str(row[1]),
             name=str(row[2]),
             attributes=json.loads(str(row[3])),
-            epistemic=EpistemicStatus(row[4]),
+            state=KnowledgeState(row[4]),
             confidence=Confidence(row[5]),
             source_versions=tuple(str(key[0]) for key in keys),
         )

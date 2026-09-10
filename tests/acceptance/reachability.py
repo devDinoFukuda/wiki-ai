@@ -13,8 +13,18 @@ PUBLIC_API: tuple[str, ...] = (
     "wiki_ai.quality",
     "wiki_ai.quality.architecture",
     "wiki_ai.quality.contracts",
+    "wiki_ai.quality.dead_code",
     "wiki_ai.quality.source_hygiene",
     "wiki_ai.quality.vocabulary",
+)
+DYNAMIC_IMPORTS: tuple[str, ...] = (
+    "wiki_ai.agent.providers.bridge",
+    "wiki_ai.agent.providers.broker",
+    "wiki_ai.agent.providers.claude",
+    "wiki_ai.agent.providers.cli_common",
+    "wiki_ai.agent.providers.codex",
+    "wiki_ai.agent.providers.jsonrpc",
+    "wiki_ai.agent.providers.prompt",
 )
 
 
@@ -63,8 +73,6 @@ def references(name: str, path: Path, modules: dict[str, Path]) -> set[str]:
             _prefixes(base, found)
             for alias in node.names:
                 _prefixes(f"{base}.{alias.name}" if base else alias.name, found)
-        elif isinstance(node, ast.Constant):
-            _prefixes(node.value, found)
     return {item for item in found if item in modules}
 
 
@@ -83,4 +91,5 @@ def reachable(root: Path, entrypoints: tuple[str, ...] = ENTRYPOINTS) -> set[str
 
 def unreachable(root: Path) -> tuple[str, ...]:
     modules = set(modules_of(root))
-    return tuple(sorted(modules - reachable(root) - set(PUBLIC_API)))
+    entered = reachable(root, ENTRYPOINTS + DYNAMIC_IMPORTS)
+    return tuple(sorted(modules - entered - set(PUBLIC_API)))

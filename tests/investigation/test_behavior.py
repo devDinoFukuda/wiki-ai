@@ -10,7 +10,7 @@ from wiki_ai.knowledge.model import (
     Confidence,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     Evidence,
     Relation,
     SourceVersion,
@@ -42,7 +42,7 @@ def entity(
         kind=kind.value,
         name=name,
         attributes=dict(attributes or {}),
-        epistemic=EpistemicStatus.IMPLEMENTED,
+        state=KnowledgeState.IMPLEMENTED,
         confidence=Confidence.INFERRED,
         source_versions=(VERSION.key,),
     )

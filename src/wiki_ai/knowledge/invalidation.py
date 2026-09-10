@@ -4,14 +4,14 @@ from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 from .gaps import open_gap
-from .model import Confidence, EntityId, EpistemicStatus, SourceVersion
+from .model import Confidence, EntityId, KnowledgeState, SourceVersion
 from .repository import KnowledgeRepository, RevisionTransaction
 
 ENTITY_TARGET = "entity"
 EVIDENCE_TARGET = "evidence"
 
-REVALIDATION_EXEMPT: frozenset[EpistemicStatus] = frozenset(
-    {EpistemicStatus.HISTORICAL}
+REVALIDATION_EXEMPT: frozenset[KnowledgeState] = frozenset(
+    {KnowledgeState.HISTORICAL}
 )
 
 
@@ -48,7 +48,7 @@ def dependents(
             evidence.setdefault(evidence_id, key)
         for entity_id in repository.entities_using(key):
             entity = repository.get_entity(EntityId(entity_id))
-            if entity is None or entity.epistemic in REVALIDATION_EXEMPT:
+            if entity is None or entity.state in REVALIDATION_EXEMPT:
                 continue
             entities.setdefault(entity_id, key)
     return entities, evidence
@@ -180,7 +180,7 @@ def apply_targeted(
                 continue
             demoted = entity.with_confidence(Confidence.UNRESOLVED)
             if entity_id in historical:
-                demoted = replace(demoted, epistemic=EpistemicStatus.HISTORICAL)
+                demoted = replace(demoted, state=KnowledgeState.HISTORICAL)
             revision.put_entity(demoted)
             question = gap_questions.get(entity_id)
             if question:

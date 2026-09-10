@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .comparison import ComparisonFinding, ComparisonReport
 from .comparison import compare as compare_repository
 from .gaps import blocking_gaps, open_gaps
-from .model import Confidence, Entity, EntityId, EpistemicStatus, Evidence, Relation
+from .model import Confidence, Entity, EntityId, KnowledgeState, Evidence, Relation
 from .repository import ENTITY_COLUMNS, KnowledgeRepository
 from .taxonomy import EntityKind, RelationKind
 
@@ -163,7 +163,7 @@ class KnowledgeQuery:
     def entities(
         self,
         kind: str | EntityKind | None = None,
-        epistemic: EpistemicStatus | None = None,
+        state: KnowledgeState | None = None,
         confidence: Confidence | None = None,
         name_contains: str | None = None,
         limit: int = DEFAULT_LIMIT,
@@ -175,9 +175,9 @@ class KnowledgeQuery:
         if kind_value is not None:
             clauses.append("kind = ?")
             params.append(kind_value)
-        if epistemic is not None:
-            clauses.append("epistemic = ?")
-            params.append(epistemic.value)
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state.value)
         if confidence is not None:
             clauses.append("confidence = ?")
             params.append(confidence.value)

@@ -5,7 +5,7 @@ import pytest
 from wiki_ai.knowledge import (
     Confidence,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     KnowledgeQuery,
     Relation,
 )
@@ -47,8 +47,8 @@ def test_entities_accepts_kind_as_string(query):
     assert query.entities(kind="flow_step") == query.entities(kind=EntityKind.FLOW_STEP)
 
 
-def test_entities_filters_by_epistemic(query):
-    proposed = query.entities(epistemic=EpistemicStatus.PROPOSED)
+def test_entities_filters_by_state(query):
+    proposed = query.entities(state=KnowledgeState.PROPOSED)
     assert names(proposed) == ["ADR 001", "Migrar renovacao para Salesforce"]
 
 
@@ -71,7 +71,7 @@ def test_entities_name_contains_is_case_insensitive(query):
 
 def test_entities_combines_filters(query):
     found = query.entities(
-        kind=EntityKind.CAPABILITY, epistemic=EpistemicStatus.DECLARED
+        kind=EntityKind.CAPABILITY, state=KnowledgeState.DECLARED
     )
     assert names(found) == ["Renovacao automatica"]
 

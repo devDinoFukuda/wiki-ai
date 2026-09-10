@@ -26,7 +26,6 @@ class ContractRule(Enum):
     TYPE = "type"
     REQUIRED = "required"
     ENUM = "enum"
-    ITEMS = "items"
     ADDITIONAL_PROPERTIES = "additionalProperties"
 
 

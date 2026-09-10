@@ -8,7 +8,7 @@ from wiki_ai.knowledge.model import (
     Confidence,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     Evidence,
     Relation,
 )
@@ -179,7 +179,7 @@ def write_flows(
                 "capability": flow.capability_name,
                 "step_count": len(flow.steps),
             },
-            epistemic=EpistemicStatus.IMPLEMENTED,
+            state=KnowledgeState.IMPLEMENTED,
             confidence=Confidence.INFERRED if flow.resolved else Confidence.UNRESOLVED,
         )
         transaction.put_entity(flow_entity)
@@ -215,7 +215,7 @@ def _write_steps(
                 "subject": step.subject,
                 "subject_kind": step.entity_kind,
             },
-            epistemic=EpistemicStatus.IMPLEMENTED,
+            state=KnowledgeState.IMPLEMENTED,
             confidence=Confidence.SUPPORTED if step.resolved else Confidence.UNRESOLVED,
         )
         transaction.put_entity(entity)
@@ -269,7 +269,7 @@ def _write_decisions(
                 "outcomes": list(decision.outcomes),
                 DERIVED_FROM: decision.source_id,
             },
-            epistemic=EpistemicStatus.IMPLEMENTED,
+            state=KnowledgeState.IMPLEMENTED,
             confidence=(
                 Confidence.SUPPORTED if decision.resolved else Confidence.UNRESOLVED
             ),

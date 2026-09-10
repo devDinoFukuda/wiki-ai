@@ -11,7 +11,7 @@ from wiki_ai.knowledge import (
     DocumentLocator,
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     KnowledgeRepository,
     Relation,
     SourceVersion,
@@ -80,7 +80,7 @@ def _document(key: str, kind: str, name: str, attributes: Mapping[str, Any], sta
         kind,
         name,
         dict(attributes),
-        epistemic=status,
+        state=status,
         confidence=Confidence.INFERRED,
     )
 
@@ -135,7 +135,7 @@ def catalog() -> dict[str, Entity]:
             "capability::cancelamento",
             "capability",
             "Cancelamento",
-            epistemic=EpistemicStatus.DECLARED,
+            state=KnowledgeState.DECLARED,
             confidence=Confidence.INFERRED,
         ),
         "proposal": _document(
@@ -148,7 +148,7 @@ def catalog() -> dict[str, Entity]:
                 "date": "2026-02-01",
                 "origin": "transcript",
             },
-            EpistemicStatus.PROPOSED,
+            KnowledgeState.PROPOSED,
         ),
         "decision": _document(
             "decision_record::migrar renovacao para salesforce",
@@ -160,7 +160,7 @@ def catalog() -> dict[str, Entity]:
                 "decided_at": "2026-03-15",
                 "origin": "transcript",
             },
-            EpistemicStatus.PROPOSED,
+            KnowledgeState.PROPOSED,
         ),
         "rule_sheet": _document(
             "xlsx/business_rule::renovacao",
@@ -172,21 +172,21 @@ def catalog() -> dict[str, Entity]:
                 "effects": ["renovacao aprovada"],
                 "aliases": ["Renovacao"],
             },
-            EpistemicStatus.DECLARED,
+            KnowledgeState.DECLARED,
         ),
         "integration_billing_declared": _document(
             "drawio/integration::billing",
             "integration",
             "Billing",
             {"direction": "outbound", "protocol": "http"},
-            EpistemicStatus.DECLARED,
+            KnowledgeState.DECLARED,
         ),
         "integration_salesforce": _document(
             "drawio/integration::salesforce",
             "integration",
             "Salesforce",
             {"direction": "outbound", "protocol": "http"},
-            EpistemicStatus.DECLARED,
+            KnowledgeState.DECLARED,
         ),
         "integration_gateway_pay": entity(
             "integration::gateway pagamento",
@@ -210,14 +210,14 @@ def catalog() -> dict[str, Entity]:
                 "statement": "o gateway deve ser resiliente",
                 "aliases": ["Gateway Pagamento", "Gateway Cobranca"],
             },
-            EpistemicStatus.DECLARED,
+            KnowledgeState.DECLARED,
         ),
         "requirement_cancel": _document(
             "requirement::cancelamento",
             "requirement",
             "Cancelamento",
             {"statement": "o sistema deve permitir cancelamento pelo cliente"},
-            EpistemicStatus.DECLARED,
+            KnowledgeState.DECLARED,
         ),
     }
 
@@ -284,7 +284,7 @@ def _with_version(
         kind=node.kind,
         name=node.name,
         attributes=node.attributes,
-        epistemic=node.epistemic,
+        state=node.state,
         confidence=node.confidence,
         source_versions=(version.key,),
     )

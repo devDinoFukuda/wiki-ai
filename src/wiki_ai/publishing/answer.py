@@ -19,7 +19,7 @@ from wiki_ai.knowledge.matching import score_names, tokens
 from wiki_ai.knowledge.model import (
     Entity,
     EntityId,
-    EpistemicStatus,
+    KnowledgeState,
     Evidence,
     Locator,
 )
@@ -27,7 +27,7 @@ from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
 
-from .narrative import epistemic_phrase
+from .narrative import state_phrase
 
 __all__ = [
     "ANSWER_LIMIT",
@@ -202,7 +202,7 @@ def _best_subject(
 def _line(entity: Entity, prefix: str = "") -> str:
     body = str(entity.attributes.get("statement") or entity.name).strip()
     head = f"{prefix} {body}" if prefix else body
-    return f"- {head} ({epistemic_phrase(entity)})."
+    return f"- {head} ({state_phrase(entity)})."
 
 
 def _gap_lines(gaps: Sequence[Entity]) -> tuple[str, ...]:
@@ -404,7 +404,7 @@ class Answerer:
         for driver in drivers:
             entities.append(driver)
             lines.append(
-                f"- {driver.name} ({epistemic_phrase(driver)}), registrado em "
+                f"- {driver.name} ({state_phrase(driver)}), registrado em "
                 + (self._origins(query, driver) or "fonte sem localizador")
                 + "."
             )
@@ -426,7 +426,7 @@ class Answerer:
                 entities.append(entity)
                 origins = self._origins(query, entity)
                 lines.append(
-                    f"- {entity.name}: {epistemic_phrase(entity)}"
+                    f"- {entity.name}: {state_phrase(entity)}"
                     + (f"; consta em {origins}." if origins else ".")
                 )
         mirrors = self._mirrors(query, reached, drivers)
@@ -436,7 +436,7 @@ class Answerer:
             entities.append(entity)
             origins = self._origins(query, entity)
             lines.append(
-                f"- {entity.name}: {epistemic_phrase(entity)}"
+                f"- {entity.name}: {state_phrase(entity)}"
                 + (f"; consta em {origins}." if origins else ".")
             )
         conflicts = query.compare(limit=ANSWER_LIMIT)
@@ -490,7 +490,7 @@ class Answerer:
                 for candidate in query.entities(kind, limit=ANSWER_LIMIT):
                     if candidate.id.value in known:
                         continue
-                    if candidate.epistemic is EpistemicStatus.IMPLEMENTED:
+                    if candidate.state is KnowledgeState.IMPLEMENTED:
                         continue
                     if not query.evidence_of(candidate.id, limit=1):
                         continue
@@ -697,7 +697,7 @@ class Answerer:
             trigger = str(mode.attributes.get("trigger", "")).strip()
             effect = str(mode.attributes.get("effect", "")).strip()
             lines.append(
-                f"- Se {trigger}, o efeito é {effect} ({epistemic_phrase(mode)})."
+                f"- Se {trigger}, o efeito é {effect} ({state_phrase(mode)})."
                 if trigger and effect
                 else _line(mode)
             )
@@ -769,7 +769,7 @@ class Answerer:
         profile = query.capability_profile(subject.id)
         if profile is None:
             return (["Não há perfil registrado para esta capacidade."], (subject,), ())
-        lines = [f"{subject.name} funciona assim ({epistemic_phrase(subject)}):"]
+        lines = [f"{subject.name} funciona assim ({state_phrase(subject)}):"]
         entities: list[Entity] = [subject]
         for label, group in (
             ("O acionamento acontece por", profile.entrypoints),

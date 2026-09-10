@@ -6,7 +6,7 @@ from typing import Any, Mapping
 import pytest
 
 from wiki_ai.knowledge.gaps import GAP_KIND, is_blocking, is_open
-from wiki_ai.knowledge.model import Confidence, Entity, EntityId, EpistemicStatus, Relation
+from wiki_ai.knowledge.model import Confidence, Entity, EntityId, KnowledgeState, Relation
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -34,7 +34,7 @@ def entity(
         kind=kind.value,
         name=name,
         attributes=dict(attributes or {}),
-        epistemic=EpistemicStatus.IMPLEMENTED,
+        state=KnowledgeState.IMPLEMENTED,
         confidence=Confidence.INFERRED,
     )
 

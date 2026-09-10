@@ -13,7 +13,7 @@ from .matching import (
     subject_of,
     tokens,
 )
-from .model import Confidence, Entity, EntityId, EpistemicStatus, Relation
+from .model import Confidence, Entity, EntityId, KnowledgeState, Relation
 from .repository import KnowledgeRepository, RevisionTransaction
 from .taxonomy import EntityKind, RelationKind, entity_kind, pair_allowed
 
@@ -68,9 +68,9 @@ AFFECTABLE_KINDS: tuple[EntityKind, ...] = (
     EntityKind.TOPIC,
 )
 
-DOCUMENTARY_STATUS: tuple[EpistemicStatus, ...] = (
-    EpistemicStatus.DECLARED,
-    EpistemicStatus.PROPOSED,
+DOCUMENTARY_STATUS: tuple[KnowledgeState, ...] = (
+    KnowledgeState.DECLARED,
+    KnowledgeState.PROPOSED,
 )
 
 DATE_ATTRIBUTES: tuple[str, ...] = ("decided_at", "date", "occurred_at", "recorded_at")
@@ -344,7 +344,7 @@ def correlate(
     implemented = tuple(
         entity
         for entity in index.entities
-        if entity.epistemic is EpistemicStatus.IMPLEMENTED
+        if entity.state is KnowledgeState.IMPLEMENTED
     )
     questions: list[str] = []
     with knowledge.begin_revision(
@@ -376,7 +376,7 @@ def _documentary(index: _Index, kinds: Sequence[EntityKind]) -> tuple[Entity, ..
     return tuple(
         entity
         for entity in index.of_kinds(kinds)
-        if entity.epistemic in DOCUMENTARY_STATUS
+        if entity.state in DOCUMENTARY_STATUS
     )
 
 
