@@ -18,13 +18,28 @@ from wiki_ai.agent.providers.cli_common import (
 )
 from wiki_ai.agent.session import AgentRun, AgentSession
 
-__all__ = ["PROVIDER_NAME", "BINARY", "ClaudeProvider", "install"]
+__all__ = [
+    "PROVIDER_NAME",
+    "BINARY",
+    "DISALLOWED_TOOLS",
+    "ClaudeProvider",
+    "install",
+]
 
 PROVIDER_NAME = "claude"
 BINARY = "claude"
 _WORKSPACE_PREFIX = "wiki-claude-"
 _CONFIG_PREFIX = "wiki-claude-config-"
 _CONFIG_NAME = "mcp-config.json"
+DISALLOWED_TOOLS: tuple[str, ...] = (
+    "Bash",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+)
 _PROBE_TIMEOUT = 30.0
 _DEFAULT_TIMEOUT = 900.0
 
@@ -103,10 +118,10 @@ class ClaudeProvider:
             str(config),
             "--allowedTools",
             *allowed_tools(session),
+            "--disallowedTools",
+            *DISALLOWED_TOOLS,
             "--max-turns",
             str(turns_for(session.budget)),
-            "--permission-mode",
-            "bypassPermissions",
         ]
         if self._model:
             argv.extend(["--model", self._model])

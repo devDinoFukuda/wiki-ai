@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -10,7 +12,12 @@ import pytest
 from tests.agent import fake_cli
 from wiki_ai.agent.protocol import AgentProvider, ToolCall, ToolResult
 from wiki_ai.agent.providers.bridge import FINISH_TOOL
-from wiki_ai.agent.providers.claude import ClaudeProvider, allowed_tools
+from wiki_ai.agent.providers.broker import ToolBrokerServer
+from wiki_ai.agent.providers.claude import (
+    DISALLOWED_TOOLS,
+    ClaudeProvider,
+    allowed_tools,
+)
 from wiki_ai.agent.providers.cli_common import BinaryMissing, CliRunner, minimal_env
 from wiki_ai.agent.providers.codex import CodexProvider, config_document
 from wiki_ai.agent.registry import ProviderRegistry
@@ -217,6 +224,40 @@ def test_allowed_tools_are_restricted_to_the_session() -> None:
         "mcp__wiki__repo.search",
         f"mcp__wiki__{FINISH_TOOL}",
     )
+
+
+def _command_line(binary: Path) -> list[str]:
+    provider = _providers(binary, {})["config-flag"]
+    broker = ToolBrokerServer(_session())
+    broker.start()
+    settings = Path(tempfile.mkdtemp())
+    try:
+        return provider._argv(_session(), settings, broker)
+    finally:
+        broker.stop()
+        shutil.rmtree(settings, ignore_errors=True)
+
+
+def test_the_command_line_never_bypasses_permissions(binary: Path) -> None:
+    argv = _command_line(binary)
+    assert "--permission-mode" not in argv
+    assert "bypassPermissions" not in argv
+
+
+def test_the_command_line_denies_the_built_in_write_tools(binary: Path) -> None:
+    argv = _command_line(binary)
+    index = argv.index("--disallowedTools")
+    assert argv[index + 1 : index + 1 + len(DISALLOWED_TOOLS)] == list(DISALLOWED_TOOLS)
+    for tool in ("Bash", "Edit", "Write", "WebFetch"):
+        assert tool in argv
+
+
+def test_the_command_line_allows_only_the_session_mcp_tools(binary: Path) -> None:
+    argv = _command_line(binary)
+    index = argv.index("--allowedTools")
+    granted = argv[index + 1 : index + 1 + len(allowed_tools(_session()))]
+    assert granted == list(allowed_tools(_session()))
+    assert all(name.startswith("mcp__wiki__") for name in granted)
 
 
 def test_the_config_document_declares_only_session_tools() -> None:
