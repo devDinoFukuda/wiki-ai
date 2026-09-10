@@ -23,6 +23,11 @@ from wiki_ai.knowledge import (
     UnsupportedEvidence,
     make_evidence,
 )
+from wiki_ai.knowledge.errors import (
+    InvalidRelationPair,
+    MissingRequiredAttribute,
+    UnknownKind,
+)
 from wiki_ai.knowledge.repository import (
     DATABASE_FILENAME,
     FORMAT_VERSION,
@@ -133,8 +138,8 @@ def test_revision_is_atomic(tmp_path):
 
 def test_revision_commits_everything_together(repository):
     version = a_source_version()
-    left = an_entity(name="Checkout", kind="component")
-    right = an_entity(name="Cobrança", kind="component")
+    left = an_entity(name="Checkout", kind="module")
+    right = an_entity(name="Cobrança", kind="module")
     evidence = code_evidence(version)
     with repository.begin_revision("pipeline", "carga inicial") as revision:
         revision.put_source_version(version)
@@ -152,10 +157,10 @@ def test_revision_commits_everything_together(repository):
 
 def test_revision_chains_to_parent(repository):
     with repository.begin_revision("pipeline", "um") as first:
-        first.put_entity(an_entity(name="A", kind="component"))
+        first.put_entity(an_entity(name="A", kind="module"))
         first_id = first.revision_id
     with repository.begin_revision("pipeline", "dois") as second:
-        second.put_entity(an_entity(name="B", kind="component"))
+        second.put_entity(an_entity(name="B", kind="module"))
         second_id = second.revision_id
     assert repository.get_revision(second_id).parent_id == first_id
     assert repository.get_revision(first_id).parent_id is None
@@ -186,8 +191,8 @@ def test_reingestion_of_same_entity_across_revisions_does_not_duplicate(reposito
 
 
 def test_same_relation_written_twice_does_not_duplicate(repository):
-    left = an_entity(name="A", kind="component")
-    right = an_entity(name="B", kind="component")
+    left = an_entity(name="A", kind="module")
+    right = an_entity(name="B", kind="module")
     relation = Relation.create("calls", left.id, right.id)
     with repository.begin_revision("pipeline", "relação") as revision:
         revision.put_entity(left)
@@ -199,7 +204,7 @@ def test_same_relation_written_twice_does_not_duplicate(repository):
 
 def test_same_evidence_written_twice_does_not_duplicate(repository):
     version = a_source_version()
-    entity = an_entity(name="A", kind="component")
+    entity = an_entity(name="A", kind="module")
     evidence = code_evidence(version)
     with repository.begin_revision("pipeline", "evidência") as revision:
         revision.put_source_version(version)
@@ -244,11 +249,11 @@ def test_entity_update_overwrites_in_place(repository):
 
 def test_find_entities_filters_by_kind(repository):
     with repository.begin_revision("pipeline", "carga") as revision:
-        revision.put_entity(an_entity(name="A", kind="component"))
-        revision.put_entity(an_entity(name="B", kind="component"))
-        revision.put_entity(an_entity(name="C", kind="business_rule"))
+        revision.put_entity(an_entity(name="A", kind="module"))
+        revision.put_entity(an_entity(name="B", kind="module"))
+        revision.put_entity(an_entity(name="C", kind="business_rule", attributes={"statement": "s", "conditions": ["c"], "effects": ["e"]}))
     assert len(repository.find_entities()) == 3
-    assert len(repository.find_entities(kind="component")) == 2
+    assert len(repository.find_entities(kind="module")) == 2
     assert [e.name for e in repository.find_entities(kind="business_rule")] == ["C"]
 
 
@@ -280,7 +285,7 @@ def test_evidence_linked_to_unknown_entity_rejected(repository):
 
 def test_evidence_for_returns_locator_intact(repository):
     version = a_source_version()
-    entity = an_entity(name="A", kind="component")
+    entity = an_entity(name="A", kind="module")
     locator = CodeLocator(path="src/a.py", line_start=3, line_end=9, symbol="run")
     evidence = make_evidence(version.source_id, version.version_hash, locator, "x", CAPTURED)
     with repository.begin_revision("pipeline", "evidência") as revision:
@@ -330,6 +335,7 @@ def test_declared_entity_does_not_require_executable_evidence(repository):
     entity = an_entity(
         name="Requisito",
         kind="requirement",
+        attributes={"statement": "requisito"},
         epistemic=EpistemicStatus.DECLARED,
         confidence=Confidence.INFERRED,
     )
@@ -339,7 +345,7 @@ def test_declared_entity_does_not_require_executable_evidence(repository):
 
 
 def test_relation_to_missing_entity_rejected(repository):
-    left = an_entity(name="A", kind="component")
+    left = an_entity(name="A", kind="module")
     ghost = EntityId("ent_fantasma")
     with pytest.raises(UnknownReference):
         with repository.begin_revision("pipeline", "alvo ausente") as revision:
@@ -349,8 +355,8 @@ def test_relation_to_missing_entity_rejected(repository):
 
 
 def test_supersedes_cycle_rejected(repository):
-    left = an_entity(name="A", kind="component")
-    right = an_entity(name="B", kind="component")
+    left = an_entity(name="A", kind="module")
+    right = an_entity(name="B", kind="module")
     with repository.begin_revision("pipeline", "substituição") as revision:
         revision.put_entity(left)
         revision.put_entity(right)
@@ -381,3 +387,161 @@ def test_concurrent_open_of_same_database_is_safe(tmp_path):
     for thread in threads:
         thread.join()
     assert failures == []
+
+
+def test_entity_kind_outside_taxonomy_is_rejected(repository):
+    with pytest.raises(UnknownKind):
+        with repository.begin_revision("pipeline", "kind livre") as revision:
+            revision.put_entity(Entity.create(kind="component", name="Servico"))
+    assert repository.entity_count() == 0
+
+
+def test_entity_missing_required_attribute_is_rejected(repository):
+    with pytest.raises(MissingRequiredAttribute):
+        with repository.begin_revision("pipeline", "sem atributos") as revision:
+            revision.put_entity(Entity.create(kind="business_rule", name="Regra"))
+    assert repository.entity_count() == 0
+
+
+def test_entity_with_required_attributes_is_accepted(repository):
+    entity = Entity.create(
+        kind="business_rule",
+        name="Regra",
+        attributes={"statement": "s", "conditions": ["c"], "effects": ["e"]},
+    )
+    with repository.begin_revision("pipeline", "com atributos") as revision:
+        revision.put_entity(entity)
+    assert repository.get_entity(entity.id).name == "Regra"
+
+
+def test_relation_kind_outside_taxonomy_is_rejected(repository):
+    left = an_entity(name="A", kind="module")
+    right = an_entity(name="B", kind="module")
+    with pytest.raises(UnknownKind):
+        with repository.begin_revision("pipeline", "relacao livre") as revision:
+            revision.put_entity(left)
+            revision.put_entity(right)
+            revision.put_relation(Relation.create("mentions", left.id, right.id))
+    assert repository.relation_count() == 0
+
+
+def test_relation_with_invalid_pair_is_rejected(repository):
+    capability = an_entity(name="Pedido", kind="capability")
+    state = an_entity(name="Ativo", kind="state")
+    with pytest.raises(InvalidRelationPair):
+        with repository.begin_revision("pipeline", "par invalido") as revision:
+            revision.put_entity(capability)
+            revision.put_entity(state)
+            revision.put_relation(
+                Relation.create("transitions_to", capability.id, state.id)
+            )
+    assert repository.relation_count() == 0
+
+
+def test_relation_confidence_roundtrips(repository):
+    left = an_entity(name="A", kind="capability")
+    right = an_entity(name="B", kind="capability")
+    relation = Relation.create("calls", left.id, right.id)
+    with repository.begin_revision("pipeline", "relacao") as revision:
+        revision.put_entity(left)
+        revision.put_entity(right)
+        revision.put_relation(relation)
+    stored = repository.get_relation(relation.id)
+    assert stored == relation
+    assert stored.confidence is Confidence.UNRESOLVED
+
+
+def test_supported_relation_without_evidence_rolls_back(repository):
+    version = a_source_version()
+    left = an_entity(name="A", kind="capability")
+    right = an_entity(name="B", kind="capability")
+    with pytest.raises(UnsupportedEvidence):
+        with repository.begin_revision("pipeline", "sem lastro") as revision:
+            revision.put_source_version(version)
+            revision.put_entity(left)
+            revision.put_entity(right)
+            revision.put_relation(
+                Relation.create(
+                    "calls", left.id, right.id, confidence=Confidence.SUPPORTED
+                )
+            )
+    assert repository.relation_count() == 0
+
+
+def test_supported_relation_with_own_evidence_is_accepted(repository):
+    version = a_source_version()
+    left = an_entity(name="A", kind="capability")
+    right = an_entity(name="B", kind="capability")
+    relation = Relation.create(
+        "calls", left.id, right.id, confidence=Confidence.SUPPORTED
+    )
+    with repository.begin_revision("pipeline", "com lastro") as revision:
+        revision.put_source_version(version)
+        revision.put_entity(left)
+        revision.put_entity(right)
+        revision.put_relation(relation)
+        revision.put_evidence(code_evidence(version), relation_ids=[relation.id])
+    assert repository.get_relation(relation.id).confidence is Confidence.SUPPORTED
+    assert len(repository.evidence_for_relation(relation.id)) == 1
+
+
+def test_supported_relation_with_supported_endpoints_is_accepted(repository):
+    version = a_source_version()
+    left = an_entity(
+        name="A",
+        kind="capability",
+        epistemic=EpistemicStatus.IMPLEMENTED,
+        confidence=Confidence.SUPPORTED,
+    )
+    right = an_entity(
+        name="B",
+        kind="capability",
+        epistemic=EpistemicStatus.IMPLEMENTED,
+        confidence=Confidence.SUPPORTED,
+    )
+    relation = Relation.create(
+        "calls", left.id, right.id, confidence=Confidence.SUPPORTED
+    )
+    with repository.begin_revision("pipeline", "extremos supported") as revision:
+        revision.put_source_version(version)
+        revision.put_entity(left)
+        revision.put_entity(right)
+        revision.put_evidence(code_evidence(version, "src/a.py"), [left.id])
+        revision.put_evidence(code_evidence(version, "src/b.py"), [right.id])
+        revision.put_relation(relation)
+    assert repository.get_relation(relation.id).confidence is Confidence.SUPPORTED
+
+
+def test_evidence_linked_to_unknown_relation_rejected(repository):
+    version = a_source_version()
+    with pytest.raises(UnknownReference):
+        with repository.begin_revision("pipeline", "relacao ausente") as revision:
+            revision.put_source_version(version)
+            revision.put_evidence(code_evidence(version), relation_ids=["rel_fantasma"])
+
+
+def test_find_relations_filters_by_kind(repository):
+    left = an_entity(name="A", kind="capability")
+    right = an_entity(name="B", kind="capability")
+    with repository.begin_revision("pipeline", "relacoes") as revision:
+        revision.put_entity(left)
+        revision.put_entity(right)
+        revision.put_relation(Relation.create("calls", left.id, right.id))
+        revision.put_relation(Relation.create("depends_on", left.id, right.id))
+    assert len(repository.find_relations()) == 2
+    assert [r.kind for r in repository.find_relations("calls")] == ["calls"]
+
+
+def test_get_relation_of_unknown_id_returns_none(repository):
+    assert repository.get_relation("rel_fantasma") is None
+
+
+def test_all_evidence_keys_lists_stored_evidence(repository):
+    version = a_source_version()
+    entity = an_entity(name="A", kind="capability")
+    evidence = code_evidence(version)
+    with repository.begin_revision("pipeline", "evidencia") as revision:
+        revision.put_source_version(version)
+        revision.put_entity(entity)
+        revision.put_evidence(evidence, [entity.id])
+    assert repository.all_evidence_keys() == ((evidence.id, version.key),)

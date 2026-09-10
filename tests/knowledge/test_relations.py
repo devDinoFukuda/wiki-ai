@@ -25,15 +25,15 @@ from wiki_ai.knowledge.repository import DATABASE_FILENAME
 def graph(tmp_path):
     repo = KnowledgeRepository.open(str(tmp_path / DATABASE_FILENAME))
     nodes = {
-        name: Entity.create(kind="component", name=name) for name in ("A", "B", "C", "D")
+        name: Entity.create(kind="capability", name=name) for name in ("A", "B", "C", "D")
     }
     with repo.begin_revision("pipeline", "grafo") as revision:
         for node in nodes.values():
             revision.put_entity(node)
         revision.put_relation(Relation.create("calls", nodes["A"].id, nodes["B"].id))
         revision.put_relation(Relation.create("calls", nodes["B"].id, nodes["C"].id))
-        revision.put_relation(Relation.create("reads", nodes["A"].id, nodes["C"].id))
-        revision.put_relation(Relation.create("belongs_to", nodes["D"].id, nodes["A"].id))
+        revision.put_relation(Relation.create("depends_on", nodes["A"].id, nodes["C"].id))
+        revision.put_relation(Relation.create("implements", nodes["D"].id, nodes["A"].id))
     yield repo, nodes
     repo.close()
 
@@ -72,13 +72,13 @@ def test_entity_exists_reflects_storage(graph):
 def test_neighborhood_out_only(graph):
     repo, nodes = graph
     kinds = sorted(r.kind for r in neighborhood(repo.conn, nodes["A"].id, "out"))
-    assert kinds == ["calls", "reads"]
+    assert kinds == ["calls", "depends_on"]
 
 
 def test_neighborhood_in_only(graph):
     repo, nodes = graph
     found = neighborhood(repo.conn, nodes["A"].id, "in")
-    assert [r.kind for r in found] == ["belongs_to"]
+    assert [r.kind for r in found] == ["implements"]
 
 
 def test_neighborhood_both_directions(graph):
@@ -106,7 +106,7 @@ def test_neighbor_ids_returns_the_other_end(graph):
 def test_relations_of_delegates_to_neighborhood(graph):
     repo, nodes = graph
     assert len(repo.relations_of(nodes["A"].id)) == 3
-    assert len(repo.relations_of(nodes["A"].id, "out", ["reads"])) == 1
+    assert len(repo.relations_of(nodes["A"].id, "out", ["depends_on"])) == 1
 
 
 def test_relation_attributes_survive_roundtrip(graph):
@@ -124,7 +124,7 @@ def test_relation_attributes_survive_roundtrip(graph):
 def test_path_exists_follows_transitive_edges(graph):
     repo, nodes = graph
     assert path_exists(repo.conn, "calls", nodes["A"].id, nodes["C"].id) is True
-    assert path_exists(repo.conn, "reads", nodes["A"].id, nodes["D"].id) is False
+    assert path_exists(repo.conn, "depends_on", nodes["A"].id, nodes["D"].id) is False
 
 
 def test_self_referencing_supersedes_rejected(graph):

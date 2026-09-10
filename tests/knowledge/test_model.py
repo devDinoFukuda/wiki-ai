@@ -62,15 +62,15 @@ def test_entity_kind_validated_on_construction():
 
 
 def test_relation_kind_validated_on_construction():
-    left = EntityId.derive("component", "svc/a")
-    right = EntityId.derive("component", "svc/b")
+    left = EntityId.derive("module", "svc/a")
+    right = EntityId.derive("module", "svc/b")
     with pytest.raises(InvalidKind):
         Relation.create(kind="Calls", source_id=left, target_id=right)
 
 
 def test_entity_id_is_deterministic_and_kind_scoped():
-    first = EntityId.derive("component", "svc/a")
-    again = EntityId.derive("component", "svc/a")
+    first = EntityId.derive("module", "svc/a")
+    again = EntityId.derive("module", "svc/a")
     other_kind = EntityId.derive("capability", "svc/a")
     assert first == again
     assert first != other_kind
@@ -78,7 +78,7 @@ def test_entity_id_is_deterministic_and_kind_scoped():
 
 
 def test_entity_attributes_are_immutable():
-    entity = Entity.create(kind="component", name="Serviço", attributes={"lang": "java"})
+    entity = Entity.create(kind="module", name="Serviço", attributes={"lang": "java"})
     assert entity.attributes["lang"] == "java"
     with pytest.raises(TypeError):
         entity.attributes["lang"] = "python"
@@ -88,12 +88,12 @@ def test_entity_attributes_are_immutable():
 
 def test_entity_name_required():
     with pytest.raises(PayloadInvalid):
-        Entity.create(kind="component", name="   ")
+        Entity.create(kind="module", name="   ")
 
 
 def test_relation_id_is_deterministic():
-    left = EntityId.derive("component", "svc/a")
-    right = EntityId.derive("component", "svc/b")
+    left = EntityId.derive("module", "svc/a")
+    right = EntityId.derive("module", "svc/b")
     first = Relation.create("calls", left, right)
     again = Relation.create("calls", left, right)
     reversed_relation = Relation.create("calls", right, left)

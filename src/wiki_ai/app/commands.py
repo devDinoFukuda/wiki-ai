@@ -4,9 +4,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Mapping, NoReturn, Sequence, TextIO
+from typing import Any, Callable, Mapping, NoReturn, Sequence, TextIO
 
 from wiki_ai.app import api
+from wiki_ai.app.wiring import Wiring
 
 __all__ = [
     "CommandLineInvalid",
@@ -20,10 +21,13 @@ __all__ = [
 ]
 
 PROGRAM_NAME = "wiki-ai"
-COMMANDS = ("version", "inspect")
+COMMANDS = ("analyze", "ingest", "ask", "publish", "status", "version", "inspect")
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_BLOCKED = 2
+
+_REPO_OPTION = "--repo"
+_DEFAULT_REPO = "."
 
 
 class CommandLineInvalid(Exception):
@@ -41,9 +45,30 @@ class _Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog=PROGRAM_NAME, add_help=False)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(COMMANDS[0], add_help=False)
-    inspect_parser = subparsers.add_parser(COMMANDS[1], add_help=False)
-    inspect_parser.add_argument("repo")
+
+    analyze_parser = subparsers.add_parser(COMMANDS[0], add_help=False)
+    analyze_parser.add_argument("repo", nargs="?", default=_DEFAULT_REPO)
+    analyze_parser.add_argument("--objective", default=None)
+
+    ingest_parser = subparsers.add_parser(COMMANDS[1], add_help=False)
+    ingest_parser.add_argument("source")
+    ingest_parser.add_argument(_REPO_OPTION, default=_DEFAULT_REPO)
+
+    ask_parser = subparsers.add_parser(COMMANDS[2], add_help=False)
+    ask_parser.add_argument("question")
+    ask_parser.add_argument(_REPO_OPTION, default=_DEFAULT_REPO)
+
+    publish_parser = subparsers.add_parser(COMMANDS[3], add_help=False)
+    publish_parser.add_argument(_REPO_OPTION, default=_DEFAULT_REPO)
+
+    status_parser = subparsers.add_parser(COMMANDS[4], add_help=False)
+    status_parser.add_argument(_REPO_OPTION, default=_DEFAULT_REPO)
+
+    subparsers.add_parser(COMMANDS[5], add_help=False)
+
+    inspect_parser = subparsers.add_parser(COMMANDS[6], add_help=False)
+    inspect_parser.add_argument("repo", nargs="?", default=_DEFAULT_REPO)
+
     return parser
 
 
@@ -52,27 +77,73 @@ def _emit(payload: Mapping[str, Any], code: int, stream: TextIO) -> int:
     return code
 
 
-def _run_version(stream: TextIO) -> int:
-    payload = {"status": "ok", "command": COMMANDS[0], "version": api.version()}
-    return _emit(payload, EXIT_OK, stream)
+def _exit_code(payload: Mapping[str, Any]) -> int:
+    if payload.get("status") == "blocked":
+        return EXIT_BLOCKED
+    if payload.get("status") == "error":
+        return EXIT_ERROR
+    return EXIT_OK
 
 
-def _run_inspect(repo: Path, stream: TextIO) -> int:
+def _guarded(
+    command: str, operation: Callable[[], Mapping[str, Any]], stream: TextIO
+) -> int:
     try:
-        report = api.inspect(repo)
+        payload = dict(operation())
     except api.OutdatedStore:
-        payload = {
-            "status": "blocked",
-            "reason": "outdated_store",
-            "action": "run a new analysis",
-        }
-        return _emit(payload, EXIT_BLOCKED, stream)
+        return _emit(
+            {
+                "status": "blocked",
+                "reason": "outdated_store",
+                "action": "run a new analysis",
+            },
+            EXIT_BLOCKED,
+            stream,
+        )
     except api.ApiError as exc:
-        payload = {"status": "error", "reason": "inspect_failed", "detail": str(exc)}
-        return _emit(payload, EXIT_ERROR, stream)
-    payload = {"status": "ok", "command": COMMANDS[1]}
-    payload.update(report.to_dict())
-    return _emit(payload, EXIT_OK, stream)
+        return _emit(
+            {"status": "error", "reason": f"{command}_failed", "detail": str(exc)},
+            EXIT_ERROR,
+            stream,
+        )
+    payload["command"] = command
+    return _emit(payload, _exit_code(payload), stream)
+
+
+def _run(command: str, parsed: argparse.Namespace, stream: TextIO) -> int:
+    wiring = Wiring()
+    if command == COMMANDS[0]:
+        repo = Path(parsed.repo)
+        return _guarded(
+            command, lambda: api.analyze(repo, parsed.objective, wiring).to_dict(), stream
+        )
+    if command == COMMANDS[1]:
+        source = Path(parsed.source)
+        repo = Path(parsed.repo)
+        return _guarded(
+            command, lambda: api.ingest(source, repo, wiring).to_dict(), stream
+        )
+    if command == COMMANDS[2]:
+        repo = Path(parsed.repo)
+        return _guarded(
+            command, lambda: api.ask(parsed.question, repo, wiring).to_dict(), stream
+        )
+    if command == COMMANDS[3]:
+        repo = Path(parsed.repo)
+        return _guarded(command, lambda: api.publish(repo, wiring).to_dict(), stream)
+    if command == COMMANDS[4]:
+        repo = Path(parsed.repo)
+        return _guarded(command, lambda: api.status(repo, wiring).to_dict(), stream)
+    if command == COMMANDS[5]:
+        return _emit(
+            {"status": "ok", "command": command, "version": api.version()},
+            EXIT_OK,
+            stream,
+        )
+    repo = Path(parsed.repo)
+    return _guarded(
+        command, lambda: {"status": "ok", **api.inspect(repo).to_dict()}, stream
+    )
 
 
 def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int:
@@ -88,6 +159,4 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
             "commands": list(COMMANDS),
         }
         return _emit(payload, EXIT_ERROR, output)
-    if parsed.command == COMMANDS[0]:
-        return _run_version(output)
-    return _run_inspect(Path(parsed.repo), output)
+    return _run(str(parsed.command), parsed, output)

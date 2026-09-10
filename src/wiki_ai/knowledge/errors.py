@@ -39,3 +39,19 @@ class UnsupportedEvidence(KnowledgeError):
 
 class RelationCycle(KnowledgeError):
     pass
+
+
+class UnknownKind(KnowledgeError):
+    pass
+
+
+class InvalidRelationPair(KnowledgeError):
+    pass
+
+
+class MissingRequiredAttribute(KnowledgeError):
+    pass
+
+
+class GapNotFound(KnowledgeError):
+    pass

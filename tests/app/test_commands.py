@@ -8,7 +8,7 @@ import pytest
 
 from wiki_ai import __version__
 from wiki_ai.app import api
-from wiki_ai.app.commands import EXIT_BLOCKED, EXIT_ERROR, EXIT_OK, main
+from wiki_ai.app.commands import COMMANDS, EXIT_BLOCKED, EXIT_ERROR, EXIT_OK, main
 from wiki_ai.app.session import OUTDATED_STORE_MARKERS
 
 
@@ -83,7 +83,7 @@ def test_unknown_command_is_reported_as_json() -> None:
     code, payload = _run("promote")
     assert code == EXIT_ERROR
     assert payload["reason"] == "invalid_arguments"
-    assert payload["commands"] == ["version", "inspect"]
+    assert payload["commands"] == list(COMMANDS)
 
 
 def test_missing_command_is_reported_as_json() -> None:

@@ -119,6 +119,7 @@ class Relation:
     source_id: EntityId
     target_id: EntityId
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    confidence: Confidence = Confidence.UNRESOLVED
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", validate_kind(self.kind))
@@ -132,6 +133,7 @@ class Relation:
         source_id: EntityId,
         target_id: EntityId,
         attributes: Mapping[str, Any] | None = None,
+        confidence: Confidence = Confidence.UNRESOLVED,
     ) -> "Relation":
         validated = validate_kind(kind)
         return cls(
@@ -140,7 +142,11 @@ class Relation:
             source_id=source_id,
             target_id=target_id,
             attributes=dict(attributes or {}),
+            confidence=confidence,
         )
+
+    def with_confidence(self, confidence: Confidence) -> "Relation":
+        return replace(self, confidence=confidence)
 
 
 @dataclass(frozen=True)

@@ -5,13 +5,13 @@ import sqlite3
 from typing import Any, Iterable, Sequence
 
 from .errors import RelationCycle, UnknownReference
-from .model import EntityId, Relation, validate_kind
+from .model import Confidence, EntityId, Relation, validate_kind
 
 DIRECTIONS: tuple[str, ...] = ("out", "in", "both")
 
 CYCLE_FORBIDDEN_KINDS: frozenset[str] = frozenset({"supersedes"})
 
-RELATION_COLUMNS = "relation_id, kind, source_id, target_id, attributes_json"
+RELATION_COLUMNS = "relation_id, kind, source_id, target_id, attributes_json, confidence"
 
 
 def entity_exists(conn: sqlite3.Connection, entity: EntityId) -> bool:
@@ -115,4 +115,5 @@ def row_to_relation(row: Sequence[Any]) -> Relation:
         source_id=EntityId(str(row[2])),
         target_id=EntityId(str(row[3])),
         attributes=json.loads(str(row[4])),
+        confidence=Confidence(str(row[5])),
     )

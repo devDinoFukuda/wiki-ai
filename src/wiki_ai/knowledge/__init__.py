@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from .comparison import ComparisonFinding, ComparisonReport
 from .errors import (
     FormatVersionMismatch,
+    GapNotFound,
+    InvalidRelationPair,
     InvalidIdentity,
     InvalidKind,
     KnowledgeError,
     LocatorInvalid,
+    MissingRequiredAttribute,
     PayloadInvalid,
     RelationCycle,
     RevisionClosed,
+    UnknownKind,
     UnknownReference,
     UnsupportedEvidence,
 )
@@ -22,6 +27,9 @@ from .evidence import (
     locator_from_dict,
     make_evidence,
 )
+from .gaps import blocking_gaps, close_gap, is_blocking, open_gap, open_gaps
+from .gate import KnowledgeRule, KnowledgeViolation
+from .gate import check as knowledge_gate
 from .identity import content_hash
 from .invalidation import Invalidation, invalidate
 from .model import (
@@ -35,40 +43,80 @@ from .model import (
     Revision,
     SourceVersion,
 )
+from .query import (
+    CapabilityProfile,
+    FlowStepView,
+    ImpactReport,
+    KnowledgeQuery,
+    PathResult,
+)
 from .repository import FORMAT_VERSION, KnowledgeRepository, RevisionTransaction
+from .taxonomy import (
+    ALLOWED_PAIRS,
+    REQUIRED_ATTRIBUTES,
+    EntityKind,
+    RelationKind,
+    validate_attributes,
+    validate_pair,
+)
 
 __all__ = [
+    "ALLOWED_PAIRS",
+    "CapabilityProfile",
     "CodeContent",
     "CodeLocator",
+    "ComparisonFinding",
+    "ComparisonReport",
     "Confidence",
     "DiagramLocator",
     "DocumentLocator",
     "Entity",
     "EntityId",
+    "EntityKind",
     "EpistemicStatus",
     "Evidence",
     "FORMAT_VERSION",
+    "FlowStepView",
     "FormatVersionMismatch",
-    "Invalidation",
+    "GapNotFound",
+    "ImpactReport",
     "InvalidIdentity",
     "InvalidKind",
+    "InvalidRelationPair",
+    "Invalidation",
     "KnowledgeError",
+    "KnowledgeQuery",
     "KnowledgeRepository",
+    "KnowledgeRule",
+    "KnowledgeViolation",
     "Locator",
     "LocatorInvalid",
+    "MissingRequiredAttribute",
+    "PathResult",
     "PayloadInvalid",
+    "REQUIRED_ATTRIBUTES",
     "Relation",
     "RelationCycle",
+    "RelationKind",
     "Revision",
     "RevisionClosed",
     "RevisionTransaction",
     "SourceVersion",
     "SpreadsheetLocator",
     "TranscriptLocator",
+    "UnknownKind",
     "UnknownReference",
     "UnsupportedEvidence",
+    "blocking_gaps",
+    "close_gap",
     "content_hash",
     "invalidate",
+    "is_blocking",
+    "knowledge_gate",
     "locator_from_dict",
     "make_evidence",
+    "open_gap",
+    "open_gaps",
+    "validate_attributes",
+    "validate_pair",
 ]

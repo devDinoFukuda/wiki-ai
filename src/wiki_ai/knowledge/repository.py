@@ -9,7 +9,12 @@ from types import TracebackType
 from typing import Any, Iterable, Sequence
 
 from . import relations as relation_store
-from .errors import FormatVersionMismatch, RevisionClosed, UnknownReference
+from .errors import (
+    FormatVersionMismatch,
+    RevisionClosed,
+    UnknownReference,
+    UnsupportedEvidence,
+)
 from .evidence import assert_supports_implemented, locator_from_dict
 from .identity import new_revision_id
 from .model import (
@@ -23,8 +28,9 @@ from .model import (
     SourceVersion,
     validate_kind,
 )
+from .taxonomy import validate_attributes, validate_pair
 
-FORMAT_VERSION = "1"
+FORMAT_VERSION = "2"
 FORMAT_VERSION_KEY = "format_version"
 DATABASE_FILENAME = "state.db"
 
@@ -74,6 +80,7 @@ CREATE TABLE IF NOT EXISTS relations (
     source_id       TEXT NOT NULL REFERENCES entities(entity_id),
     target_id       TEXT NOT NULL REFERENCES entities(entity_id),
     attributes_json TEXT NOT NULL DEFAULT '{}',
+    confidence      TEXT NOT NULL DEFAULT 'unresolved',
     revision_id     TEXT NOT NULL REFERENCES revisions(revision_id)
 );
 
@@ -94,6 +101,12 @@ CREATE TABLE IF NOT EXISTS evidence_links (
     PRIMARY KEY (evidence_id, entity_id)
 );
 
+CREATE TABLE IF NOT EXISTS relation_evidence_links (
+    evidence_id TEXT NOT NULL REFERENCES evidence(evidence_id),
+    relation_id TEXT NOT NULL REFERENCES relations(relation_id),
+    PRIMARY KEY (evidence_id, relation_id)
+);
+
 CREATE TABLE IF NOT EXISTS invalidations (
     target_kind        TEXT NOT NULL,
     target_id          TEXT NOT NULL,
@@ -110,6 +123,7 @@ CREATE INDEX IF NOT EXISTS ix_relations_target ON relations(target_id, kind);
 CREATE INDEX IF NOT EXISTS ix_evidence_version ON evidence(source_version_key);
 CREATE INDEX IF NOT EXISTS ix_evidence_source  ON evidence(source_id);
 CREATE INDEX IF NOT EXISTS ix_evlinks_entity   ON evidence_links(entity_id);
+CREATE INDEX IF NOT EXISTS ix_rellinks_rel     ON relation_evidence_links(relation_id);
 CREATE INDEX IF NOT EXISTS ix_srcver_source    ON source_versions(source_id);
 """
 
@@ -118,6 +132,7 @@ EVIDENCE_COLUMNS = (
     "e.evidence_id, e.source_id, e.version_hash, e.locator_json, e.excerpt_hash, e.captured_at"
 )
 SOURCE_VERSION_COLUMNS = "source_id, version_hash, locator_root, captured_at"
+RELATION_COLUMNS = "relation_id, kind, source_id, target_id, attributes_json, confidence"
 
 
 def utc_now() -> str:
@@ -194,6 +209,7 @@ class RevisionTransaction:
         self._revision = revision
         self._open = False
         self._touched_entities: list[str] = []
+        self._touched_relations: list[str] = []
 
     @property
     def revision(self) -> Revision:
@@ -265,6 +281,7 @@ class RevisionTransaction:
 
     def put_entity(self, entity: Entity) -> EntityId:
         self._guard()
+        validate_attributes(entity.kind, entity.attributes)
         for key in entity.source_versions:
             known = self._conn.execute(
                 "SELECT 1 FROM source_versions WHERE source_version_key=?", (key,)
@@ -305,24 +322,35 @@ class RevisionTransaction:
     def put_relation(self, relation: Relation) -> str:
         self._guard()
         relation_store.validate_relation(self._conn, relation)
+        validate_pair(
+            relation.kind,
+            self._kind_of(relation.source_id),
+            self._kind_of(relation.target_id),
+        )
+        if relation.id not in self._touched_relations:
+            self._touched_relations.append(relation.id)
         self._conn.execute(
             "INSERT INTO relations(relation_id, kind, source_id, target_id, "
-            "attributes_json, revision_id) VALUES (?,?,?,?,?,?) "
+            "attributes_json, confidence, revision_id) VALUES (?,?,?,?,?,?,?) "
             "ON CONFLICT(relation_id) DO UPDATE SET attributes_json=excluded.attributes_json, "
-            "revision_id=excluded.revision_id",
+            "confidence=excluded.confidence, revision_id=excluded.revision_id",
             (
                 relation.id,
                 relation.kind,
                 relation.source_id.value,
                 relation.target_id.value,
                 _dumps(relation.attributes),
+                relation.confidence.value,
                 self._revision.id,
             ),
         )
         return relation.id
 
     def put_evidence(
-        self, evidence: Evidence, entity_ids: Sequence[EntityId] = ()
+        self,
+        evidence: Evidence,
+        entity_ids: Sequence[EntityId] = (),
+        relation_ids: Sequence[str] = (),
     ) -> str:
         self._guard()
         known = self._conn.execute(
@@ -362,6 +390,21 @@ class RevisionTransaction:
             )
             if entity.value not in self._touched_entities:
                 self._touched_entities.append(entity.value)
+        for relation_id in relation_ids:
+            known_relation = self._conn.execute(
+                "SELECT 1 FROM relations WHERE relation_id=?", (relation_id,)
+            ).fetchone()
+            if known_relation is None:
+                raise UnknownReference(
+                    f"evidência {evidence.id} vinculada a relação inexistente: {relation_id}"
+                )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO relation_evidence_links(evidence_id, relation_id) "
+                "VALUES (?,?)",
+                (evidence.id, relation_id),
+            )
+            if relation_id not in self._touched_relations:
+                self._touched_relations.append(relation_id)
         return evidence.id
 
     def record_invalidation(self, target_kind: str, target_id: str, key: str) -> None:
@@ -372,7 +415,16 @@ class RevisionTransaction:
             (validate_kind(target_kind), target_id, key, self._revision.id),
         )
 
+    def _kind_of(self, entity_id: EntityId) -> str:
+        row = self._conn.execute(
+            "SELECT kind FROM entities WHERE entity_id=?", (entity_id.value,)
+        ).fetchone()
+        if row is None:
+            raise UnknownReference(f"entidade inexistente: {entity_id.value}")
+        return str(row[0])
+
     def _check_support(self) -> None:
+        self._check_relation_support()
         for entity_id in self._touched_entities:
             entity = self._repository.get_entity(EntityId(entity_id))
             if entity is None:
@@ -382,6 +434,28 @@ class RevisionTransaction:
             if entity.confidence is not Confidence.SUPPORTED:
                 continue
             assert_supports_implemented(self._repository.evidence_for(entity.id))
+
+    def _check_relation_support(self) -> None:
+        for relation_id in self._touched_relations:
+            relation = self._repository.get_relation(relation_id)
+            if relation is None or relation.confidence is not Confidence.SUPPORTED:
+                continue
+            if self._repository.evidence_for_relation(relation_id):
+                continue
+            endpoints = (
+                self._repository.get_entity(relation.source_id),
+                self._repository.get_entity(relation.target_id),
+            )
+            if all(
+                node is not None and node.confidence is Confidence.SUPPORTED
+                for node in endpoints
+            ):
+                continue
+            raise UnsupportedEvidence(
+                f"relação {relation.kind} {relation.source_id.value} -> "
+                f"{relation.target_id.value} marcada supported sem evidência própria "
+                "e sem extremos supported"
+            )
 
 
 class KnowledgeRepository:
@@ -454,7 +528,7 @@ class KnowledgeRepository:
             f"SELECT {ENTITY_COLUMNS} FROM entities WHERE entity_id=?",
             (entity_id.value,),
         ).fetchone()
-        return self._row_to_entity(row) if row else None
+        return self.row_to_entity(row) if row else None
 
     def find_entities(self, kind: str | None = None) -> list[Entity]:
         sql = f"SELECT {ENTITY_COLUMNS} FROM entities"
@@ -463,7 +537,7 @@ class KnowledgeRepository:
             sql += " WHERE kind=?"
             params.append(validate_kind(kind))
         sql += " ORDER BY entity_id"
-        return [self._row_to_entity(row) for row in self.conn.execute(sql, params)]
+        return [self.row_to_entity(row) for row in self.conn.execute(sql, params)]
 
     def entity_count(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0])
@@ -475,6 +549,30 @@ class KnowledgeRepository:
         kinds: Iterable[str] | None = None,
     ) -> list[Relation]:
         return relation_store.neighborhood(self.conn, entity_id, direction, kinds)
+
+    def get_relation(self, relation_id: str) -> Relation | None:
+        row = self.conn.execute(
+            f"SELECT {RELATION_COLUMNS} FROM relations WHERE relation_id=?",
+            (relation_id,),
+        ).fetchone()
+        return relation_store.row_to_relation(row) if row else None
+
+    def find_relations(self, kind: str | None = None) -> list[Relation]:
+        sql = f"SELECT {RELATION_COLUMNS} FROM relations"
+        params: list[Any] = []
+        if kind is not None:
+            sql += " WHERE kind=?"
+            params.append(validate_kind(kind))
+        sql += " ORDER BY relation_id"
+        return [relation_store.row_to_relation(row) for row in self.conn.execute(sql, params)]
+
+    def evidence_for_relation(self, relation_id: str) -> list[Evidence]:
+        rows = self.conn.execute(
+            f"SELECT {EVIDENCE_COLUMNS} FROM evidence e JOIN relation_evidence_links l "
+            "ON l.evidence_id = e.evidence_id WHERE l.relation_id=? ORDER BY e.evidence_id",
+            (relation_id,),
+        ).fetchall()
+        return [self._row_to_evidence(row) for row in rows]
 
     def relation_count(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0])
@@ -520,6 +618,12 @@ class KnowledgeRepository:
         ).fetchall()
         return tuple(sorted(str(row[0]) for row in rows))
 
+    def all_evidence_keys(self) -> tuple[tuple[str, str], ...]:
+        rows = self.conn.execute(
+            "SELECT evidence_id, source_version_key FROM evidence ORDER BY evidence_id"
+        ).fetchall()
+        return tuple((str(row[0]), str(row[1])) for row in rows)
+
     def evidence_using(self, source_version_key: str) -> tuple[str, ...]:
         rows = self.conn.execute(
             "SELECT evidence_id FROM evidence WHERE source_version_key=? ORDER BY evidence_id",
@@ -534,7 +638,7 @@ class KnowledgeRepository:
         ).fetchall()
         return tuple(str(row[0]) for row in rows)
 
-    def _row_to_entity(self, row: Sequence[Any]) -> Entity:
+    def row_to_entity(self, row: Sequence[Any]) -> Entity:
         entity_id = str(row[0])
         keys = self.conn.execute(
             "SELECT source_version_key FROM entity_source_versions WHERE entity_id=? "

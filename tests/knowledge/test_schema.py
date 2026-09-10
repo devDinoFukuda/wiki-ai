@@ -39,8 +39,8 @@ def entity_payload(**overrides):
 
 
 def relation_payload(**overrides):
-    left = Entity.create(kind="component", name="A")
-    right = Entity.create(kind="component", name="B")
+    left = Entity.create(kind="module", name="A")
+    right = Entity.create(kind="module", name="B")
     relation = Relation.create("calls", left.id, right.id)
     payload = {
         "id": relation.id,
