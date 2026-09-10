@@ -121,6 +121,72 @@ def applied_update(repository, previous, changed, changed_evidence, historical=(
     )
 
 
+@pytest.mark.parametrize(
+    "confidence",
+    [Confidence.SUPPORTED, Confidence.INFERRED, Confidence.UNRESOLVED],
+)
+def test_relations_of_entities_reaches_every_confidence(loaded, confidence):
+    repository, _prev, changed, *_ = loaded
+    existing = relations_of_entities(repository, [changed.id.value])
+    repository.conn.execute(
+        "UPDATE relations SET confidence=? WHERE relation_id=?",
+        (confidence.value, existing[0]),
+    )
+
+    assert relations_of_entities(repository, [changed.id.value]) == existing
+
+
+@pytest.mark.parametrize("confidence", [Confidence.SUPPORTED, Confidence.INFERRED])
+def test_an_inferred_relation_is_reinvestigated_like_a_supported_one(
+    loaded, confidence
+):
+    repository, previous, changed, _intact, changed_evidence, _other = loaded
+    relation_id = relations_of_entities(repository, [changed.id.value])[0]
+    repository.conn.execute(
+        "UPDATE relations SET confidence=? WHERE relation_id=?",
+        (confidence.value, relation_id),
+    )
+
+    applied = applied_update(repository, previous, changed, changed_evidence)
+
+    assert relation_id in applied.relations
+    assert relation_id in applied.relation_ids
+    assert relation_id in set(repository.invalidated(RELATION_TARGET))
+    assert repository.get_relation(relation_id).confidence is not Confidence.SUPPORTED
+
+
+@pytest.mark.parametrize("confidence", [Confidence.SUPPORTED, Confidence.INFERRED])
+def test_a_relation_losing_all_evidence_becomes_unresolved(loaded, confidence):
+    repository, previous, changed, _intact, changed_evidence, _other = loaded
+    relation_id = relations_of_entities(repository, [changed.id.value])[0]
+    repository.conn.execute(
+        "UPDATE relations SET confidence=? WHERE relation_id=?",
+        (confidence.value, relation_id),
+    )
+    own = [
+        item.id
+        for item in repository.evidence_for_relation(relation_id, active_only=False)
+    ]
+
+    applied = apply_targeted(
+        repository=repository,
+        incoming=version_of("v2"),
+        obsolete_key=previous.key,
+        evidence_ids=tuple(own) + (changed_evidence.id,),
+        entity_ids=(changed.id.value,),
+        relation_ids=(relation_id,),
+        historical_ids=(),
+        carried_entities=(),
+        carried_evidence=(),
+        gap_questions={},
+        author="update",
+        summary="targeted update",
+    )
+
+    assert relation_id in applied.relations
+    assert repository.get_relation(relation_id).confidence is Confidence.UNRESOLVED
+
+
 def test_apply_targeted_demotes_only_the_named_entity(loaded):
     repository, previous, changed, intact, changed_evidence, _other = loaded
     applied_update(repository, previous, changed, changed_evidence)

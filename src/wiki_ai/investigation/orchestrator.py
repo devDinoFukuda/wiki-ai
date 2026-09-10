@@ -16,7 +16,7 @@ from wiki_ai.agent.session import (
     RunStatus,
     ToolSpec,
 )
-from wiki_ai.knowledge.model import Entity
+from wiki_ai.knowledge.model import Entity, GraphPolicy
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind
@@ -491,7 +491,7 @@ def _close_capability(
     gaps: list[str],
     flows: list[dict[str, Any]],
 ) -> tuple[coverage.CoverageState, int]:
-    query = KnowledgeQuery(knowledge)
+    query = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED)
     capability = _capability_entity(query, step.subject)
     if capability is None:
         return state, 0

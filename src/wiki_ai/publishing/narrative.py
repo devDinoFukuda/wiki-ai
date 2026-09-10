@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Sequence
 
 from wiki_ai.knowledge.gaps import GAP_BLOCKING, GAP_QUESTION, is_blocking
-from wiki_ai.knowledge.model import Entity, EntityId
+from wiki_ai.knowledge.model import Confidence, Entity, EntityId, GraphPolicy
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
 
@@ -39,6 +39,7 @@ from .content import (
 )
 from .diagrams import diagrams_for
 from .model import (
+    INFERRED_SECTION_TITLE,
     DiagramSpec,
     DocumentKind,
     DocumentPlan,
@@ -47,7 +48,15 @@ from .model import (
     NarrativeDocument,
 )
 
-__all__ = ["NarrativeBuilder", "NarrativeEnricher", "state_phrase", "trace_entries"]
+__all__ = [
+    "INFERRED_RELATION_QUALIFIER",
+    "NarrativeBuilder",
+    "NarrativeEnricher",
+    "state_phrase",
+    "trace_entries",
+]
+
+INFERRED_RELATION_QUALIFIER = "relação inferida, sem evidência que a sustente"
 
 
 class NarrativeBuilder:
@@ -163,6 +172,28 @@ class NarrativeBuilder:
                 )
             )
         return tuple(found)
+
+    def _inferred_relation_assertions(self) -> tuple[Assertion, ...]:
+        repository = self._query.repository
+        found: list[Assertion] = []
+        for relation in repository.find_relations():
+            if relation.confidence is not Confidence.INFERRED:
+                continue
+            source = repository.get_entity(relation.source_id)
+            target = repository.get_entity(relation.target_id)
+            if source is None or target is None:
+                continue
+            found.append(
+                Assertion(
+                    text=(
+                        f"Relação apenas inferida entre {source.name} e "
+                        f"{target.name} do tipo {relation.kind}"
+                    ),
+                    stance=AssertionStance.OPEN,
+                    qualifier=INFERRED_RELATION_QUALIFIER,
+                )
+            )
+        return tuple(sorted(found, key=lambda item: item.text))
 
     def _gaps_about(self, entities: Sequence[Entity]) -> tuple[Entity, ...]:
         found: list[Entity] = []
@@ -483,10 +514,12 @@ class NarrativeBuilder:
             + comparison.declared_not_implemented
         )
         body.append(gap_section(contradictions, 4))
-        body.append(section(5, "Lacunas conhecidas"))
-        body.append(gap_section(self._gap_assertions(every), 5))
-        body.append(section(6, "Rastreabilidade técnica"))
-        body.append(trace_table(self._query, every, 6))
+        body.append(section(5, INFERRED_SECTION_TITLE))
+        body.append(gap_section(self._inferred_relation_assertions(), 5))
+        body.append(section(6, "Lacunas conhecidas"))
+        body.append(gap_section(self._gap_assertions(every), 6))
+        body.append(section(7, "Rastreabilidade técnica"))
+        body.append(trace_table(self._query, every, 7))
         return self._finish(
             document,
             body,

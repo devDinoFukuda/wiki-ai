@@ -50,7 +50,7 @@ __all__ = [
 ]
 
 FORMAT_VERSION = 2
-ANALYSIS_CONTRACT_VERSION = "1"
+ANALYSIS_CONTRACT_VERSION = "2"
 STATE_DIR_NAME = ".wiki-ai"
 SUBDIRECTORIES = ("snapshots", "publications")
 FORMAT_FILE = "format.json"

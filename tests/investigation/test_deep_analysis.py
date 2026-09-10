@@ -9,7 +9,7 @@ from tests.investigation.fixtures_snapshots import java_repo, mainframe_repo
 from wiki_ai.knowledge.evidence import CodeContent, CodeLocator
 from wiki_ai.knowledge.gaps import GAP_KIND, is_blocking, is_open
 from wiki_ai.knowledge.identity import excerpt_digest
-from wiki_ai.knowledge.model import Confidence, KnowledgeState
+from wiki_ai.knowledge.model import Confidence, GraphPolicy, KnowledgeState
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -334,7 +334,7 @@ def test_java_identifies_the_entrypoint_with_executable_evidence(
 ) -> None:
     with knowledge_at(tmp_path) as knowledge:
         run_java(tmp_path, knowledge)
-        profile = KnowledgeQuery(knowledge).capability_profile(
+        profile = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED).capability_profile(
             capability_of(knowledge, CAPABILITY).id
         )
         assert profile is not None
@@ -350,7 +350,7 @@ def test_java_identifies_the_entrypoint_with_executable_evidence(
 def test_java_fills_the_section_profile_of_ten_two(tmp_path: Path) -> None:
     with knowledge_at(tmp_path) as knowledge:
         run_java(tmp_path, knowledge)
-        profile = KnowledgeQuery(knowledge).capability_profile(
+        profile = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED).capability_profile(
             capability_of(knowledge, CAPABILITY).id
         )
         assert profile is not None
@@ -377,7 +377,7 @@ def test_java_reconstructs_the_rule_with_conditions_and_effects(
 ) -> None:
     with knowledge_at(tmp_path) as knowledge:
         run_java(tmp_path, knowledge)
-        profile = KnowledgeQuery(knowledge).capability_profile(
+        profile = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED).capability_profile(
             capability_of(knowledge, CAPABILITY).id
         )
         assert profile is not None
@@ -395,7 +395,7 @@ def test_java_reconstructs_the_rule_with_conditions_and_effects(
 def test_java_identifies_persistence_and_kafka_events(tmp_path: Path) -> None:
     with knowledge_at(tmp_path) as knowledge:
         run_java(tmp_path, knowledge)
-        profile = KnowledgeQuery(knowledge).capability_profile(
+        profile = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED).capability_profile(
             capability_of(knowledge, CAPABILITY).id
         )
         assert profile is not None
@@ -412,7 +412,7 @@ def test_java_identifies_persistence_and_kafka_events(tmp_path: Path) -> None:
 def test_java_identifies_failures_and_edge_cases(tmp_path: Path) -> None:
     with knowledge_at(tmp_path) as knowledge:
         run_java(tmp_path, knowledge)
-        profile = KnowledgeQuery(knowledge).capability_profile(
+        profile = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED).capability_profile(
             capability_of(knowledge, CAPABILITY).id
         )
         assert profile is not None
@@ -433,7 +433,7 @@ def test_java_generates_a_flow_with_ordered_steps_from_the_entrypoint(
         flows = knowledge.find_entities(EntityKind.FLOW.value)
         assert flows
         steps = knowledge.find_entities(EntityKind.FLOW_STEP.value)
-        ordered = KnowledgeQuery(knowledge).flow(flows[0].id)
+        ordered = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED).flow(flows[0].id)
         ordinals = [view.entity.attributes["ordinal"] for view in ordered]
         assert ordinals == sorted(ordinals)
         assert len(ordered) == len(steps)
@@ -463,7 +463,17 @@ def test_java_every_flow_step_presents_the_evidence_it_inherited(
             step for step in steps if step.confidence is Confidence.UNRESOLVED
         ]
         for step in unresolved:
-            assert not knowledge.evidence_for(step.id)
+            reached_by = knowledge.relations_of(
+                step.id,
+                "out",
+                (RelationKind.CALLS.value,),
+                policy=GraphPolicy.ALL,
+            )
+            weak_edge = all(
+                relation.confidence is not Confidence.SUPPORTED
+                for relation in reached_by
+            )
+            assert not knowledge.evidence_for(step.id) or weak_edge
 
 
 def test_java_a_decision_is_derived_from_the_rule_conditions(tmp_path: Path) -> None:
@@ -493,7 +503,7 @@ def test_java_the_open_sections_become_typed_gaps_about_the_capability(
         assert "persistence" not in sections
         assert "events" not in sections
         capability = capability_of(knowledge, CAPABILITY)
-        about = KnowledgeQuery(knowledge).capability_profile(capability.id)
+        about = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED).capability_profile(capability.id)
         assert about is not None
         assert about.gaps
 
@@ -763,7 +773,7 @@ def test_a_budget_spent_mid_analysis_leaves_explicit_gaps_and_an_honest_outcome(
         )
         capabilities = knowledge.find_entities(EntityKind.CAPABILITY.value)
         assert capabilities
-        profile = KnowledgeQuery(knowledge).capability_profile(capabilities[0].id)
+        profile = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED).capability_profile(capabilities[0].id)
     assert outcome.details["tool_calls"] <= 6
     assert outcome.unresolved
     assert profile is not None

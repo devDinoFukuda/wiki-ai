@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from .errors import GapNotFound
-from .model import Confidence, Entity, EntityId, KnowledgeState, Relation
+from .model import Confidence, Entity, EntityId, GraphPolicy, KnowledgeState, Relation
 from .repository import KnowledgeRepository, RevisionTransaction
 from .taxonomy import EntityKind, RelationKind
 
@@ -107,7 +107,7 @@ def gaps_about(
 ) -> tuple[Entity, ...]:
     found: list[Entity] = []
     for relation in repository.relations_of(
-        entity_id, "in", (RelationKind.AFFECTS.value,)
+        entity_id, "in", (RelationKind.AFFECTS.value,), policy=GraphPolicy.ALL
     ):
         candidate = repository.get_entity(relation.source_id)
         if candidate is not None and candidate.kind == GAP_KIND:

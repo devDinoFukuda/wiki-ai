@@ -8,7 +8,7 @@ from tests.repository.fixtures_repos import java_repo, mainframe_repo, write
 from wiki_ai.agent.protocol import AgentCapabilities
 from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.agent.session import AgentRun, AgentSession
-from wiki_ai.knowledge.model import Entity
+from wiki_ai.knowledge.model import Entity, GraphPolicy
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind
@@ -25,6 +25,57 @@ JAVA_TEST = "src/test/java/com/acme/order/OrderServiceTest.java"
 CONFIG = "src/main/resources/application.yml"
 LEGACY_EIGHT = f"{BASE}/OrderLegacySupport.java"
 MODERN_TWENTY_ONE = f"{BASE}/OrderSummary.java"
+MODULE = f"{BASE}/OrderModule.java"
+ENTRY_GUARD = f"{BASE}/OrderEntryGuard.java"
+
+JAVA_ENTRY_GUARD_SOURCE = """package com.acme.order;
+
+public class OrderEntryGuard {
+    private final OrderRepository repository;
+    public OrderEntryGuard(OrderRepository repository) {
+        this.repository = repository;
+    }
+    public String place(String reference) {
+        if (reference == null) {
+            return repository.save(null);
+        }
+        return repository.save(reference);
+    }
+}
+"""
+
+JAVA_MODULE_SOURCE = """package com.acme.order;
+
+public final class OrderModule {
+    public static final String NAMESPACE = "order module";
+    public static final String[] MEMBERS = {
+        "place order",
+        "OrderController place",
+        "OrderService place",
+        "order reference",
+        "saved order reference",
+        "a reference reaches place",
+        "every placed order is saved",
+        "raw references are trimmed and emptied entries dropped",
+        "an order summary describes its status",
+        "place always returns what save returned",
+        "order repository",
+        "orders kafka producer",
+        "orders-v1 message",
+        "producer send receives null",
+        "place with a null reference",
+        "describe with an unknown status",
+    };
+    public static boolean contains(String member) {
+        for (String owned : MEMBERS) {
+            if (owned.equals(member)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+"""
 
 COBOL = "cobol/PAYRUN.cbl"
 COPYBOOK = "copybook/PAYREC.cpy"
@@ -127,8 +178,19 @@ def ref(path: str, start: int, end: int) -> dict[str, Any]:
     return {"path": path, "line_start": start, "line_end": end}
 
 
-def rel(kind: str, target: str, target_type: str | None = None) -> dict[str, Any]:
-    payload: dict[str, Any] = {"kind": kind, "target_subject": target}
+def rel(
+    kind: str,
+    target: str,
+    target_type: str | None = None,
+    statement: str = "",
+    evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "kind": kind,
+        "target_subject": target,
+        "statement": statement,
+        "evidence": list(evidence or []),
+    }
     if target_type is not None:
         payload["target_type"] = target_type
     return payload
@@ -138,6 +200,8 @@ def java_acceptance_repo(root: Path) -> Path:
     java_repo(root)
     write(root, LEGACY_EIGHT, JAVA_EIGHT_SOURCE)
     write(root, MODERN_TWENTY_ONE, JAVA_TWENTY_ONE_SOURCE)
+    write(root, MODULE, JAVA_MODULE_SOURCE)
+    write(root, ENTRY_GUARD, JAVA_ENTRY_GUARD_SOURCE)
     return root
 
 
@@ -153,8 +217,11 @@ def java_discovery() -> Script:
             ("repo.inventory", {}),
             ("repo.dependencies", {}),
             ("repo.search", {"pattern": "place"}),
+            ("repo.read", {"path": MODULE}),
             capture(CONTROLLER, 15, 17, "place"),
+            capture(SERVICE, 5, 12, "place"),
             capture(SERVICE, 10, 12, "place"),
+            capture(MODULE, 4, 22, "MEMBERS"),
         ),
         findings=[
             {
@@ -170,7 +237,7 @@ def java_discovery() -> Script:
                 "statement": "com.acme.order groups the order classes",
                 "evidence": [ref(SERVICE, 10, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", "acme orders", "system")],
+                "relations": [rel("belongs_to", "acme orders", "system", statement="the order module belongs to the acme orders system")],
             },
             {
                 "type": "capability",
@@ -180,7 +247,13 @@ def java_discovery() -> Script:
                 ),
                 "evidence": [ref(CONTROLLER, 15, 17)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", "order module", "module")],
+                "relations": [rel(
+                        "belongs_to",
+                        "order module",
+                        "module",
+                        statement="place order belongs to the order module namespace",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "entry_point",
@@ -192,7 +265,13 @@ def java_discovery() -> Script:
                 },
                 "evidence": [ref(CONTROLLER, 15, 17)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="OrderController place belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
         ],
     )
@@ -207,14 +286,19 @@ def java_capability() -> Script:
             ("repo.read", {"path": MODERN_TWENTY_ONE}),
             ("repo.tests", {}),
             ("repo.config", {}),
+            ("repo.read", {"path": MODULE}),
+            capture(MODULE, 4, 22, "MEMBERS"),
+            capture(SERVICE, 5, 12, "place"),
             capture(SERVICE, 10, 12, "place"),
             capture(REPOSITORY, 3, 4, "save"),
             capture(PRODUCER, 10, 12, "emit"),
             capture(JAVA_TEST, 4, 7, "placesOrder"),
             capture(CONFIG, 4, 6),
             capture(CONTROLLER, 15, 17, "place"),
-            capture(LEGACY_EIGHT, 8, 13, "normalize"),
+            capture(LEGACY_EIGHT, 7, 13, "normalize"),
             capture(MODERN_TWENTY_ONE, 5, 12, "describe"),
+            ("repo.read", {"path": ENTRY_GUARD}),
+            capture(ENTRY_GUARD, 7, 13, "place"),
         ),
         findings=[
             {
@@ -223,7 +307,13 @@ def java_capability() -> Script:
                 "statement": "place receives a String reference",
                 "evidence": [ref(CONTROLLER, 15, 17)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the order reference input belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "output",
@@ -231,7 +321,13 @@ def java_capability() -> Script:
                 "statement": "place returns the String produced by save",
                 "evidence": [ref(SERVICE, 10, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the placed order reference output belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "precondition",
@@ -239,35 +335,54 @@ def java_capability() -> Script:
                 "statement": "place is only reached with a reference argument",
                 "evidence": [ref(CONTROLLER, 15, 17)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the reference argument precondition belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "business_rule",
                 "subject": "every placed order is saved",
                 "statement": (
-                    "OrderService place hands the reference to OrderRepository save"
+                    "OrderService place returns what OrderRepository save returns "
+                    "for the reference"
                 ),
                 "conditions": ["place is called with a reference"],
-                "effects": ["OrderRepository save receives the reference"],
-                "evidence": [ref(SERVICE, 10, 12)],
+                "effects": ["repository save is called with the reference"],
+                "evidence": [ref(SERVICE, 5, 12)],
                 "confidence": "supported",
                 "relations": [
-                    rel("belongs_to", CAPABILITY, "capability"),
-                    rel("validates", "order reference", "input"),
+                    rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="every placed order is saved belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    ),
+                    rel("validates", "order reference", "input", statement="place validates that the order reference is present before saving"),
                 ],
             },
             {
                 "type": "business_rule",
                 "subject": "raw references are trimmed and emptied entries dropped",
                 "statement": (
-                    "OrderLegacySupport normalize splits raw, trims each item and "
-                    "filters the empty ones"
+                    "OrderLegacySupport normalize splits raw, maps trim and filters "
+                    "isEmpty"
                 ),
-                "conditions": ["normalize receives a raw String"],
-                "effects": ["only trimmed non empty items remain"],
-                "evidence": [ref(LEGACY_EIGHT, 8, 13)],
+                "conditions": ["normalize is called with a raw String"],
+                "effects": ["each item is trimmed and empty items are filtered"],
+                "evidence": [ref(LEGACY_EIGHT, 7, 13)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the trimming rule belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "business_rule",
@@ -280,7 +395,13 @@ def java_capability() -> Script:
                 "effects": ["the status is rendered as text"],
                 "evidence": [ref(MODERN_TWENTY_ONE, 5, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the order summary rule belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "invariant",
@@ -288,7 +409,13 @@ def java_capability() -> Script:
                 "statement": "the return of place is the return of save",
                 "evidence": [ref(SERVICE, 10, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the return invariant belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "persistence",
@@ -296,7 +423,13 @@ def java_capability() -> Script:
                 "statement": "OrderRepository save persists the order reference",
                 "evidence": [ref(REPOSITORY, 3, 4)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the order repository persistence belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "integration",
@@ -307,7 +440,13 @@ def java_capability() -> Script:
                 "attributes": {"direction": "outbound", "protocol": "kafka"},
                 "evidence": [ref(PRODUCER, 10, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the orders-v1 event belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "event",
@@ -317,7 +456,13 @@ def java_capability() -> Script:
                 ),
                 "evidence": [ref(CONFIG, 4, 6)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the integration belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "failure_mode",
@@ -329,19 +474,33 @@ def java_capability() -> Script:
                 },
                 "evidence": [ref(PRODUCER, 10, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the null record failure mode belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "edge_case",
                 "subject": "place with a null reference",
-                "statement": "place forwards the reference without checking it",
+                "statement": (
+                    "place checks reference against null before repository save"
+                ),
                 "attributes": {
                     "condition": "reference is null",
-                    "expected": "save receives null",
+                    "expected": "repository save is called with null",
                 },
-                "evidence": [ref(SERVICE, 10, 12)],
+                "evidence": [ref(ENTRY_GUARD, 7, 13)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the unchecked reference edge case belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "edge_case",
@@ -353,7 +512,13 @@ def java_capability() -> Script:
                 },
                 "evidence": [ref(MODERN_TWENTY_ONE, 5, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", CAPABILITY, "capability")],
+                "relations": [rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="the unknown status edge case belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    )],
             },
             {
                 "type": "test_scenario",
@@ -362,7 +527,7 @@ def java_capability() -> Script:
                 "attributes": {"scenario": "place is called with R-1"},
                 "evidence": [ref(JAVA_TEST, 4, 7)],
                 "confidence": "supported",
-                "relations": [rel("tests", CAPABILITY, "capability")],
+                "relations": [rel("tests", CAPABILITY, "capability", statement="placesOrder asserts the expected outcome of the place order capability")],
             },
             {
                 "type": "operation",
@@ -374,8 +539,17 @@ def java_capability() -> Script:
                 "evidence": [ref(SERVICE, 10, 12)],
                 "confidence": "supported",
                 "relations": [
-                    rel("persists_to", "order repository", "persistence"),
-                    rel("publishes", "orders-v1 message", "event"),
+                    rel(
+                        "persists_to",
+                        "order repository",
+                        "persistence",
+                        statement=(
+                            "OrderService place persists the reference through "
+                            "OrderRepository save"
+                        ),
+                        evidence=[ref(SERVICE, 10, 12)],
+                    ),
+                    rel("publishes", "orders-v1 message", "event", statement="OrderService place publishes the orders-v1 message after saving"),
                 ],
             },
         ],
@@ -384,7 +558,10 @@ def java_capability() -> Script:
 
 def java_link() -> Script:
     return Script(
-        steps=(capture(CONTROLLER, 15, 17, "place"),),
+        steps=(
+            capture(CONTROLLER, 15, 17, "place"),
+            capture(MODULE, 4, 22, "MEMBERS"),
+        ),
         findings=[
             {
                 "type": "entry_point",
@@ -397,8 +574,23 @@ def java_link() -> Script:
                 "evidence": [ref(CONTROLLER, 15, 17)],
                 "confidence": "supported",
                 "relations": [
-                    rel("calls", "OrderService place", "operation"),
-                    rel("belongs_to", CAPABILITY, "capability"),
+                    rel(
+                        "calls",
+                        "OrderService place",
+                        "operation",
+                        statement=(
+                            "OrderController place delegates the reference to "
+                            "OrderService place"
+                        ),
+                        evidence=[ref(CONTROLLER, 15, 17)],
+                    ),
+                    rel(
+                        "belongs_to",
+                        CAPABILITY,
+                        "capability",
+                        statement="OrderController place belongs to the place order capability",
+                        evidence=[ref(MODULE, 4, 22)],
+                    ),
                 ],
             }
         ],
@@ -434,7 +626,7 @@ def cobol_discovery() -> Script:
                 "statement": "PROGRAM-ID PAYRUN declares the payroll program",
                 "evidence": [ref(COBOL, 2, 2)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="PAYRUN belongs to the payroll run capability")],
             },
             {
                 "type": "entry_point",
@@ -443,7 +635,7 @@ def cobol_discovery() -> Script:
                 "attributes": {"mechanism": "jcl", "location": "PAYJOB.STEP01"},
                 "evidence": [ref(JCL, 1, 2)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="PAYJOB STEP01 belongs to the payroll run capability")],
             },
         ],
     )
@@ -477,7 +669,7 @@ def cobol_capability() -> Script:
                 "statement": "MAIN-LOGIC performs CALC-TOTAL before calling TAXCALC",
                 "evidence": [ref(COBOL, 8, 8)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="MAIN-LOGIC belongs to the payroll run capability")],
             },
             {
                 "type": "business_rule",
@@ -487,7 +679,7 @@ def cobol_capability() -> Script:
                 "effects": ["WS-GROSS receives WS-HOURS multiplied by WS-RATE"],
                 "evidence": [ref(COBOL, 12, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="CALC-TOTAL belongs to the payroll run capability")],
             },
             {
                 "type": "operation",
@@ -496,7 +688,7 @@ def cobol_capability() -> Script:
                 "attributes": {"verb": "call"},
                 "evidence": [ref(COBOL, 9, 9)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="TAXCALC belongs to the payroll run capability")],
             },
             {
                 "type": "data_contract",
@@ -504,7 +696,7 @@ def cobol_capability() -> Script:
                 "statement": "COPY PAYREC brings PAY-RECORD into WORKING-STORAGE",
                 "evidence": [ref(COBOL, 5, 5), ref(COPYBOOK, 2, 5)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="PAY-RECORD belongs to the payroll run capability")],
             },
             {
                 "type": "input",
@@ -512,7 +704,7 @@ def cobol_capability() -> Script:
                 "statement": "INFILE DD points PAYRUN at PROD.PAYROLL.MASTER",
                 "evidence": [ref(JCL, 4, 4)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="the INFILE dataset belongs to the payroll run capability")],
             },
             {
                 "type": "entry_point",
@@ -521,7 +713,7 @@ def cobol_capability() -> Script:
                 "attributes": {"mechanism": "jcl", "location": "PAYJOB.STEP02"},
                 "evidence": [ref(JCL, 5, 5)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="STEP02 belongs to the payroll run capability")],
             },
             {
                 "type": "query",
@@ -538,7 +730,7 @@ def cobol_capability() -> Script:
                 },
                 "evidence": [ref(EMBEDDED_SQL, 8, 12)],
                 "confidence": "supported",
-                "relations": [rel("belongs_to", PAYROLL, "capability")],
+                "relations": [rel("belongs_to", PAYROLL, "capability", statement="the gross select query belongs to the payroll run capability")],
             },
             {
                 "type": "procedure",
@@ -547,8 +739,14 @@ def cobol_capability() -> Script:
                 "evidence": [ref(EMBEDDED_SQL, 13, 13)],
                 "confidence": "supported",
                 "relations": [
-                    rel("belongs_to", PAYROLL, "capability"),
-                    rel("calls", "PAYRUN", "procedure"),
+                    rel("belongs_to", PAYROLL, "capability", statement="BILLRUN belongs to the payroll run capability"),
+                    rel(
+                        "calls",
+                        "PAYRUN",
+                        "procedure",
+                        statement="BILL-LOGIC calls PAYRUN passing WS-GROSS",
+                        evidence=[ref(EMBEDDED_SQL, 13, 13)],
+                    ),
                 ],
             },
         ],
@@ -571,7 +769,10 @@ def entity_named(
 
 def profile_of(knowledge: KnowledgeRepository, name: str):
     capability = entity_named(knowledge, EntityKind.CAPABILITY, name)
-    return KnowledgeQuery(knowledge).capability_profile(capability.id)
+    query = KnowledgeQuery(knowledge)
+    assert query.policy is GraphPolicy.SUPPORTED_ONLY
+    return query.capability_profile(capability.id)
+
 
 
 def names_of(entities: Sequence[Entity]) -> set[str]:

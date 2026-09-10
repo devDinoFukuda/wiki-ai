@@ -289,8 +289,17 @@ def build(tmp_path) -> Graph:
         for node in nodes.values():
             revision.put_entity(node)
         for kind, source, target in EDGES:
-            revision.put_relation(
-                Relation.create(kind, nodes[source].id, nodes[target].id)
+            relation = Relation.create(
+                kind,
+                nodes[source].id,
+                nodes[target].id,
+                confidence=Confidence.SUPPORTED,
+            )
+            revision.put_relation(relation)
+            revision.put_evidence(
+                code_evidence(code, f"src/edges/{relation.id}.py", kind),
+                (),
+                [relation.id],
             )
         revision.put_evidence(
             code_evidence(code, "src/renewal.py", "renew"), [nodes["capability"].id]

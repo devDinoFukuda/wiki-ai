@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from wiki_ai.knowledge import Entity, KnowledgeQuery, KnowledgeRepository
+from wiki_ai.knowledge import (
+    Entity,
+    GraphPolicy,
+    KnowledgeQuery,
+    KnowledgeRepository,
+)
 from wiki_ai.knowledge.gaps import open_gap
 from wiki_ai.knowledge.model import Confidence, KnowledgeState, Relation
 from wiki_ai.knowledge.repository import DATABASE_FILENAME, FORMAT_VERSION
@@ -62,12 +67,28 @@ def test_neighbor_ids_returns_the_other_end_of_each_relation(repository):
         revision.put_relation(
             Relation.create(RelationKind.DEPENDS_ON.value, left.id, right.id)
         )
-    query = KnowledgeQuery(repository)
+    query = KnowledgeQuery(repository, GraphPolicy.ALL)
     assert query.neighbor_ids(left.id, RelationKind.DEPENDS_ON, "out") == (
         right.id.value,
     )
     assert query.neighbor_ids(right.id, RelationKind.DEPENDS_ON, "out") == ()
     assert query.neighbor_ids(right.id) == (left.id.value,)
+
+
+def test_neighbor_ids_of_an_unresolved_relation_are_empty_by_default(repository):
+    left = capability("Renewal")
+    right = capability("Billing")
+    with repository.begin_revision("pipeline", "carga") as revision:
+        revision.put_entity(left)
+        revision.put_entity(right)
+        revision.put_relation(
+            Relation.create(RelationKind.DEPENDS_ON.value, left.id, right.id)
+        )
+    query = KnowledgeQuery(repository)
+
+    assert query.policy is GraphPolicy.SUPPORTED_ONLY
+    assert query.neighbor_ids(left.id, RelationKind.DEPENDS_ON, "out") == ()
+    assert query.neighbors(left.id) == ()
 
 
 def test_capability_profile_reports_the_gaps_that_affect_it(repository):

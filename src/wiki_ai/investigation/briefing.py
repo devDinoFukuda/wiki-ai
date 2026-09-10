@@ -87,8 +87,12 @@ RELATION_RULES: tuple[str, ...] = (
     "question is raised as a gap",
     "a relation is supported only when its own evidence excerpt names both the "
     "finding subject and the target; endpoints being supported never suffices",
+    "statement is mandatory for a supported relation: a relation without a "
+    "statement stays inferred however good its excerpt is",
     "statement says what the code does in that relation, for example "
     "'OrderService delegates persistence to OrderRepository.save'",
+    "a statement that only repeats the two names proves nothing: it must name "
+    "the action the excerpt spells, for example the invoked method",
     "the excerpt must spell the action the relation kind names: a calls relation "
     "needs the invocation, a writes relation needs the write; wiring or "
     "construction alone keeps the relation inferred",

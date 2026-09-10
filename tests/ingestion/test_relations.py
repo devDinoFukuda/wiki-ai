@@ -94,10 +94,20 @@ def test_a_writing_sentence_supports_a_writes_relation() -> None:
     verdict = _verdict(
         RelationKind.WRITES,
         "Cobranca",
+        "Faturamento grava e persiste os registros na Cobranca",
+        "o Faturamento grava e persiste os registros na Cobranca a cada lote",
+    )
+    assert verdict is Confidence.SUPPORTED
+
+
+def test_a_writing_sentence_with_a_single_strong_term_stays_inferred() -> None:
+    verdict = _verdict(
+        RelationKind.WRITES,
+        "Cobranca",
         "Faturamento grava na Cobranca",
         "o Faturamento grava na Cobranca a cada lote",
     )
-    assert verdict is Confidence.SUPPORTED
+    assert verdict is Confidence.INFERRED
 
 
 def test_a_documental_declares_relation_needs_its_predicate_in_the_text() -> None:
@@ -156,3 +166,27 @@ def test_a_relation_statement_survives_the_round_trip() -> None:
     claim = _claim(RelationKind.CALLS, "Cobranca", "  Faturamento chama Cobranca  ")
     assert claim.statement == "Faturamento chama Cobranca"
     assert claim.to_dict()["statement"] == "Faturamento chama Cobranca"
+
+
+def test_a_return_sentence_never_supports_a_calls_relation() -> None:
+    verdict = _verdict(
+        RelationKind.CALLS,
+        "Cobranca",
+        "Faturamento chama Cobranca",
+        "o Faturamento retorna Cobranca ao final do metodo",
+    )
+    assert verdict is Confidence.INFERRED
+
+
+def test_a_writes_relation_without_a_statement_stays_inferred_even_with_a_grounded_capture() -> None:
+    claim = _claim(RelationKind.WRITES, "Cobranca", "")
+    verdict = assess_relation(
+        claim,
+        _source("Faturamento", claim),
+        _resolution(),
+        "Cobranca",
+        (_capture("o Faturamento grava na Cobranca a cada lote"),),
+        False,
+    )
+    assert verdict.confidence is Confidence.INFERRED
+    assert any("statement" in reason for reason in verdict.reasons)

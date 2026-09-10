@@ -24,10 +24,12 @@ __all__ = [
     "GAPS_SECTIONS",
     "CHANGE_IMPACT_SECTIONS",
     "GAPS_SECTION_TITLE",
+    "INFERRED_SECTION_TITLE",
     "TRACEABILITY_SECTION_TITLE",
 ]
 
 GAPS_SECTION_TITLE = "Lacunas conhecidas"
+INFERRED_SECTION_TITLE = "Relações apenas inferidas"
 TRACEABILITY_SECTION_TITLE = "Rastreabilidade técnica"
 
 
@@ -104,6 +106,7 @@ GAPS_SECTIONS: tuple[str, ...] = (
     "Lacunas bloqueantes",
     "Lacunas não bloqueantes",
     "Contradições entre fontes",
+    INFERRED_SECTION_TITLE,
     GAPS_SECTION_TITLE,
     TRACEABILITY_SECTION_TITLE,
 )

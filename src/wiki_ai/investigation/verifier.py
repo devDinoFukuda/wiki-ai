@@ -14,6 +14,7 @@ from wiki_ai.repository.snapshot import RepositorySnapshot
 from wiki_ai.investigation.evidence import CaptureRegistry, capture_id, detect_content
 from wiki_ai.investigation.finding import EvidenceRef, Finding, RelationClaim
 from wiki_ai.knowledge.grounding import (
+    RELATION_STATEMENT_COMPONENT,
     GroundingCheck,
     check_component,
     check_relation_predicate,
@@ -275,6 +276,15 @@ def _relation_grounding(
     return checks, source.ok and target.ok and predicate.ok
 
 
+def _missing_statement_check() -> GroundingCheck:
+    return GroundingCheck(
+        component=RELATION_STATEMENT_COMPONENT,
+        terms_required=(),
+        terms_found=(),
+        ok=False,
+    )
+
+
 def verify_relation(
     finding: Finding,
     claim: RelationClaim,
@@ -310,6 +320,19 @@ def verify_relation(
         return RelationCheck(
             index=index,
             confidence=Confidence.INFERRED,
+            reasons=tuple(reasons),
+        )
+    if not claim.statement:
+        reasons.append(
+            f"relation {claim.kind.value} to {claim.label!r} carries no statement "
+            "saying what the excerpt proves, so the excerpt alone cannot support it"
+        )
+        return RelationCheck(
+            index=index,
+            evidence_valid=True,
+            confidence=Confidence.INFERRED,
+            evidence=tuple(resolved),
+            grounding=(_missing_statement_check(),),
             reasons=tuple(reasons),
         )
     grounding, grounded = _relation_grounding(finding, claim, resolved)

@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Mapping, Sequence
 
 from wiki_ai.knowledge.gaps import open_gap
-from wiki_ai.knowledge.model import Entity, EntityId
+from wiki_ai.knowledge.model import Entity, EntityId, GraphPolicy
 from wiki_ai.knowledge.query import CapabilityProfile, KnowledgeQuery
 from wiki_ai.knowledge.repository import RevisionTransaction
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -251,7 +251,9 @@ def profile_gaps(
     capability_id: EntityId,
     rules: Sequence[SectionRule] = SECTION_RULES,
 ) -> tuple[SectionGap, ...]:
-    profile = query.capability_profile(capability_id)
+    profile = KnowledgeQuery(
+        query.repository, policy=GraphPolicy.SUPPORTED_AND_INFERRED
+    ).capability_profile(capability_id)
     if profile is None:
         return ()
     filled = _filled_sections(profile)
@@ -314,13 +316,14 @@ def _purpose_of(capability: Entity) -> str:
 def _neighbourhood(
     query: KnowledgeQuery, capability_id: EntityId
 ) -> tuple[tuple[str, str, str], ...]:
+    audit = KnowledgeQuery(query.repository, policy=GraphPolicy.ALL)
     found: list[tuple[str, str, str]] = []
-    for relation, entity in query.neighbors(capability_id, limit=1000):
+    for relation, entity in audit.neighbors(capability_id, limit=1000):
         found.append((relation.kind, entity.kind, entity.name))
-    for member_relation, member in query.neighbors(
+    for member_relation, member in audit.neighbors(
         capability_id, RelationKind.BELONGS_TO, limit=1000
     ):
-        for relation, entity in query.neighbors(member.id, limit=1000):
+        for relation, entity in audit.neighbors(member.id, limit=1000):
             found.append((relation.kind, entity.kind, entity.name))
         found.append((member_relation.kind, member.kind, member.name))
     return tuple(dict.fromkeys(found))

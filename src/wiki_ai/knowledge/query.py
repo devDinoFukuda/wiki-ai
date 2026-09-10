@@ -8,13 +8,22 @@ from .comparison import ComparisonFinding, ComparisonReport
 from .comparison import compare as compare_repository
 from .gaps import blocking_gaps, gaps_about, open_gaps
 from .gate import KnowledgeProvenance, provenance
-from .model import Confidence, Entity, EntityId, KnowledgeState, Evidence, Relation
+from .model import (
+    Confidence,
+    Entity,
+    EntityId,
+    GraphPolicy,
+    KnowledgeState,
+    Evidence,
+    Relation,
+)
 from .relations import neighbor_ids
 from .repository import ENTITY_COLUMNS, KnowledgeRepository
 from .taxonomy import EntityKind, RelationKind
 
 __all__ = [
     "CapabilityProfile",
+    "GraphPolicy",
     "ComparisonFinding",
     "ComparisonReport",
     "DEFAULT_LIMIT",
@@ -156,12 +165,21 @@ def _relation_values(
 
 
 class KnowledgeQuery:
-    def __init__(self, repository: KnowledgeRepository) -> None:
+    def __init__(
+        self,
+        repository: KnowledgeRepository,
+        policy: GraphPolicy = GraphPolicy.SUPPORTED_ONLY,
+    ) -> None:
         self._repo = repository
+        self._policy = policy
 
     @property
     def repository(self) -> KnowledgeRepository:
         return self._repo
+
+    @property
+    def policy(self) -> GraphPolicy:
+        return self._policy
 
     def provenance(self) -> KnowledgeProvenance:
         return provenance(self._repo)
@@ -173,7 +191,11 @@ class KnowledgeQuery:
         direction: str = DIRECTION_BOTH,
     ) -> tuple[str, ...]:
         return neighbor_ids(
-            self._repo.conn, entity_id, direction, _relation_values(relation_kind)
+            self._repo.conn,
+            entity_id,
+            direction,
+            _relation_values(relation_kind),
+            policy=self._policy,
         )
 
     def entities(
@@ -232,7 +254,9 @@ class KnowledgeQuery:
         offset: int = 0,
     ) -> tuple[tuple[Relation, Entity], ...]:
         kinds = _relation_values(relation_kind)
-        found = self._repo.relations_of(entity_id, direction, kinds or None)
+        found = self._repo.relations_of(
+            entity_id, direction, kinds or None, policy=self._policy
+        )
         pairs: list[tuple[Relation, Entity]] = []
         for relation in found:
             other = (
@@ -267,7 +291,7 @@ class KnowledgeQuery:
             if len(edges) >= max(0, max_depth):
                 continue
             for relation in self._repo.relations_of(
-                EntityId(nodes[-1]), DIRECTION_OUT, kinds or None
+                EntityId(nodes[-1]), DIRECTION_OUT, kinds or None, policy=self._policy
             ):
                 target = relation.target_id.value
                 if target in nodes:
@@ -294,7 +318,7 @@ class KnowledgeQuery:
     ) -> tuple[tuple[Entity, str | None], ...]:
         owned: list[tuple[int, Entity]] = []
         for relation in self._repo.relations_of(
-            entity_id, DIRECTION_IN, (RelationKind.BELONGS_TO.value,)
+            entity_id, DIRECTION_IN, (RelationKind.BELONGS_TO.value,), policy=self._policy
         ):
             step = self._repo.get_entity(relation.source_id)
             if step is None or step.kind != EntityKind.FLOW_STEP.value:
@@ -312,6 +336,7 @@ class KnowledgeQuery:
                 current,
                 DIRECTION_OUT,
                 tuple(kind.value for kind in FLOW_RELATIONS),
+                policy=self._policy,
             ):
                 target = self._repo.get_entity(relation.target_id)
                 if target is None or target.id.value in seen:
@@ -448,7 +473,9 @@ class KnowledgeQuery:
             node, level = queue.popleft()
             if level >= max(0, max_depth):
                 continue
-            for relation in self._repo.relations_of(EntityId(node), DIRECTION_IN, kinds):
+            for relation in self._repo.relations_of(
+                EntityId(node), DIRECTION_IN, kinds, policy=self._policy
+            ):
                 origin = relation.source_id.value
                 if origin in seen:
                     continue
@@ -497,7 +524,10 @@ class KnowledgeQuery:
     def _members(self, container_id: EntityId) -> tuple[Entity, ...]:
         found: list[Entity] = []
         for relation in self._repo.relations_of(
-            container_id, DIRECTION_IN, (RelationKind.BELONGS_TO.value,)
+            container_id,
+            DIRECTION_IN,
+            (RelationKind.BELONGS_TO.value,),
+            policy=self._policy,
         ):
             member = self._repo.get_entity(relation.source_id)
             if member is not None:
@@ -512,7 +542,9 @@ class KnowledgeQuery:
         kind: EntityKind | None,
     ) -> tuple[Entity, ...]:
         found: list[Entity] = []
-        for edge in self._repo.relations_of(entity_id, direction, (relation.value,)):
+        for edge in self._repo.relations_of(
+            entity_id, direction, (relation.value,), policy=self._policy
+        ):
             other = edge.target_id if direction == DIRECTION_OUT else edge.source_id
             node = self._repo.get_entity(other)
             if node is None:

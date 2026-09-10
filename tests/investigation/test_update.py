@@ -654,3 +654,56 @@ def test_the_gate_is_clean_after_the_relation_only_invalidation(wired) -> None:
     UpdateEngine().run(previous, current, knowledge, None, NAMESPACE)
     found = knowledge_gate(knowledge, {NAMESPACE: current.digest})
     assert BLOCKING_RULES.isdisjoint({item.rule for item in found})
+
+
+def restore_wiring(root: Path):
+    write(root, WIRING, _WIRING_V1)
+    return snapshot_of(root)
+
+
+def test_a_relation_whose_evidence_returns_becomes_supported_again(wired) -> None:
+    root, previous, knowledge = wired
+    changed = change_wiring(root)
+    UpdateEngine().run(previous, changed, knowledge, None, NAMESPACE)
+    assert only_relation(knowledge).confidence is not Confidence.SUPPORTED
+    restored = restore_wiring(root)
+    assert restored.digest == previous.digest
+    Investigator().run(
+        OBJECTIVE,
+        restored,
+        knowledge,
+        FakeProvider(scripts=[wiring_script()]),
+        NAMESPACE,
+    )
+    relation = only_relation(knowledge)
+    assert relation.confidence is Confidence.SUPPORTED
+    linked = knowledge.evidence_for_relation(relation.id)
+    assert linked
+    assert [item.invalidated_at for item in linked] == [""] * len(linked)
+    found = knowledge_gate(knowledge, {NAMESPACE: restored.digest})
+    assert BLOCKING_RULES.isdisjoint({item.rule for item in found})
+
+
+def test_an_entity_whose_evidence_returns_becomes_supported_again(wired) -> None:
+    root, previous, knowledge = wired
+    changed = change_wiring(root)
+    UpdateEngine().run(previous, changed, knowledge, None, NAMESPACE)
+    restored = restore_wiring(root)
+    Investigator().run(
+        OBJECTIVE,
+        restored,
+        knowledge,
+        FakeProvider(scripts=[wiring_script()]),
+        NAMESPACE,
+    )
+    for name, kind in (
+        ("OrderRepository save", EntityKind.OPERATION.value),
+        ("OrderProducer emit", EntityKind.INTEGRATION.value),
+    ):
+        entity = entity_named(knowledge, kind, name)
+        assert entity.confidence is Confidence.SUPPORTED
+        active = knowledge.evidence_for(entity.id)
+        assert active
+        assert [item.invalidated_at for item in active] == [""] * len(active)
+    found = knowledge_gate(knowledge, {NAMESPACE: restored.digest})
+    assert BLOCKING_RULES.isdisjoint({item.rule for item in found})

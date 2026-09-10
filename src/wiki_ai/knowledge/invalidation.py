@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 from .gaps import open_gap
-from .model import Confidence, EntityId, KnowledgeState, SourceVersion
+from .model import Confidence, EntityId, GraphPolicy, KnowledgeState, SourceVersion
 from .repository import KnowledgeRepository, RevisionTransaction
 
 ENTITY_TARGET = "entity"
@@ -140,7 +140,9 @@ def relations_of_entities(
 ) -> tuple[str, ...]:
     found: set[str] = set()
     for raw in entity_ids:
-        for relation in repository.relations_of(EntityId(raw)):
+        for relation in repository.relations_of(
+            EntityId(raw), policy=GraphPolicy.ALL
+        ):
             found.add(relation.id)
     return tuple(sorted(found))
 

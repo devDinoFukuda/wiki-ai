@@ -143,7 +143,9 @@ class IngestionEngine:
         faults = ingested.faults
         self._register(ingested, knowledge, namespace)
         outcome = SemanticOutcome()
+        investigated = False
         if provider is not None and not faults:
+            investigated = True
             outcome = self._investigate(ingested, knowledge, provider, namespace)
             diagnostics.extend(outcome.diagnostics)
             diagnostics.extend(f"gap:{item}" for item in outcome.gaps_opened)
@@ -164,7 +166,7 @@ class IngestionEngine:
             status=status,
             reason=reason,
             diagnostics=tuple(dict.fromkeys(diagnostics)),
-            provider_used=provider is not None,
+            provider_used=investigated,
         )
 
     def _investigate(

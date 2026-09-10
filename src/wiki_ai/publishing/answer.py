@@ -34,7 +34,7 @@ from .answer_session import (
     envelope_of,
     validate_envelope,
 )
-from .query_harness import KnowledgeQueryHarness, QueryLimits
+from .query_harness import KnowledgeQueryHarness, QueryFactory, QueryLimits
 
 __all__ = [
     "ANSWER_LIMIT",
@@ -119,7 +119,7 @@ class SessionProvider(Protocol):
 class Answerer:
     def __init__(
         self,
-        query_factory: Callable[[KnowledgeRepository], KnowledgeQuery] = KnowledgeQuery,
+        query_factory: QueryFactory = KnowledgeQuery,
         enricher: AnswerEnricher | None = None,
         limits: QueryLimits | None = None,
         round_calls: int = ANSWER_ROUND_CALLS,

@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from wiki_ai.knowledge import (
+    Confidence,
     Entity,
     EntityId,
+    GraphPolicy,
     InvalidKind,
     KnowledgeRepository,
     Relation,
@@ -71,24 +73,29 @@ def test_entity_exists_reflects_storage(graph):
 
 def test_neighborhood_out_only(graph):
     repo, nodes = graph
-    kinds = sorted(r.kind for r in neighborhood(repo.conn, nodes["A"].id, "out"))
+    kinds = sorted(
+        r.kind
+        for r in neighborhood(repo.conn, nodes["A"].id, "out", policy=GraphPolicy.ALL)
+    )
     assert kinds == ["calls", "depends_on"]
 
 
 def test_neighborhood_in_only(graph):
     repo, nodes = graph
-    found = neighborhood(repo.conn, nodes["A"].id, "in")
+    found = neighborhood(repo.conn, nodes["A"].id, "in", policy=GraphPolicy.ALL)
     assert [r.kind for r in found] == ["implements"]
 
 
 def test_neighborhood_both_directions(graph):
     repo, nodes = graph
-    assert len(neighborhood(repo.conn, nodes["A"].id, "both")) == 3
+    assert len(neighborhood(repo.conn, nodes["A"].id, "both", policy=GraphPolicy.ALL)) == 3
 
 
 def test_neighborhood_filters_by_kind(graph):
     repo, nodes = graph
-    found = neighborhood(repo.conn, nodes["A"].id, "both", kinds=["calls"])
+    found = neighborhood(
+        repo.conn, nodes["A"].id, "both", kinds=["calls"], policy=GraphPolicy.ALL
+    )
     assert [r.kind for r in found] == ["calls"]
 
 
@@ -100,13 +107,18 @@ def test_neighborhood_rejects_unknown_direction(graph):
 
 def test_neighbor_ids_returns_the_other_end(graph):
     repo, nodes = graph
-    assert neighbor_ids(repo.conn, nodes["A"].id, "out", ["calls"]) == (nodes["B"].id.value,)
+    assert neighbor_ids(
+        repo.conn, nodes["A"].id, "out", ["calls"], policy=GraphPolicy.ALL
+    ) == (nodes["B"].id.value,)
 
 
 def test_relations_of_delegates_to_neighborhood(graph):
     repo, nodes = graph
-    assert len(repo.relations_of(nodes["A"].id)) == 3
-    assert len(repo.relations_of(nodes["A"].id, "out", ["depends_on"])) == 1
+    assert len(repo.relations_of(nodes["A"].id, policy=GraphPolicy.ALL)) == 3
+    assert (
+        len(repo.relations_of(nodes["A"].id, "out", ["depends_on"], policy=GraphPolicy.ALL))
+        == 1
+    )
 
 
 def test_relation_attributes_survive_roundtrip(graph):
@@ -116,7 +128,7 @@ def test_relation_attributes_survive_roundtrip(graph):
     )
     with repo.begin_revision("pipeline", "atributos") as revision:
         revision.put_relation(relation)
-    stored = repo.relations_of(nodes["C"].id, "out", ["calls"])[0]
+    stored = repo.relations_of(nodes["C"].id, "out", ["calls"], policy=GraphPolicy.ALL)[0]
     assert stored == relation
     assert dict(stored.attributes) == {"protocol": "http", "count": 3}
 
@@ -149,4 +161,69 @@ def test_cycle_allowed_for_ordinary_kinds(graph):
     repo, nodes = graph
     with repo.begin_revision("pipeline", "ciclo de chamada") as revision:
         revision.put_relation(Relation.create("calls", nodes["C"].id, nodes["A"].id))
-    assert len(repo.relations_of(nodes["C"].id, "out", ["calls"])) == 1
+    assert len(repo.relations_of(nodes["C"].id, "out", ["calls"], policy=GraphPolicy.ALL)) == 1
+
+
+def test_neighborhood_hides_unresolved_relations_by_default(graph):
+    repo, nodes = graph
+
+    assert neighborhood(repo.conn, nodes["A"].id, "out", ["calls"]) == []
+    assert repo.relations_of(nodes["A"].id) == []
+
+
+def test_all_policy_exposes_unresolved_relations_with_confidence(graph):
+    repo, nodes = graph
+
+    found = neighborhood(repo.conn, nodes["A"].id, "out", ["calls"], policy=GraphPolicy.ALL)
+
+    assert [item.confidence for item in found] == [Confidence.UNRESOLVED]
+    assert found[0].to_dict()["confidence"] == "unresolved"
+
+
+def test_supported_and_inferred_policy_drops_unresolved_and_contradicted(graph):
+    repo, nodes = graph
+    with repo.begin_revision("pipeline", "graus") as revision:
+        revision.put_relation(
+            Relation.create(
+                "calls",
+                nodes["A"].id,
+                nodes["B"].id,
+                confidence=Confidence.INFERRED,
+            )
+        )
+        revision.put_relation(
+            Relation.create(
+                "depends_on",
+                nodes["A"].id,
+                nodes["C"].id,
+                confidence=Confidence.CONTRADICTED,
+            )
+        )
+
+    found = neighborhood(
+        repo.conn,
+        nodes["A"].id,
+        "out",
+        policy=GraphPolicy.SUPPORTED_AND_INFERRED,
+    )
+
+    assert [item.kind for item in found] == ["calls"]
+
+
+def test_neighbor_ids_honours_the_policy(graph):
+    repo, nodes = graph
+
+    assert neighbor_ids(repo.conn, nodes["A"].id, "out", ["calls"]) == ()
+    assert neighbor_ids(
+        repo.conn, nodes["A"].id, "out", ["calls"], policy=GraphPolicy.ALL
+    ) == (nodes["B"].id.value,)
+
+
+def test_graph_policy_allows_matches_each_confidence() -> None:
+    assert GraphPolicy.SUPPORTED_ONLY.allows(Confidence.SUPPORTED) is True
+    assert GraphPolicy.SUPPORTED_ONLY.allows(Confidence.INFERRED) is False
+    assert GraphPolicy.SUPPORTED_AND_INFERRED.allows(Confidence.INFERRED) is True
+    assert (
+        GraphPolicy.SUPPORTED_AND_INFERRED.allows(Confidence.CONTRADICTED) is False
+    )
+    assert all(GraphPolicy.ALL.allows(item) for item in Confidence)

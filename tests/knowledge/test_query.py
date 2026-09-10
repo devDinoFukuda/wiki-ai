@@ -320,7 +320,7 @@ def test_supported_relation_needs_evidence_or_supported_endpoints(graph):
         with repo.begin_revision("pipeline", "relacao sem lastro") as revision:
             revision.put_relation(
                 Relation.create(
-                    "calls",
+                    "depends_on",
                     graph.id("capability"),
                     graph.id("integration"),
                     confidence=Confidence.SUPPORTED,

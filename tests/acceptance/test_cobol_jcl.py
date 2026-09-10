@@ -25,7 +25,7 @@ from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.app import api
 from wiki_ai.app.commands import EXIT_OK, main
 from wiki_ai.app.session import Session
-from wiki_ai.knowledge.model import Confidence
+from wiki_ai.knowledge.model import Confidence, GraphPolicy
 from wiki_ai.knowledge.taxonomy import EntityKind
 
 BLOCKING_WORDS: tuple[str, ...] = (
@@ -91,11 +91,15 @@ def test_call_and_perform_are_followed_by_investigation(
         }
         assert "TAXCALC" in operations
         billrun = entity_named(knowledge, EntityKind.PROCEDURE, "BILLRUN")
+        edges = knowledge.relations_of(
+            billrun.id, "out", ("calls",), policy=GraphPolicy.SUPPORTED_AND_INFERRED
+        )
         called = {
-            knowledge.get_entity(relation.target_id).name
-            for relation in knowledge.relations_of(billrun.id, "out", ("calls",))
+            knowledge.get_entity(relation.target_id).name for relation in edges
         }
         assert "PAYRUN" in called
+        assert {relation.confidence for relation in edges} == {Confidence.INFERRED}
+        assert list(knowledge.relations_of(billrun.id, "out", ("calls",))) == []
     patterns = {
         str(arguments.get("pattern"))
         for script in cobol_scripts()

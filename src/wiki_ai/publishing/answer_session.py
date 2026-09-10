@@ -19,11 +19,13 @@ from wiki_ai.knowledge.grounding import GroundingCheck, check_component
 from .answer_fallback import provenance
 from .query_harness import (
     GroundingVocabulary,
+    INCLUDE_INFERRED,
     KnowledgeQueryHarness,
     QueryToolError,
     TOOL_ENTITY,
     TOOL_EVIDENCE,
     TOOL_GAPS,
+    TOOL_NEIGHBORS,
     TOOL_SEARCH,
 )
 
@@ -31,6 +33,8 @@ __all__ = [
     "ANSWER_ROUND_CALLS",
     "ANSWER_MAX_SECONDS",
     "ClaimVerdict",
+    "INFERRED_CONFIDENCE",
+    "INFERRED_LABEL",
     "RejectionReason",
     "ValidatedClaim",
     "ValidatedAnswer",
@@ -49,6 +53,8 @@ ANSWER_ROUND_CALLS = 24
 ANSWER_MAX_SECONDS = 300.0
 MAX_CLAIMS = 40
 MAX_UNRESOLVED = 40
+INFERRED_CONFIDENCE = "inferred"
+INFERRED_LABEL = "inferido, sem evidência que sustente a relação"
 
 METHOD_STEPS: tuple[str, ...] = (
     f"locate the entities the question is about with {TOOL_SEARCH}, then read each "
@@ -83,6 +89,14 @@ ANSWER_RULES: tuple[str, ...] = (
     "the free answer text is a draft kept only for audit: the delivered answer is "
     "assembled from the claims that survive validation, so everything that must be "
     "read has to live inside a claim",
+    f"the relation tools walk only the relations the evidence sustains; passing "
+    f"{INCLUDE_INFERRED} true to {TOOL_NEIGHBORS} and its siblings also walks the "
+    "relations the knowledge merely infers, and each one comes back with its own "
+    "relation_confidence",
+    f"a claim that stands on a relation whose relation_confidence is not "
+    f"\"supported\" is only accepted when the claim itself declares "
+    f"confidence \"{INFERRED_CONFIDENCE}\"; without that mark the claim is "
+    "refused, because the reader would take an inference for a fact",
 )
 
 CLAIM_COMPONENT = "claim"
@@ -102,6 +116,7 @@ class RejectionReason(Enum):
     EVIDENCE_NOT_LINKED = "evidence_not_linked"
     EVIDENCE_WITHOUT_EXCERPT = "evidence_without_excerpt"
     NOT_GROUNDED = "claim_not_grounded"
+    UNSUPPORTED_RELATION_CITED = "unsupported_relation_cited"
 
 
 @dataclass(frozen=True)
@@ -419,6 +434,18 @@ def _validate_claim(
             RejectionReason.EVIDENCE_WITHOUT_EXCERPT,
             rejected_evidence_ids=without_excerpt,
         )
+    unsupported = harness.unsupported_relations(entity_ids, evidence_ids)
+    if unsupported and confidence.lower() != INFERRED_CONFIDENCE:
+        return _rejected(
+            statement,
+            entity_ids,
+            evidence_ids,
+            confidence,
+            RejectionReason.UNSUPPORTED_RELATION_CITED,
+            rejected_entity_ids=tuple(
+                relation.target_id.value for relation in unsupported
+            ),
+        )
     vocabulary = harness.grounding_vocabulary(entity_ids, evidence_ids)
     grounding = claim_grounding(statement, vocabulary)
     if not grounding.ok:
@@ -488,6 +515,8 @@ def compose_answer(
     statements: list[str] = []
     for claim in validated.supported_claims:
         sentence = claim.statement.rstrip()
+        if claim.confidence.lower() == INFERRED_CONFIDENCE:
+            sentence = f"{sentence.rstrip('.')} ({INFERRED_LABEL})"
         if not sentence.endswith((".", "!", "?", ":")):
             sentence = f"{sentence}."
         if sentence not in statements:

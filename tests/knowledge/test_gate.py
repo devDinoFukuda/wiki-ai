@@ -70,7 +70,7 @@ def test_supported_entity_without_evidence_is_a_violation(graph):
 def test_supported_relation_without_evidence_is_a_violation(graph):
     repo = graph.repository
     relation = Relation.create(
-        "calls", graph.id("capability"), graph.id("integration")
+        "depends_on", graph.id("capability"), graph.id("integration")
     )
     with repo.begin_revision("pipeline", "relacao") as revision:
         revision.put_relation(relation)
@@ -87,7 +87,7 @@ def test_supported_relation_without_evidence_is_a_violation(graph):
 def test_supported_endpoints_do_not_excuse_a_relation_without_evidence(graph):
     repo = graph.repository
     relation = Relation.create(
-        "calls", graph.id("capability"), graph.id("integration")
+        "depends_on", graph.id("capability"), graph.id("integration")
     )
     with repo.begin_revision("pipeline", "relacao") as revision:
         revision.put_relation(relation)
@@ -108,7 +108,7 @@ def test_supported_endpoints_do_not_excuse_a_relation_without_evidence(graph):
 def test_supported_relation_with_its_own_evidence_passes(graph):
     repo = graph.repository
     relation = Relation.create(
-        "calls", graph.id("capability"), graph.id("integration")
+        "depends_on", graph.id("capability"), graph.id("integration")
     )
     with repo.begin_revision("pipeline", "relacao") as revision:
         revision.put_relation(relation)

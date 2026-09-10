@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Sequence
 
 from wiki_ai.knowledge.gaps import GAP_QUESTION, blocking_gaps
-from wiki_ai.knowledge.model import Entity
+from wiki_ai.knowledge.model import Entity, GraphPolicy
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import RelationKind
 
@@ -84,7 +84,12 @@ def _package_violations(
 
 def _subjects_of(knowledge: KnowledgeRepository, gap: Entity) -> tuple[str, ...]:
     names: list[str] = []
-    for relation in knowledge.relations_of(gap.id, "out", (RelationKind.AFFECTS.value,)):
+    for relation in knowledge.relations_of(
+        gap.id,
+        "out",
+        (RelationKind.AFFECTS.value,),
+        policy=GraphPolicy.ALL,
+    ):
         subject = knowledge.get_entity(relation.target_id)
         if subject is not None:
             names.append(subject.name)

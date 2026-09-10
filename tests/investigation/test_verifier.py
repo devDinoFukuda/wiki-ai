@@ -463,3 +463,94 @@ def test_the_relation_grounding_reports_source_target_and_predicate(
         "relation_target",
         "relation_predicate",
     ]
+
+
+ACCESSOR = (
+    "class OrderService {\n"
+    "    OrderRepository repository;\n"
+    "    OrderRepository repository() {\n"
+    "        return repository;\n"
+    "    }\n"
+    "}\n"
+)
+
+SAVES = (
+    "class OrderService {\n"
+    "    OrderRepository repository;\n"
+    "    String place(Order order) {\n"
+    "        return repository.save(order);\n"
+    "    }\n"
+    "}\n"
+)
+
+
+def test_a_calls_relation_over_a_getter_returning_the_field_stays_inferred(
+    tmp_path: Path,
+) -> None:
+    check = relation_report(
+        tmp_path,
+        ACCESSOR,
+        RelationClaim(
+            kind=RelationKind.CALLS,
+            target_subject="OrderRepository",
+            statement="OrderService calls OrderRepository",
+            evidence=relation_evidence(ACCESSOR),
+        ),
+    )
+    assert check.evidence_valid
+    assert not check.claim_supported
+    assert check.confidence is Confidence.INFERRED
+
+
+def test_a_calls_relation_over_a_save_invocation_with_a_statement_is_supported(
+    tmp_path: Path,
+) -> None:
+    check = relation_report(
+        tmp_path,
+        SAVES,
+        RelationClaim(
+            kind=RelationKind.CALLS,
+            target_subject="OrderRepository",
+            statement="OrderService delega persistencia a OrderRepository.save",
+            evidence=relation_evidence(SAVES),
+        ),
+    )
+    assert check.evidence_valid
+    assert check.claim_supported
+    assert check.confidence is Confidence.SUPPORTED
+
+
+def test_a_relation_without_a_statement_stays_inferred_over_an_invocation(
+    tmp_path: Path,
+) -> None:
+    check = relation_report(
+        tmp_path,
+        SAVES,
+        RelationClaim(
+            kind=RelationKind.CALLS,
+            target_subject="OrderRepository",
+            evidence=relation_evidence(SAVES),
+        ),
+    )
+    assert check.evidence_valid
+    assert not check.claim_supported
+    assert check.confidence is Confidence.INFERRED
+    assert [item.component for item in check.grounding] == ["relation_statement"]
+    assert any("no statement" in reason for reason in check.reasons)
+
+
+def test_an_empty_statement_blocks_support_the_same_way_as_a_missing_one(
+    tmp_path: Path,
+) -> None:
+    check = relation_report(
+        tmp_path,
+        SAVES,
+        RelationClaim(
+            kind=RelationKind.CALLS,
+            target_subject="OrderRepository",
+            statement="   ",
+            evidence=relation_evidence(SAVES),
+        ),
+    )
+    assert not check.claim_supported
+    assert check.confidence is Confidence.INFERRED

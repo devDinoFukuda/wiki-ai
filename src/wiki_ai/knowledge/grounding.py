@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .errors import PayloadInvalid
+from .invocation import invocation_targets
 
 __all__ = [
     "GroundingCheck",
@@ -17,15 +18,24 @@ __all__ = [
     "STOPWORDS",
     "MIN_TERM_LENGTH",
     "INVOCATION_MARKER",
+    "ASSIGNMENT_MARKER",
+    "SQL_READ_MARKER",
+    "SQL_WRITE_MARKER",
+    "IO_SEND_MARKER",
+    "IO_RECEIVE_MARKER",
+    "STRUCTURAL_MARKERS",
+    "STRUCTURAL_KINDS",
     "RELATION_PREDICATES_PATH",
     "RELATION_PREDICATE_COMPONENT",
     "RELATION_STATEMENT_COMPONENT",
     "key_terms",
     "mandatory_terms",
     "excerpt_vocabulary",
+    "invocation_targets",
     "check_component",
     "check_relation_predicate",
     "relation_predicate_terms",
+    "relation_predicate_lexicon",
     "symbol_defined_or_referenced",
 ]
 
@@ -259,9 +269,58 @@ NEGATIONS: frozenset[str] = frozenset(
 NEGATION_MARKER = "!negated"
 
 INVOCATION_MARKER = "!invocation"
+ASSIGNMENT_MARKER = "!assignment"
+SQL_READ_MARKER = "!sql_read"
+SQL_WRITE_MARKER = "!sql_write"
+IO_SEND_MARKER = "!io_send"
+IO_RECEIVE_MARKER = "!io_receive"
 
-_INVOCATION = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*\s*[.:>-]{1,2}\s*[A-Za-z_][A-Za-z0-9_]*\s*\("
+CALLEE_PREFIX = "!callee:"
+
+STRUCTURAL_MARKERS: frozenset[str] = frozenset(
+    {
+        INVOCATION_MARKER,
+        ASSIGNMENT_MARKER,
+        SQL_READ_MARKER,
+        SQL_WRITE_MARKER,
+        IO_SEND_MARKER,
+        IO_RECEIVE_MARKER,
+    }
+)
+
+STRUCTURAL_KINDS: frozenset[str] = frozenset(
+    {
+        "calls",
+        "triggers",
+        "reads",
+        "writes",
+        "persists_to",
+        "publishes",
+        "consumes",
+    }
+)
+
+_ASSIGNMENT = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_.\[\]]*\s*(?::=|=)(?!=)\s*\S"
+)
+
+_SQL_READ = re.compile(
+    r"\bselect\b[\s\S]{0,200}?\bfrom\b", re.IGNORECASE
+)
+
+_SQL_WRITE = re.compile(
+    r"\b(?:insert\s+into|update\s+[A-Za-z_]|delete\s+from|merge\s+into)",
+    re.IGNORECASE,
+)
+
+_IO_SEND = re.compile(
+    r"\b(?:send|sends|emit|emits|publish|publishes|post)[A-Za-z_]*\s*\(",
+    re.IGNORECASE,
+)
+
+_IO_RECEIVE = re.compile(
+    r"\b(?:subscribe|subscribes|consume|consumes|receive|receives|on)[A-Za-z_]*\s*\(",
+    re.IGNORECASE,
 )
 
 _ADVERB_SUFFIXES: tuple[str, ...] = ("mente", "ly")
@@ -594,8 +653,23 @@ def excerpt_vocabulary(excerpt: str) -> frozenset[str]:
         vocabulary.add(match.group(1).strip().lower())
     for match in _OPERATOR.finditer(folded):
         vocabulary.add(match.group(0))
-    if _INVOCATION.search(folded):
+    for marker, pattern in (
+        (ASSIGNMENT_MARKER, _ASSIGNMENT),
+        (SQL_READ_MARKER, _SQL_READ),
+        (SQL_WRITE_MARKER, _SQL_WRITE),
+        (IO_SEND_MARKER, _IO_SEND),
+        (IO_RECEIVE_MARKER, _IO_RECEIVE),
+    ):
+        if pattern.search(folded):
+            vocabulary.add(marker)
+    for name in invocation_targets(folded):
         vocabulary.add(INVOCATION_MARKER)
+        vocabulary.add(f"{CALLEE_PREFIX}{name}")
+        if name.isalpha():
+            vocabulary.add(f"{CALLEE_PREFIX}{_stem(name)}")
+        for piece in _split_identifier(name):
+            vocabulary.add(f"{CALLEE_PREFIX}{piece}")
+            vocabulary.add(f"{CALLEE_PREFIX}{_stem(piece)}")
     for token in tuple(vocabulary):
         if token.isalpha():
             vocabulary.add(_stem(token))
@@ -671,8 +745,34 @@ def symbol_defined_or_referenced(
     )
 
 
+@dataclass(frozen=True)
+class RelationLexicon:
+    kind: str
+    strong: tuple[str, ...]
+    structural: tuple[str, ...]
+
+    @property
+    def terms(self) -> tuple[str, ...]:
+        return self.structural + self.strong
+
+    @property
+    def demands_structure(self) -> bool:
+        return self.kind in STRUCTURAL_KINDS
+
+
+_EMPTY_LEXICON = RelationLexicon(kind="", strong=(), structural=())
+
+
+def _terms_of(kind: str, payload: Any, label: str) -> tuple[str, ...]:
+    if not isinstance(payload, (list, tuple)):
+        raise PayloadInvalid(
+            f"{RELATION_PREDICATES_PATH}: {kind}.{label} exige sequência de termos"
+        )
+    return tuple(dict.fromkeys(str(term).strip().lower() for term in payload if str(term).strip()))
+
+
 @lru_cache(maxsize=1)
-def _relation_predicates() -> Mapping[str, tuple[str, ...]]:
+def _relation_predicates() -> Mapping[str, RelationLexicon]:
     try:
         raw = RELATION_PREDICATES_PATH.read_text(encoding="utf-8")
     except OSError as exc:
@@ -683,41 +783,89 @@ def _relation_predicates() -> Mapping[str, tuple[str, ...]]:
         raise PayloadInvalid(f"{RELATION_PREDICATES_PATH}: {exc}") from exc
     if not isinstance(payload, Mapping):
         raise PayloadInvalid(f"{RELATION_PREDICATES_PATH}: payload não é mapeamento")
-    lexicon: dict[str, tuple[str, ...]] = {}
-    for kind, terms in payload.items():
-        if not isinstance(terms, (list, tuple)):
+    lexicon: dict[str, RelationLexicon] = {}
+    for raw_kind, entry in payload.items():
+        kind = str(raw_kind).strip().lower()
+        if not isinstance(entry, Mapping):
             raise PayloadInvalid(
-                f"{RELATION_PREDICATES_PATH}: {kind} exige sequência de termos"
+                f"{RELATION_PREDICATES_PATH}: {kind} exige mapeamento strong/structural"
             )
-        lexicon[str(kind)] = tuple(dict.fromkeys(str(term).lower() for term in terms))
+        strong = _terms_of(kind, entry.get("strong", ()), "strong")
+        structural = _terms_of(kind, entry.get("structural", ()), "structural")
+        if not strong:
+            raise PayloadInvalid(
+                f"{RELATION_PREDICATES_PATH}: {kind} sem termos strong"
+            )
+        unknown = tuple(term for term in structural if term not in STRUCTURAL_MARKERS)
+        if unknown:
+            raise PayloadInvalid(
+                f"{RELATION_PREDICATES_PATH}: {kind} cita marcador estrutural "
+                f"desconhecido: {', '.join(unknown)}"
+            )
+        lexicon[kind] = RelationLexicon(
+            kind=kind, strong=strong, structural=structural
+        )
     return lexicon
 
 
+def relation_predicate_lexicon(kind: str) -> RelationLexicon:
+    return _relation_predicates().get((kind or "").strip().lower(), _EMPTY_LEXICON)
+
+
 def relation_predicate_terms(kind: str) -> tuple[str, ...]:
-    return _relation_predicates().get((kind or "").strip().lower(), ())
+    return relation_predicate_lexicon(kind).terms
 
 
 def _lexicon_stems(kind: str) -> frozenset[str]:
     stems: set[str] = set()
-    for term in relation_predicate_terms(kind):
+    for term in relation_predicate_lexicon(kind).strong:
         stems.add(term)
         if term.isalpha():
             stems.add(_stem(term))
     return frozenset(stems)
 
 
+def _present(term: str, vocabulary: frozenset[str]) -> bool:
+    if term in vocabulary:
+        return True
+    return term.isalpha() and _stem(term) in vocabulary
+
+
+def _distinct_strong(found: Sequence[str]) -> int:
+    roots: set[str] = set()
+    for term in found:
+        roots.add(_stem(term) if term.isalpha() else term)
+    return len(roots)
+
+
 def check_relation_predicate(
     kind: str, statement: str, vocabulary: frozenset[str]
 ) -> GroundingCheck:
-    required = relation_predicate_terms(kind)
-    found = tuple(
-        term for term in required if term in vocabulary or _stem(term) in vocabulary
+    lexicon = relation_predicate_lexicon(kind)
+    required = lexicon.terms
+    strong_found = tuple(
+        term for term in lexicon.strong if _present(term, vocabulary)
     )
+    callees = tuple(
+        term for term in lexicon.strong if f"{CALLEE_PREFIX}{term}" in vocabulary
+    )
+    structural_found = tuple(
+        term for term in lexicon.structural if term in vocabulary
+    )
+    if callees:
+        structural_found = structural_found + tuple(
+            f"{CALLEE_PREFIX}{term}" for term in callees
+        )
+    found = structural_found + strong_found
+    if lexicon.demands_structure:
+        signal_ok = bool(structural_found) or _distinct_strong(strong_found) >= 2
+    else:
+        signal_ok = bool(strong_found)
     statement_text = (statement or "").strip()
-    statement_ok = True
+    statement_ok = False
     if statement_text:
         widened = vocabulary
-        if found:
+        if signal_ok:
             widened = vocabulary | _lexicon_stems(kind)
         statement_ok = check_component(
             RELATION_STATEMENT_COMPONENT, statement_text, widened
@@ -726,6 +874,6 @@ def check_relation_predicate(
         component=RELATION_PREDICATE_COMPONENT,
         terms_required=required,
         terms_found=found,
-        ok=bool(required) and bool(found) and statement_ok,
-        required_terms=required[:1],
+        ok=bool(required) and signal_ok and statement_ok,
+        required_terms=lexicon.structural or lexicon.strong[:1],
     )

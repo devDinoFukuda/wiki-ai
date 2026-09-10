@@ -63,10 +63,11 @@ class StepSpec:
     via: str
     entity_kind: str
     evidence_ids: tuple[str, ...] = ()
+    via_confidence: Confidence = Confidence.SUPPORTED
 
     @property
     def resolved(self) -> bool:
-        return bool(self.evidence_ids)
+        return bool(self.evidence_ids) and self.via_confidence is Confidence.SUPPORTED
 
     @property
     def stable_key(self) -> str:
@@ -355,6 +356,7 @@ def _walk(query: KnowledgeQuery, entrypoint: Entity, max_depth: int) -> tuple[St
                         via=relation.kind,
                         entity_kind=entity.kind,
                         evidence_ids=_evidence_of(query, entity.id),
+                        via_confidence=relation.confidence,
                     )
                 )
                 following.append(entity.id)

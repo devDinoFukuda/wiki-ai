@@ -8,6 +8,7 @@ from wiki_ai.knowledge.correlation import correlate
 from wiki_ai.publishing.answer import Answerer, Intent, classify
 
 from tests.knowledge.inception_fixture import SOURCE_IDS, build
+from tests.publishing.relation_confidence import promote_relations
 
 _INTERNAL_ID = re.compile(r"(ent_|rel_|evd_|srv_)[0-9a-f]{8,}")
 
@@ -26,6 +27,7 @@ INCEPTION_QUESTIONS: tuple[tuple[str, Intent], ...] = (
 def inception(tmp_path):
     fixture = build(tmp_path)
     correlate(fixture.repository, "ns")
+    promote_relations(fixture.repository)
     yield fixture
     fixture.repository.close()
 

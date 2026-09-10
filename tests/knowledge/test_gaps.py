@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from wiki_ai.knowledge import Entity, EntityId, KnowledgeQuery, KnowledgeRepository
+from wiki_ai.knowledge import (
+    Entity,
+    EntityId,
+    GraphPolicy,
+    KnowledgeQuery,
+    KnowledgeRepository,
+)
 from wiki_ai.knowledge.errors import GapNotFound, MissingRequiredAttribute
 from wiki_ai.knowledge.gaps import (
     GAP_KIND,
@@ -53,7 +59,9 @@ def test_open_gap_persists_and_links_to_the_subject(graph):
     stored = repo.get_entity(gap_id)
     assert stored is not None
     assert stored.kind == GAP_KIND
-    linked = repo.relations_of(gap_id, "out", (RelationKind.AFFECTS.value,))
+    linked = repo.relations_of(
+        gap_id, "out", (RelationKind.AFFECTS.value,), policy=GraphPolicy.ALL
+    )
     assert [relation.target_id for relation in linked] == [graph.id("integration")]
 
 

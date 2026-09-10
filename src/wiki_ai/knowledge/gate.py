@@ -74,7 +74,7 @@ def _supported_without_evidence(
     for entity in repository.find_entities():
         if entity.confidence is not Confidence.SUPPORTED:
             continue
-        if repository.evidence_for(entity.id):
+        if repository.evidence_for(entity.id, active_only=False):
             continue
         found.append(
             KnowledgeViolation(
@@ -87,7 +87,7 @@ def _supported_without_evidence(
     for relation in repository.find_relations():
         if relation.confidence is not Confidence.SUPPORTED:
             continue
-        if repository.evidence_for_relation(relation.id):
+        if repository.evidence_for_relation(relation.id, active_only=False):
             continue
         found.append(
             KnowledgeViolation(

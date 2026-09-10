@@ -23,7 +23,7 @@ from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.app import api
 from wiki_ai.app.session import Session
 from wiki_ai.knowledge.evidence import CodeContent, CodeLocator
-from wiki_ai.knowledge.model import Confidence, KnowledgeState
+from wiki_ai.knowledge.model import Confidence, GraphPolicy, KnowledgeState
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.taxonomy import EntityKind
 from wiki_ai.publishing.release import RELEASES_DIRNAME
@@ -108,7 +108,7 @@ def test_the_business_rules_are_reconstructed_with_conditions_and_effects(
         ][0]
         assert rule.attributes["conditions"] == ["place is called with a reference"]
         assert rule.attributes["effects"] == [
-            "OrderRepository save receives the reference"
+            "repository save is called with the reference"
         ]
         assert rule.state is KnowledgeState.IMPLEMENTED
         assert knowledge.evidence_for(rule.id)
@@ -167,14 +167,18 @@ def test_the_edge_cases_are_identified(analyzed: Path) -> None:
             if item.name == "place with a null reference"
         ][0]
         assert edge.attributes["condition"] == "reference is null"
-        assert edge.attributes["expected"] == "save receives null"
+        assert edge.attributes["expected"] == "repository save is called with null"
 
 
 def test_a_flow_with_ordered_steps_is_generated(analyzed: Path) -> None:
     with Session.open(analyzed).open_knowledge() as knowledge:
         flows = knowledge.find_entities(EntityKind.FLOW.value)
         assert flows
-        ordered = KnowledgeQuery(knowledge).flow(flows[0].id)
+        query = KnowledgeQuery(
+            knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED
+        )
+        ordered = query.flow(flows[0].id)
+        assert KnowledgeQuery(knowledge).policy is GraphPolicy.SUPPORTED_ONLY
         ordinals = [view.entity.attributes["ordinal"] for view in ordered]
         assert ordinals == sorted(ordinals)
         subjects = [view.entity.attributes["subject"] for view in ordered]

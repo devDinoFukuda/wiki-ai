@@ -102,7 +102,8 @@ def _architectural_script(graph) -> Script:
 
 def _capability_evidence(graph) -> str:
     found = graph.repository.evidence_for(graph.id("capability"))
-    return found[0].id
+    richest = max(found, key=lambda item: (len(item.excerpt), item.id))
+    return richest.id
 
 
 def test_harness_offers_the_ten_read_only_tools(harness):

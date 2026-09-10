@@ -124,26 +124,31 @@ def test_statement_number_present_in_the_excerpt_is_grounded() -> None:
     assert check.ok is True
 
 
-def test_empty_statement_still_requires_the_lexicon() -> None:
+def test_empty_statement_is_never_grounded() -> None:
     grounded = check_relation_predicate(
         RelationKind.CALLS.value, "", excerpt_vocabulary(SAVE_EXCERPT)
     )
     ungrounded = check_relation_predicate(
         RelationKind.CALLS.value, "", excerpt_vocabulary(CONFIGURE_EXCERPT)
     )
+    blank = check_relation_predicate(
+        RelationKind.WRITES.value, "   ", excerpt_vocabulary(SAVE_EXCERPT)
+    )
 
-    assert grounded.ok is True
+    assert grounded.ok is False
     assert ungrounded.ok is False
+    assert blank.ok is False
 
 
 def test_documental_kinds_have_their_own_lexicon() -> None:
     excerpt = "the proposal declares that every order must define a settlement window"
+    statement = "the proposal declares the settlement window of an order"
 
     declares = check_relation_predicate(
-        RelationKind.DECLARES.value, "", excerpt_vocabulary(excerpt)
+        RelationKind.DECLARES.value, statement, excerpt_vocabulary(excerpt)
     )
     calls = check_relation_predicate(
-        RelationKind.CALLS.value, "", excerpt_vocabulary(excerpt)
+        RelationKind.CALLS.value, statement, excerpt_vocabulary(excerpt)
     )
 
     assert declares.ok is True
@@ -163,14 +168,27 @@ def test_retries_lexicon_needs_retry_vocabulary() -> None:
 
 
 def test_falls_back_to_lexicon_needs_fallback_vocabulary() -> None:
+    statement = "on Timeout the remote call degrades to the fallback queue"
     grounded = check_relation_predicate(
         RelationKind.FALLS_BACK_TO.value,
-        "",
-        excerpt_vocabulary("try:\n    remote()\nexcept Timeout:\n    return default"),
+        statement,
+        excerpt_vocabulary(
+            "try:\n    remote()\nexcept Timeout:\n    degrades_to(fallback_queue)"
+        ),
     )
     ungrounded = check_relation_predicate(
-        RelationKind.FALLS_BACK_TO.value, "", excerpt_vocabulary(SAVE_EXCERPT)
+        RelationKind.FALLS_BACK_TO.value, statement, excerpt_vocabulary(SAVE_EXCERPT)
     )
 
     assert grounded.ok is True
     assert ungrounded.ok is False
+
+
+def test_bare_except_no_longer_sustains_falls_back_to() -> None:
+    check = check_relation_predicate(
+        RelationKind.FALLS_BACK_TO.value,
+        "on Timeout the remote call returns the default",
+        excerpt_vocabulary("try:\n    remote()\nexcept Timeout:\n    return default"),
+    )
+
+    assert check.ok is False

@@ -117,7 +117,13 @@ def enrich_capability_excerpt(graph) -> str:
     enriched = make_evidence(
         version.source_id,
         version.version_hash,
-        stored.locator,
+        CodeLocator(
+            path=stored.locator.path,
+            line_start=101,
+            line_end=140,
+            symbol=stored.locator.symbol,
+            content=CodeContent.EXECUTABLE,
+        ),
         GRAPH_CAPABILITY_EXCERPT,
         CAPTURED,
     )

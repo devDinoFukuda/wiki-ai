@@ -5,7 +5,7 @@ import sqlite3
 from typing import Any, Iterable, Sequence
 
 from .errors import RelationCycle, UnknownReference
-from .model import Confidence, EntityId, Relation, validate_kind
+from .model import Confidence, EntityId, GraphPolicy, Relation, validate_kind
 
 DIRECTIONS: tuple[str, ...] = ("out", "in", "both")
 
@@ -62,11 +62,19 @@ def path_exists(
     return False
 
 
+def allowed_confidences(policy: GraphPolicy) -> tuple[str, ...]:
+    return tuple(
+        item.value for item in Confidence if policy.allows(item)
+    )
+
+
 def neighborhood(
     conn: sqlite3.Connection,
     entity: EntityId,
     direction: str = "both",
     kinds: Iterable[str] | None = None,
+    *,
+    policy: GraphPolicy = GraphPolicy.SUPPORTED_ONLY,
 ) -> list[Relation]:
     if direction not in DIRECTIONS:
         raise UnknownReference(
@@ -86,6 +94,10 @@ def neighborhood(
     if selected:
         sql += f" AND kind IN ({','.join('?' for _ in selected)})"
         params.extend(selected)
+    if policy is not GraphPolicy.ALL:
+        allowed = allowed_confidences(policy)
+        sql += f" AND confidence IN ({','.join('?' for _ in allowed)})"
+        params.extend(allowed)
     sql += " ORDER BY kind, relation_id"
     return [row_to_relation(row) for row in conn.execute(sql, params).fetchall()]
 
@@ -95,9 +107,11 @@ def neighbor_ids(
     entity: EntityId,
     direction: str = "both",
     kinds: Iterable[str] | None = None,
+    *,
+    policy: GraphPolicy = GraphPolicy.SUPPORTED_ONLY,
 ) -> tuple[str, ...]:
     found: list[str] = []
-    for relation in neighborhood(conn, entity, direction, kinds):
+    for relation in neighborhood(conn, entity, direction, kinds, policy=policy):
         other = (
             relation.target_id.value
             if relation.source_id == entity

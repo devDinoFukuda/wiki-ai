@@ -11,6 +11,7 @@ from wiki_ai.knowledge.model import (
     Confidence,
     Entity,
     EntityId,
+    GraphPolicy,
     KnowledgeState,
     Evidence,
     Relation,
@@ -91,6 +92,7 @@ def java_graph(repository: KnowledgeRepository) -> Entity:
         revision.put_source_version(VERSION)
         for item in (capability, entry, validation, operation, table, event, rule):
             revision.put_entity(item)
+        edges = []
         for kind, source, target in (
             (RelationKind.BELONGS_TO, entry, capability),
             (RelationKind.BELONGS_TO, rule, capability),
@@ -99,7 +101,19 @@ def java_graph(repository: KnowledgeRepository) -> Entity:
             (RelationKind.PERSISTS_TO, operation, table),
             (RelationKind.PUBLISHES, operation, event),
         ):
-            revision.put_relation(Relation.create(kind.value, source.id, target.id))
+            relation = Relation.create(
+                kind.value,
+                source.id,
+                target.id,
+                confidence=Confidence.SUPPORTED,
+            )
+            revision.put_relation(relation)
+            edges.append(relation)
+        for ordinal, relation in enumerate(edges):
+            revision.put_evidence(
+                evidence_at("Edges.java", 100 + ordinal, 101 + ordinal),
+                relation_ids=(relation.id,),
+            )
         revision.put_evidence(
             evidence_at("OrderController.java", 15, 17), entity_ids=(entry.id,)
         )
@@ -164,18 +178,21 @@ def test_a_step_without_evidence_stays_unresolved(
     orphan = entity(EntityKind.OPERATION, "OrderAudit log", {"verb": "log"})
     with knowledge.begin_revision(author=AUTHOR, summary="orphan") as revision:
         revision.put_entity(orphan)
-        revision.put_relation(
-            Relation.create(
-                RelationKind.CALLS.value,
-                EntityId(
-                    [
-                        item.id.value
-                        for item in knowledge.find_entities(EntityKind.OPERATION.value)
-                        if item.name == "OrderService place"
-                    ][0]
-                ),
-                orphan.id,
-            )
+        edge = Relation.create(
+            RelationKind.CALLS.value,
+            EntityId(
+                [
+                    item.id.value
+                    for item in knowledge.find_entities(EntityKind.OPERATION.value)
+                    if item.name == "OrderService place"
+                ][0]
+            ),
+            orphan.id,
+            confidence=Confidence.SUPPORTED,
+        )
+        revision.put_relation(edge)
+        revision.put_evidence(
+            evidence_at("OrderAudit.java", 5, 6), relation_ids=(edge.id,)
         )
     flows = build_flows(KnowledgeQuery(knowledge), capability.id)
     step = [item for item in flows[0].steps if item.subject == "OrderAudit log"][0]
@@ -228,7 +245,10 @@ def test_the_written_flow_belongs_to_the_capability(
     flows = knowledge.find_entities(EntityKind.FLOW.value)
     assert flows
     relations = knowledge.relations_of(
-        flows[0].id, "out", (RelationKind.BELONGS_TO.value,)
+        flows[0].id,
+        "out",
+        (RelationKind.BELONGS_TO.value,),
+        policy=GraphPolicy.ALL,
     )
     assert [relation.target_id for relation in relations] == [capability.id]
 
@@ -271,3 +291,70 @@ def test_an_unknown_capability_produces_no_flow(
     knowledge: KnowledgeRepository,
 ) -> None:
     assert build_flows(KnowledgeQuery(knowledge), EntityId("ent_missing")) == ()
+
+
+def test_an_inferred_edge_never_becomes_a_flow_step(
+    knowledge: KnowledgeRepository,
+) -> None:
+    capability = java_graph(knowledge)
+    guess = entity(EntityKind.OPERATION, "OrderGuess audit", {"verb": "audit"})
+    with knowledge.begin_revision(author=AUTHOR, summary="guess") as revision:
+        revision.put_entity(guess)
+        revision.put_relation(
+            Relation.create(
+                RelationKind.CALLS.value,
+                EntityId(
+                    [
+                        item.id.value
+                        for item in knowledge.find_entities(EntityKind.OPERATION.value)
+                        if item.name == "OrderService place"
+                    ][0]
+                ),
+                guess.id,
+                confidence=Confidence.INFERRED,
+            )
+        )
+        revision.put_evidence(
+            evidence_at("OrderGuess.java", 7, 8), entity_ids=(guess.id,)
+        )
+    flows = build_flows(KnowledgeQuery(knowledge), capability.id)
+    assert "OrderGuess audit" not in [step.subject for step in flows[0].steps]
+
+
+def test_an_inferred_edge_never_launders_a_step_into_supported(
+    knowledge: KnowledgeRepository,
+) -> None:
+    capability = java_graph(knowledge)
+    guess = entity(EntityKind.OPERATION, "OrderGuess audit", {"verb": "audit"})
+    with knowledge.begin_revision(author=AUTHOR, summary="guess") as revision:
+        revision.put_entity(guess)
+        revision.put_relation(
+            Relation.create(
+                RelationKind.CALLS.value,
+                EntityId(
+                    [
+                        item.id.value
+                        for item in knowledge.find_entities(EntityKind.OPERATION.value)
+                        if item.name == "OrderService place"
+                    ][0]
+                ),
+                guess.id,
+                confidence=Confidence.INFERRED,
+            )
+        )
+        revision.put_evidence(
+            evidence_at("OrderGuess.java", 7, 8), entity_ids=(guess.id,)
+        )
+    query = KnowledgeQuery(knowledge, policy=GraphPolicy.SUPPORTED_AND_INFERRED)
+    flows = build_flows(query, capability.id)
+    step = [item for item in flows[0].steps if item.subject == "OrderGuess audit"][0]
+    assert step.evidence_ids
+    assert not step.resolved
+    with knowledge.begin_revision(author=AUTHOR, summary="flows") as revision:
+        write_flows(revision, query, capability.id, flows)
+    written = [
+        item
+        for item in knowledge.find_entities(EntityKind.FLOW_STEP.value)
+        if item.attributes["subject"] == "OrderGuess audit"
+    ]
+    assert written and written[0].confidence is Confidence.UNRESOLVED

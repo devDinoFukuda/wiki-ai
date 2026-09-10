@@ -13,7 +13,7 @@ from .matching import (
     subject_of,
     tokens,
 )
-from .model import Confidence, Entity, EntityId, KnowledgeState, Relation
+from .model import Confidence, Entity, EntityId, GraphPolicy, KnowledgeState, Relation
 from .repository import KnowledgeRepository, RevisionTransaction
 from .taxonomy import EntityKind, RelationKind, entity_kind, pair_allowed
 
@@ -255,7 +255,7 @@ def _reachable(
         if depth >= MAX_IMPACT_DEPTH:
             continue
         for relation in repository.relations_of(
-            EntityId(node), "both", IMPACT_RELATIONS
+            EntityId(node), "both", IMPACT_RELATIONS, policy=GraphPolicy.ALL
         ):
             for other in (relation.source_id.value, relation.target_id.value):
                 if other in seen:
@@ -473,7 +473,7 @@ def _anchors(
         writer.targets_of(RelationKind.PROPOSES_CHANGE_TO, origin.id.value)
     )
     for relation in repository.relations_of(
-        origin.id, "out", (RelationKind.PROPOSES_CHANGE_TO.value,)
+        origin.id, "out", (RelationKind.PROPOSES_CHANGE_TO.value,), policy=GraphPolicy.ALL
     ):
         found.append(relation.target_id.value)
     return tuple(EntityId(value) for value in dict.fromkeys(found))

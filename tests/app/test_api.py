@@ -728,6 +728,61 @@ def test_repeating_the_new_objective_on_the_same_snapshot_is_up_to_date(
     assert composition.update.calls == 0
 
 
+def _downgrade_contract(root: Path) -> Path:
+    state_path = root / STATE_DIR_NAME / ANALYSIS_STATE_FILE
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["contract_version"] = "1"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    return state_path
+
+
+def test_a_baseline_from_an_older_contract_never_reaches_the_incremental_update(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    composition = _WiringWithRecorders()
+    first = api.analyze(tmp_path, "how does renewal work", composition)
+    assert first.analysis_status == AnalysisStatus.COMPLETE.value
+    _downgrade_contract(tmp_path)
+    (tmp_path / "src" / "extra.py").write_text("other = 2\n", encoding="utf-8")
+    second = api.analyze(tmp_path, "how does renewal work", composition)
+    assert composition.update.calls == 0
+    assert composition.investigation.objectives == [
+        "how does renewal work",
+        "how does renewal work",
+    ]
+    assert second.status == "ok"
+    assert second.reason != api.UP_TO_DATE
+    assert "diff" not in second.details
+    assert second.analyzed_digest == second.snapshot_digest
+    state = Session.open(tmp_path).analysis_state()
+    assert state.contract_version == ANALYSIS_CONTRACT_VERSION
+    assert state.contract_version == "2"
+
+
+def test_an_older_contract_without_repository_changes_is_not_up_to_date(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    composition = _WiringWithRecorders()
+    api.analyze(tmp_path, "how does renewal work", composition)
+    _downgrade_contract(tmp_path)
+    second = api.analyze(tmp_path, "how does renewal work", composition)
+    assert second.reason != api.UP_TO_DATE
+    assert second.status == "ok"
+    assert composition.update.calls == 0
+    assert composition.investigation.objectives == [
+        "how does renewal work",
+        "how does renewal work",
+    ]
+    state = Session.open(tmp_path).analysis_state()
+    assert state.contract_version == ANALYSIS_CONTRACT_VERSION
+
+
+def test_the_current_analysis_contract_is_the_second(tmp_path: Path) -> None:
+    assert ANALYSIS_CONTRACT_VERSION == "2"
+
+
 def test_an_update_never_records_an_objective_it_did_not_investigate(
     tmp_path: Path,
 ) -> None:

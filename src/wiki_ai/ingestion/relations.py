@@ -271,6 +271,14 @@ def assess_relation(
                 "which no finding of this run states",
             ),
         )
+    if not claim.statement:
+        return RelationVerdict(
+            confidence=Confidence.INFERRED,
+            reasons=(
+                f"relation {claim.kind.value} to {claim.target_subject!r} "
+                "was stated without its own statement",
+            ),
+        )
     if not claim.evidence:
         return RelationVerdict(
             confidence=Confidence.INFERRED,

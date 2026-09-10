@@ -43,13 +43,16 @@ def store(
     repository: KnowledgeRepository,
     entities: tuple[Entity, ...],
     relations: tuple[tuple[RelationKind, Entity, Entity], ...] = (),
+    confidence: Confidence = Confidence.INFERRED,
 ) -> None:
     with repository.begin_revision(author=AUTHOR, summary="fixture") as revision:
         for item in entities:
             revision.put_entity(item)
         for kind, source, target in relations:
             revision.put_relation(
-                Relation.create(kind.value, source.id, target.id)
+                Relation.create(
+                    kind.value, source.id, target.id, confidence=confidence
+                )
             )
 
 
@@ -230,3 +233,28 @@ def test_opening_the_same_gaps_twice_does_not_duplicate_them(
 
 def test_an_unknown_capability_yields_no_gap(knowledge: KnowledgeRepository) -> None:
     assert profile_gaps(KnowledgeQuery(knowledge), EntityId("ent_missing")) == ()
+
+
+def test_an_unresolved_relation_still_raises_the_section_question(
+    knowledge: KnowledgeRepository,
+) -> None:
+    capability = entity(EntityKind.CAPABILITY, "place order")
+    entry = entity(
+        EntityKind.ENTRY_POINT,
+        "OrderController place",
+        {"mechanism": "http", "location": "OrderController.place"},
+    )
+    table = entity(EntityKind.TABLE, "ORDERS", {"schema": "public"})
+    store(
+        knowledge,
+        (capability, entry, table),
+        (
+            (RelationKind.BELONGS_TO, entry, capability),
+            (RelationKind.PERSISTS_TO, entry, table),
+        ),
+        confidence=Confidence.UNRESOLVED,
+    )
+    found = profile_gaps(KnowledgeQuery(knowledge), capability.id)
+    persistence = [gap for gap in found if gap.section == "persistence"]
+    assert persistence and persistence[0].blocking
+    assert persistence[0].signals

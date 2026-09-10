@@ -178,6 +178,35 @@ def test_the_outcome_shape_matches_the_application_port(
     }
 
 
+def test_a_structural_fault_with_a_provider_present_never_invokes_it(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    target = tmp_path / "falso.pdf"
+    target.write_bytes(b"nao sou um pdf")
+    engine = IngestionEngine()
+    outcome = engine.run(
+        target,
+        "",
+        knowledge,
+        "falso",
+        provider=_decision_provider(_transcript(tmp_path)),
+    )
+    assert outcome.status is IngestionStatus.FAILED
+    assert outcome.provider_used is False
+    assert outcome.entities_written == 0
+
+
+def test_a_provider_present_without_a_structural_fault_is_marked_used(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    source = _transcript(tmp_path)
+    engine = IngestionEngine()
+    outcome = engine.run(
+        source, "", knowledge, "reuniao", provider=_decision_provider(source)
+    )
+    assert outcome.provider_used is True
+
+
 def test_the_engine_never_resolves_a_provider_of_its_own(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:

@@ -13,6 +13,7 @@ from .errors import (
     FormatVersionMismatch,
     IdentityCollision,
     IdentityFacts,
+    PayloadInvalid,
     RelationEvidenceRequired,
     RevisionClosed,
     UnknownReference,
@@ -23,6 +24,7 @@ from .model import (
     Confidence,
     Entity,
     EntityId,
+    GraphPolicy,
     KnowledgeState,
     Evidence,
     Relation,
@@ -410,13 +412,23 @@ class RevisionTransaction:
                 f"evidência {evidence.id} cita source_version desconhecida: "
                 f"{evidence.source_version_key}"
             )
+        stored = self._conn.execute(
+            "SELECT excerpt_hash FROM evidence WHERE evidence_id=?", (evidence.id,)
+        ).fetchone()
+        if stored is not None and str(stored[0]) != evidence.excerpt_hash:
+            raise PayloadInvalid(
+                f"evidência {evidence.id} já registrada com excerpt_hash "
+                f"{stored[0]}; recebido {evidence.excerpt_hash} no mesmo "
+                f"source_version {evidence.source_version_key}"
+            )
         self._conn.execute(
             "INSERT INTO evidence(evidence_id, source_id, version_hash, "
             "source_version_key, locator_json, excerpt_hash, captured_at, revision_id, "
             "excerpt) "
             "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET "
             "excerpt_hash=excluded.excerpt_hash, captured_at=excluded.captured_at, "
-            "revision_id=excluded.revision_id, excerpt=excluded.excerpt",
+            "revision_id=excluded.revision_id, excerpt=excluded.excerpt, "
+            "invalidated_at=''",
             (
                 evidence.id,
                 evidence.source_id,
@@ -674,8 +686,12 @@ class KnowledgeRepository:
         entity_id: EntityId,
         direction: str = "both",
         kinds: Iterable[str] | None = None,
+        *,
+        policy: GraphPolicy = GraphPolicy.SUPPORTED_ONLY,
     ) -> list[Relation]:
-        return relation_store.neighborhood(self.conn, entity_id, direction, kinds)
+        return relation_store.neighborhood(
+            self.conn, entity_id, direction, kinds, policy=policy
+        )
 
     def get_relation(self, relation_id: str) -> Relation | None:
         row = self.conn.execute(

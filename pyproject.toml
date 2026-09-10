@@ -17,6 +17,10 @@ wiki-ai = "wiki_ai.app.commands:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"wiki_ai.knowledge" = ["relation_predicates.json"]
+"wiki_ai.quality" = ["vocabulary.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

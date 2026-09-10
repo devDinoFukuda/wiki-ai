@@ -181,20 +181,26 @@ def test_unsupported_claim_rate_detects_a_fabricated_claim(
     tmp_path: Path, java_truth: RepositoryTruth
 ) -> None:
     real = java_truth.business_rules[0]
+    real_anchor = real.anchors[0]
+    invented_anchor = Anchor(
+        path=real_anchor.path,
+        line_start=real_anchor.line_end + 40,
+        line_end=real_anchor.line_end + 45,
+    )
     invented = type(real)(
         key="fabricated",
         statement="renewals are approved automatically for accounts flagged by the fraud engine",
         key_terms=("fraud", "engine", "automatically"),
         conditions=("account flagged by fraud engine",),
         effects=("renewal approved without policy evaluation",),
-        anchors=real.anchors,
+        anchors=(invented_anchor,),
     )
     with _open(tmp_path) as knowledge:
         _write(
             knowledge,
             (
-                ("business_rules", real, Confidence.SUPPORTED, real.anchors[0]),
-                ("business_rules", invented, Confidence.SUPPORTED, real.anchors[0]),
+                ("business_rules", real, Confidence.SUPPORTED, real_anchor),
+                ("business_rules", invented, Confidence.SUPPORTED, invented_anchor),
             ),
         )
         report = metrics.evaluate(knowledge, java_truth)

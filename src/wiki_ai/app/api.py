@@ -11,6 +11,7 @@ from wiki_ai import __version__
 from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.app.ports import CapabilityUnavailable, OutcomeStatus
 from wiki_ai.app.session import (
+    ANALYSIS_CONTRACT_VERSION,
     PREFERENCE_SOURCES,
     STATE_DIR_NAME,
     AnalysisState,
@@ -460,6 +461,7 @@ def _settled_baseline(state: AnalysisState, objective_key: str) -> bool:
         state.analysis_status is AnalysisStatus.COMPLETE
         and bool(objective_key)
         and objective_key == state.analyzed_objective_hash
+        and state.contract_version == ANALYSIS_CONTRACT_VERSION
     )
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from .model import Confidence, Entity, EntityId, KnowledgeState
+from .model import Confidence, Entity, EntityId, GraphPolicy, KnowledgeState
 from .repository import KnowledgeRepository
 from .taxonomy import EntityKind, RelationKind
 
@@ -144,7 +144,7 @@ def _basis_of(attributes: Mapping[str, Any]) -> str:
 
 def has_implementation(repository: KnowledgeRepository, entity_id: EntityId) -> bool:
     for relation in repository.relations_of(
-        entity_id, "in", (RelationKind.IMPLEMENTS.value,)
+        entity_id, "in", (RelationKind.IMPLEMENTS.value,), policy=GraphPolicy.ALL
     ):
         implementor = repository.get_entity(relation.source_id)
         if (
@@ -221,7 +221,9 @@ def _correlated_to_implementation(
     repository: KnowledgeRepository, entity_id: EntityId
 ) -> bool:
     for kind in (RelationKind.CONTRADICTS, RelationKind.DECLARES):
-        for relation in repository.relations_of(entity_id, "both", (kind.value,)):
+        for relation in repository.relations_of(
+            entity_id, "both", (kind.value,), policy=GraphPolicy.ALL
+        ):
             other_id = (
                 relation.target_id
                 if relation.source_id == entity_id

@@ -199,6 +199,7 @@ def test_relation_evidence_that_names_both_endpoints_makes_it_supported(
         kind=RelationKind.CALLS,
         target_subject="OrderRepository save",
         target_type=EntityKind.OPERATION,
+        statement="OrderService place invokes OrderRepository save",
         evidence=(WIRING_REF,),
     )
     findings = [calls_repository(claim), repository_save()]
@@ -323,3 +324,20 @@ def test_relation_evidence_persists_the_excerpt_of_its_capture(
         for evidence in linked:
             assert evidence.excerpt
             assert excerpt_digest(evidence.excerpt) == evidence.excerpt_hash
+
+
+def test_relation_evidence_without_a_statement_never_reaches_supported(
+    tmp_path: Path,
+) -> None:
+    claim = RelationClaim(
+        kind=RelationKind.CALLS,
+        target_subject="OrderRepository save",
+        target_type=EntityKind.OPERATION,
+        evidence=(WIRING_REF,),
+    )
+    findings = [calls_repository(claim), repository_save()]
+    with knowledge_at(tmp_path) as knowledge:
+        result = normalized(tmp_path, findings, knowledge)
+        assert result.relations_written == 1
+        relation = relation_of(knowledge)
+        assert relation.confidence is Confidence.INFERRED

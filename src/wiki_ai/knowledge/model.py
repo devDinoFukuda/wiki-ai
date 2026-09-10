@@ -50,6 +50,19 @@ class Confidence(str, Enum):
     CONTRADICTED = "contradicted"
 
 
+class GraphPolicy(Enum):
+    SUPPORTED_ONLY = "supported_only"
+    SUPPORTED_AND_INFERRED = "supported_and_inferred"
+    ALL = "all"
+
+    def allows(self, confidence: Confidence) -> bool:
+        if self is GraphPolicy.ALL:
+            return True
+        if self is GraphPolicy.SUPPORTED_AND_INFERRED:
+            return confidence in (Confidence.SUPPORTED, Confidence.INFERRED)
+        return confidence is Confidence.SUPPORTED
+
+
 @dataclass(frozen=True)
 class EntityId:
     value: str
@@ -219,6 +232,16 @@ class Relation:
 
     def with_confidence(self, confidence: Confidence) -> "Relation":
         return replace(self, confidence=confidence)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "source_id": self.source_id.value,
+            "target_id": self.target_id.value,
+            "attributes": dict(self.attributes),
+            "confidence": self.confidence.value,
+        }
 
 
 @dataclass(frozen=True)
