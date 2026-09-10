@@ -137,9 +137,6 @@ class StrategyState:
             completed=completed,
         )
 
-    def with_coverage(self, coverage: CoverageState) -> "StrategyState":
-        return replace(self, coverage=coverage)
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_budget": self.total_budget,

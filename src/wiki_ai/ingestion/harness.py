@@ -127,6 +127,14 @@ class DocumentHarness:
     def kind(self) -> SourceKind:
         return self._document.source.kind
 
+    @property
+    def title(self) -> str:
+        declared = str(self._document.source.metadata.get("title") or "").strip()
+        if declared:
+            return declared
+        uri = self._document.source.uri
+        return uri.rsplit("/", 1)[-1] or uri
+
     def specs(self) -> tuple[DocumentToolSpec, ...]:
         return _SPECS
 

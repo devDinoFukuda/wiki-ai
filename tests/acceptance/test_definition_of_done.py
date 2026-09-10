@@ -14,6 +14,7 @@ from tests.acceptance.scenarios import (
     MODERN_TWENTY_ONE,
     NAMESPACE_OBJECTIVE,
     SERVICE,
+    assert_settled,
     cobol_scripts,
     java_acceptance_repo,
     java_scripts,
@@ -43,7 +44,7 @@ from wiki_ai.app.ports import (
     QueryRunner,
     UpdateRunner,
 )
-from wiki_ai.app.session import Session
+from wiki_ai.app.session import STATE_DIR_NAME, Session
 from wiki_ai.app.wiring import Wiring
 from wiki_ai.ingestion.adapters import registry as adapters
 from wiki_ai.ingestion import pipeline
@@ -93,7 +94,7 @@ def java(tmp_path: Path) -> tuple[Path, ProviderRegistry]:
     repo = java_acceptance_repo(tmp_path / "java")
     registry = scripted_registry(java_scripts())
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=registry)
-    assert report.status == "ok", report.to_dict()
+    assert_settled(report)
     return repo, registry
 
 
@@ -177,7 +178,7 @@ def test_the_agent_investigates_the_repository_dynamically(
 ) -> None:
     repo, _ = java
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=scripted_registry(java_scripts()))
-    assert report.reason == "up_to_date"
+    assert_settled(report)
     with Session.open(repo).open_knowledge() as knowledge:
         assert knowledge.find_entities(EntityKind.CAPABILITY.value)
     assert "repo.search" in REPOSITORY_TOOLS
@@ -199,7 +200,12 @@ def test_the_repository_harness_never_writes_into_the_snapshot(
     java: tuple[Path, ProviderRegistry]
 ) -> None:
     repo, _ = java
-    harness = RepositoryHarness(take_snapshot(SnapshotSpec(root=repo)))
+    harness = RepositoryHarness(
+        take_snapshot(
+            SnapshotSpec(root=repo, excludes=(STATE_DIR_NAME,)),
+            store=Session.open(repo).snapshot_store,
+        )
+    )
     before = {
         item.relative_to(repo).as_posix(): item.stat().st_mtime
         for item in repo.rglob("*")
@@ -239,7 +245,7 @@ def test_the_analysis_works_without_a_language_specific_parser(
     report = api.analyze(
         repo, NAMESPACE_OBJECTIVE, registry=scripted_registry(cobol_scripts())
     )
-    assert report.status == "ok"
+    assert_settled(report)
     assert report.details["entities_written"] > 0
     assert "aborted" not in report.details
 
@@ -386,7 +392,7 @@ def test_an_update_invalidates_by_source_version(
     registry = ProviderRegistry()
     registry.register("scripted", lambda: _UpdateProvider(scripts=[_update_script()]))
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=registry)
-    assert report.status == "ok"
+    assert_settled(report)
     assert report.details["invalidated"] > 0
     assert report.details["diff"]["changed"] == [SERVICE]
     with Session.open(repo).open_knowledge() as knowledge:

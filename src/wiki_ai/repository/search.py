@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
-from wiki_ai.repository.reader import resolve_within
+from wiki_ai.repository.reader import (
+    BINARY_PROBE_BYTES,
+    FileUnreadable,
+    PathOutsideSnapshot,
+    snapshot_bytes,
+)
 from wiki_ai.repository.snapshot import (
     RepositorySnapshot,
     matches_any,
@@ -111,20 +115,19 @@ def _excerpt(line: str) -> str:
 
 
 def _scan_file(
-    root: Path,
+    snapshot: RepositorySnapshot,
     path: str,
     expression: re.Pattern[str],
     query: SearchQuery,
     remaining: int,
 ) -> tuple[list[SearchMatch], str | None]:
     try:
-        full_path = resolve_within(root, path)
-        raw = full_path.read_bytes()
-    except (OSError, ValueError) as exc:
+        raw = snapshot_bytes(snapshot, path)
+    except (PathOutsideSnapshot, FileUnreadable) as exc:
         return [], f"{path}: {exc}"
     if len(raw) > query.max_file_bytes:
         return [], f"{path}: exceeds max_file_bytes ({len(raw)})"
-    if b"\x00" in raw[:8192]:
+    if b"\x00" in raw[:BINARY_PROBE_BYTES]:
         return [], f"{path}: binary content"
     text = raw.decode("utf-8", errors="replace")
     found: list[SearchMatch] = []
@@ -166,7 +169,6 @@ def search(
     if query.max_results <= 0:
         raise SearchPatternInvalid(f"max_results must be positive: {max_results}")
     expression = query.compile()
-    root = Path(snapshot.root)
     matches: list[SearchMatch] = []
     skipped: list[str] = []
     truncated = False
@@ -175,7 +177,7 @@ def search(
         if remaining <= 0:
             truncated = True
             break
-        found, skip_reason = _scan_file(root, path, expression, query, remaining)
+        found, skip_reason = _scan_file(snapshot, path, expression, query, remaining)
         if skip_reason is not None:
             skipped.append(skip_reason)
             continue

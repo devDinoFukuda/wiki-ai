@@ -11,6 +11,7 @@ from tests.acceptance.scenarios import (
     CAPABILITY,
     CONTROLLER,
     NAMESPACE_OBJECTIVE,
+    assert_settled,
     java_acceptance_repo,
 )
 from tests.agent import fake_cli
@@ -112,29 +113,41 @@ def _knowledge_shape(repo: Path) -> list[dict[str, Any]]:
         return _entities(knowledge)
 
 
+IDENTIFIED_ATTRIBUTES = ("capability",)
+
+
+def _comparable(attributes: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in attributes.items()
+        if key not in IDENTIFIED_ATTRIBUTES
+    }
+
+
 def _entities(knowledge: KnowledgeRepository) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
-    for entity in sorted(knowledge.find_entities(), key=lambda item: item.id.value):
+    for entity in knowledge.find_entities():
         found.append(
             {
                 "kind": entity.kind,
                 "name": entity.name,
                 "confidence": entity.confidence.value,
                 "state": entity.state.value,
-                "attributes": dict(entity.attributes),
+                "attributes": _comparable(entity.attributes),
                 "locators": sorted(
                     evidence.locator.to_dict()["path"]
                     for evidence in knowledge.evidence_for(entity.id)
                 ),
             }
         )
+    found.sort(key=lambda item: (str(item["kind"]), item["name"]))
     return found
 
 
 def _run(name: str, binary: Path, root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     repo = java_acceptance_repo(root)
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, wiring=_wiring(name, binary))
-    assert report.status == "ok", report.to_dict()
+    assert_settled(report)
     return report.to_dict(), _knowledge_shape(repo)
 
 

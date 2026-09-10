@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from tests.repository.fixtures_repos import java_repo, snapshot_of, write
+from tests.investigation.fixtures_snapshots import java_repo, snapshot_of, write
 
 from wiki_ai.knowledge.model import Confidence
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -195,3 +195,120 @@ def test_relation_claims_survive_verification(tmp_path: Path) -> None:
     )
     report = verify([finding], registry_with(item), snapshot)
     assert report.verified[0].finding.relations[0].target_subject == "OrderRepository save"
+
+
+def test_reviewer_example_deleting_claim_over_a_find_excerpt_is_inferred(
+    tmp_path: Path,
+) -> None:
+    write(
+        tmp_path,
+        "src/OrderService.java",
+        "public class OrderService {\n"
+        "    public Order load(String id) {\n"
+        "        return repository.find(id);\n"
+        "    }\n"
+        "}\n",
+    )
+    snapshot = snapshot_of(tmp_path)
+    item = capture(snapshot, "src/OrderService.java", 3, 3, symbol="load")
+    finding = Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="OrderService",
+        statement="OrderService deletes the order after three failures",
+        conditions=("three consecutive failures happened",),
+        effects=("the order is deleted",),
+        evidence=(EvidenceRef(path="src/OrderService.java", line_start=3, line_end=3),),
+        confidence=Confidence.SUPPORTED,
+    )
+    report = verify([finding], registry_with(item), snapshot)
+    verified = report.verified[0]
+    assert verified.confidence is Confidence.INFERRED
+    assert verified.evidence_valid
+    assert not verified.claim_supported
+    assert Rejection.STATEMENT_UNSUPPORTED_BY_EXCERPT in verified.rejections
+
+
+def test_class_name_alone_does_not_ground_a_business_rule(tmp_path: Path) -> None:
+    snapshot = java_repo(tmp_path)
+    item = capture(snapshot, SERVICE, 10, 12, symbol="place")
+    finding = Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="OrderService",
+        statement="OrderService charges a penalty of 250 when the deadline expires",
+        conditions=("the deadline expired",),
+        effects=("a penalty of 250 is charged",),
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+        confidence=Confidence.SUPPORTED,
+    )
+    report = verify([finding], registry_with(item), snapshot)
+    verified = report.verified[0]
+    assert verified.confidence is Confidence.INFERRED
+    assert not verified.claim_supported
+
+
+def test_business_rule_whose_components_appear_in_the_excerpt_is_supported(
+    tmp_path: Path,
+) -> None:
+    snapshot = java_repo(tmp_path)
+    item = capture(snapshot, SERVICE, 10, 12, symbol="place")
+    finding = Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="place",
+        statement="place saves the reference through the repository",
+        conditions=("a reference is given",),
+        effects=("repository save is called with the reference",),
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+    )
+    report = verify([finding], registry_with(item), snapshot)
+    verified = report.verified[0]
+    assert verified.confidence is Confidence.SUPPORTED
+    assert verified.evidence_valid
+    assert verified.claim_supported
+
+
+def test_grounding_names_the_component_that_failed(tmp_path: Path) -> None:
+    snapshot = java_repo(tmp_path)
+    item = capture(snapshot, SERVICE, 10, 12, symbol="place")
+    finding = Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="place",
+        statement="place saves the reference",
+        conditions=("a reference is given",),
+        effects=("an invoice is escalated to the auditor",),
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+    )
+    report = verify([finding], registry_with(item), snapshot)
+    verified = report.verified[0]
+    assert verified.confidence is Confidence.INFERRED
+    failed = [check.component for check in verified.grounding if not check.ok]
+    assert "effects[0]" in failed
+    assert any("effects[0]" in reason for reason in verified.reasons)
+
+
+def test_tampered_evidence_reports_evidence_invalid(tmp_path: Path) -> None:
+    snapshot = java_repo(tmp_path)
+    item = capture(snapshot, SERVICE, 10, 12)
+    forged = replace(item, excerpt_sha256="0" * 64)
+    finding = place_finding(
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),)
+    )
+    report = verify([finding], registry_with(forged), snapshot)
+    discarded = report.discarded[0]
+    assert not discarded.evidence_valid
+    assert not discarded.claim_supported
+
+
+def test_invariant_needs_its_statement_terms_in_executable_code(
+    tmp_path: Path,
+) -> None:
+    snapshot = java_repo(tmp_path)
+    item = capture(snapshot, SERVICE, 10, 12, symbol="place")
+    finding = Finding(
+        type=EntityKind.INVARIANT,
+        subject="place",
+        statement="the ledger balance never drops below the reserve floor",
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+        confidence=Confidence.SUPPORTED,
+    )
+    report = verify([finding], registry_with(item), snapshot)
+    assert report.verified[0].confidence is Confidence.INFERRED

@@ -203,7 +203,7 @@ def test_locator_diagnostics_reports_every_unresolvable_block() -> None:
     found = locator_diagnostics(SourceKind.TRANSCRIPT, blocks)
     assert len(found) == 1
     assert found[0].level is DiagnosticLevel.ERROR
-    assert found[0].code == "locator.incomplete"
+    assert found[0].code == "locator_incomplete"
     assert blocks[1].id in found[0].message
 
 

@@ -9,18 +9,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 __all__ = [
     "SnapshotError",
     "SnapshotSpecInvalid",
     "SnapshotPayloadInvalid",
+    "SnapshotNotMaterialized",
+    "BlobUnavailable",
     "SnapshotSpec",
     "FileRecord",
     "RepositorySnapshot",
+    "RepositoryObservation",
     "normalize_path",
     "matches_any",
+    "compute_digest",
     "take_snapshot",
+    "observe",
     "SnapshotDiff",
     "diff",
 ]
@@ -38,10 +43,19 @@ class SnapshotPayloadInvalid(SnapshotError):
     pass
 
 
+class SnapshotNotMaterialized(SnapshotError):
+    pass
+
+
+class BlobUnavailable(SnapshotError):
+    pass
+
+
 _GLOB_CHARS = ("*", "?", "[")
 _SKIPPED_DIRECTORIES = frozenset({".git"})
 _HASH_CHUNK = 65536
 _GIT_TIMEOUT_SECONDS = 30
+_BLOBS_DIRECTORY = "blobs"
 
 
 def normalize_path(raw: str) -> str:
@@ -110,6 +124,11 @@ class RepositorySnapshot:
     files: tuple[FileRecord, ...]
     digest: str
     taken_at: str
+    store_root: str | None = None
+
+    @property
+    def materialized(self) -> bool:
+        return self.store_root is not None
 
     def file_map(self) -> Mapping[str, FileRecord]:
         return {record.path: record for record in self.files}
@@ -117,12 +136,38 @@ class RepositorySnapshot:
     def contains(self, path: str) -> bool:
         return normalize_path(path) in self.file_map()
 
+    def read_bytes(self, path: str) -> bytes:
+        if self.store_root is None:
+            raise SnapshotNotMaterialized(
+                f"snapshot {self.digest[:12]} has no materialized content"
+            )
+        relative = normalize_path(path)
+        record = self.file_map().get(relative)
+        if record is None:
+            raise BlobUnavailable(
+                f"path is not part of snapshot {self.digest[:12]}: {path}"
+            )
+        blob = (
+            Path(self.store_root)
+            / _BLOBS_DIRECTORY
+            / record.sha256[:2]
+            / record.sha256
+        )
+        try:
+            payload = blob.read_bytes()
+        except OSError as exc:
+            raise BlobUnavailable(f"{relative}: {exc}") from exc
+        if hashlib.sha256(payload).hexdigest() != record.sha256:
+            raise BlobUnavailable(f"{relative}: blob does not match its digest")
+        return payload
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "root": self.root,
             "git_head": self.git_head,
             "digest": self.digest,
             "taken_at": self.taken_at,
+            "store_root": self.store_root,
             "files": [
                 {"path": record.path, "size": record.size, "sha256": record.sha256}
                 for record in self.files
@@ -154,12 +199,14 @@ class RepositorySnapshot:
                     sha256=str(item["sha256"]),
                 )
             )
+        store_root = payload.get("store_root")
         return cls(
             root=str(payload["root"]),
             git_head=payload.get("git_head"),
             files=tuple(records),
             digest=str(payload["digest"]),
             taken_at=str(payload["taken_at"]),
+            store_root=None if store_root is None else str(store_root),
         )
 
     @classmethod
@@ -232,23 +279,71 @@ def _walk(spec: SnapshotSpec) -> list[FileRecord]:
     return records
 
 
-def take_snapshot(spec: SnapshotSpec) -> RepositorySnapshot:
+class SnapshotMaterializer(Protocol):
+    def materialize(
+        self, snapshot: RepositorySnapshot, source_root: Path
+    ) -> RepositorySnapshot: ...
+
+
+def _resolved_spec(spec: SnapshotSpec) -> SnapshotSpec:
     if not spec.root.is_dir():
         raise SnapshotSpecInvalid(f"root is not an existing directory: {spec.root}")
-    root = spec.root.resolve()
-    resolved = SnapshotSpec(
-        root=root,
+    return SnapshotSpec(
+        root=spec.root.resolve(),
         roots=spec.roots,
         includes=spec.includes,
         excludes=spec.excludes,
     )
+
+
+def take_snapshot(
+    spec: SnapshotSpec, store: SnapshotMaterializer | None = None
+) -> RepositorySnapshot:
+    resolved = _resolved_spec(spec)
+    root = resolved.root
     records = _walk(resolved)
-    return RepositorySnapshot(
+    snapshot = RepositorySnapshot(
         root=str(root),
         git_head=read_git_head(root),
         files=tuple(records),
         digest=compute_digest(records),
         taken_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    if store is None:
+        return snapshot
+    return store.materialize(snapshot, root)
+
+
+@dataclass(frozen=True)
+class RepositoryObservation:
+    root: str
+    digest: str
+    files: tuple[FileRecord, ...]
+    observed_at: str
+
+    def file_map(self) -> Mapping[str, FileRecord]:
+        return {record.path: record for record in self.files}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "root": self.root,
+            "digest": self.digest,
+            "observed_at": self.observed_at,
+            "files": [
+                {"path": record.path, "size": record.size, "sha256": record.sha256}
+                for record in self.files
+            ],
+        }
+
+
+def observe(spec: SnapshotSpec) -> RepositoryObservation:
+    resolved = _resolved_spec(spec)
+    records = _walk(resolved)
+    return RepositoryObservation(
+        root=str(resolved.root),
+        digest=compute_digest(records),
+        files=tuple(records),
+        observed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
 
 

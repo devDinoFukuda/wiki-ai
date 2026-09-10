@@ -5,11 +5,32 @@ from enum import Enum
 from typing import Mapping
 
 from .model import Confidence, EntityId
-from .repository import KnowledgeRepository
+from .repository import FORMAT_VERSION, KnowledgeRepository
 
 ENTITY_TARGET = "entity"
 RELATION_TARGET = "relation"
 EVIDENCE_TARGET = "evidence"
+
+
+@dataclass(frozen=True)
+class KnowledgeProvenance:
+    format_version: str
+    revision_count: int
+    head_revision_id: str
+    head_author: str
+    head_created_at: str
+
+
+def provenance(repository: KnowledgeRepository) -> KnowledgeProvenance:
+    head_id = repository.head_revision_id() or ""
+    head = repository.get_revision(head_id) if head_id else None
+    return KnowledgeProvenance(
+        format_version=repository.format_version or FORMAT_VERSION,
+        revision_count=repository.revision_count(),
+        head_revision_id=head.id if head is not None else "",
+        head_author=head.author if head is not None else "",
+        head_created_at=head.created_at if head is not None else "",
+    )
 
 
 class KnowledgeRule(Enum):

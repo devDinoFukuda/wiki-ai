@@ -19,3 +19,20 @@ def query(graph: Graph) -> KnowledgeQuery:
 @pytest.fixture
 def publications_dir(tmp_path):
     return tmp_path / "publications"
+
+
+@pytest.fixture
+def silent_narrative(monkeypatch):
+    from wiki_ai.publishing import narrative as narrative_module
+
+    monkeypatch.setattr(
+        narrative_module.NarrativeBuilder,
+        "_gap_assertions",
+        lambda self, gaps: (),
+    )
+    monkeypatch.setattr(
+        narrative_module.NarrativeBuilder,
+        "_reserved_assertions",
+        lambda self, entities: (),
+    )
+    return narrative_module

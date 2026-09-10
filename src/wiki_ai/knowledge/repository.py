@@ -11,12 +11,14 @@ from typing import Any, Iterable, Sequence
 from . import relations as relation_store
 from .errors import (
     FormatVersionMismatch,
+    IdentityCollision,
+    IdentityFacts,
     RevisionClosed,
     UnknownReference,
     UnsupportedEvidence,
 )
 from .evidence import assert_supports_implemented, locator_from_dict
-from .identity import new_revision_id
+from .identity import canonical_name, new_revision_id
 from .model import (
     Confidence,
     Entity,
@@ -30,7 +32,7 @@ from .model import (
 )
 from .taxonomy import validate_attributes, validate_pair
 
-FORMAT_VERSION = "3"
+FORMAT_VERSION = "4"
 FORMAT_VERSION_KEY = "format_version"
 DATABASE_FILENAME = "state.db"
 
@@ -64,6 +66,7 @@ CREATE TABLE IF NOT EXISTS entities (
     attributes_json TEXT NOT NULL DEFAULT '{}',
     state           TEXT NOT NULL,
     confidence      TEXT NOT NULL,
+    owner_id        TEXT,
     revision_id     TEXT NOT NULL REFERENCES revisions(revision_id)
 );
 
@@ -116,6 +119,7 @@ CREATE TABLE IF NOT EXISTS invalidations (
 );
 
 CREATE INDEX IF NOT EXISTS ix_entities_kind    ON entities(kind);
+CREATE INDEX IF NOT EXISTS ix_entities_owner   ON entities(owner_id);
 CREATE INDEX IF NOT EXISTS ix_entities_rev     ON entities(revision_id);
 CREATE INDEX IF NOT EXISTS ix_entsrc_version   ON entity_source_versions(source_version_key);
 CREATE INDEX IF NOT EXISTS ix_relations_source ON relations(source_id, kind);
@@ -127,7 +131,7 @@ CREATE INDEX IF NOT EXISTS ix_rellinks_rel     ON relation_evidence_links(relati
 CREATE INDEX IF NOT EXISTS ix_srcver_source    ON source_versions(source_id);
 """
 
-ENTITY_COLUMNS = "entity_id, kind, name, attributes_json, state, confidence"
+ENTITY_COLUMNS = "entity_id, kind, name, attributes_json, state, confidence, owner_id"
 EVIDENCE_COLUMNS = (
     "e.evidence_id, e.source_id, e.version_hash, e.locator_json, e.excerpt_hash, e.captured_at"
 )
@@ -282,6 +286,7 @@ class RevisionTransaction:
     def put_entity(self, entity: Entity) -> EntityId:
         self._guard()
         validate_attributes(entity.kind, entity.attributes)
+        self._assert_no_collision(entity)
         for key in entity.source_versions:
             known = self._conn.execute(
                 "SELECT 1 FROM source_versions WHERE source_version_key=?", (key,)
@@ -292,10 +297,11 @@ class RevisionTransaction:
                 )
         self._conn.execute(
             "INSERT INTO entities(entity_id, kind, name, attributes_json, state, "
-            "confidence, revision_id) VALUES (?,?,?,?,?,?,?) "
+            "confidence, owner_id, revision_id) VALUES (?,?,?,?,?,?,?,?) "
             "ON CONFLICT(entity_id) DO UPDATE SET kind=excluded.kind, name=excluded.name, "
             "attributes_json=excluded.attributes_json, state=excluded.state, "
-            "confidence=excluded.confidence, revision_id=excluded.revision_id",
+            "confidence=excluded.confidence, owner_id=excluded.owner_id, "
+            "revision_id=excluded.revision_id",
             (
                 entity.id.value,
                 entity.kind,
@@ -303,6 +309,7 @@ class RevisionTransaction:
                 _dumps(entity.attributes),
                 entity.state.value,
                 entity.confidence.value,
+                entity.owner_id.value if entity.owner_id is not None else None,
                 self._revision.id,
             ),
         )
@@ -414,6 +421,33 @@ class RevisionTransaction:
             "source_version_key, revision_id) VALUES (?,?,?,?)",
             (validate_kind(target_kind), target_id, key, self._revision.id),
         )
+
+    def _assert_no_collision(self, entity: Entity) -> None:
+        row = self._conn.execute(
+            "SELECT kind, name, owner_id FROM entities WHERE entity_id=?",
+            (entity.id.value,),
+        ).fetchone()
+        if row is None:
+            return
+        stored_owner = str(row[2]) if row[2] else None
+        incoming_owner = (
+            entity.owner_id.value if entity.owner_id is not None else None
+        )
+        existing = IdentityFacts(
+            entity_id=entity.id.value,
+            kind=str(row[0]),
+            owner_id=stored_owner,
+            canonical_name=canonical_name(str(row[1])),
+        )
+        incoming = IdentityFacts(
+            entity_id=entity.id.value,
+            kind=entity.kind,
+            owner_id=incoming_owner,
+            canonical_name=entity.canonical_name,
+        )
+        if existing == incoming:
+            return
+        raise IdentityCollision(existing, incoming)
 
     def _kind_of(self, entity_id: EntityId) -> str:
         row = self._conn.execute(
@@ -653,6 +687,7 @@ class KnowledgeRepository:
             state=KnowledgeState(row[4]),
             confidence=Confidence(row[5]),
             source_versions=tuple(str(key[0]) for key in keys),
+            owner_id=EntityId(str(row[6])) if row[6] else None,
         )
 
     def _row_to_evidence(self, row: Sequence[Any]) -> Evidence:

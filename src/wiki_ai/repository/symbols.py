@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from wiki_ai.repository.inventory import language_hint_for
-from wiki_ai.repository.reader import resolve_within
+from wiki_ai.repository.reader import snapshot_text
 from wiki_ai.repository.snapshot import RepositorySnapshot, normalize_path
 
 __all__ = [
@@ -351,17 +351,6 @@ def _candidate_paths(snapshot: RepositorySnapshot, path: str | None) -> list[str
     ]
 
 
-def _read_text(root: Path, path: str, max_file_bytes: int) -> str | None:
-    try:
-        full_path = resolve_within(root, path)
-        raw = full_path.read_bytes()
-    except (OSError, ValueError):
-        return None
-    if len(raw) > max_file_bytes or b"\x00" in raw[:8192]:
-        return None
-    return raw.decode("utf-8", errors="replace")
-
-
 def find_symbols(
     snapshot: RepositorySnapshot,
     path: str | None = None,
@@ -374,10 +363,9 @@ def find_symbols(
     if max_results <= 0:
         return ()
     wanted_kinds = frozenset(kinds)
-    root = Path(snapshot.root)
     collected: list[SymbolInfo] = []
     for candidate in _candidate_paths(snapshot, path):
-        text = _read_text(root, candidate, max_file_bytes)
+        text = snapshot_text(snapshot, candidate, max_file_bytes)
         if text is None:
             continue
         language = _language_of(candidate)

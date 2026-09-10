@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from tests.investigation.fake_provider import FakeProvider, Script
-from tests.repository.fixtures_repos import java_repo, mainframe_repo, snapshot_of, write
+from tests.investigation.fixtures_snapshots import java_repo, mainframe_repo, snapshot_of, write
 
 from wiki_ai.knowledge.evidence import CodeContent, CodeLocator
 from wiki_ai.knowledge.gaps import GAP_KIND
@@ -12,7 +12,17 @@ from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import ENTITY_KIND_VALUES, EntityKind
 from wiki_ai.repository.harness import RepositoryHarness, ScopeFocus
-from wiki_ai.investigation.orchestrator import ABORT_SNAPSHOT_CHANGED, Investigator
+from wiki_ai.repository.snapshot import SnapshotSpec, take_snapshot
+from wiki_ai.investigation.objective import ObjectiveKind, parse
+from wiki_ai.investigation.orchestrator import (
+    ABORT_SNAPSHOT_CHANGED,
+    ABORT_SNAPSHOT_NOT_MATERIALIZED,
+    DEFAULT_TOTAL_TOOL_CALLS,
+    REASON_BUDGET_EXHAUSTED,
+    REASON_NO_PROVIDER,
+    InvestigationStatus,
+    Investigator,
+)
 
 CONTROLLER = "src/main/java/com/acme/order/OrderController.java"
 SERVICE = "src/main/java/com/acme/order/OrderService.java"
@@ -594,4 +604,78 @@ def test_outcome_details_carry_rounds_coverage_and_verification(
     }
     assert details["verification"]["counts"]["supported"] == 6
     assert details["captures"]
-    assert details["task_state"] == "succeeded"
+    assert details["task_state"] == "partial"
+    assert details["status"] == "partial"
+    assert outcome.status is InvestigationStatus.PARTIAL
+    assert outcome.unresolved
+
+
+def test_a_working_tree_change_is_detected_without_a_moving_harness(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    snapshot = java_repo(root)
+
+    def mutate(index: int) -> None:
+        if index == 0:
+            write(root, "src/main/java/com/acme/order/OrderExtra.java", "class Extra {}\n")
+
+    provider = FakeProvider(
+        scripts=[Script(steps=(("repo.inventory", {}),))], on_round=mutate
+    )
+    with knowledge_at(tmp_path) as knowledge:
+        outcome = Investigator().run(OBJECTIVE, snapshot, knowledge, provider, "acme")
+    assert outcome.status is InvestigationStatus.FAILED
+    assert outcome.reason == ABORT_SNAPSHOT_CHANGED
+    assert outcome.details["task_state"] == "failed"
+
+
+def test_a_non_materialized_snapshot_fails_before_any_round(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    java_repo(root)
+    bare = take_snapshot(SnapshotSpec(root=root))
+    assert not bare.materialized
+    provider = FakeProvider(scripts=[java_round_one_script()])
+    with knowledge_at(tmp_path) as knowledge:
+        outcome = Investigator().run(OBJECTIVE, bare, knowledge, provider, "acme")
+    assert outcome.status is InvestigationStatus.FAILED
+    assert outcome.reason == ABORT_SNAPSHOT_NOT_MATERIALIZED
+    assert outcome.details["round_count"] == 0
+
+
+def test_no_provider_is_blocked_not_ok(tmp_path: Path) -> None:
+    snapshot = java_repo(tmp_path / "repo")
+    with knowledge_at(tmp_path) as knowledge:
+        outcome = Investigator().run(OBJECTIVE, snapshot, knowledge, None, "acme")
+    assert outcome.status is InvestigationStatus.BLOCKED
+    assert outcome.reason == REASON_NO_PROVIDER
+    assert outcome.entities_written == 0
+
+
+def test_budget_exhausted_with_open_frontier_is_partial(tmp_path: Path) -> None:
+    snapshot = java_repo(tmp_path / "repo")
+    busy = Script(steps=(("repo.inventory", {}),) * 6)
+    provider = FakeProvider(scripts=[busy] * 12)
+    objective = parse("analyze place order", kind=ObjectiveKind.CAPABILITY_ANALYSIS)
+    with knowledge_at(tmp_path) as knowledge:
+        outcome = Investigator(total_tool_calls=4, round_budget=4).run(
+            objective, snapshot, knowledge, provider, "acme"
+        )
+    assert outcome.details["tool_calls"] == 4
+    assert outcome.status is InvestigationStatus.PARTIAL
+    assert outcome.reason == REASON_BUDGET_EXHAUSTED
+    assert outcome.unresolved
+    assert outcome.details["task_state"] == "partial"
+
+
+def test_an_open_frontier_without_budget_exhaustion_is_also_partial(
+    tmp_path: Path,
+) -> None:
+    snapshot = java_repo(tmp_path / "repo")
+    provider = FakeProvider(scripts=[java_round_one_script()])
+    with knowledge_at(tmp_path) as knowledge:
+        outcome = Investigator().run(OBJECTIVE, snapshot, knowledge, provider, "acme")
+    assert outcome.details["tool_calls"] < DEFAULT_TOTAL_TOOL_CALLS
+    assert outcome.status is InvestigationStatus.PARTIAL
+    assert outcome.reason == "open_frontier_or_blocking_gaps"
+    assert outcome.details["task_state"] == "partial"

@@ -14,6 +14,8 @@ from tests.acceptance.scenarios import (
     NAMESPACE_OBJECTIVE,
     PAYROLL,
     ScriptedProvider,
+    SETTLED_STATUSES,
+    assert_settled,
     cobol_scripts,
     entity_named,
     mainframe_acceptance_repo,
@@ -53,7 +55,7 @@ def registry(provider: ScriptedProvider) -> ProviderRegistry:
 @pytest.fixture()
 def analyzed(repo: Path, registry: ProviderRegistry) -> Path:
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=registry)
-    assert report.status == "ok", report.to_dict()
+    assert_settled(report)
     return repo
 
 
@@ -61,7 +63,7 @@ def test_the_analysis_never_blocks_for_a_missing_parser(
     repo: Path, registry: ProviderRegistry, provider: ScriptedProvider
 ) -> None:
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=registry)
-    assert report.status == "ok"
+    assert_settled(report)
     assert "aborted" not in report.details
     assert report.details["entities_written"] > 0
     text = json.dumps(report.to_dict(), ensure_ascii=False).lower()
@@ -183,5 +185,6 @@ def test_the_command_line_reports_the_mainframe_analysis_as_json(
     )
     payload = json.loads(stream.getvalue())
     assert code == EXIT_OK
-    assert payload["status"] == "ok"
+    assert payload["status"] in SETTLED_STATUSES
+    assert payload["analysis_status"] in ("complete", "partial")
     assert payload["details"]["entities_written"] > 0

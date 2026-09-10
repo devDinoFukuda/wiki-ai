@@ -11,6 +11,7 @@ from wiki_ai.ingestion.integration import (
     PROVIDER_UNAVAILABLE,
     VERSION_MISMATCH,
     IngestionEngine,
+    IngestionStatus,
 )
 from wiki_ai.knowledge.model import KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
@@ -142,7 +143,7 @@ def test_a_silent_provider_writes_nothing_but_keeps_the_source(
 def test_the_outcome_shape_matches_the_application_port(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
-    from wiki_ai.app.ports import IngestionOutcome
+    from wiki_ai.app.ports import IngestionOutcome, OutcomeStatus
 
     source = _transcript(tmp_path)
     engine = IngestionEngine(provider_resolver=lambda: None)
@@ -152,6 +153,11 @@ def test_the_outcome_shape_matches_the_application_port(
         version_hash=outcome.version_hash,
         blocks=outcome.blocks,
         entities_written=outcome.entities_written,
+        status=OutcomeStatus(outcome.status.value),
+        reason=outcome.reason,
         diagnostics=outcome.diagnostics,
     )
     assert port.to_dict() == outcome.to_dict()
+    assert {item.value for item in OutcomeStatus} == {
+        item.value for item in IngestionStatus
+    }

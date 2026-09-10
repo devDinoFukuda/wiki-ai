@@ -9,6 +9,7 @@ from wiki_ai.repository.reader import (
     PathOutsideSnapshot,
     ReaderError,
     read_range,
+    snapshot_bytes,
 )
 from wiki_ai.repository.snapshot import RepositorySnapshot, normalize_path
 
@@ -125,7 +126,16 @@ def verify(snapshot: RepositorySnapshot, item: EvidenceCapture) -> bool:
     if excerpt_digest(item.excerpt) != item.excerpt_sha256:
         return False
     try:
+        payload = snapshot_bytes(snapshot, item.path)
+    except ReaderError:
+        return False
+    if hashlib.sha256(payload).hexdigest() != item.file_sha256:
+        return False
+    try:
         fresh = read_range(snapshot, item.path, item.line_start, item.line_end)
     except ReaderError:
         return False
-    return excerpt_digest(fresh.text) == item.excerpt_sha256
+    return (
+        excerpt_digest(fresh.text) == item.excerpt_sha256
+        and fresh.text == item.excerpt
+    )

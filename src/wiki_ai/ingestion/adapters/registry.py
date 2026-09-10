@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from wiki_ai.ingestion.adapters.documents import empty_document
+from wiki_ai.ingestion.outcome import StructuralFault
 from wiki_ai.ingestion.source import SourceDocument, SourceKind
 
 __all__ = [
@@ -21,8 +22,8 @@ __all__ = [
     "UNREADABLE_SOURCE",
 ]
 
-UNSUPPORTED_FORMAT = "unsupported_format"
-UNREADABLE_SOURCE = "unreadable_source"
+UNSUPPORTED_FORMAT = StructuralFault.UNSUPPORTED_FORMAT.value
+UNREADABLE_SOURCE = StructuralFault.UNREADABLE_SOURCE.value
 
 EXTENSION_KINDS: dict[str, SourceKind] = {
     ".docx": SourceKind.DOCX,

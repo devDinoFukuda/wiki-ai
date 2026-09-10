@@ -6,6 +6,8 @@ from .correlation import CorrelatedRelation, CorrelationReport, correlate
 from .errors import (
     FormatVersionMismatch,
     GapNotFound,
+    IdentityCollision,
+    IdentityFacts,
     InvalidRelationPair,
     InvalidIdentity,
     InvalidKind,
@@ -30,9 +32,9 @@ from .evidence import (
     make_evidence,
 )
 from .gaps import blocking_gaps, close_gap, is_blocking, open_gap, open_gaps
-from .gate import KnowledgeRule, KnowledgeViolation
+from .gate import KnowledgeProvenance, KnowledgeRule, KnowledgeViolation
 from .gate import check as knowledge_gate
-from .identity import content_hash
+from .identity import canonical_name, content_hash, contextual_key, entity_id
 from .invalidation import Invalidation, invalidate
 from .model import (
     Confidence,
@@ -85,12 +87,15 @@ __all__ = [
     "FlowStepView",
     "FormatVersionMismatch",
     "GapNotFound",
+    "IdentityCollision",
+    "IdentityFacts",
     "ImpactReport",
     "InvalidIdentity",
     "InvalidKind",
     "InvalidRelationPair",
     "Invalidation",
     "KnowledgeError",
+    "KnowledgeProvenance",
     "KnowledgeQuery",
     "KnowledgeRepository",
     "KnowledgeRule",
@@ -114,10 +119,13 @@ __all__ = [
     "UnknownReference",
     "UnsupportedEvidence",
     "blocking_gaps",
+    "canonical_name",
     "close_gap",
     "content_hash",
+    "contextual_key",
     "contradiction_between",
     "correlate",
+    "entity_id",
     "invalidate",
     "is_blocking",
     "knowledge_gate",

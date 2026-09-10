@@ -10,6 +10,7 @@ __all__ = [
     "ErrorCode",
     "PROTOCOL_VERSION",
     "Request",
+    "parse_request",
     "encode",
     "decode",
     "read_message",
@@ -47,6 +48,15 @@ class Request:
     @property
     def is_notification(self) -> bool:
         return self.identifier is None
+
+
+def parse_request(message: Mapping[str, Any]) -> Request:
+    method = message.get("method")
+    if not isinstance(method, str) or not method.strip():
+        raise JsonRpcError(ErrorCode.INVALID_REQUEST, "message without a method")
+    raw_params = message.get("params")
+    params = dict(raw_params) if isinstance(raw_params, Mapping) else {}
+    return Request(method=method, params=params, identifier=message.get("id"))
 
 
 def encode(payload: Mapping[str, Any]) -> bytes:

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from tests.investigation.fake_provider import FakeProvider, Script
-from tests.repository.fixtures_repos import java_repo
+from tests.investigation.fixtures_snapshots import java_repo
 
 from wiki_ai.investigation.briefing import REPOSITORY_FOCUS
 from wiki_ai.investigation.objective import Objective, ObjectiveKind, Scope, parse

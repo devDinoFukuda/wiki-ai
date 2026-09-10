@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from wiki_ai.knowledge.identity import contextual_key
 from wiki_ai.knowledge.model import Confidence
 from wiki_ai.knowledge.taxonomy import ENTITY_KIND_VALUES, EntityKind, RelationKind
 from wiki_ai.investigation.finding import (
@@ -14,6 +15,7 @@ from wiki_ai.investigation.finding import (
     finding_schema,
     parse_finding,
     parse_findings,
+    with_owner,
 )
 
 
@@ -36,7 +38,9 @@ def test_finding_parses_the_open_schema_of_section_8_4() -> None:
     assert parsed.type is EntityKind.BUSINESS_RULE
     assert parsed.confidence is Confidence.SUPPORTED
     assert parsed.evidence[0].capture_id == "cap_1"
-    assert parsed.stable_key == "business_rule::renewal eligibility"
+    assert parsed.stable_key("acme") == contextual_key(
+        "acme", "business_rule", None, "renewal eligibility"
+    )
 
 
 def test_unknown_type_is_rejected_with_a_typed_error() -> None:
@@ -120,3 +124,27 @@ def test_finding_direct_construction_promotes_statement_into_attributes() -> Non
         statement="total is clamped at zero",
     )
     assert parsed.attributes["statement"] == "total is clamped at zero"
+
+
+def test_with_owner_fills_only_an_absent_owner() -> None:
+    bare = parse_finding(rule_payload())
+    owned = with_owner(bare, "Ordering")
+    assert owned.owner == "Ordering"
+    assert with_owner(owned, "Billing").owner == "Ordering"
+    assert with_owner(bare, "   ") is bare
+
+
+def test_owner_changes_the_stable_key_but_explicit_id_wins() -> None:
+    bare = parse_finding(rule_payload())
+    owned = with_owner(bare, "Ordering")
+    assert bare.stable_key("acme") != owned.stable_key("acme")
+    explicit = parse_finding(rule_payload(explicit_id="RULE-7"))
+    assert explicit.stable_key("acme") == with_owner(explicit, "Ordering").stable_key(
+        "acme"
+    )
+
+
+def test_schema_exposes_owner_and_explicit_id() -> None:
+    properties = finding_schema()["properties"]
+    assert "owner" in properties
+    assert "explicit_id" in properties

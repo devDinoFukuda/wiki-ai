@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
+from wiki_ai.knowledge.identity import contextual_key
 from wiki_ai.knowledge.model import Confidence
 from wiki_ai.knowledge.taxonomy import (
     ENTITY_KIND_VALUES,
@@ -24,6 +25,7 @@ __all__ = [
     "Finding",
     "parse_finding",
     "parse_findings",
+    "with_owner",
     "finding_schema",
 ]
 
@@ -127,6 +129,8 @@ class Finding:
     confidence: Confidence = Confidence.INFERRED
     relations: tuple[RelationClaim, ...] = ()
     contradicts: tuple[str, ...] = ()
+    owner: str | None = None
+    explicit_id: str | None = None
 
     def __post_init__(self) -> None:
         subject = (self.subject or "").strip()
@@ -134,6 +138,10 @@ class Finding:
             raise FindingError(f"finding of type {self.type.value} without a subject")
         object.__setattr__(self, "subject", subject)
         object.__setattr__(self, "statement", (self.statement or "").strip())
+        owner = (self.owner or "").strip()
+        object.__setattr__(self, "owner", owner or None)
+        explicit = (self.explicit_id or "").strip()
+        object.__setattr__(self, "explicit_id", explicit or None)
         merged = dict(self.attributes)
         if self.conditions:
             merged.setdefault("conditions", list(self.conditions))
@@ -158,14 +166,17 @@ class Finding:
                 f"{', '.join(missing)}"
             )
 
-    @property
-    def stable_key(self) -> str:
-        return f"{self.type.value}::{self.subject.strip().lower()}"
+    def stable_key(self, namespace: str) -> str:
+        return contextual_key(
+            namespace, self.type.value, self.owner, self.subject, self.explicit_id
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": self.type.value,
             "subject": self.subject,
+            "owner": self.owner,
+            "explicit_id": self.explicit_id,
             "statement": self.statement,
             "attributes": dict(self.attributes),
             "conditions": list(self.conditions),
@@ -271,7 +282,15 @@ def parse_finding(payload: Mapping[str, Any]) -> Finding:
         confidence=_confidence(payload.get("confidence")),
         relations=tuple(_relation_claim(item) for item in payload.get("relations") or ()),
         contradicts=_texts(payload.get("contradicts")),
+        owner=str(payload.get("owner") or "") or None,
+        explicit_id=str(payload.get("explicit_id") or "") or None,
     )
+
+
+def with_owner(finding: Finding, owner: str) -> Finding:
+    if finding.owner or not owner.strip():
+        return finding
+    return replace(finding, owner=owner.strip())
 
 
 @dataclass(frozen=True)
@@ -319,6 +338,8 @@ def finding_schema() -> dict[str, Any]:
         "properties": {
             "type": {"type": "string", "enum": sorted(ENTITY_KIND_VALUES)},
             "subject": {"type": "string"},
+            "owner": {"type": "string"},
+            "explicit_id": {"type": "string"},
             "statement": {"type": "string"},
             "attributes": {"type": "object"},
             "conditions": {"type": "array", "items": {"type": "string"}},

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-import shutil
 from pathlib import Path
-from typing import Any, Mapping
 
 import pytest
 

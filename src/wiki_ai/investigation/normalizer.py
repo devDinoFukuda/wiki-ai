@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-from wiki_ai.knowledge.errors import InvalidRelationPair, KnowledgeError
+from wiki_ai.knowledge.errors import (
+    IdentityCollision,
+    InvalidRelationPair,
+    KnowledgeError,
+)
+from wiki_ai.knowledge.identity import contextual_key
 from wiki_ai.knowledge.gaps import open_gap
 from wiki_ai.knowledge.model import (
     Confidence,
@@ -99,15 +104,21 @@ def _attribute_payload(item: VerifiedFinding) -> dict[str, Any]:
     return payload
 
 
-def entity_of(item: VerifiedFinding, source_version_key: str) -> Entity:
+def entity_of(
+    item: VerifiedFinding,
+    source_version_key: str,
+    stable_key: str,
+    owner_id: EntityId | None = None,
+) -> Entity:
     return Entity.create(
         kind=item.finding.type.value,
         name=item.finding.subject,
-        stable_key=item.stable_key,
+        stable_key=stable_key,
         attributes=_attribute_payload(item),
         state=_STATE_BY_CONFIDENCE[item.confidence],
         confidence=item.confidence,
         source_versions=(source_version_key,),
+        owner_id=owner_id,
     )
 
 
@@ -121,8 +132,21 @@ def _placeholder_attributes(kind: EntityKind, subject: str) -> dict[str, Any]:
     return {name: subject for name in REQUIRED_ATTRIBUTES.get(kind, ())}
 
 
-def _stable_key(kind: EntityKind, subject: str) -> str:
-    return f"{kind.value}::{subject.strip().lower()}"
+def _stable_key(namespace: str, kind: EntityKind, subject: str) -> str:
+    return contextual_key(namespace, kind.value, None, subject)
+
+
+def _owner_entity_id(
+    namespace: str, owner: str | None, entity_ids: Mapping[str, EntityId]
+) -> EntityId | None:
+    if not owner:
+        return None
+    for kind in (EntityKind.CAPABILITY, EntityKind.MODULE, EntityKind.SYSTEM):
+        key = contextual_key(namespace, kind.value, None, owner)
+        found = entity_ids.get(key)
+        if found is not None:
+            return found
+    return None
 
 
 def normalize(
@@ -143,7 +167,7 @@ def normalize(
     )
     by_key: dict[str, VerifiedFinding] = {}
     for item in items:
-        by_key[item.stable_key] = item
+        by_key[item.finding.stable_key(namespace)] = item
     subject_index: dict[str, str] = {}
     for key, item in by_key.items():
         subject_index.setdefault(item.finding.subject.strip().lower(), key)
@@ -154,14 +178,29 @@ def normalize(
     unresolved_relations: list[str] = []
     diagnostics: list[str] = []
     opened_gaps: list[str] = []
+    collisions: list[str] = []
+    rejected: set[str] = set()
 
     with knowledge.begin_revision(author=AUTHOR, summary=summary) as transaction:
         transaction.put_source_version(version)
-        for key in sorted(by_key):
+        for key in _ownership_order(by_key):
             item = by_key[key]
-            entity = entity_of(item, version.key)
-            transaction.put_entity(entity)
+            owner_id = _owner_entity_id(namespace, item.finding.owner, entity_ids)
+            entity = entity_of(item, version.key, key, owner_id)
+            try:
+                transaction.put_entity(entity)
+            except IdentityCollision as exc:
+                rejected.add(key)
+                message = (
+                    f"identity collision for {item.finding.type.value} "
+                    f"{item.finding.subject!r}: {exc}"
+                )
+                if message not in collisions:
+                    collisions.append(message)
+                continue
             entity_ids[key] = entity.id
+        for key in rejected:
+            by_key.pop(key, None)
         _link_evidence(
             transaction, by_key, entity_ids, snapshot, namespace, stamp, written_evidence
         )
@@ -177,8 +216,8 @@ def normalize(
                 diagnostics,
             )
         )
-        for question in _unique(gaps):
-            open_gap(transaction, question, blocking=False)
+        for question in _unique(tuple(gaps) + tuple(collisions)):
+            open_gap(transaction, question, blocking=bool(question in collisions))
             opened_gaps.append(question)
         for subject in _unique(unresolved_relations):
             question = f"relation target not found in this run: {subject}"
@@ -192,7 +231,7 @@ def normalize(
         gaps_opened=tuple(opened_gaps),
         unresolved_relations=tuple(_unique(unresolved_relations)),
         entity_ids={key: value.value for key, value in entity_ids.items()},
-        diagnostics=tuple(diagnostics),
+        diagnostics=tuple(diagnostics + collisions),
     )
 
 
@@ -239,7 +278,7 @@ def _write_relations(
             target_key = subject_index.get(target)
             if target_key is None:
                 kind = _placeholder_kind(claim)
-                target_key = _stable_key(kind, claim.target_subject)
+                target_key = _stable_key(version.source_id, kind, claim.target_subject)
                 if target_key not in entity_ids:
                     placeholder = Entity.create(
                         kind=kind.value,
@@ -258,7 +297,7 @@ def _write_relations(
                 else:
                     unresolved.append(claim.target_subject)
             source_kind = item.finding.type
-            target_kind_value = target_key.split("::", 1)[0]
+            target_kind_value = _kind_of_key(target_key, by_key, claim)
             try:
                 validate_pair(claim.kind, source_kind.value, target_kind_value)
             except InvalidRelationPair as exc:
@@ -293,6 +332,33 @@ def _relation_confidence(
     if Confidence.CONTRADICTED in (source_confidence, target.confidence):
         return Confidence.CONTRADICTED
     return Confidence.INFERRED
+
+
+def _ownership_order(by_key: Mapping[str, VerifiedFinding]) -> tuple[str, ...]:
+    owners = {
+        (item.finding.owner or "").strip().lower()
+        for item in by_key.values()
+        if item.finding.owner
+    }
+    first = sorted(
+        key
+        for key in by_key
+        if by_key[key].finding.subject.strip().lower() in owners
+        and not by_key[key].finding.owner
+    )
+    rest = sorted(key for key in by_key if key not in set(first))
+    return tuple(first) + tuple(rest)
+
+
+def _kind_of_key(
+    target_key: str,
+    by_key: Mapping[str, VerifiedFinding],
+    claim: RelationClaim,
+) -> str:
+    found = by_key.get(target_key)
+    if found is not None:
+        return found.finding.type.value
+    return _placeholder_kind(claim).value
 
 
 def _unique(values: Sequence[str]) -> tuple[str, ...]:

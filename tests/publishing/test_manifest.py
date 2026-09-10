@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from wiki_ai.publishing.manifest import (
-    Artifact,
     ArtifactKind,
     Manifest,
     ManifestInvalid,
@@ -135,13 +134,3 @@ def test_manifest_lookup_helpers() -> None:
 def test_manifest_normalizes_naive_creation_time() -> None:
     manifest = build_manifest(created_at=datetime(2026, 9, 10, 8, 30, 0))
     assert manifest.created_at.tzinfo is timezone.utc
-
-
-def test_with_artifacts_keeps_identity_fields() -> None:
-    manifest = build_manifest()
-    replaced = manifest.with_artifacts(
-        [Artifact("only.md", hash_bytes(b"x"), 1, ArtifactKind.MARKDOWN)]
-    )
-    assert replaced.publication_id == manifest.publication_id
-    assert replaced.revision == manifest.revision
-    assert replaced.relative_paths == ("only.md",)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import pytest
 
@@ -9,7 +9,7 @@ from tests.benchmark import metrics
 from tests.benchmark.ground_truth import corpora
 from tests.benchmark.ground_truth.truth import Anchor, RepositoryTruth, TruthItem
 from wiki_ai.knowledge.evidence import CodeLocator, make_evidence
-from wiki_ai.knowledge.model import Confidence, Entity, EntityId, KnowledgeState, SourceVersion
+from wiki_ai.knowledge.model import Confidence, Entity, KnowledgeState, SourceVersion
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind
 

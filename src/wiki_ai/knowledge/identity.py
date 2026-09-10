@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 import uuid
 from typing import Any, Mapping
 
@@ -9,6 +11,11 @@ from .errors import InvalidIdentity
 
 ID_LENGTH = 32
 FIELD_SEPARATOR = "\x1f"
+KEY_SEPARATOR = "::"
+EXPLICIT_PREFIX = "explicit"
+GLOBAL_OWNER = "global"
+
+_NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
 
 
 def content_hash(payload: bytes | str) -> str:
@@ -38,6 +45,33 @@ def _required(value: str, label: str) -> str:
     if not text:
         raise InvalidIdentity(f"{label} vazio: identidade determinística exige valor")
     return text
+
+
+def canonical_name(value: str) -> str:
+    folded = unicodedata.normalize("NFKD", str(value or "").lower())
+    stripped = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return "_".join(_NON_ALPHANUMERIC.sub(" ", stripped).split())
+
+
+def contextual_key(
+    namespace: str,
+    kind: str,
+    owner: str | None,
+    name: str,
+    explicit_id: str | None = None,
+) -> str:
+    explicit = (explicit_id or "").strip()
+    if explicit:
+        return f"{EXPLICIT_PREFIX}{KEY_SEPARATOR}{explicit}"
+    parts = (
+        canonical_name(_required(namespace, "namespace")),
+        canonical_name(_required(kind, "kind")),
+        canonical_name(owner) or GLOBAL_OWNER,
+        canonical_name(_required(name, "name")),
+    )
+    if not parts[3]:
+        raise InvalidIdentity("name sem caracteres alfanuméricos: identidade indefinida")
+    return KEY_SEPARATOR.join(parts)
 
 
 def entity_id(kind: str, stable_key: str) -> str:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.repository.fixtures_repos import java_repo
+from tests.investigation.fixtures_snapshots import java_repo
 
 from wiki_ai.knowledge.model import Confidence
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind

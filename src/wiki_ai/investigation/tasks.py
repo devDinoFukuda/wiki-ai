@@ -13,12 +13,13 @@ class TaskState(Enum):
     READY = "ready"
     LEASED = "leased"
     SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
     FAILED = "failed"
     BLOCKED = "blocked"
 
 
 TERMINAL_STATES: frozenset[TaskState] = frozenset(
-    {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.BLOCKED}
+    {TaskState.SUCCEEDED, TaskState.PARTIAL, TaskState.FAILED, TaskState.BLOCKED}
 )
 
 ALLOWED_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
@@ -29,11 +30,13 @@ ALLOWED_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
             TaskState.READY,
             TaskState.PENDING,
             TaskState.SUCCEEDED,
+            TaskState.PARTIAL,
             TaskState.FAILED,
             TaskState.BLOCKED,
         }
     ),
     TaskState.SUCCEEDED: frozenset({TaskState.PENDING}),
+    TaskState.PARTIAL: frozenset({TaskState.PENDING}),
     TaskState.FAILED: frozenset({TaskState.PENDING}),
     TaskState.BLOCKED: frozenset({TaskState.PENDING}),
 }
@@ -103,7 +106,7 @@ def transition(task: Task, to: TaskState, reason: str, *, result_hash: str = "")
     if to not in ALLOWED_TRANSITIONS[task.state]:
         raise IllegalTransition(task.task_id, task.state, to, reason)
     sealed = result_hash or task.result_hash
-    if to is TaskState.SUCCEEDED and not sealed:
+    if to in (TaskState.SUCCEEDED, TaskState.PARTIAL) and not sealed:
         raise MissingResult(task.task_id)
     return replace(
         task,

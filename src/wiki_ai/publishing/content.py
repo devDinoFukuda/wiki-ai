@@ -16,7 +16,6 @@ from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
 from .model import (
     Assertion,
     AssertionStance,
-    DiagramSpec,
     DocumentKind,
     NarrativeBlock,
     NarrativeKind,
@@ -398,7 +397,3 @@ def keywords(capability: Entity, profile: CapabilityProfile) -> tuple[str, ...]:
         for entity in group[:4]:
             names.append(entity.name)
     return tuple(dict.fromkeys(names))
-
-
-def _diagrams(query: KnowledgeQuery, subject: Entity) -> tuple[DiagramSpec, ...]:
-    return diagrams_for(query, subject)

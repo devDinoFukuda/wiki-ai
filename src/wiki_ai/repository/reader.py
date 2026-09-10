@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
-from wiki_ai.repository.snapshot import RepositorySnapshot, normalize_path
+from wiki_ai.repository.snapshot import (
+    BlobUnavailable,
+    RepositorySnapshot,
+    normalize_path,
+)
 
 __all__ = [
     "ReaderError",
@@ -12,11 +15,14 @@ __all__ = [
     "FileUnreadable",
     "TextRange",
     "DEFAULT_MAX_BYTES",
-    "resolve_within",
+    "BINARY_PROBE_BYTES",
+    "snapshot_bytes",
+    "snapshot_text",
     "read_range",
 ]
 
 DEFAULT_MAX_BYTES = 262144
+BINARY_PROBE_BYTES = 8192
 
 
 class ReaderError(Exception):
@@ -45,12 +51,24 @@ class TextRange:
     total_lines: int
 
 
-def resolve_within(root: Path, relative: str) -> Path:
-    base = root.resolve()
-    candidate = (base / relative).resolve()
-    if candidate != base and base not in candidate.parents:
-        raise PathOutsideSnapshot(f"path escapes the snapshot root: {relative}")
-    return candidate
+def snapshot_bytes(snapshot: RepositorySnapshot, path: str) -> bytes:
+    relative = _admitted_path(snapshot, path)
+    try:
+        return snapshot.read_bytes(relative)
+    except BlobUnavailable as exc:
+        raise FileUnreadable(f"{relative}: {exc}") from exc
+
+
+def snapshot_text(
+    snapshot: RepositorySnapshot, path: str, max_file_bytes: int
+) -> str | None:
+    try:
+        raw = snapshot_bytes(snapshot, path)
+    except (PathOutsideSnapshot, FileUnreadable):
+        return None
+    if len(raw) > max_file_bytes or b"\x00" in raw[:BINARY_PROBE_BYTES]:
+        return None
+    return raw.decode("utf-8", errors="replace")
 
 
 def _admitted_path(snapshot: RepositorySnapshot, path: str) -> str:
@@ -72,13 +90,9 @@ def read_range(
     max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> TextRange:
     relative = _admitted_path(snapshot, path)
-    full_path = resolve_within(Path(snapshot.root), relative)
     if max_bytes <= 0:
         raise RangeInvalid(f"max_bytes must be positive: {max_bytes}")
-    try:
-        raw = full_path.read_bytes()
-    except OSError as exc:
-        raise FileUnreadable(f"{relative}: {exc}") from exc
+    raw = snapshot_bytes(snapshot, relative)
     text = raw.decode("utf-8", errors="replace")
     lines = text.splitlines(keepends=True)
     total = len(lines)

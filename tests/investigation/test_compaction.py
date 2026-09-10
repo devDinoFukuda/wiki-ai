@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.repository.fixtures_repos import java_repo
+from tests.investigation.fixtures_snapshots import java_repo
 
 from wiki_ai.agent.protocol import ToolCall, ToolResult
 from wiki_ai.agent.session import TranscriptEntry

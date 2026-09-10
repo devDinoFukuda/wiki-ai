@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from wiki_ai.ingestion.adapters import registry
 from wiki_ai.ingestion.adapters.documents import version_hash
+from wiki_ai.ingestion.outcome import Gap, StructuralFault
 from wiki_ai.ingestion.source import (
     Block,
     Diagnostic,
@@ -30,8 +32,11 @@ __all__ = [
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+_FAULTS: Mapping[str, StructuralFault] = {item.value: item for item in StructuralFault}
+_GAPS: Mapping[str, Gap] = {item.value: item for item in Gap}
 
-class IngestStatus(str):
+
+class IngestStatus(str, Enum):
     COMPLETE = "complete"
     PARTIAL = "partial"
     FAILED = "failed"
@@ -40,7 +45,7 @@ class IngestStatus(str):
 @dataclass(frozen=True)
 class IngestedSource:
     document: SourceDocument
-    status: str
+    status: IngestStatus
     uri: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -74,16 +79,38 @@ class IngestedSource:
             d for d in self.document.diagnostics if d.level is DiagnosticLevel.WARNING
         )
 
+    @property
+    def faults(self) -> tuple[StructuralFault, ...]:
+        found: list[StructuralFault] = []
+        for item in self.document.diagnostics:
+            if item.level is not DiagnosticLevel.ERROR:
+                continue
+            fault = _FAULTS.get(item.code)
+            if fault is not None and fault not in found:
+                found.append(fault)
+        return tuple(found)
+
+    @property
+    def open_gaps(self) -> tuple[Gap, ...]:
+        found: list[Gap] = []
+        for item in self.document.diagnostics:
+            if item.level is DiagnosticLevel.INFO:
+                continue
+            gap = _GAPS.get(item.code)
+            if gap is not None and gap not in found:
+                found.append(gap)
+        return tuple(found)
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "status": self.status,
+            "status": self.status.value,
             "uri": self.uri,
             "metadata": dict(self.metadata),
             **self.document.to_dict(),
         }
 
 
-def _status(document: SourceDocument) -> str:
+def _status(document: SourceDocument) -> IngestStatus:
     if document.errors:
         return IngestStatus.FAILED
     if any(d.level is DiagnosticLevel.WARNING for d in document.diagnostics):

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import re
 
-from wiki_ai.publishing.answer import Answerer, Intent, classify
+from wiki_ai.publishing.answer import (
+    FALLBACK_NOTE,
+    AnswerMode,
+    Answerer,
+    Intent,
+    classify,
+)
 
 _INTERNAL_ID = re.compile(r"(ent_|rel_|evd_|srcv_)[0-9a-f]{8,}")
 
@@ -124,15 +130,11 @@ def test_answers_are_deterministic(graph):
         assert _answer(graph, question).answer == _answer(graph, question).answer
 
 
-def test_provider_is_ignored_in_this_wave(graph):
-    class Provider:
-        pass
-
-    plain = Answerer().run("Como funciona a renovação?", graph.repository, None, "ns")
-    with_provider = Answerer().run(
-        "Como funciona a renovação?", graph.repository, Provider(), "ns"
-    )
-    assert plain.answer == with_provider.answer
+def test_answering_without_a_provider_declares_the_fallback_mode(graph):
+    outcome = _answer(graph, "Como funciona a renovação?")
+    assert outcome.mode is AnswerMode.DETERMINISTIC_FALLBACK
+    assert outcome.reason == "provider_unavailable"
+    assert FALLBACK_NOTE in outcome.answer
 
 
 def test_enricher_extension_point_can_rewrite_the_answer(graph):
@@ -143,7 +145,8 @@ def test_enricher_extension_point_can_rewrite_the_answer(graph):
     outcome = Answerer(enricher=Shout()).run(
         "Como funciona a renovação?", graph.repository, None, "ns"
     )
-    assert outcome.answer == outcome.answer.upper()
+    body = outcome.answer.replace(FALLBACK_NOTE, "").strip()
+    assert body == body.upper()
 
 
 def test_enricher_falling_back_keeps_the_deterministic_answer(graph):

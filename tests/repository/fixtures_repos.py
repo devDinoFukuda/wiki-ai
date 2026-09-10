@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 from wiki_ai.repository.snapshot import RepositorySnapshot, SnapshotSpec, take_snapshot
+from wiki_ai.repository.store import SnapshotStore
 
 __all__ = [
     "write",
+    "store_for",
     "snapshot_of",
     "java_repo",
     "python_repo",
@@ -24,8 +26,12 @@ def write(root: Path, relative: str, content: str) -> Path:
     return target
 
 
+def store_for(root: Path) -> SnapshotStore:
+    return SnapshotStore(Path(root).parent / f"{Path(root).name}.snapshots")
+
+
 def snapshot_of(root: Path) -> RepositorySnapshot:
-    return take_snapshot(SnapshotSpec(root=root))
+    return take_snapshot(SnapshotSpec(root=root), store_for(root))
 
 
 _JAVA_CONTROLLER = """package com.acme.order;

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
 from wiki_ai.knowledge.errors import KnowledgeError
+from wiki_ai.knowledge.identity import contextual_key
 from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.taxonomy import (
     ENTITY_KIND_VALUES,
@@ -18,11 +19,12 @@ from wiki_ai.knowledge.taxonomy import (
 
 from wiki_ai.ingestion import briefing
 from wiki_ai.ingestion.harness import DocumentEvidenceCapture, DocumentHarness, excerpt_hash
-from wiki_ai.ingestion.hints import normalize_text, stable_key
+from wiki_ai.ingestion.hints import normalize_text
 from wiki_ai.ingestion.source import SourceKind
 
 __all__ = [
     "MIN_TERM_LENGTH",
+    "DEFAULT_NAMESPACE",
     "DocumentFindingError",
     "DocumentEvidenceRef",
     "DocumentRelationClaim",
@@ -34,9 +36,12 @@ __all__ = [
     "parse_findings",
     "state_for",
     "verify",
+    "owner_from_captures",
+    "OWNER_FIELDS",
 ]
 
 MIN_TERM_LENGTH = 4
+DEFAULT_NAMESPACE = "document"
 
 
 class DocumentFindingError(Exception):
@@ -85,9 +90,19 @@ class DocumentFinding:
     proposed: bool = False
     relations: tuple[DocumentRelationClaim, ...] = ()
     gap_question: str = ""
+    owner: str | None = None
+    explicit_id: str | None = None
+    namespace: str = DEFAULT_NAMESPACE
 
     def __post_init__(self) -> None:
         subject = str(self.subject or "").strip()
+        owner = str(self.owner or "").strip()
+        object.__setattr__(self, "owner", owner or None)
+        explicit = str(self.explicit_id or "").strip()
+        object.__setattr__(self, "explicit_id", explicit or None)
+        object.__setattr__(
+            self, "namespace", str(self.namespace or "").strip() or DEFAULT_NAMESPACE
+        )
         if not subject:
             raise DocumentFindingError(f"finding {self.type.value} without a subject")
         object.__setattr__(self, "subject", subject)
@@ -118,12 +133,28 @@ class DocumentFinding:
 
     @property
     def stable_key(self) -> str:
-        return stable_key(self.type.value, self.subject)
+        return contextual_key(
+            self.namespace,
+            self.type.value,
+            self.owner,
+            self.subject,
+            self.explicit_id,
+        )
+
+    def with_context(self, namespace: str, owner: str | None) -> "DocumentFinding":
+        return replace(
+            self,
+            namespace=namespace or self.namespace,
+            owner=self.owner or owner,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": self.type.value,
             "subject": self.subject,
+            "owner": self.owner,
+            "explicit_id": self.explicit_id,
+            "namespace": self.namespace,
             "statement": self.statement,
             "attributes": dict(self.attributes),
             "conditions": list(self.conditions),
@@ -212,6 +243,8 @@ def document_finding_schema(kind: SourceKind | None = None) -> dict[str, Any]:
         "properties": {
             "type": {"type": "string", "enum": allowed_types},
             "subject": {"type": "string"},
+            "owner": {"type": "string"},
+            "explicit_id": {"type": "string"},
             "statement": {"type": "string"},
             "attributes": {"type": "object"},
             "conditions": {"type": "array", "items": {"type": "string"}},
@@ -300,6 +333,8 @@ def parse_finding(payload: Mapping[str, Any]) -> DocumentFinding:
     return DocumentFinding(
         type=entity_kind(str(raw_type)),
         subject=str(payload.get("subject") or ""),
+        owner=str(payload.get("owner") or "") or None,
+        explicit_id=str(payload.get("explicit_id") or "") or None,
         statement=str(payload.get("statement") or ""),
         attributes=dict(attributes) if isinstance(attributes, Mapping) else {},
         conditions=_texts(payload.get("conditions")),
@@ -354,9 +389,34 @@ def _grounded(finding: DocumentFinding, captures: Sequence[DocumentEvidenceCaptu
     return False
 
 
+OWNER_FIELDS: tuple[str, ...] = (
+    "section",
+    "worksheet",
+    "speaker",
+    "page",
+    "path",
+    "pointer",
+    "xpath",
+    "block",
+)
+
+
+def owner_from_captures(captures: Sequence[DocumentEvidenceCapture]) -> str:
+    for capture in captures:
+        for name in OWNER_FIELDS:
+            value = capture.locator.get(name)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return f"{name}:{text}"
+    return ""
+
+
 def verify(
     findings: Sequence[DocumentFinding],
     harness: DocumentHarness,
+    namespace: str = DEFAULT_NAMESPACE,
 ) -> tuple[tuple[VerifiedDocumentFinding, ...], tuple[str, ...]]:
     allowed = frozenset(briefing.allowed_types(harness.kind))
     results: list[VerifiedDocumentFinding] = []
@@ -405,8 +465,11 @@ def verify(
                     f"no term of {finding.subject!r} appears in the captured blocks"
                 )
                 confidence = Confidence.INFERRED
+        contextual = finding.with_context(
+            namespace, finding.owner or owner_from_captures(captures) or harness.title
+        )
         item = VerifiedDocumentFinding(
-            finding=finding,
+            finding=contextual,
             confidence=confidence,
             state=state_for(finding),
             captures=tuple(captures),

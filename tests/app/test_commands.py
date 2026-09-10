@@ -9,7 +9,11 @@ import pytest
 from wiki_ai import __version__
 from wiki_ai.app import api
 from wiki_ai.app.commands import COMMANDS, EXIT_BLOCKED, EXIT_ERROR, EXIT_OK, main
-from wiki_ai.app.session import OUTDATED_STORE_MARKERS
+from wiki_ai.app.session import (
+    CODESCAN_DIRECTORY,
+    COMPANION_DIRECTORIES,
+    DOCX_DIRECTORY,
+)
 
 
 def _run(*argv: str) -> tuple[int, dict]:
@@ -59,17 +63,43 @@ def test_inspect_reports_counts_for_a_mixed_repository(tmp_path: Path) -> None:
     assert len(payload["snapshot_digest"]) == 64
 
 
-@pytest.mark.parametrize("marker", OUTDATED_STORE_MARKERS)
-def test_inspect_is_blocked_by_an_outdated_store(tmp_path: Path, marker: str) -> None:
-    _mixed_repo(tmp_path)
-    (tmp_path / marker).mkdir(parents=True, exist_ok=True)
-    code, payload = _run("inspect", str(tmp_path))
-    assert code == EXIT_BLOCKED
-    assert payload == {
+def _blocked_payload() -> dict:
+    return {
         "status": "blocked",
         "reason": "outdated_store",
         "action": "run a new analysis",
     }
+
+
+def test_inspect_is_blocked_by_a_codescan_store(tmp_path: Path) -> None:
+    _mixed_repo(tmp_path)
+    directory = tmp_path / CODESCAN_DIRECTORY
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "state.db").write_bytes(b"")
+    code, payload = _run("inspect", str(tmp_path))
+    assert code == EXIT_BLOCKED
+    assert payload == _blocked_payload()
+
+
+def test_inspect_is_blocked_by_a_docx_store(tmp_path: Path) -> None:
+    _mixed_repo(tmp_path)
+    (tmp_path / DOCX_DIRECTORY).mkdir(parents=True, exist_ok=True)
+    for name in COMPANION_DIRECTORIES:
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    code, payload = _run("inspect", str(tmp_path))
+    assert code == EXIT_BLOCKED
+    assert payload == _blocked_payload()
+
+
+def test_inspect_accepts_a_repository_with_raw_or_wiki_directories(
+    tmp_path: Path,
+) -> None:
+    _mixed_repo(tmp_path)
+    for name in COMPANION_DIRECTORIES:
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    code, payload = _run("inspect", str(tmp_path))
+    assert code == EXIT_OK
+    assert payload["status"] == "ok"
 
 
 def test_inspect_reports_missing_repository(tmp_path: Path) -> None:

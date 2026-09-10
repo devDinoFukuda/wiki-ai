@@ -8,7 +8,13 @@ from types import MappingProxyType
 from typing import Any, ClassVar, Mapping, Sequence
 
 from .errors import InvalidKind, PayloadInvalid
-from .identity import entity_id, relation_id, source_version_id
+from .identity import (
+    canonical_name,
+    contextual_key,
+    entity_id,
+    relation_id,
+    source_version_id,
+)
 
 KIND_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 
@@ -80,12 +86,17 @@ class Entity:
     state: KnowledgeState = KnowledgeState.DECLARED
     confidence: Confidence = Confidence.UNRESOLVED
     source_versions: tuple[str, ...] = ()
+    owner_id: EntityId | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", validate_kind(self.kind))
         object.__setattr__(self, "name", _required_text(self.name, "Entity.name"))
         object.__setattr__(self, "attributes", MappingProxyType(dict(self.attributes)))
         object.__setattr__(self, "source_versions", tuple(self.source_versions))
+
+    @property
+    def canonical_name(self) -> str:
+        return canonical_name(self.name)
 
     @classmethod
     def create(
@@ -97,6 +108,7 @@ class Entity:
         state: KnowledgeState = KnowledgeState.DECLARED,
         confidence: Confidence = Confidence.UNRESOLVED,
         source_versions: Sequence[str] = (),
+        owner_id: EntityId | None = None,
     ) -> "Entity":
         return cls(
             id=EntityId.derive(kind, stable_key or _required_text(name, "Entity.name")),
@@ -106,10 +118,69 @@ class Entity:
             state=state,
             confidence=confidence,
             source_versions=tuple(source_versions),
+            owner_id=owner_id,
+        )
+
+    @classmethod
+    def owned(
+        cls,
+        namespace: str,
+        kind: str,
+        name: str,
+        owner: "Entity | None" = None,
+        explicit_id: str | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        state: KnowledgeState = KnowledgeState.DECLARED,
+        confidence: Confidence = Confidence.UNRESOLVED,
+        source_versions: Sequence[str] = (),
+    ) -> "Entity":
+        return cls.create(
+            kind=kind,
+            name=name,
+            stable_key=contextual_key(
+                namespace,
+                validate_kind(kind),
+                owner.name if owner is not None else None,
+                name,
+                explicit_id,
+            ),
+            attributes=attributes,
+            state=state,
+            confidence=confidence,
+            source_versions=source_versions,
+            owner_id=owner.id if owner is not None else None,
         )
 
     def with_confidence(self, confidence: Confidence) -> "Entity":
         return replace(self, confidence=confidence)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id.value,
+            "kind": self.kind,
+            "name": self.name,
+            "attributes": dict(self.attributes),
+            "state": self.state.value,
+            "confidence": self.confidence.value,
+            "source_versions": list(self.source_versions),
+            "owner_id": self.owner_id.value if self.owner_id is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Entity":
+        owner = data.get("owner_id")
+        return cls(
+            id=EntityId(str(data["id"])),
+            kind=str(data["kind"]),
+            name=str(data["name"]),
+            attributes=dict(data.get("attributes") or {}),
+            state=KnowledgeState(str(data.get("state", KnowledgeState.DECLARED.value))),
+            confidence=Confidence(
+                str(data.get("confidence", Confidence.UNRESOLVED.value))
+            ),
+            source_versions=tuple(str(key) for key in data.get("source_versions") or ()),
+            owner_id=EntityId(str(owner)) if owner else None,
+        )
 
 
 @dataclass(frozen=True)

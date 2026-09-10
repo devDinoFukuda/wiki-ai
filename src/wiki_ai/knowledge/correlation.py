@@ -20,14 +20,17 @@ from .taxonomy import EntityKind, RelationKind, entity_kind, pair_allowed
 __all__ = [
     "AMBIGUOUS_PREFIX",
     "BASIS_ALIAS",
+    "BASIS_CROSS_OWNER",
     "BASIS_IMPACT",
     "BASIS_STABLE_KEY",
     "CORRELATED_BY",
     "CORRELATION_AUTHOR",
+    "CROSS_OWNER_PENALTY",
     "CorrelatedRelation",
     "CorrelationReport",
     "LEFT_SOURCE",
     "RIGHT_SOURCE",
+    "SAME_OWNER",
     "SCORE",
     "correlate",
 ]
@@ -37,6 +40,11 @@ CORRELATION_AUTHOR = "correlation"
 BASIS_STABLE_KEY = "stable_key"
 BASIS_ALIAS = "alias"
 BASIS_IMPACT = "impact"
+BASIS_CROSS_OWNER = "cross_owner"
+
+CROSS_OWNER_PENALTY = 0.75
+
+SAME_OWNER = "same_owner"
 
 CORRELATED_BY = "correlated_by"
 SCORE = "score"
@@ -171,8 +179,16 @@ class _Index:
         return keys[0] if keys else ""
 
 
+def _same_owner(left: Entity, right: Entity) -> bool:
+    return _owner_of(left) == _owner_of(right)
+
+
+def _owner_of(entity: Entity) -> str:
+    return entity.owner_id.value if entity.owner_id is not None else ""
+
+
 def _match(index: _Index, left: Entity, right: Entity) -> tuple[float, str]:
-    best = score_names(subject_of(left.name), right.name)
+    best = score_names(subject_of(left.name), right.canonical_name)
     basis = BASIS_STABLE_KEY
     for first in index.aliases(left):
         for second in index.aliases(right):
@@ -180,7 +196,9 @@ def _match(index: _Index, left: Entity, right: Entity) -> tuple[float, str]:
             if score > best:
                 best = score
                 basis = BASIS_ALIAS
-    return best, basis
+    if _same_owner(left, right):
+        return best, basis
+    return round(best * CROSS_OWNER_PENALTY, 4), BASIS_CROSS_OWNER
 
 
 def _candidates(
@@ -295,6 +313,7 @@ class _Writer:
             SCORE: round(float(score), 4),
             LEFT_SOURCE: left_source,
             RIGHT_SOURCE: right_source,
+            SAME_OWNER: _same_owner(left, right),
         }
         attributes.update(dict(extra or {}))
         relation = Relation.create(
@@ -475,11 +494,13 @@ def _affects(repository: KnowledgeRepository, index: _Index, writer: _Writer) ->
 
 
 def _pair_score(index: _Index, left: Entity, right: Entity) -> float:
-    best = score_names(left.name, right.name)
+    best = score_names(left.canonical_name, right.canonical_name)
     for first in index.aliases(left):
         for second in index.aliases(right):
             best = max(best, score_names(first, second))
-    return best
+    if _same_owner(left, right):
+        return best
+    return round(best * CROSS_OWNER_PENALTY, 4)
 
 
 def _contradicts(index: _Index, writer: _Writer, threshold: float) -> None:

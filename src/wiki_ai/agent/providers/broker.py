@@ -12,6 +12,7 @@ from wiki_ai.agent.providers.jsonrpc import (
     decode,
     encode,
     error_message,
+    parse_request,
     result_message,
 )
 from wiki_ai.agent.session import AgentSession, BudgetExhausted, SessionError
@@ -78,23 +79,23 @@ class _Handler(socketserver.StreamRequestHandler):
                 self.wfile.write(encode(error_message(None, exc.code, exc.detail)))
                 self.wfile.flush()
                 continue
-            identifier = message.get("id")
-            method = message.get("method")
-            raw_params = message.get("params")
-            params = dict(raw_params) if isinstance(raw_params, Mapping) else {}
-            if not isinstance(method, str):
+            try:
+                request = parse_request(message)
+            except JsonRpcError:
                 continue
             try:
-                result = broker.dispatch(method, params)
+                result = broker.dispatch(request.method, request.params)
             except JsonRpcError as exc:
-                if identifier is not None:
+                if not request.is_notification:
                     self.wfile.write(
-                        encode(error_message(identifier, exc.code, exc.detail))
+                        encode(
+                            error_message(request.identifier, exc.code, exc.detail)
+                        )
                     )
                     self.wfile.flush()
                 continue
-            if identifier is not None:
-                self.wfile.write(encode(result_message(identifier, result)))
+            if not request.is_notification:
+                self.wfile.write(encode(result_message(request.identifier, result)))
                 self.wfile.flush()
 
     def handle_error(self, request: Any, client_address: Any) -> None:

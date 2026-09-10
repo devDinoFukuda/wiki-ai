@@ -2,11 +2,18 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from wiki_ai.ingestion.source import Block, BlockKind, Diagnostic, DiagnosticLevel, make_block
+from wiki_ai.ingestion.outcome import Gap
+from wiki_ai.ingestion.source import (
+    Block,
+    BlockKind,
+    Diagnostic,
+    DiagnosticLevel,
+    make_block,
+)
 
 __all__ = ["BlockBuilder", "IMAGE_GAP_CODE", "image_gap"]
 
-IMAGE_GAP_CODE = "image_content_not_interpreted"
+IMAGE_GAP_CODE = Gap.IMAGE_CONTENT_NOT_INTERPRETED.value
 
 
 class BlockBuilder:
@@ -14,10 +21,6 @@ class BlockBuilder:
         self._source_id = source_id
         self._blocks: list[Block] = []
         self._diagnostics: list[Diagnostic] = []
-
-    @property
-    def next_order(self) -> int:
-        return len(self._blocks)
 
     def add(
         self,
@@ -61,11 +64,6 @@ class BlockBuilder:
         self, code: str, message: str, locator: Mapping[str, Any] | None = None
     ) -> Diagnostic:
         return self.record(DiagnosticLevel.ERROR, code, message, locator)
-
-    def inform(
-        self, code: str, message: str, locator: Mapping[str, Any] | None = None
-    ) -> Diagnostic:
-        return self.record(DiagnosticLevel.INFO, code, message, locator)
 
     def extend_diagnostics(self, found: tuple[Diagnostic, ...]) -> None:
         self._diagnostics.extend(found)

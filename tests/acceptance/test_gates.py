@@ -13,6 +13,7 @@ from tests.acceptance.reachability import (
 )
 from tests.acceptance.scenarios import (
     NAMESPACE_OBJECTIVE,
+    assert_settled,
     cobol_scripts,
     java_acceptance_repo,
     java_scripts,
@@ -37,7 +38,7 @@ def java(tmp_path: Path) -> tuple[Path, ProviderRegistry]:
     repo = java_acceptance_repo(tmp_path / "java")
     registry = scripted_registry(java_scripts())
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=registry)
-    assert report.status == "ok", report.to_dict()
+    assert_settled(report)
     return repo, registry
 
 
@@ -47,7 +48,7 @@ def mainframe(tmp_path: Path) -> Path:
     report = api.analyze(
         repo, NAMESPACE_OBJECTIVE, registry=scripted_registry(cobol_scripts())
     )
-    assert report.status == "ok", report.to_dict()
+    assert_settled(report)
     return repo
 
 

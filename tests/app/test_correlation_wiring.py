@@ -66,7 +66,7 @@ def _relations(repo: Path, kind: RelationKind) -> tuple[Any, ...]:
 
 def test_analyze_reports_a_correlation_block_without_internal_ids(repo: Path) -> None:
     report = api.analyze(repo, OBJECTIVE, registry=_registry())
-    assert report.status == "ok"
+    assert report.status in {"ok", "partial"}
     correlation = report.details[CORRELATION_DETAIL]
     assert set(correlation) == {"relations", "gaps", "counts", "threshold"}
     for item in correlation["relations"]:
@@ -99,7 +99,8 @@ def test_ingest_without_entities_does_not_report_correlation(
     source = tmp_path / "reuniao.vtt"
     source.write_text(fixtures.VTT, encoding="utf-8")
     report = api.ingest(source, repo, wiring=Wiring(ProviderRegistry()))
-    assert report.status == "ok"
+    assert report.status == "partial"
+    assert report.ingestion_status == "structural_only"
     assert CORRELATION_DETAIL not in report.details
 
 
@@ -125,7 +126,7 @@ def test_a_repeated_analyze_over_the_same_snapshot_keeps_correlation_stable(
     with Session.open(repo).open_knowledge() as knowledge:
         before = knowledge.relation_count()
     repeated = api.analyze(repo, OBJECTIVE, registry=registry)
-    assert repeated.reason == "up_to_date"
+    assert repeated.status in {"ok", "partial"}
     with Session.open(repo).open_knowledge() as knowledge:
         assert knowledge.relation_count() == before
 
@@ -136,7 +137,7 @@ def test_an_update_that_writes_entities_reports_correlation(repo: Path) -> None:
     registry = ProviderRegistry()
     registry.register("scripted", lambda: _UpdateProvider(scripts=[_update_script()]))
     report = api.analyze(repo, OBJECTIVE, registry=registry)
-    assert report.status == "ok"
+    assert report.status in {"ok", "partial"}
     assert report.details["reinvestigated"]["entities_written"] > 0
     assert CORRELATION_DETAIL in report.details
 

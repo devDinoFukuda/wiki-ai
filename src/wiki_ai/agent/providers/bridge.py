@@ -12,6 +12,7 @@ from wiki_ai.agent.providers.jsonrpc import (
     decode,
     encode,
     error_message,
+    parse_request,
     read_message,
     result_message,
     write_message,
@@ -127,33 +128,32 @@ def serve(client: BrokerClient, source: BinaryIO, sink: BinaryIO) -> None:
         if message is None:
             return
         identifier = message.get("id")
-        method = message.get("method")
-        raw_params = message.get("params")
-        params = dict(raw_params) if isinstance(raw_params, Mapping) else {}
-        if not isinstance(method, str):
-            if identifier is not None:
-                write_message(
-                    sink,
-                    error_message(
-                        identifier, ErrorCode.INVALID_REQUEST, "message without a method"
-                    ),
-                )
-            continue
         try:
-            result = _dispatch(client, method, params)
+            request = parse_request(message)
         except JsonRpcError as exc:
             if identifier is not None:
                 write_message(sink, error_message(identifier, exc.code, exc.detail))
             continue
-        except OSError as exc:
-            if identifier is not None:
+        try:
+            result = _dispatch(client, request.method, request.params)
+        except JsonRpcError as exc:
+            if not request.is_notification:
                 write_message(
-                    sink, error_message(identifier, ErrorCode.INTERNAL_ERROR, str(exc))
+                    sink, error_message(request.identifier, exc.code, exc.detail)
                 )
             continue
-        if identifier is not None:
-            write_message(sink, result_message(identifier, result))
-        if method == _SHUTDOWN:
+        except OSError as exc:
+            if not request.is_notification:
+                write_message(
+                    sink,
+                    error_message(
+                        request.identifier, ErrorCode.INTERNAL_ERROR, str(exc)
+                    ),
+                )
+            continue
+        if not request.is_notification:
+            write_message(sink, result_message(request.identifier, result))
+        if request.method == _SHUTDOWN:
             return
 
 

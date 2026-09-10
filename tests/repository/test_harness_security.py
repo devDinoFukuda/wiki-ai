@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.repository.fixtures_repos import python_repo, write
+from tests.repository.fixtures_repos import python_repo, store_for, write
 from wiki_ai.repository.harness import InvalidToolArguments, RepositoryHarness
 from wiki_ai.repository.snapshot import SnapshotSpec, take_snapshot
 
@@ -77,7 +77,9 @@ def test_search_globs_cannot_escape_the_snapshot(tmp_path: Path) -> None:
 def test_excluded_files_stay_invisible_to_every_tool(tmp_path: Path) -> None:
     write(tmp_path, "app/main.py", "SECRET = 'visible'\n")
     write(tmp_path, "app/private.py", "SECRET = 'hidden'\n")
-    snapshot = take_snapshot(SnapshotSpec(root=tmp_path, excludes=("app/private.py",)))
+    snapshot = take_snapshot(
+        SnapshotSpec(root=tmp_path, excludes=("app/private.py",)), store_for(tmp_path)
+    )
     harness = RepositoryHarness(snapshot)
     paths = {entry["path"] for entry in harness.invoke("repo.inventory", {})["entries"]}
     assert paths == {"app/main.py"}

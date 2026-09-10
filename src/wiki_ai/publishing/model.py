@@ -242,10 +242,6 @@ class DiagramSpec:
                 "visual exige lista de frases equivalentes"
             )
 
-    @property
-    def slug(self) -> str:
-        return f"{self.kind.value}"
-
 
 @dataclass(frozen=True)
 class DocumentProperties:

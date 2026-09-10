@@ -9,6 +9,7 @@ import pytest
 from tests.acceptance.scenarios import (
     CAPABILITY,
     NAMESPACE_OBJECTIVE,
+    assert_settled,
     java_acceptance_repo,
     java_scripts,
     scripted_registry,
@@ -45,7 +46,7 @@ def registry() -> ProviderRegistry:
 def analyzed(tmp_path: Path, registry: ProviderRegistry) -> Path:
     repo = java_acceptance_repo(tmp_path / "repo")
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=registry)
-    assert report.status == "ok", report.to_dict()
+    assert_settled(report)
     return repo
 
 

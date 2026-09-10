@@ -7,20 +7,40 @@ from typing import Any, Mapping, Sequence
 
 from wiki_ai.knowledge.evidence import CodeContent
 from wiki_ai.knowledge.model import Confidence
+from wiki_ai.knowledge.taxonomy import EntityKind
 from wiki_ai.repository.evidence import EvidenceCapture, verify as verify_capture
 from wiki_ai.repository.snapshot import RepositorySnapshot
 
 from wiki_ai.investigation.evidence import CaptureRegistry, capture_id, detect_content
 from wiki_ai.investigation.finding import EvidenceRef, Finding
+from wiki_ai.investigation.grounding import (
+    GroundingCheck,
+    check_component,
+    excerpt_vocabulary,
+    symbol_defined_or_referenced,
+)
 
 __all__ = [
     "Rejection",
     "ResolvedEvidence",
+    "GroundingCheck",
     "VerifiedFinding",
     "VerificationReport",
+    "DECOMPOSED_KINDS",
+    "DEFAULT_NAMESPACE",
     "verify",
 ]
 
+DECOMPOSED_KINDS: frozenset[EntityKind] = frozenset(
+    {
+        EntityKind.BUSINESS_RULE,
+        EntityKind.VALIDATION,
+        EntityKind.EDGE_CASE,
+        EntityKind.INVARIANT,
+    }
+)
+
+DEFAULT_NAMESPACE = "repository"
 MIN_TOKEN_LENGTH = 4
 _TOKEN_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,}")
 _NEGATIONS = ("not ", "never ", "no ", "não ", "nunca ", "sem ")
@@ -73,14 +93,14 @@ class VerifiedFinding:
     evidence: tuple[ResolvedEvidence, ...] = ()
     rejections: tuple[Rejection, ...] = ()
     reasons: tuple[str, ...] = ()
+    evidence_valid: bool = False
+    claim_supported: bool = False
+    grounding: tuple[GroundingCheck, ...] = ()
+    stable_key: str = ""
 
     @property
     def subject(self) -> str:
         return self.finding.subject
-
-    @property
-    def stable_key(self) -> str:
-        return self.finding.stable_key
 
     @property
     def persistable(self) -> bool:
@@ -91,6 +111,9 @@ class VerifiedFinding:
             "type": self.finding.type.value,
             "subject": self.finding.subject,
             "confidence": self.confidence.value,
+            "evidence_valid": self.evidence_valid,
+            "claim_supported": self.claim_supported,
+            "grounding": [item.to_dict() for item in self.grounding],
             "evidence": [item.to_dict() for item in self.evidence],
             "rejections": [item.value for item in self.rejections],
             "reasons": list(self.reasons),
@@ -103,9 +126,6 @@ class VerificationReport:
     discarded: tuple[VerifiedFinding, ...] = ()
     gaps: tuple[str, ...] = ()
     counts: Mapping[str, int] = field(default_factory=dict)
-
-    def by_confidence(self, confidence: Confidence) -> tuple[VerifiedFinding, ...]:
-        return tuple(item for item in self.verified if item.confidence is confidence)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,20 +155,73 @@ def _split_identifiers(tokens: set[str]) -> set[str]:
     return expanded
 
 
-def _lexically_grounded(finding: Finding, resolved: Sequence[ResolvedEvidence]) -> bool:
-    claim = _split_identifiers(_tokens(f"{finding.subject} {finding.statement}"))
-    if not claim:
-        return False
+def _executable_vocabulary(resolved: Sequence[ResolvedEvidence]) -> frozenset[str]:
+    vocabulary: set[str] = set()
     for item in resolved:
-        haystack = _split_identifiers(
-            _tokens(item.capture.excerpt + " " + item.capture.path.replace("/", " "))
-        )
+        if not item.executable:
+            continue
+        vocabulary |= excerpt_vocabulary(item.capture.excerpt)
         symbol = item.capture.symbol or ""
         if symbol:
-            haystack |= _split_identifiers(_tokens(symbol))
-        if claim & haystack:
-            return True
-    return False
+            vocabulary |= excerpt_vocabulary(symbol)
+    return frozenset(vocabulary)
+
+
+def _any_vocabulary(resolved: Sequence[ResolvedEvidence]) -> frozenset[str]:
+    vocabulary: set[str] = set()
+    for item in resolved:
+        vocabulary |= excerpt_vocabulary(item.capture.excerpt)
+        symbol = item.capture.symbol or ""
+        if symbol:
+            vocabulary |= excerpt_vocabulary(symbol)
+    return frozenset(vocabulary)
+
+
+def _component_texts(finding: Finding) -> tuple[tuple[str, str], ...]:
+    components: list[tuple[str, str]] = []
+    for index, condition in enumerate(finding.conditions):
+        components.append((f"conditions[{index}]", condition))
+    for index, effect in enumerate(finding.effects):
+        components.append((f"effects[{index}]", effect))
+    if components:
+        return tuple(components)
+    for name in ("condition", "expected", "rule"):
+        value = finding.attributes.get(name)
+        if isinstance(value, str) and value.strip():
+            components.append((name, value))
+    if components:
+        return tuple(components)
+    if finding.statement:
+        return (("statement", finding.statement),)
+    return ()
+
+
+def ground(
+    finding: Finding, resolved: Sequence[ResolvedEvidence]
+) -> tuple[tuple[GroundingCheck, ...], bool]:
+    executable = _executable_vocabulary(resolved)
+    vocabulary = executable or _any_vocabulary(resolved)
+    if not vocabulary:
+        return (), False
+    symbol = symbol_defined_or_referenced(finding.subject, vocabulary)
+    if finding.type not in DECOMPOSED_KINDS:
+        statement = finding.statement or finding.subject
+        claim = check_component(
+            "statement", statement, vocabulary, exclude=()
+        )
+        checks = (symbol, claim)
+        return checks, symbol.ok or claim.ok
+    components = _component_texts(finding)
+    if not components:
+        return (symbol,), False
+    checks: list[GroundingCheck] = [symbol]
+    for name, text in components:
+        checks.append(
+            check_component(name, text, executable, subject=finding.subject)
+        )
+    decomposed = tuple(item for item in checks if item.component != "symbol")
+    supported = bool(decomposed) and all(item.ok for item in decomposed)
+    return tuple(checks), supported and symbol.ok
 
 
 def _resolve(
@@ -201,18 +274,22 @@ def _opposite_effects(left: Finding, right: Finding) -> bool:
     )
 
 
-def _declared_contradiction(left: Finding, right: Finding) -> bool:
+def _declared_contradiction(
+    left: Finding, right: Finding, keys: Mapping[int, str]
+) -> bool:
     targets = {item.strip().lower() for item in left.contradicts}
     targets |= {item.strip().lower() for item in right.contradicts}
     return (
         left.subject.strip().lower() in targets
         or right.subject.strip().lower() in targets
-        or left.stable_key in targets
-        or right.stable_key in targets
+        or keys[id(left)] in targets
+        or keys[id(right)] in targets
     )
 
 
-def _contradiction_groups(findings: Sequence[Finding]) -> dict[str, tuple[str, ...]]:
+def _contradiction_groups(
+    findings: Sequence[Finding], keys: Mapping[int, str]
+) -> dict[str, tuple[str, ...]]:
     grouped: dict[str, list[Finding]] = {}
     for finding in findings:
         grouped.setdefault(finding.subject.strip().lower(), []).append(finding)
@@ -221,7 +298,8 @@ def _contradiction_groups(findings: Sequence[Finding]) -> dict[str, tuple[str, .
         for index, left in enumerate(group):
             for right in group[index + 1 :]:
                 if not (
-                    _declared_contradiction(left, right) or _opposite_effects(left, right)
+                    _declared_contradiction(left, right, keys)
+                    or _opposite_effects(left, right)
                 ):
                     continue
                 message = (
@@ -230,7 +308,7 @@ def _contradiction_groups(findings: Sequence[Finding]) -> dict[str, tuple[str, .
                     f"{right.statement or right.subject!r}"
                 )
                 for finding in (left, right):
-                    entries = flagged.setdefault(finding.stable_key, [])
+                    entries = flagged.setdefault(keys[id(finding)], [])
                     if message not in entries:
                         entries.append(message)
     return {key: tuple(values) for key, values in flagged.items()}
@@ -240,8 +318,10 @@ def verify(
     findings: Sequence[Finding],
     registry: CaptureRegistry,
     snapshot: RepositorySnapshot,
+    namespace: str = DEFAULT_NAMESPACE,
 ) -> VerificationReport:
-    contradictions = _contradiction_groups(findings)
+    keys = {id(finding): finding.stable_key(namespace) for finding in findings}
+    contradictions = _contradiction_groups(findings, keys)
     verified: list[VerifiedFinding] = []
     discarded: list[VerifiedFinding] = []
     gaps: list[str] = []
@@ -259,8 +339,10 @@ def verify(
                 rejections.append(rejection)
             if reason:
                 reasons.append(reason)
-        confidence = _confidence_for(finding, resolved, rejections, reasons)
-        contradiction = contradictions.get(finding.stable_key, ())
+        assessment = _assess(finding, resolved, rejections, reasons)
+        confidence = assessment.confidence
+        stable_key = keys[id(finding)]
+        contradiction = contradictions.get(stable_key, ())
         if contradiction:
             confidence = Confidence.CONTRADICTED
             if Rejection.CONTRADICTED_BY_PEER not in rejections:
@@ -272,6 +354,10 @@ def verify(
             evidence=tuple(resolved),
             rejections=tuple(rejections),
             reasons=tuple(dict.fromkeys(reasons)),
+            evidence_valid=assessment.evidence_valid,
+            claim_supported=assessment.claim_supported,
+            grounding=assessment.grounding,
+            stable_key=stable_key,
         )
         counts[confidence.value] = counts.get(confidence.value, 0) + 1
         if item.persistable:
@@ -295,34 +381,60 @@ def verify(
     )
 
 
-def _confidence_for(
+@dataclass(frozen=True)
+class _Assessment:
+    confidence: Confidence
+    evidence_valid: bool
+    claim_supported: bool
+    grounding: tuple[GroundingCheck, ...]
+
+
+def _assess(
     finding: Finding,
     resolved: Sequence[ResolvedEvidence],
     rejections: list[Rejection],
     reasons: list[str],
-) -> Confidence:
+) -> _Assessment:
     if not finding.evidence:
         rejections.append(Rejection.NO_EVIDENCE)
         reasons.append(
             f"{finding.type.value} {finding.subject!r} was stated without evidence"
         )
-        return Confidence.UNRESOLVED
+        return _Assessment(Confidence.UNRESOLVED, False, False, ())
     if not resolved:
-        return Confidence.UNRESOLVED
-    if not _lexically_grounded(finding, resolved):
+        return _Assessment(Confidence.UNRESOLVED, False, False, ())
+    grounding, supported = ground(finding, resolved)
+    executable = any(item.executable for item in resolved)
+    if not supported:
         rejections.append(Rejection.STATEMENT_UNSUPPORTED_BY_EXCERPT)
-        reasons.append(
-            f"no term of {finding.subject!r} appears in the captured excerpts or paths"
-        )
-        return Confidence.INFERRED
-    if not any(item.executable for item in resolved):
+        reasons.append(_grounding_reason(finding, grounding))
+        return _Assessment(Confidence.INFERRED, True, False, grounding)
+    if not executable:
         rejections.append(Rejection.NO_EXECUTABLE_EVIDENCE)
         kinds = sorted({item.content.value for item in resolved})
         reasons.append(
             f"only non-executable evidence ({', '.join(kinds)}) supports "
             f"{finding.subject!r}"
         )
-        return Confidence.INFERRED
+        return _Assessment(Confidence.INFERRED, True, False, grounding)
     if finding.confidence is Confidence.CONTRADICTED:
-        return Confidence.CONTRADICTED
-    return Confidence.SUPPORTED
+        return _Assessment(Confidence.CONTRADICTED, True, True, grounding)
+    return _Assessment(Confidence.SUPPORTED, True, True, grounding)
+
+
+def _grounding_reason(
+    finding: Finding, grounding: Sequence[GroundingCheck]
+) -> str:
+    failed = [item for item in grounding if not item.ok]
+    if not failed:
+        return (
+            f"no executable excerpt sustains the claim about {finding.subject!r}"
+        )
+    parts: list[str] = []
+    for item in failed:
+        missing = item.terms_missing or item.terms_required
+        parts.append(f"{item.component} needs {', '.join(missing) or 'key terms'}")
+    return (
+        f"{finding.type.value} {finding.subject!r} is not grounded in the "
+        f"executable excerpt: " + "; ".join(parts)
+    )

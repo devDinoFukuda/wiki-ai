@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from tests.investigation.fake_provider import FakeProvider, Script
-from tests.repository.fixtures_repos import java_repo, snapshot_of, write
+from tests.investigation.fixtures_snapshots import java_repo, snapshot_of, write
 
 from wiki_ai.agent.protocol import ToolCall
 from wiki_ai.knowledge.gaps import GAP_KIND
@@ -16,6 +16,11 @@ from wiki_ai.knowledge.model import Confidence, KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind
 from wiki_ai.investigation.orchestrator import Investigator
+from wiki_ai.investigation.orchestrator import (
+    ABORT_SNAPSHOT_NOT_MATERIALIZED,
+    InvestigationStatus,
+)
+from wiki_ai.repository.snapshot import SnapshotSpec, take_snapshot
 from wiki_ai.investigation.update import (
     SKIPPED_NO_DIFF,
     SKIPPED_NO_PROVIDER,
@@ -466,3 +471,32 @@ def test_an_unscoped_search_during_the_update_sees_only_the_changed_file(
     assert set(focused["paths"]) == {SERVICE}
     assert CONTROLLER in widened["paths"]
     assert "Focus:" + chr(10) + "- " + SERVICE in provider.seen_objectives[0]
+
+
+def test_update_without_provider_is_blocked_not_ok(analysed) -> None:
+    root, previous, knowledge = analysed
+    current = change_service(root)
+    outcome = UpdateEngine().run(previous, current, knowledge, None, NAMESPACE)
+    assert outcome.status is InvestigationStatus.BLOCKED
+    assert outcome.reason == SKIPPED_NO_PROVIDER
+    assert outcome.to_dict()["status"] == "blocked"
+
+
+def test_update_over_a_non_materialized_snapshot_fails(analysed) -> None:
+    root, previous, knowledge = analysed
+    write(root, f"{BASE}/OrderService.java", _SERVICE_V2)
+    bare = take_snapshot(SnapshotSpec(root=root))
+    provider = FakeProvider(scripts=[reinvestigation_script(10, 15)])
+    outcome = UpdateEngine().run(previous, bare, knowledge, provider, NAMESPACE)
+    assert outcome.status is InvestigationStatus.FAILED
+    assert outcome.reason == ABORT_SNAPSHOT_NOT_MATERIALIZED
+
+
+def test_update_carries_the_reinvestigation_status(analysed) -> None:
+    root, previous, knowledge = analysed
+    current = change_service(root)
+    provider = FakeProvider(scripts=[reinvestigation_script(10, 15)])
+    outcome = UpdateEngine().run(previous, current, knowledge, provider, NAMESPACE)
+    assert outcome.reinvestigation is not None
+    assert outcome.status is outcome.reinvestigation.status
+    assert outcome.to_dict()["reinvestigation"]["status"] == outcome.status.value

@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 __all__ = [
     "MANIFEST_FILENAME",
@@ -194,16 +194,6 @@ class Manifest:
         if not isinstance(payload, Mapping):
             raise ManifestInvalid("manifest payload is not an object")
         return cls.from_dict(payload)
-
-    def with_artifacts(self, artifacts: Iterable[Artifact]) -> "Manifest":
-        return Manifest(
-            publication_id=self.publication_id,
-            revision=self.revision,
-            created_at=self.created_at,
-            source_snapshot_hash=self.source_snapshot_hash,
-            artifacts=tuple(artifacts),
-            previous_publication_id=self.previous_publication_id,
-        )
 
 
 def _as_utc(moment: datetime) -> datetime:

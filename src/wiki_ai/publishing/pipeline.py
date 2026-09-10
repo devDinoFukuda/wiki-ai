@@ -11,6 +11,8 @@ from wiki_ai.knowledge.repository import KnowledgeRepository
 
 from .docx.errors import DocxError
 from .docx.inspect import read_package
+from .gate import PublishingViolation
+from .gate import check as gate_check
 from .manifest import (
     Artifact,
     ArtifactKind,
@@ -60,6 +62,7 @@ class BlockReason(str, enum.Enum):
     DIAGRAM_WITHOUT_TEXT = "diagram_without_textual_equivalent"
     MANIFEST_DIVERGES = "manifest_diverges_from_package"
     REQUIRED_DOCUMENT_MISSING = "required_document_missing"
+    GATE_REFUSED = "publishing_gate_refused"
 
 
 @dataclass(frozen=True)
@@ -204,6 +207,9 @@ class Publisher:
         )
         if violations:
             raise PublicationBlocked(_violation_reasons(violations))
+        breaches = gate_check(staged.directory, knowledge)
+        if breaches:
+            raise PublicationBlocked(_breach_reasons(breaches))
         published = promote(staged)
         return PublicationOutcome(
             publication_id=published.publication_id,
@@ -250,6 +256,14 @@ def _violation_reasons(violations: Sequence[PackageViolation]) -> list[str]:
         f"{BlockReason.MANIFEST_DIVERGES.value}: {item.code.value}: "
         f"{item.relative_path}: {item.message}"
         for item in violations
+    ]
+
+
+def _breach_reasons(breaches: Sequence[PublishingViolation]) -> list[str]:
+    return [
+        f"{BlockReason.GATE_REFUSED.value}: {item.rule.value}: "
+        f"{item.relative_path}: {item.detail}"
+        for item in breaches
     ]
 
 

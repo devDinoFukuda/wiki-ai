@@ -11,6 +11,7 @@ from tests.acceptance.scenarios import (
     LEGACY_EIGHT,
     MODERN_TWENTY_ONE,
     NAMESPACE_OBJECTIVE,
+    assert_settled,
     entity_named,
     java_acceptance_repo,
     java_scripts,
@@ -66,7 +67,7 @@ def registry(repo: Path) -> ProviderRegistry:
 @pytest.fixture()
 def analyzed(repo: Path, registry: ProviderRegistry) -> Path:
     report = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=registry)
-    assert report.status == "ok", report.to_dict()
+    assert_settled(report)
     return repo
 
 

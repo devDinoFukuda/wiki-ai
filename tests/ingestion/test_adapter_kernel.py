@@ -58,13 +58,13 @@ def test_block_builder_numbers_blocks_in_insertion_order() -> None:
     first = builder.add(BlockKind.PARAGRAPH, "um", {"a": 1})
     second = builder.add(BlockKind.PARAGRAPH, "dois", {"a": 2})
     assert (first.order, second.order) == (0, 1)
-    assert builder.next_order == 2
+    assert len(builder.blocks) == 2
     assert first.source_id == "src-teste"
 
 
 def test_block_builder_separates_levels() -> None:
     builder = BlockBuilder("src-teste")
-    builder.inform("i", "informativo")
+    builder.record(DiagnosticLevel.INFO, "i", "informativo")
     builder.warn("w", "aviso")
     builder.fail("e", "erro")
     assert [d.level for d in builder.diagnostics] == [

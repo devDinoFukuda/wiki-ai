@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from wiki_ai.publishing import release
 from wiki_ai.publishing.gate import PublishingRule, check
 from wiki_ai.publishing.manifest import (
@@ -10,7 +12,7 @@ from wiki_ai.publishing.manifest import (
     ArtifactKind,
     Manifest,
 )
-from wiki_ai.publishing.pipeline import Publisher
+from wiki_ai.publishing.pipeline import PublicationBlocked, Publisher
 
 
 MOMENT = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -23,6 +25,13 @@ def _published(graph, publications_dir):
 
 def _rules(violations):
     return {item.rule for item in violations}
+
+
+def _only_staged(publications_dir):
+    staging = publications_dir / release.STAGING_DIRNAME
+    directories = sorted(entry for entry in staging.iterdir() if entry.is_dir())
+    assert len(directories) == 1
+    return directories[0]
 
 
 def test_clean_release_passes(graph, publications_dir):
@@ -107,24 +116,27 @@ def test_diagram_image_without_text_is_reported(tmp_path):
 
 
 def test_completeness_hiding_blocking_gaps_is_reported(
-    graph, publications_dir, monkeypatch
+    graph, publications_dir, monkeypatch, silent_narrative
 ):
-    import wiki_ai.publishing.narrative as narrative_module
-
-    monkeypatch.setattr(
-        narrative_module.NarrativeBuilder,
-        "_gap_assertions",
-        lambda self, gaps: (),
-    )
-    monkeypatch.setattr(
-        narrative_module.NarrativeBuilder,
-        "_reserved_assertions",
-        lambda self, entities: (),
-    )
-    published = _published(graph, publications_dir)
+    with pytest.raises(PublicationBlocked):
+        Publisher().run(graph.repository, publications_dir, "ns")
+    staged = _only_staged(publications_dir)
     assert PublishingRule.COMPLETENESS_HIDES_BLOCKING_GAPS in _rules(
-        check(published.directory, graph.repository)
+        check(staged, graph.repository)
     )
+
+
+def test_gate_reads_a_staging_directory(graph, publications_dir):
+    published = _published(graph, publications_dir)
+    staged = publications_dir / release.STAGING_DIRNAME / published.publication_id
+    staged.mkdir(parents=True)
+    for artifact in published.manifest.artifacts:
+        source = published.directory / artifact.relative_path
+        (staged / artifact.relative_path).write_bytes(source.read_bytes())
+    (staged / MANIFEST_FILENAME).write_text(
+        published.manifest.to_json(), encoding="utf-8"
+    )
+    assert check(staged, graph.repository) == ()
 
 
 def test_gate_without_knowledge_skips_the_completeness_rule(graph, publications_dir):

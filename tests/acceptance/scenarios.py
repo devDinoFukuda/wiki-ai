@@ -96,6 +96,16 @@ class ScriptedProvider(FakeProvider):
         return super().run(session)
 
 
+SETTLED_STATUSES = ("ok", "partial")
+
+
+def assert_settled(report: Any) -> Any:
+    payload = report.to_dict()
+    assert payload["status"] in SETTLED_STATUSES, payload
+    assert payload["analysis_status"] in ("complete", "partial"), payload
+    return report
+
+
 def registry_of(provider: FakeProvider) -> ProviderRegistry:
     registry = ProviderRegistry()
     registry.register(PROVIDER_NAME, lambda: provider)

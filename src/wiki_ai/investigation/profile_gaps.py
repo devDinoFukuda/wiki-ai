@@ -230,11 +230,6 @@ SECTION_RULES: tuple[SectionRule, ...] = (
     ),
 )
 
-_RULES_BY_SECTION: Mapping[str, SectionRule] = {
-    rule.section: rule for rule in SECTION_RULES
-}
-
-
 @dataclass(frozen=True)
 class SectionGap:
     section: str
@@ -360,7 +355,3 @@ def _members_with_attribute(
             if value and entity not in found:
                 found.append(entity)
     return tuple(found)
-
-
-def rule_for(section: str) -> SectionRule | None:
-    return _RULES_BY_SECTION.get(section)

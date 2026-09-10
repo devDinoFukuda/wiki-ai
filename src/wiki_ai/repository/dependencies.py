@@ -8,7 +8,7 @@ from typing import Iterable, Mapping, Sequence
 
 from wiki_ai.repository.inventory import language_hint_for
 from wiki_ai.repository.manifests import ManifestEntry, is_manifest, manifest_entries
-from wiki_ai.repository.reader import resolve_within
+from wiki_ai.repository.reader import snapshot_text
 from wiki_ai.repository.snapshot import RepositorySnapshot
 
 __all__ = [
@@ -157,17 +157,6 @@ _MESSAGING_PATTERNS: Mapping[str, re.Pattern[str]] = {
 }
 
 _INTERNAL_PREFIXES = ("./", "../", ".", "/")
-
-
-def _read_text(root: Path, path: str, max_file_bytes: int) -> str | None:
-    try:
-        full_path = resolve_within(root, path)
-        raw = full_path.read_bytes()
-    except (OSError, ValueError):
-        return None
-    if len(raw) > max_file_bytes or b"\x00" in raw[:8192]:
-        return None
-    return raw.decode("utf-8", errors="replace")
 
 
 def _module_candidates(paths: Iterable[str]) -> frozenset[str]:
@@ -403,7 +392,6 @@ def detect_dependencies(
     *,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
 ) -> DependencyReport:
-    root = Path(snapshot.root)
     paths = [record.path for record in snapshot.files]
     modules = _module_candidates(paths)
     imports: list[ImportEdge] = []
@@ -411,7 +399,7 @@ def detect_dependencies(
     endpoints: list[ExternalEndpoint] = []
     messaging: list[MessagingHint] = []
     for path in paths:
-        text = _read_text(root, path, max_file_bytes)
+        text = snapshot_text(snapshot, path, max_file_bytes)
         if text is None:
             continue
         language = language_hint_for(path)

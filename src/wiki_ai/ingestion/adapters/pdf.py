@@ -1,204 +1,146 @@
 from __future__ import annotations
 
-import re
-import zlib
+import io
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from wiki_ai.ingestion.adapters import documents
 from wiki_ai.ingestion.adapters.blocks import IMAGE_GAP_CODE, BlockBuilder, image_gap
+from wiki_ai.ingestion.outcome import Gap, StructuralFault
 from wiki_ai.ingestion.source import BlockKind, SourceDocument, SourceKind
 
 __all__ = [
-    "PageText",
-    "PdfTextExtractor",
-    "StreamTextExtractor",
+    "LIBRARY",
     "Confidence",
+    "PageText",
+    "PdfReadout",
+    "PdfTextExtractor",
+    "LibraryUnavailable",
+    "DocumentUnreadable",
+    "LibraryTextExtractor",
     "adapt",
     "OCR_UNAVAILABLE",
     "MALFORMED_DOCUMENT",
     "NO_TEXT_LAYER",
+    "PDF_LIBRARY_UNAVAILABLE",
     "IMAGE_GAP_CODE",
 ]
 
-OCR_UNAVAILABLE = "ocr_unavailable"
-MALFORMED_DOCUMENT = "malformed_document"
-NO_TEXT_LAYER = "no_text_layer"
+LIBRARY = "pypdf"
+OCR_UNAVAILABLE = Gap.OCR_UNAVAILABLE.value
+MALFORMED_DOCUMENT = StructuralFault.MALFORMED_DOCUMENT.value
+NO_TEXT_LAYER = Gap.NO_TEXT_LAYER.value
+PDF_LIBRARY_UNAVAILABLE = StructuralFault.PDF_LIBRARY_UNAVAILABLE.value
 
 _HEADER = b"%PDF"
-_OBJECT = re.compile(rb"(\d+)\s+(\d+)\s+obj(.*?)endobj", re.DOTALL)
-_STREAM = re.compile(rb"stream\r?\n(.*?)\r?\n?endstream", re.DOTALL)
-_INFO_ENTRY = re.compile(rb"/(\w+)\s*\(((?:[^()\\]|\\.)*)\)")
-_PAGE_TYPE = re.compile(rb"/Type\s*/Page[^s]")
-_COUNT = re.compile(rb"/Count\s+(\d+)")
-_FLATE = re.compile(rb"/Filter\s*(?:\[\s*)?/FlateDecode")
-_IMAGE_SUBTYPE = re.compile(rb"/Subtype\s*/Image")
-_XOBJECT = re.compile(rb"/XObject")
-_SHOW_TEXT = re.compile(rb"\((?:[^()\\]|\\.)*\)\s*(?:Tj|TJ|'|\")")
-_ARRAY_TEXT = re.compile(rb"\[(.*?)\]\s*TJ", re.DOTALL)
-_LITERAL = re.compile(rb"\((?:[^()\\]|\\.)*\)")
-_ESCAPES = {
-    b"\\n": b"\n",
-    b"\\r": b"\r",
-    b"\\t": b"\t",
-    b"\\b": b"\b",
-    b"\\f": b"\f",
-    b"\\(": b"(",
-    b"\\)": b")",
-    b"\\\\": b"\\",
-}
+_METADATA_FIELDS: tuple[tuple[str, str], ...] = (
+    ("Title", "title"),
+    ("Author", "author"),
+    ("Subject", "subject"),
+    ("Creator", "creator"),
+    ("Producer", "producer"),
+)
 
 
-class Confidence(str):
+class Confidence(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class LibraryUnavailable(Exception):
+    def __init__(self, library: str) -> None:
+        self.library = library
+        super().__init__(
+            f"{library} is not installed in this runtime; install the pdf extra"
+        )
+
+
+class DocumentUnreadable(Exception):
+    def __init__(self, target: str, reason: str) -> None:
+        self.target = target
+        self.reason = reason
+        super().__init__(f"{target} could not be parsed as a pdf: {reason}")
 
 
 @dataclass(frozen=True)
 class PageText:
     page: int
     text: str
-    confidence: str = Confidence.LOW
+    confidence: Confidence = Confidence.LOW
     has_image: bool = False
+
+
+@dataclass(frozen=True)
+class PdfReadout:
+    pages: tuple[PageText, ...] = ()
+    properties: dict[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pages", tuple(self.pages))
+        object.__setattr__(self, "properties", dict(self.properties or {}))
 
 
 @runtime_checkable
 class PdfTextExtractor(Protocol):
-    def extract(self, path: str | Path) -> Sequence[PageText]: ...
+    def extract(self, path: str | Path, payload: bytes) -> PdfReadout: ...
 
 
-@dataclass(frozen=True)
-class PdfObject:
-    number: int
-    body: bytes
-    stream: bytes
+def _load_library() -> Any:
+    try:
+        import pypdf
+    except ModuleNotFoundError as exc:
+        raise LibraryUnavailable(LIBRARY) from exc
+    return pypdf
 
 
-def _objects(payload: bytes) -> list[PdfObject]:
-    found: list[PdfObject] = []
-    for match in _OBJECT.finditer(payload):
-        body = match.group(3)
-        stream_match = _STREAM.search(body)
-        stream = stream_match.group(1) if stream_match else b""
-        head = body[: stream_match.start()] if stream_match else body
-        found.append(PdfObject(number=int(match.group(1)), body=head, stream=stream))
-    return found
-
-
-def _unescape(literal: bytes) -> bytes:
-    text = literal[1:-1]
-    for token, replacement in _ESCAPES.items():
-        text = text.replace(token, replacement)
-    return text
-
-
-def _decode_stream(obj: PdfObject) -> bytes | None:
-    if not obj.stream:
-        return None
-    if _FLATE.search(obj.body):
+class LibraryTextExtractor:
+    def extract(self, path: str | Path, payload: bytes) -> PdfReadout:
+        library = _load_library()
         try:
-            return zlib.decompress(obj.stream)
-        except zlib.error:
-            try:
-                return zlib.decompressobj().decompress(obj.stream)
-            except zlib.error:
-                return None
-    return obj.stream
+            reader = library.PdfReader(io.BytesIO(payload))
+            pages = tuple(
+                self._page(index, page)
+                for index, page in enumerate(reader.pages, start=1)
+            )
+            properties = self._properties(reader)
+        except LibraryUnavailable:
+            raise
+        except Exception as exc:
+            raise DocumentUnreadable(Path(path).name, str(exc)) from exc
+        return PdfReadout(pages=pages, properties=properties)
 
-
-def _content_text(content: bytes) -> str:
-    parts: list[str] = []
-    for match in _SHOW_TEXT.finditer(content):
-        literal = _LITERAL.search(match.group(0))
-        if literal is not None:
-            parts.append(_unescape(literal.group(0)).decode("latin-1"))
-    for match in _ARRAY_TEXT.finditer(content):
-        chunk = "".join(
-            _unescape(item.group(0)).decode("latin-1")
-            for item in _LITERAL.finditer(match.group(1))
+    def _page(self, index: int, page: Any) -> PageText:
+        text = str(page.extract_text() or "").strip()
+        return PageText(
+            page=index,
+            text=" ".join(text.split()),
+            confidence=Confidence.HIGH if text else Confidence.LOW,
+            has_image=self._has_image(page),
         )
-        if chunk and chunk not in parts:
-            parts.append(chunk)
-    return " ".join(part for part in parts if part.strip()).strip()
 
+    def _has_image(self, page: Any) -> bool:
+        try:
+            return len(page.images) > 0
+        except Exception:
+            return "/XObject" in str(page.get("/Resources") or "")
 
-def _info(payload: bytes) -> dict[str, str]:
-    found: dict[str, str] = {}
-    for obj in _objects(payload):
-        if b"/Producer" not in obj.body and b"/Title" not in obj.body and b"/Author" not in obj.body:
-            continue
-        for match in _INFO_ENTRY.finditer(obj.body):
-            key = match.group(1).decode("latin-1")
-            found.setdefault(key, _unescape(b"(" + match.group(2) + b")").decode("latin-1"))
-    return found
-
-
-def _page_count(payload: bytes, objects: list[PdfObject]) -> int:
-    declared = 0
-    for obj in objects:
-        if b"/Type" in obj.body and b"/Pages" in obj.body:
-            match = _COUNT.search(obj.body)
-            if match:
-                declared = max(declared, int(match.group(1)))
-    counted = sum(1 for obj in objects if _PAGE_TYPE.search(obj.body + b" "))
-    return declared or counted or (1 if payload.startswith(_HEADER) else 0)
-
-
-class StreamTextExtractor:
-    def extract(self, path: str | Path) -> Sequence[PageText]:
-        payload = Path(path).read_bytes()
-        return self.extract_bytes(payload)
-
-    def extract_bytes(self, payload: bytes) -> Sequence[PageText]:
-        objects = _objects(payload)
-        pages = [obj for obj in objects if _PAGE_TYPE.search(obj.body + b" ")]
-        streams = {obj.number: obj for obj in objects if obj.stream}
-        images = {
-            obj.number for obj in objects if _IMAGE_SUBTYPE.search(obj.body)
-        }
-        found: list[PageText] = []
-        total = len(pages) or _page_count(payload, objects)
-        if not pages:
-            text = " ".join(
-                _content_text(_decode_stream(obj) or b"") for obj in streams.values()
-            ).strip()
-            has_image = bool(images)
-            return (
-                PageText(page=1, text=text, confidence=Confidence.LOW, has_image=has_image),
-            ) if (text or has_image) else ()
-        for index, page in enumerate(pages, start=1):
-            references = [int(n) for n in re.findall(rb"(\d+)\s+\d+\s+R", page.body)]
-            has_image = bool(_XOBJECT.search(page.body)) or any(
-                ref in images for ref in references
-            )
-            chunks: list[str] = []
-            for ref in references:
-                obj = streams.get(ref)
-                if obj is None:
-                    continue
-                content = _decode_stream(obj)
-                if content is None:
-                    continue
-                chunk = _content_text(content)
-                if chunk:
-                    chunks.append(chunk)
-            found.append(
-                PageText(
-                    page=index,
-                    text=" ".join(chunks).strip(),
-                    confidence=Confidence.LOW,
-                    has_image=has_image,
-                )
-            )
-        if total > len(found):
-            found.extend(
-                PageText(page=index, text="", confidence=Confidence.LOW, has_image=True)
-                for index in range(len(found) + 1, total + 1)
-            )
-        return tuple(found)
+    def _properties(self, reader: Any) -> dict[str, str]:
+        metadata = reader.metadata
+        if metadata is None:
+            return {}
+        found: dict[str, str] = {}
+        for key, attribute in _METADATA_FIELDS:
+            value = getattr(metadata, attribute, None)
+            if value is None:
+                value = metadata.get(f"/{key}")
+            text = "" if value is None else str(value).strip()
+            if text:
+                found[key] = text
+        return found
 
 
 def adapt(
@@ -208,43 +150,56 @@ def adapt(
     extractor: PdfTextExtractor | None = None,
 ) -> SourceDocument:
     target = Path(path)
-    info = _info(payload) if payload.startswith(_HEADER) else {}
+    engine = extractor or LibraryTextExtractor()
+    readout: PdfReadout | None = None
+    failure: str = ""
+    if payload.startswith(_HEADER):
+        try:
+            readout = engine.extract(target, payload)
+        except LibraryUnavailable:
+            failure = PDF_LIBRARY_UNAVAILABLE
+        except DocumentUnreadable:
+            failure = MALFORMED_DOCUMENT
+    else:
+        failure = MALFORMED_DOCUMENT
+
+    properties = dict(readout.properties or {}) if readout is not None else {}
     metadata: dict[str, Any] = {"source_type": SourceKind.PDF.value}
-    if info.get("Title"):
-        metadata["title"] = info["Title"]
+    if properties.get("Title"):
+        metadata["title"] = properties["Title"]
     source, metadata_diagnostics = documents.build_source(
         target, SourceKind.PDF, payload, metadata, captured_at
     )
     builder = BlockBuilder(source.id)
     builder.extend_diagnostics(metadata_diagnostics)
 
-    if not payload.startswith(_HEADER):
+    if failure == PDF_LIBRARY_UNAVAILABLE:
+        builder.fail(
+            PDF_LIBRARY_UNAVAILABLE,
+            f"{target.name} needs {LIBRARY}, which this runtime does not provide",
+            {"page": 1, "block": "document"},
+        )
+        return SourceDocument(source=source, blocks=(), diagnostics=builder.diagnostics)
+    if failure == MALFORMED_DOCUMENT or readout is None:
         builder.fail(
             MALFORMED_DOCUMENT,
-            f"{target.name} carries no %PDF header",
+            f"{target.name} is not a pdf {LIBRARY} can read",
             {"page": 1, "block": "document"},
         )
         return SourceDocument(source=source, blocks=(), diagnostics=builder.diagnostics)
 
-    objects = _objects(payload)
-    total = _page_count(payload, objects)
+    pages = readout.pages
     builder.add(
         BlockKind.OTHER,
-        "\n".join(f"{key}: {value}" for key, value in sorted(info.items())),
+        "\n".join(f"{key}: {value}" for key, value in sorted(properties.items())),
         {"page": 0, "block": "document_properties"},
-        attributes={"properties": dict(sorted(info.items())), "pages": total},
+        attributes={"properties": dict(sorted(properties.items())), "pages": len(pages)},
     )
-
-    engine = extractor or StreamTextExtractor()
-    if isinstance(engine, StreamTextExtractor):
-        pages = engine.extract_bytes(payload)
-    else:
-        pages = engine.extract(target)
 
     if not pages:
         builder.warn(
             NO_TEXT_LAYER,
-            f"{target.name} exposes no page object the structural adapter can read",
+            f"{target.name} exposes no page {LIBRARY} can read",
             {"page": 1, "block": "document"},
         )
 
@@ -255,22 +210,29 @@ def adapt(
                 BlockKind.PARAGRAPH,
                 page.text,
                 locator,
-                attributes={"confidence": page.confidence, "has_image": page.has_image},
+                attributes={
+                    "confidence": page.confidence.value,
+                    "has_image": page.has_image,
+                },
             )
-        else:
-            builder.add(
-                BlockKind.IMAGE,
-                "",
-                locator,
-                attributes={"gap": True, "confidence": page.confidence, "has_image": True},
-            )
-            image_gap(builder, f"{target.name} page {page.page}", locator)
-            builder.warn(
-                OCR_UNAVAILABLE,
-                f"page {page.page} needs an optical capability that this runtime "
-                "does not provide",
-                locator,
-            )
+            continue
+        builder.add(
+            BlockKind.IMAGE,
+            "",
+            locator,
+            attributes={
+                "gap": True,
+                "confidence": page.confidence.value,
+                "has_image": True,
+            },
+        )
+        image_gap(builder, f"{target.name} page {page.page}", locator)
+        builder.warn(
+            OCR_UNAVAILABLE,
+            f"page {page.page} needs an optical capability that this runtime "
+            "does not provide",
+            locator,
+        )
 
     return SourceDocument(
         source=source, blocks=builder.blocks, diagnostics=builder.diagnostics

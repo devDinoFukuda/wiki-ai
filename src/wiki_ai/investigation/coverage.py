@@ -12,6 +12,7 @@ from wiki_ai.investigation.verifier import VerificationReport, VerifiedFinding
 __all__ = [
     "ENTRY_LIKE_SYMBOL_KINDS",
     "ENTRY_LIKE_ENTITY_KINDS",
+    "INTEGRATION_KINDS",
     "SECTION_KIND",
     "FrontierItem",
     "CoverageState",
@@ -253,6 +254,7 @@ def update(
     resolved = list(state.resolved_subjects)
     entrypoints = list(state.entrypoints)
     capabilities = list(state.capabilities)
+    integrations: list[str] = []
     missing = list(state.missing_evidence)
     gaps = list(state.explicit_gaps)
     files = list(state.files_covered)
@@ -274,6 +276,8 @@ def update(
             entrypoints.append(item.finding.subject)
         if item.finding.type in CAPABILITY_KINDS and item.finding.subject not in capabilities:
             capabilities.append(item.finding.subject)
+        if item.finding.type in INTEGRATION_KINDS and subject not in integrations:
+            integrations.append(subject)
         for resolved_evidence in item.evidence:
             if resolved_evidence.capture.path not in files:
                 files.append(resolved_evidence.capture.path)
@@ -285,6 +289,7 @@ def update(
     known = set(resolved)
     known |= {name.strip().lower() for name in entrypoints}
     known |= {name.strip().lower() for name in capabilities}
+    known |= set(integrations)
 
     round_subjects = {
         item.finding.subject.strip().lower() for item in report.verified

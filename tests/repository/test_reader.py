@@ -9,6 +9,7 @@ from wiki_ai.repository.reader import (
     RangeInvalid,
     read_range,
 )
+from tests.repository.fixtures_repos import store_for
 from wiki_ai.repository.snapshot import SnapshotSpec, take_snapshot
 
 _CONTENT = "one\ntwo\nthree\nfour\n"
@@ -17,7 +18,7 @@ _CONTENT = "one\ntwo\nthree\nfour\n"
 def _snapshot(root: Path):
     (root / "src").mkdir(parents=True, exist_ok=True)
     (root / "src" / "file.py").write_bytes(_CONTENT.encode("utf-8"))
-    return take_snapshot(SnapshotSpec(root=root))
+    return take_snapshot(SnapshotSpec(root=root), store_for(root))
 
 
 def test_read_range_returns_selected_lines(tmp_path: Path) -> None:

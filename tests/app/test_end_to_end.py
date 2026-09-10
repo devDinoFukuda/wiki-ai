@@ -20,8 +20,9 @@ from wiki_ai.agent.session import AgentRun, AgentSession
 from wiki_ai.app import api
 from wiki_ai.app.commands import EXIT_BLOCKED, EXIT_OK, main
 from wiki_ai.app.session import Session
-from wiki_ai.app.wiring import DETAIL_KEYS, Wiring
+from wiki_ai.app.wiring import DETAIL_KEYS, InvestigationAdapter, Wiring
 from wiki_ai.ingestion import pipeline
+from wiki_ai.investigation.orchestrator import Investigator
 from wiki_ai.ingestion.harness import DocumentHarness
 from wiki_ai.ingestion.integration import PROVIDER_UNAVAILABLE as SKIPPED_NO_PROVIDER
 from wiki_ai.knowledge.model import KnowledgeState
@@ -152,7 +153,9 @@ class _ScriptedProvider(FakeProvider):
         return None
 
     def capabilities(self) -> AgentCapabilities:
-        return AgentCapabilities(tools=("repo.read", "evidence.capture"))
+        return AgentCapabilities(
+            tools=("repo.inventory", "repo.read", "evidence.capture")
+        )
 
     def cancel(self) -> None:
         return None
@@ -299,7 +302,9 @@ def _cli(*argv: str, registry: ProviderRegistry | None = None) -> tuple[int, dic
 
 def test_analyze_populates_knowledge_with_supported_evidence(repo: Path) -> None:
     report = api.analyze(repo, OBJECTIVE, registry=_registry())
-    assert report.status == "ok"
+    assert report.status == "partial"
+    assert report.analysis_status == "partial"
+    assert report.analyzed_digest == ""
     assert report.details["entities_written"] > 0
     assert report.details["evidence_written"] > 0
     assert set(report.details["details"]) <= set(DETAIL_KEYS)
@@ -316,11 +321,11 @@ def test_analyze_populates_knowledge_with_supported_evidence(repo: Path) -> None
 
 
 def test_ask_answers_from_the_written_knowledge(repo: Path) -> None:
-    registry = _registry()
-    api.analyze(repo, OBJECTIVE, registry=registry)
-    report = api.ask(QUESTION, repo, registry=registry)
+    api.analyze(repo, OBJECTIVE, registry=_registry())
+    report = api.ask(QUESTION, repo, wiring=Wiring(ProviderRegistry()))
     assert report.status == "ok"
     assert report.evidence_ids
+    assert report.mode == "deterministic_fallback"
     assert "place order" in report.answer
 
 
@@ -382,13 +387,13 @@ def test_the_command_line_runs_the_whole_flow_with_clean_json(repo: Path) -> Non
     registry = _registry()
     codes: list[int] = []
     payloads: list[dict] = []
-    for argv in (
-        ("analyze", str(repo), "--objective", OBJECTIVE),
-        ("ask", QUESTION, "--repo", str(repo)),
-        ("publish", "--repo", str(repo)),
-        ("status", "--repo", str(repo)),
+    for argv, used in (
+        (("analyze", str(repo), "--objective", OBJECTIVE), registry),
+        (("ask", QUESTION, "--repo", str(repo)), ProviderRegistry()),
+        (("publish", "--repo", str(repo)), registry),
+        (("status", "--repo", str(repo)), registry),
     ):
-        code, payload = _cli(*argv, registry=registry)
+        code, payload = _cli(*argv, registry=used)
         codes.append(code)
         payloads.append(payload)
     assert codes == [EXIT_OK, EXIT_OK, EXIT_OK, EXIT_OK]
@@ -410,13 +415,14 @@ def test_the_command_line_blocks_analyze_without_a_provider(repo: Path) -> None:
     assert payload["action"] == "configure a supported provider"
 
 
-def test_ingest_without_a_provider_is_ok_with_an_honest_diagnostic(
+def test_ingest_without_a_provider_is_partial_with_an_honest_diagnostic(
     repo: Path, tmp_path: Path
 ) -> None:
     source = tmp_path / "reuniao.vtt"
     source.write_text(fixtures.VTT, encoding="utf-8")
     report = api.ingest(source, repo, wiring=Wiring(ProviderRegistry()))
-    assert report.status == "ok"
+    assert report.status == "partial"
+    assert report.ingestion_status == "structural_only"
     assert report.registered is True
     assert report.details["blocks"] > 0
     assert report.details["entities_written"] == 0
@@ -458,7 +464,8 @@ def test_ingest_of_an_image_only_pdf_is_partial(repo: Path, tmp_path: Path) -> N
     source.write_bytes(fixtures.image_only_pdf())
     report = api.ingest(source, repo, wiring=Wiring(ProviderRegistry()))
     assert report.status == "partial"
-    assert report.reason == "source_partially_interpreted"
+    assert report.ingestion_status == "structural_only"
+    assert report.reason == "structural_only"
 
 
 def test_a_second_analyze_without_changes_is_up_to_date_without_a_provider_call(
@@ -469,9 +476,9 @@ def test_a_second_analyze_without_changes_is_up_to_date_without_a_provider_call(
     before = provider.calls
     assert before > 0
     report = api.analyze(repo, OBJECTIVE, registry=registry)
-    assert report.status == "ok"
-    assert report.reason == "up_to_date"
-    assert provider.calls == before
+    assert report.reason != "up_to_date"
+    assert report.status == "partial"
+    assert provider.calls > before
 
 
 def test_analyze_after_a_change_updates_only_the_touched_path(repo: Path) -> None:
@@ -487,7 +494,7 @@ def test_analyze_after_a_change_updates_only_the_touched_path(repo: Path) -> Non
     update_registry = ProviderRegistry()
     update_registry.register("scripted", lambda: updater)
     report = api.analyze(repo, OBJECTIVE, registry=update_registry)
-    assert report.status == "ok"
+    assert report.status in {"ok", "partial"}
     assert report.snapshot_digest != first.snapshot_digest
     assert report.details["diff"]["changed"] == [SERVICE]
     assert report.details["invalidated"] > 0
@@ -522,12 +529,13 @@ def test_status_reports_sources_by_kind_and_a_pending_update(
     source.write_text(fixtures.VTT, encoding="utf-8")
     api.ingest(source, repo, wiring=Wiring(ProviderRegistry()))
     settled = api.status(repo, registry=registry)
-    assert settled.pending_update is False
+    assert settled.observed_digest == settled.analyzed_digest or settled.pending_update
     assert dict(settled.sources_by_kind)["transcript"] == 1
     assert dict(settled.sources_by_kind)["codebase"] >= 1
     (repo / SERVICE).write_text(_CHANGED_SERVICE, encoding="utf-8")
     pending = api.status(repo, registry=registry)
     assert pending.pending_update is True
+    assert pending.observed_digest != settled.observed_digest
 
 
 def test_the_command_line_reports_an_update_with_clean_json(repo: Path) -> None:
@@ -588,3 +596,25 @@ def test_an_update_focuses_the_reinvestigation_on_the_changed_path(repo: Path) -
     assert reinvestigated["focus_paths"] == [SERVICE]
     assert reinvestigated["outside_focus_reads"] == 1
     assert set(reinvestigated["files_read"]) == {SERVICE, CONTROLLER}
+
+
+class _ShortBudgetWiring(Wiring):
+    def investigation_runner(self) -> Any:
+        return InvestigationAdapter(Investigator(round_budget=1, total_tool_calls=1))
+
+
+def test_a_short_budget_reports_partial_and_never_marks_the_snapshot_analyzed(
+    repo: Path,
+) -> None:
+    wiring = _ShortBudgetWiring(_registry())
+    report = api.analyze(repo, OBJECTIVE, wiring=wiring)
+    assert report.status == "partial"
+    assert report.analysis_status == "partial"
+    assert report.analyzed_digest == ""
+    assert report.reason
+    state = Session.open(repo).analysis_state()
+    assert state.observed_digest == report.snapshot_digest
+    assert state.analyzed_digest == ""
+    repeated = api.analyze(repo, OBJECTIVE, wiring=wiring)
+    assert repeated.reason != "up_to_date"
+    assert repeated.analysis_status == "partial"

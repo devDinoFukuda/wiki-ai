@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from wiki_ai.agent.envelope import EnvelopeIdentity, StaleReason, StaleResult, seal
 from wiki_ai.investigation.recovery import (
     Decision,
-    Failure,
     FailureKind,
     InvalidAttempt,
     InvalidPolicy,
     Outcome,
     RetryPolicy,
-    from_stale_result,
     next_attempt,
     permanent,
     recover,
@@ -83,12 +80,6 @@ def test_fingerprint_ignores_volatile_identifiers():
 
 def test_failure_kind_changes_the_fingerprint():
     assert transient("x", "d").fingerprint != permanent("x", "d").fingerprint
-
-
-def test_stale_result_becomes_a_stale_failure():
-    envelope = seal(EnvelopeIdentity("t1", "a", "b", "c"), payload={}, produced_at=1.0)
-    failure = from_stale_result(StaleResult(envelope, StaleReason.SNAPSHOT_CHANGED))
-    assert failure == Failure(FailureKind.STALE, "snapshot_changed", envelope.envelope_id)
 
 
 def test_transient_failure_requeues_the_task_with_the_policy_delay():

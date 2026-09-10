@@ -79,6 +79,9 @@ class ComparisonReport:
     def total(self) -> int:
         return len(self.all_findings())
 
+    def corroborated(self) -> tuple[ComparisonFinding, ...]:
+        return tuple(item for item in self.all_findings() if item.has_both_sides)
+
 
 def _sorted(found: list[ComparisonFinding]) -> tuple[ComparisonFinding, ...]:
     return tuple(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.repository.fixtures_repos import (
+from tests.investigation.fixtures_snapshots import (
     java_repo,
     mainframe_repo,
     python_repo,

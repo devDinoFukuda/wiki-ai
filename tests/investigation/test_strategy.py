@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from wiki_ai.investigation.coverage import CoverageState, FrontierItem
 from wiki_ai.investigation.objective import Objective, ObjectiveKind, Scope, parse
 from wiki_ai.investigation.strategy import (
@@ -123,7 +125,9 @@ def test_a_capability_discovered_later_gets_its_own_step() -> None:
     )
     discovery = strategy.next(state)
     assert discovery is not None
-    state = state.advanced(discovery, 10).with_coverage(coverage_with("late finding"))
+    state = replace(
+        state.advanced(discovery, 10), coverage=coverage_with("late finding")
+    )
     following = strategy.next(state)
     assert following is not None and following.subject == "late finding"
 

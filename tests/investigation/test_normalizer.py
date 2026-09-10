@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.repository.fixtures_repos import java_repo
+from tests.investigation.fixtures_snapshots import java_repo
 
 from wiki_ai.knowledge.evidence import CodeLocator
 from wiki_ai.knowledge.gaps import GAP_KIND, open_gaps
+from wiki_ai.knowledge.identity import contextual_key
 from wiki_ai.knowledge.model import Confidence, EntityId, KnowledgeState
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -108,10 +109,9 @@ def test_entity_ids_are_deterministic_from_kind_and_subject(tmp_path: Path) -> N
     report = verify(place_and_save(), registry, snapshot)
     with knowledge_at(tmp_path) as knowledge:
         result = normalize(report.verified, knowledge, snapshot, "acme", "obj_x")
-    expected = EntityId.derive(
-        EntityKind.CAPABILITY.value, "capability::orderservice place"
-    ).value
-    assert result.entity_ids["capability::orderservice place"] == expected
+    key = contextual_key("acme", EntityKind.CAPABILITY.value, None, "OrderService place")
+    expected = EntityId.derive(EntityKind.CAPABILITY.value, key).value
+    assert result.entity_ids[key] == expected
 
 
 def test_relation_to_an_unknown_target_creates_a_placeholder_and_a_gap(
@@ -198,3 +198,114 @@ def test_an_invalid_relation_pair_is_reported_not_written(tmp_path: Path) -> Non
         result = normalize(report.verified, knowledge, snapshot, "acme", "obj_x")
         assert result.relations_written == 0
         assert result.diagnostics
+
+
+def owned_rule(owner: str) -> Finding:
+    return Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="Eligibility",
+        statement="place saves the reference through the repository",
+        conditions=("a reference is given",),
+        effects=("repository save is called with the reference",),
+        owner=owner,
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+    )
+
+
+def test_same_named_rules_under_different_owners_do_not_collide(
+    tmp_path: Path,
+) -> None:
+    snapshot, registry = prepared(tmp_path)
+    findings = [owned_rule("Ordering"), owned_rule("Billing")]
+    report = verify(findings, registry, snapshot, "acme")
+    with knowledge_at(tmp_path) as knowledge:
+        result = normalize(report.verified, knowledge, snapshot, "acme", "obj_x")
+        assert knowledge.entity_count() == 2
+    assert len(set(result.entity_ids.values())) == 2
+    assert contextual_key("acme", "business_rule", "Ordering", "Eligibility") in (
+        result.entity_ids
+    )
+    assert contextual_key("acme", "business_rule", "Billing", "Eligibility") in (
+        result.entity_ids
+    )
+
+
+def test_explicit_id_prevails_over_owner_and_subject(tmp_path: Path) -> None:
+    snapshot, registry = prepared(tmp_path)
+    finding = Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="Eligibility",
+        statement="place saves the reference through the repository",
+        conditions=("a reference is given",),
+        effects=("repository save is called with the reference",),
+        owner="Ordering",
+        explicit_id="RULE-7",
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+    )
+    report = verify([finding], registry, snapshot, "acme")
+    with knowledge_at(tmp_path) as knowledge:
+        result = normalize(report.verified, knowledge, snapshot, "acme", "obj_x")
+    assert contextual_key("acme", "business_rule", "Ordering", "Eligibility", "RULE-7") in (
+        result.entity_ids
+    )
+
+
+def test_owner_entity_written_in_the_same_run_becomes_owner_id(
+    tmp_path: Path,
+) -> None:
+    snapshot, registry = prepared(tmp_path)
+    capability = Finding(
+        type=EntityKind.CAPABILITY,
+        subject="Ordering",
+        statement="OrderService place delegates to repository save",
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+    )
+    report = verify([capability, owned_rule("Ordering")], registry, snapshot, "acme")
+    with knowledge_at(tmp_path) as knowledge:
+        normalize(report.verified, knowledge, snapshot, "acme", "obj_x")
+        owner_key = contextual_key("acme", "capability", None, "Ordering")
+        owner = knowledge.get_entity(EntityId.derive("capability", owner_key))
+        rule_key = contextual_key("acme", "business_rule", "Ordering", "Eligibility")
+        rule = knowledge.get_entity(EntityId.derive("business_rule", rule_key))
+        assert owner is not None
+        assert rule is not None
+        assert rule.owner_id == owner.id
+
+
+def test_identity_collision_rejects_the_finding_and_opens_a_gap(
+    tmp_path: Path,
+) -> None:
+    snapshot, registry = prepared(tmp_path)
+    first = Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="Eligibility",
+        statement="place saves the reference through the repository",
+        conditions=("a reference is given",),
+        effects=("repository save is called with the reference",),
+        explicit_id="RULE-7",
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+    )
+    with knowledge_at(tmp_path) as knowledge:
+        report = verify([first], registry, snapshot, "acme")
+        normalize(report.verified, knowledge, snapshot, "acme", "obj_x")
+        stored = len(knowledge.find_entities("business_rule"))
+        clashing = Finding(
+            type=EntityKind.BUSINESS_RULE,
+            subject="Different Rule Entirely",
+            statement="place saves the reference through the repository",
+            conditions=("a reference is given",),
+            effects=("repository save is called with the reference",),
+            explicit_id="RULE-7",
+            evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+        )
+        second = verify([clashing], registry, snapshot, "acme")
+        result = normalize(second.verified, knowledge, snapshot, "acme", "obj_y")
+        assert len(knowledge.find_entities("business_rule")) == stored
+        survivor = knowledge.get_entity(
+            EntityId.derive("business_rule", "explicit::RULE-7")
+        )
+        assert survivor is not None
+        assert survivor.name == "Eligibility"
+    assert result.entities_written == 0
+    assert any("identity collision" in item for item in result.diagnostics)
+    assert any("identity collision" in item for item in result.gaps_opened)

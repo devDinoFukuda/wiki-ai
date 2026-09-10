@@ -46,7 +46,8 @@
       "agent"
     ],
     "publishing": [
-      "knowledge"
+      "knowledge",
+      "agent"
     ],
     "ingestion": [
       "knowledge",

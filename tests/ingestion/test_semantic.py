@@ -592,7 +592,7 @@ def test_the_finding_schema_defaults_to_the_full_taxonomy() -> None:
     assert "module" in restricted["properties"]["type"]["enum"]
 
 
-def test_stable_keys_are_normalized_for_correlation(
+def test_stable_keys_carry_namespace_kind_and_owner(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
     ingested = pipeline.ingest(_transcript(tmp_path))
@@ -618,4 +618,7 @@ def test_stable_keys_are_normalized_for_correlation(
         ]
     )
     outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
-    assert outcome.verified[0].stable_key == "decision_record::corte no dia 5"
+    assert outcome.verified[0].stable_key == (
+        "reuniao::decision_record::speaker_ana::corte_no_dia_5"
+    )
+    assert outcome.verified[0].finding.owner == "speaker:Ana"

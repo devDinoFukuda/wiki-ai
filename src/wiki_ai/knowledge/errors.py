@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 
 class KnowledgeError(Exception):
     pass
@@ -55,3 +57,25 @@ class MissingRequiredAttribute(KnowledgeError):
 
 class GapNotFound(KnowledgeError):
     pass
+
+
+@dataclass(frozen=True)
+class IdentityFacts:
+    entity_id: str
+    kind: str
+    owner_id: str | None
+    canonical_name: str
+
+
+class IdentityCollision(KnowledgeError):
+    def __init__(self, existing: IdentityFacts, incoming: IdentityFacts) -> None:
+        super().__init__(
+            f"id {incoming.entity_id} já pertence a "
+            f"kind={existing.kind} owner={existing.owner_id or '-'} "
+            f"nome={existing.canonical_name}; recebido "
+            f"kind={incoming.kind} owner={incoming.owner_id or '-'} "
+            f"nome={incoming.canonical_name}"
+        )
+        self.existing = existing
+        self.incoming = incoming
+

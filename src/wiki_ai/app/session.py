@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -12,32 +14,48 @@ from wiki_ai.agent.session import AgentProvider
 from wiki_ai.agent.registry import ProviderRegistry, ProviderUnavailable
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.repository.snapshot import RepositorySnapshot
+from wiki_ai.repository.store import SnapshotStore
 
 __all__ = [
     "SessionError",
     "SnapshotNotStored",
+    "FormatUnsupported",
+    "AnalysisStatus",
+    "AnalysisState",
     "FORMAT_VERSION",
     "STATE_DIR_NAME",
     "SUBDIRECTORIES",
     "FORMAT_FILE",
     "DATABASE_FILE",
     "LATEST_FILE",
+    "ANALYSIS_STATE_FILE",
+    "IGNORE_FILE",
+    "IGNORE_CONTENT",
     "HOME_VARIABLE",
-    "OUTDATED_STORE_MARKERS",
+    "CODESCAN_DIRECTORY",
+    "CODESCAN_FILES",
+    "DOCX_DIRECTORY",
+    "COMPANION_DIRECTORIES",
     "detect_outdated_store",
     "repository_identity",
     "state_dir_for",
     "Session",
 ]
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 STATE_DIR_NAME = ".wiki-ai"
-SUBDIRECTORIES = ("snapshots", "evidence", "publications")
+SUBDIRECTORIES = ("snapshots", "publications")
 FORMAT_FILE = "format.json"
 DATABASE_FILE = "state.db"
 LATEST_FILE = "latest.json"
+ANALYSIS_STATE_FILE = "analysis_state.json"
+IGNORE_FILE = ".gitignore"
+IGNORE_CONTENT = "*\n"
 HOME_VARIABLE = "WIKI_AI_HOME"
-OUTDATED_STORE_MARKERS = (".codescan", "raw", "wiki", "wiki-docx", "agent-outputs")
+CODESCAN_DIRECTORY = ".codescan"
+CODESCAN_FILES = ("state.db", "manifest.json")
+DOCX_DIRECTORY = "wiki-docx"
+COMPANION_DIRECTORIES = ("raw", "wiki")
 
 _GIT_TIMEOUT_SECONDS = 30
 _IDENTITY_LENGTH = 32
@@ -51,9 +69,41 @@ class SnapshotNotStored(SessionError):
     pass
 
 
+class FormatUnsupported(SessionError):
+    def __init__(self, found: int) -> None:
+        super().__init__(f"state format version {found} is not readable")
+        self.found = found
+
+
+class AnalysisStatus(Enum):
+    NEVER = "never"
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
+def _codescan_signature(root: Path) -> bool:
+    directory = root / CODESCAN_DIRECTORY
+    if not directory.is_dir():
+        return False
+    return any((directory / name).is_file() for name in CODESCAN_FILES)
+
+
+def _docx_signature(root: Path) -> bool:
+    if not (root / DOCX_DIRECTORY).is_dir():
+        return False
+    return all((root / name).is_dir() for name in COMPANION_DIRECTORIES)
+
+
 def detect_outdated_store(repo: Path) -> tuple[str, ...]:
     root = Path(repo)
-    return tuple(name for name in OUTDATED_STORE_MARKERS if (root / name).is_dir())
+    found: list[str] = []
+    if _codescan_signature(root):
+        found.append(CODESCAN_DIRECTORY)
+    if _docx_signature(root):
+        found.append(DOCX_DIRECTORY)
+    return tuple(found)
 
 
 def _git_value(root: Path, *arguments: str) -> str | None:
@@ -97,6 +147,46 @@ def state_dir_for(repo: Path, identity: str, home: str | None = None) -> Path:
 
 
 @dataclass(frozen=True)
+class AnalysisState:
+    observed_digest: str = ""
+    analyzed_digest: str = ""
+    analysis_status: AnalysisStatus = AnalysisStatus.NEVER
+    analyzed_at: str = ""
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "observed_digest": self.observed_digest,
+            "analyzed_digest": self.analyzed_digest,
+            "analysis_status": self.analysis_status.value,
+            "analyzed_at": self.analyzed_at,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "AnalysisState":
+        raw = str(payload.get("analysis_status", AnalysisStatus.NEVER.value))
+        try:
+            status = AnalysisStatus(raw)
+        except ValueError:
+            status = AnalysisStatus.NEVER
+        return cls(
+            observed_digest=str(payload.get("observed_digest", "")),
+            analyzed_digest=str(payload.get("analyzed_digest", "")),
+            analysis_status=status,
+            analyzed_at=str(payload.get("analyzed_at", "")),
+            reason=str(payload.get("reason", "")),
+        )
+
+    def is_current_for(self, digest: str) -> bool:
+        return (
+            bool(digest)
+            and digest == self.analyzed_digest
+            and self.analysis_status is AnalysisStatus.COMPLETE
+        )
+
+
+@dataclass(frozen=True)
 class Session:
     repo: Path
     state_dir: Path
@@ -126,12 +216,8 @@ class Session:
         return self.state_dir / SUBDIRECTORIES[0]
 
     @property
-    def evidence_dir(self) -> Path:
-        return self.state_dir / SUBDIRECTORIES[1]
-
-    @property
     def publications_dir(self) -> Path:
-        return self.state_dir / SUBDIRECTORIES[2]
+        return self.state_dir / SUBDIRECTORIES[1]
 
     @property
     def database_path(self) -> Path:
@@ -145,12 +231,32 @@ class Session:
     def latest_path(self) -> Path:
         return self.snapshots_dir / LATEST_FILE
 
+    @property
+    def analysis_state_path(self) -> Path:
+        return self.state_dir / ANALYSIS_STATE_FILE
+
+    @property
+    def ignore_path(self) -> Path:
+        return self.state_dir / IGNORE_FILE
+
+    @property
+    def snapshot_store(self) -> SnapshotStore:
+        return SnapshotStore(self.snapshots_dir)
+
     def prepare(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         for name in SUBDIRECTORIES:
             (self.state_dir / name).mkdir(parents=True, exist_ok=True)
+        self.write_ignore()
         if not self.format_path.is_file():
             self.write_format()
+        elif self.format_version() > FORMAT_VERSION:
+            raise FormatUnsupported(self.format_version())
+
+    def write_ignore(self) -> None:
+        if self.ignore_path.is_file():
+            return
+        self.ignore_path.write_text(IGNORE_CONTENT, encoding="utf-8")
 
     def write_format(self) -> None:
         payload = {"format_version": FORMAT_VERSION, "repository_identity": self.identity}
@@ -221,13 +327,46 @@ class Session:
             raise SnapshotNotStored(f"{target}: {exc}") from exc
         return RepositorySnapshot.from_json(raw)
 
-    def stored_snapshots(self) -> tuple[str, ...]:
-        return tuple(
-            sorted(
-                path.stem
-                for path in self.snapshots_dir.glob("*.json")
-                if path.name != LATEST_FILE
-            )
+    def analysis_state(self) -> AnalysisState:
+        try:
+            payload = json.loads(self.analysis_state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return AnalysisState()
+        if not isinstance(payload, Mapping):
+            return AnalysisState()
+        return AnalysisState.from_mapping(payload)
+
+    def record_observation(self, digest: str) -> AnalysisState:
+        state = self.analysis_state()
+        updated = AnalysisState(
+            observed_digest=digest,
+            analyzed_digest=state.analyzed_digest,
+            analysis_status=state.analysis_status,
+            analyzed_at=state.analyzed_at,
+            reason=state.reason,
+        )
+        self._save_analysis_state(updated)
+        return updated
+
+    def record_analysis(
+        self, digest: str, status: AnalysisStatus, reason: str = ""
+    ) -> AnalysisState:
+        state = self.analysis_state()
+        complete = status is AnalysisStatus.COMPLETE
+        updated = AnalysisState(
+            observed_digest=digest,
+            analyzed_digest=digest if complete else state.analyzed_digest,
+            analysis_status=status,
+            analyzed_at=_utc_now() if complete else state.analyzed_at,
+            reason=reason,
+        )
+        self._save_analysis_state(updated)
+        return updated
+
+    def _save_analysis_state(self, state: AnalysisState) -> None:
+        self._write_atomic(
+            self.analysis_state_path,
+            json.dumps(state.to_dict(), sort_keys=True, ensure_ascii=False) + "\n",
         )
 
     def open_knowledge(self) -> KnowledgeRepository:
@@ -240,3 +379,7 @@ class Session:
             return registry.resolve(preference)
         except ProviderUnavailable:
             return None
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")

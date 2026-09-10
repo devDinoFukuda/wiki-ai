@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from wiki_ai.knowledge.model import SourceVersion
 from wiki_ai.knowledge.repository import KnowledgeRepository
 
 from wiki_ai.ingestion import pipeline
+from wiki_ai.ingestion.outcome import (
+    BLOCKING_FAULTS,
+    Gap,
+    IngestionStatus,
+    PARTIAL_GAPS,
+    SemanticFault,
+    StructuralFault,
+)
 from wiki_ai.ingestion.pipeline import IngestedSource, IngestStatus
 from wiki_ai.ingestion.semantic import (
     AUTHOR,
@@ -20,13 +28,17 @@ from wiki_ai.ingestion.source import DiagnosticLevel
 __all__ = [
     "PROVIDER_UNAVAILABLE",
     "VERSION_MISMATCH",
+    "IngestionStatus",
     "IngestionResult",
     "ProviderResolver",
     "IngestionEngine",
+    "derive_status",
 ]
 
-PROVIDER_UNAVAILABLE = "semantic_investigation_skipped:agent_provider_unavailable"
-VERSION_MISMATCH = "version_hash_mismatch"
+PROVIDER_UNAVAILABLE = SemanticFault.PROVIDER_UNAVAILABLE.value
+VERSION_MISMATCH = SemanticFault.VERSION_HASH_MISMATCH.value
+
+_NO_REASON = ""
 
 
 @runtime_checkable
@@ -40,6 +52,8 @@ class IngestionResult:
     version_hash: str
     blocks: int
     entities_written: int
+    status: IngestionStatus = IngestionStatus.COMPLETE
+    reason: str = _NO_REASON
     diagnostics: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -48,8 +62,36 @@ class IngestionResult:
             "version_hash": self.version_hash,
             "blocks": self.blocks,
             "entities_written": self.entities_written,
+            "status": self.status.value,
+            "reason": self.reason,
             "diagnostics": list(self.diagnostics),
         }
+
+
+def derive_status(
+    faults: Sequence[StructuralFault],
+    gaps: Sequence[Gap],
+    provider_present: bool,
+    semantic_faults: Sequence[SemanticFault] = (),
+) -> tuple[IngestionStatus, str]:
+    for fault in faults:
+        if fault in BLOCKING_FAULTS:
+            return IngestionStatus.BLOCKED, fault.value
+    if faults:
+        return IngestionStatus.FAILED, faults[0].value
+    if not provider_present:
+        return (
+            IngestionStatus.STRUCTURAL_ONLY,
+            SemanticFault.PROVIDER_UNAVAILABLE.value,
+        )
+    for fault in semantic_faults:
+        if fault is SemanticFault.PROVIDER_RUN_ABORTED:
+            return IngestionStatus.FAILED, fault.value
+        return IngestionStatus.PARTIAL, fault.value
+    for gap in gaps:
+        if gap in PARTIAL_GAPS:
+            return IngestionStatus.PARTIAL, gap.value
+    return IngestionStatus.COMPLETE, _NO_REASON
 
 
 def _structural_diagnostics(ingested: IngestedSource) -> tuple[str, ...]:
@@ -58,9 +100,9 @@ def _structural_diagnostics(ingested: IngestedSource) -> tuple[str, ...]:
         if item.level is DiagnosticLevel.INFO:
             continue
         found.append(f"{item.level.value}:{item.code}")
-    if ingested.status == IngestStatus.PARTIAL:
+    if ingested.status is IngestStatus.PARTIAL:
         found.append("source_partially_interpreted")
-    if ingested.status == IngestStatus.FAILED:
+    if ingested.status is IngestStatus.FAILED:
         found.append("source_not_interpreted")
     return tuple(dict.fromkeys(found))
 
@@ -84,38 +126,47 @@ class IngestionEngine:
         namespace: str,
         metadata: Mapping[str, Any] | None = None,
     ) -> IngestionResult:
-        ingested = self._ingest(source_path, metadata or {})
+        try:
+            ingested = self._ingest(source_path, metadata or {})
+        except OSError:
+            return IngestionResult(
+                source_id=str(Path(source_path)),
+                version_hash=str(version_hash or ""),
+                blocks=0,
+                entities_written=0,
+                status=IngestionStatus.FAILED,
+                reason=StructuralFault.UNREADABLE_SOURCE.value,
+                diagnostics=(f"error:{StructuralFault.UNREADABLE_SOURCE.value}",),
+            )
         diagnostics = list(_structural_diagnostics(ingested))
+        semantic_faults: list[SemanticFault] = []
         declared = str(version_hash or "").strip()
         if declared and declared != ingested.version_hash:
             diagnostics.append(VERSION_MISMATCH)
+        faults = ingested.faults
         self._register(ingested, knowledge, namespace)
         provider = self._resolve() if self._resolve is not None else None
+        outcome = SemanticOutcome()
+        if provider is not None and not faults:
+            outcome = self._investigate(ingested, knowledge, provider, namespace)
+            diagnostics.extend(outcome.diagnostics)
+            diagnostics.extend(f"gap:{item}" for item in outcome.gaps_opened)
+            semantic_faults.extend(outcome.faults)
         if provider is None:
             diagnostics.append(PROVIDER_UNAVAILABLE)
-            return IngestionResult(
-                source_id=ingested.source_id,
-                version_hash=ingested.version_hash,
-                blocks=len(ingested.blocks),
-                entities_written=0,
-                diagnostics=tuple(dict.fromkeys(diagnostics)),
-            )
-        if ingested.status == IngestStatus.FAILED:
-            return IngestionResult(
-                source_id=ingested.source_id,
-                version_hash=ingested.version_hash,
-                blocks=len(ingested.blocks),
-                entities_written=0,
-                diagnostics=tuple(dict.fromkeys(diagnostics)),
-            )
-        outcome = self._investigate(ingested, knowledge, provider, namespace)
-        diagnostics.extend(outcome.diagnostics)
-        diagnostics.extend(f"gap:{item}" for item in outcome.gaps_opened)
+        status, reason = derive_status(
+            faults=faults,
+            gaps=ingested.open_gaps,
+            provider_present=provider is not None,
+            semantic_faults=tuple(semantic_faults),
+        )
         return IngestionResult(
             source_id=ingested.source_id,
             version_hash=ingested.version_hash,
             blocks=len(ingested.blocks),
             entities_written=outcome.entities_written,
+            status=status,
+            reason=reason,
             diagnostics=tuple(dict.fromkeys(diagnostics)),
         )
 

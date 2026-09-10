@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-from wiki_ai.agent.envelope import StaleResult
 from wiki_ai.investigation.tasks import (
     Task,
     TaskState,
@@ -69,10 +68,6 @@ def permanent(code: str, detail: str = "") -> Failure:
 
 def stale(code: str, detail: str = "") -> Failure:
     return Failure(FailureKind.STALE, code, detail)
-
-
-def from_stale_result(error: StaleResult) -> Failure:
-    return Failure(FailureKind.STALE, error.reason.value, error.envelope.envelope_id)
 
 
 @dataclass(frozen=True)

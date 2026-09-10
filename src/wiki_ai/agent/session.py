@@ -271,7 +271,7 @@ class AgentSession:
         return max(0, self._budget.max_tool_calls - len(self._transcript))
 
     def exhausted(self, now: float | None = None) -> str | None:
-        if len(self._transcript) >= self._budget.max_tool_calls:
+        if self.remaining_tool_calls() == 0:
             return "max_tool_calls"
         if self._budget.max_tokens is not None and self._tokens >= self._budget.max_tokens:
             return "max_tokens"

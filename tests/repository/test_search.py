@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from wiki_ai.repository.search import SearchPatternInvalid, search
+from tests.repository.fixtures_repos import store_for
 from wiki_ai.repository.snapshot import SnapshotSpec, take_snapshot
 
 
@@ -18,7 +19,7 @@ def _snapshot(root: Path):
     _write(root, "src/alpha.py", "alpha = 1\nbeta = alpha + 1\n")
     _write(root, "src/beta.java", "int alpha = 2;\n")
     _write(root, "docs/notes.md", "alpha in prose\n")
-    return take_snapshot(SnapshotSpec(root=root))
+    return take_snapshot(SnapshotSpec(root=root), store_for(root))
 
 
 def test_search_finds_literal_matches(tmp_path: Path) -> None:

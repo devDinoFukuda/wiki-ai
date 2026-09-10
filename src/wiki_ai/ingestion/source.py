@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
+from wiki_ai.ingestion.outcome import StructuralFault
+
 __all__ = [
     "SourceKind",
     "BlockKind",
@@ -17,6 +19,7 @@ __all__ = [
     "MetadataNotInert",
     "METADATA_WHITELIST",
     "SUSPICIOUS_METADATA_KEYS",
+    "LOCATOR_INCOMPLETE",
     "MAX_METADATA_VALUE",
     "MAX_METADATA_ITEMS",
     "assert_inert",
@@ -150,6 +153,8 @@ SUSPICIOUS_METADATA_KEYS: frozenset[str] = frozenset(
         "trust",
     }
 )
+
+LOCATOR_INCOMPLETE = StructuralFault.LOCATOR_INCOMPLETE.value
 
 MAX_METADATA_VALUE = 4000
 MAX_METADATA_ITEMS = 200
@@ -462,7 +467,7 @@ def locator_diagnostics(
         found.append(
             Diagnostic(
                 level=DiagnosticLevel.ERROR,
-                code="locator.incomplete",
+                code=LOCATOR_INCOMPLETE,
                 message=(
                     f"block {block.id} has no resolvable locator for {kind.value}: "
                     f"missing {', '.join(missing)}"

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Mapping
 
 from wiki_ai.repository.inventory import language_hint_for
-from wiki_ai.repository.reader import resolve_within
+from wiki_ai.repository.reader import snapshot_text
 from wiki_ai.repository.snapshot import RepositorySnapshot
 
 __all__ = [
@@ -94,17 +94,6 @@ def _is_config_file(path: str) -> bool:
     if name in _CONFIG_NAMES or name.startswith(".env"):
         return True
     return name.endswith(_CONFIG_SUFFIXES)
-
-
-def _read_text(root: Path, path: str, max_file_bytes: int) -> str | None:
-    try:
-        full_path = resolve_within(root, path)
-        raw = full_path.read_bytes()
-    except (OSError, ValueError):
-        return None
-    if len(raw) > max_file_bytes or b"\x00" in raw[:8192]:
-        return None
-    return raw.decode("utf-8", errors="replace")
 
 
 def _matches_query(key: str, query: str) -> bool:
@@ -257,10 +246,9 @@ def find_config(
     query = (key_or_usage or "").strip()
     if not query or limit <= 0:
         return ()
-    root = Path(snapshot.root)
     collected: list[ConfigHit] = []
     for record in snapshot.files:
-        text = _read_text(root, record.path, max_file_bytes)
+        text = snapshot_text(snapshot, record.path, max_file_bytes)
         if text is None:
             continue
         if _is_config_file(record.path):

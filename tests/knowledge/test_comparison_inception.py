@@ -169,3 +169,16 @@ def test_comparison_is_stable_across_reruns(inception, report):
     correlate(inception.repository, "ns")
     again = KnowledgeQuery(inception.repository).compare()
     assert again.all_findings() == report.all_findings()
+
+
+def test_query_compare_lists_corroborated_findings_before_one_sided_ones(inception):
+    conflicts = KnowledgeQuery(inception.repository).compare().proposal_conflicts
+    flags = [item.has_both_sides for item in conflicts]
+    assert flags == sorted(flags, reverse=True)
+
+
+def test_corroborated_keeps_only_findings_with_evidence_on_both_sides(report):
+    corroborated = report.corroborated()
+    assert corroborated
+    assert all(item.has_both_sides for item in corroborated)
+    assert len(corroborated) < report.total

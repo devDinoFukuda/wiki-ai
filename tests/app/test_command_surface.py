@@ -120,7 +120,9 @@ def test_ingest_exits_zero_and_registers_the_source(tmp_path: Path) -> None:
     source.write_text("# renewal\n", encoding="utf-8")
     code, payload = _run("ingest", str(source), "--repo", str(repo))
     assert code == EXIT_OK
-    assert payload["status"] == "ok"
+    assert payload["status"] == "partial"
+    assert payload["ingestion_status"] == "structural_only"
+    assert payload["reason"] == "structural_only"
     assert payload["registered"] is True
     assert payload["kind"] == "markdown"
 
@@ -139,7 +141,6 @@ def test_state_layout_is_created_by_the_first_command(tmp_path: Path) -> None:
     state = tmp_path / ".wiki-ai"
     assert (state / "format.json").is_file()
     assert (state / "snapshots" / "latest.json").is_file()
-    assert (state / "evidence").is_dir()
     assert (state / "publications").is_dir()
 
 

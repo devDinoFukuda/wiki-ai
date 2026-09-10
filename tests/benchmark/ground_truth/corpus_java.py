@@ -1,0 +1,530 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Mapping
+
+from tests.benchmark.ground_truth.sheets import (
+    GeneratedCorpus,
+    Sheet,
+    mark,
+    write,
+    write_docx,
+)
+from tests.benchmark.ground_truth.truth import (
+    ContradictionTruth,
+    EdgeCaseTruth,
+    EntryPointTruth,
+    FailureModeTruth,
+    IntegrationTruth,
+    InvariantTruth,
+    RepositoryTruth,
+    RuleTruth,
+)
+
+__all__ = [
+    "JAVA_CONTROLLER_PATH",
+    "JAVA_SERVICE_PATH",
+    "JAVA_ELIGIBILITY_PATH",
+    "JAVA_REPOSITORY_PATH",
+    "JAVA_PUBLISHER_PATH",
+    "JAVA_TEST_PATH",
+    "JAVA_CONFIG_PATH",
+    "JAVA_CONTRADICTION_DOCUMENT",
+    "build_java",
+]
+
+
+JAVA_CONTROLLER_PATH = "src/main/java/com/acme/renewal/RenewalController.java"
+JAVA_SERVICE_PATH = "src/main/java/com/acme/renewal/RenewalService.java"
+JAVA_ELIGIBILITY_PATH = "src/main/java/com/acme/renewal/EligibilityPolicy.java"
+JAVA_REPOSITORY_PATH = "src/main/java/com/acme/renewal/ContractRepository.java"
+JAVA_PUBLISHER_PATH = "src/main/java/com/acme/renewal/RenewalEventPublisher.java"
+JAVA_TEST_PATH = "src/test/java/com/acme/renewal/EligibilityPolicyTest.java"
+JAVA_CONFIG_PATH = "src/main/resources/application.yml"
+
+_JAVA_CONTROLLER = (
+    "package com.acme.renewal;",
+    "",
+    "import org.springframework.http.ResponseEntity;",
+    "import org.springframework.web.bind.annotation.PathVariable;",
+    "import org.springframework.web.bind.annotation.PostMapping;",
+    "import org.springframework.web.bind.annotation.RequestMapping;",
+    "import org.springframework.web.bind.annotation.RestController;",
+    "",
+    "@RestController",
+    mark("mapping", '@RequestMapping("/contracts")'),
+    "public class RenewalController {",
+    "",
+    "    private final RenewalService service;",
+    "",
+    "    public RenewalController(RenewalService service) {",
+    "        this.service = service;",
+    "    }",
+    "",
+    mark("post", '    @PostMapping("/{contractId}/renewals")'),
+    mark("handler", "    public ResponseEntity<RenewalResult> renew(@PathVariable String contractId) {"),
+    "        RenewalResult result = service.renew(contractId);",
+    "        if (!result.accepted()) {",
+    "            return ResponseEntity.unprocessableEntity().body(result);",
+    "        }",
+    "        return ResponseEntity.accepted().body(result);",
+    "    }",
+    "}",
+)
+
+_JAVA_ELIGIBILITY = (
+    "package com.acme.renewal;",
+    "",
+    "import java.time.Duration;",
+    "import java.time.Instant;",
+    "import java.math.BigDecimal;",
+    "",
+    "public final class EligibilityPolicy {",
+    "",
+    mark("window", "    public static final Duration RENEWAL_WINDOW = Duration.ofDays(30);"),
+    "",
+    mark("evaluate", "    public EligibilityDecision evaluate(Contract contract, Instant now) {"),
+    mark("debt", "        if (contract.outstandingDebt().compareTo(BigDecimal.ZERO) > 0) {"),
+    mark("debt_effect", '            return EligibilityDecision.blocked("outstanding_debt");'),
+    "        }",
+    mark("premium", '        if (contract.plan().equals("premium")) {',),
+    mark("premium_effect", "            return EligibilityDecision.allowed();"),
+    "        }",
+    mark("expiry", "        Duration remaining = Duration.between(now, contract.expiresAt());"),
+    mark("window_check", "        if (remaining.compareTo(RENEWAL_WINDOW) > 0) {"),
+    mark("window_effect", '            return EligibilityDecision.blocked("outside_renewal_window");'),
+    "        }",
+    mark("expired", "        if (remaining.isNegative()) {"),
+    mark("expired_effect", '            return EligibilityDecision.blocked("contract_expired");'),
+    "        }",
+    "        return EligibilityDecision.allowed();",
+    "    }",
+    "}",
+)
+
+_JAVA_SERVICE = (
+    "package com.acme.renewal;",
+    "",
+    "import java.time.Duration;",
+    "import java.time.Instant;",
+    "import org.springframework.stereotype.Service;",
+    "import org.springframework.transaction.annotation.Transactional;",
+    "",
+    "@Service",
+    "public class RenewalService {",
+    "",
+    "    private final ContractRepository contracts;",
+    "    private final EligibilityPolicy policy;",
+    "    private final RenewalEventPublisher publisher;",
+    mark("timeout", "    private static final Duration PUBLISH_TIMEOUT = Duration.ofSeconds(5);"),
+    mark("attempts", "    private static final int MAX_ATTEMPTS = 3;"),
+    mark("backoff", "    private static final long BACKOFF_MILLIS = 250L;"),
+    "",
+    "    public RenewalService(",
+    "            ContractRepository contracts,",
+    "            EligibilityPolicy policy,",
+    "            RenewalEventPublisher publisher) {",
+    "        this.contracts = contracts;",
+    "        this.policy = policy;",
+    "        this.publisher = publisher;",
+    "    }",
+    "",
+    "    @Transactional",
+    mark("renew", "    public RenewalResult renew(String contractId) {"),
+    mark("load", "        Contract contract = contracts.findByIdForUpdate(contractId)"),
+    mark("missing", "                .orElseThrow(() -> new ContractNotFoundException(contractId));"),
+    mark("decide", "        EligibilityDecision decision = policy.evaluate(contract, Instant.now());"),
+    "        if (!decision.allowed()) {",
+    mark("reject", "            return RenewalResult.rejected(decision.reason());"),
+    "        }",
+    mark("persist", "        Contract renewed = contracts.save(contract.extendBy(EligibilityPolicy.RENEWAL_WINDOW));"),
+    mark("publish_call", "        publishWithRetry(new RenewalPerformed(renewed.id(), renewed.expiresAt()));"),
+    "        return RenewalResult.accepted(renewed.expiresAt());",
+    "    }",
+    "",
+    mark("retry", "    private void publishWithRetry(RenewalPerformed event) {"),
+    mark("loop", "        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {"),
+    "            try {",
+    mark("publish", "                publisher.publish(event, PUBLISH_TIMEOUT);"),
+    "                return;",
+    mark("catch", "            } catch (PublishFailedException failure) {"),
+    mark("exhausted", "                if (attempt == MAX_ATTEMPTS) {"),
+    mark("rethrow", "                    throw new RenewalNotNotifiedException(event.contractId(), failure);"),
+    "                }",
+    mark("sleep", "                sleepQuietly(BACKOFF_MILLIS * (1L << (attempt - 1)));"),
+    "            }",
+    "        }",
+    "    }",
+    "",
+    "    private void sleepQuietly(long millis) {",
+    "        try {",
+    "            Thread.sleep(millis);",
+    "        } catch (InterruptedException interrupted) {",
+    "            Thread.currentThread().interrupt();",
+    "        }",
+    "    }",
+    "}",
+)
+
+_JAVA_REPOSITORY = (
+    "package com.acme.renewal;",
+    "",
+    "import java.util.Optional;",
+    "import jakarta.persistence.LockModeType;",
+    "import org.springframework.data.jpa.repository.JpaRepository;",
+    "import org.springframework.data.jpa.repository.Lock;",
+    "import org.springframework.data.jpa.repository.Query;",
+    "",
+    mark("iface", "public interface ContractRepository extends JpaRepository<Contract, String> {"),
+    "",
+    mark("lock", "    @Lock(LockModeType.PESSIMISTIC_WRITE)"),
+    mark("query", '    @Query("select c from Contract c where c.id = :id")'),
+    mark("find", "    Optional<Contract> findByIdForUpdate(String id);"),
+    "}",
+)
+
+_JAVA_PUBLISHER = (
+    "package com.acme.renewal;",
+    "",
+    "import java.time.Duration;",
+    "import java.util.concurrent.TimeUnit;",
+    "import java.util.concurrent.TimeoutException;",
+    "import org.apache.kafka.clients.producer.ProducerRecord;",
+    "import org.springframework.kafka.core.KafkaTemplate;",
+    "import org.springframework.stereotype.Component;",
+    "",
+    "@Component",
+    "public class RenewalEventPublisher {",
+    "",
+    mark("topic", '    public static final String TOPIC = "contract.renewal.performed";'),
+    "",
+    "    private final KafkaTemplate<String, RenewalPerformed> template;",
+    "",
+    "    public RenewalEventPublisher(KafkaTemplate<String, RenewalPerformed> template) {",
+    "        this.template = template;",
+    "    }",
+    "",
+    mark("publish", "    public void publish(RenewalPerformed event, Duration timeout) {"),
+    mark("record", "        ProducerRecord<String, RenewalPerformed> record ="),
+    "                new ProducerRecord<>(TOPIC, event.contractId(), event);",
+    "        try {",
+    mark("send", "            template.send(record).get(timeout.toMillis(), TimeUnit.MILLISECONDS);"),
+    mark("timeout_catch", "        } catch (TimeoutException expired) {"),
+    mark("timeout_effect", '            throw new PublishFailedException("publish_timeout", expired);'),
+    "        } catch (Exception broken) {",
+    mark("failure_effect", '            throw new PublishFailedException("publish_failed", broken);'),
+    "        }",
+    "    }",
+    "}",
+)
+
+_JAVA_TEST = (
+    "package com.acme.renewal;",
+    "",
+    "import static org.junit.jupiter.api.Assertions.assertEquals;",
+    "import static org.junit.jupiter.api.Assertions.assertTrue;",
+    "",
+    "import java.math.BigDecimal;",
+    "import java.time.Instant;",
+    "import org.junit.jupiter.api.Test;",
+    "",
+    "class EligibilityPolicyTest {",
+    "",
+    "    @Test",
+    mark("debt_test", "    void blocksWhenOutstandingDebtExists() {"),
+    "        Contract contract = Contract.of(\"c-1\", \"basic\", new BigDecimal(\"12.50\"),",
+    "                Instant.parse(\"2026-01-10T00:00:00Z\"));",
+    "        EligibilityDecision decision =",
+    "                new EligibilityPolicy().evaluate(contract, Instant.parse(\"2026-01-01T00:00:00Z\"));",
+    "        assertEquals(\"outstanding_debt\", decision.reason());",
+    "    }",
+    "",
+    "    @Test",
+    mark("premium_test", "    void premiumPlanSkipsWindowCheck() {"),
+    "        Contract contract = Contract.of(\"c-2\", \"premium\", BigDecimal.ZERO,",
+    "                Instant.parse(\"2027-01-10T00:00:00Z\"));",
+    "        EligibilityDecision decision =",
+    "                new EligibilityPolicy().evaluate(contract, Instant.parse(\"2026-01-01T00:00:00Z\"));",
+    "        assertTrue(decision.allowed());",
+    "    }",
+    "}",
+)
+
+_JAVA_CONFIG = (
+    "spring:",
+    "  kafka:",
+    "    bootstrap-servers: broker-1.acme.internal:9092",
+    "renewal:",
+    mark("window_config", "  window-days: 30"),
+    mark("attempts_config", "  max-attempts: 3"),
+    mark("timeout_config", "  publish-timeout-seconds: 5"),
+)
+
+_JAVA_SUPPORT: Mapping[str, tuple[str, ...]] = {
+    "src/main/java/com/acme/renewal/Contract.java": (
+        "package com.acme.renewal;",
+        "",
+        "import java.math.BigDecimal;",
+        "import java.time.Duration;",
+        "import java.time.Instant;",
+        "",
+        "public record Contract(String id, String plan, BigDecimal outstandingDebt, Instant expiresAt) {",
+        "    public static Contract of(String id, String plan, BigDecimal debt, Instant expiresAt) {",
+        "        return new Contract(id, plan, debt, expiresAt);",
+        "    }",
+        "",
+        "    public Contract extendBy(Duration window) {",
+        "        return new Contract(id, plan, outstandingDebt, expiresAt.plus(window));",
+        "    }",
+        "}",
+    ),
+    "src/main/java/com/acme/renewal/EligibilityDecision.java": (
+        "package com.acme.renewal;",
+        "",
+        "public record EligibilityDecision(boolean allowed, String reason) {",
+        "    public static EligibilityDecision allowed() {",
+        '        return new EligibilityDecision(true, "");',
+        "    }",
+        "",
+        "    public static EligibilityDecision blocked(String reason) {",
+        "        return new EligibilityDecision(false, reason);",
+        "    }",
+        "}",
+    ),
+    "src/main/java/com/acme/renewal/RenewalResult.java": (
+        "package com.acme.renewal;",
+        "",
+        "import java.time.Instant;",
+        "",
+        "public record RenewalResult(boolean accepted, String reason, Instant expiresAt) {",
+        "    public static RenewalResult accepted(Instant expiresAt) {",
+        '        return new RenewalResult(true, "", expiresAt);',
+        "    }",
+        "",
+        "    public static RenewalResult rejected(String reason) {",
+        "        return new RenewalResult(false, reason, null);",
+        "    }",
+        "}",
+    ),
+    "src/main/java/com/acme/renewal/RenewalPerformed.java": (
+        "package com.acme.renewal;",
+        "",
+        "import java.time.Instant;",
+        "",
+        "public record RenewalPerformed(String contractId, Instant expiresAt) {",
+        "}",
+    ),
+    "src/main/java/com/acme/renewal/PublishFailedException.java": (
+        "package com.acme.renewal;",
+        "",
+        "public class PublishFailedException extends RuntimeException {",
+        "    public PublishFailedException(String reason, Throwable cause) {",
+        "        super(reason, cause);",
+        "    }",
+        "}",
+    ),
+    "src/main/java/com/acme/renewal/RenewalNotNotifiedException.java": (
+        "package com.acme.renewal;",
+        "",
+        "public class RenewalNotNotifiedException extends RuntimeException {",
+        "    public RenewalNotNotifiedException(String contractId, Throwable cause) {",
+        "        super(contractId, cause);",
+        "    }",
+        "}",
+    ),
+    "src/main/java/com/acme/renewal/ContractNotFoundException.java": (
+        "package com.acme.renewal;",
+        "",
+        "public class ContractNotFoundException extends RuntimeException {",
+        "    public ContractNotFoundException(String contractId) {",
+        "        super(contractId);",
+        "    }",
+        "}",
+    ),
+    "pom.xml": (
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">',
+        "  <modelVersion>4.0.0</modelVersion>",
+        "  <groupId>com.acme</groupId>",
+        "  <artifactId>renewal-service</artifactId>",
+        "  <version>1.0.0</version>",
+        "</project>",
+    ),
+}
+
+JAVA_CONTRADICTION_DOCUMENT = "renewal-policy.docx"
+
+
+def build_java(root: Path) -> GeneratedCorpus:
+    controller = Sheet(JAVA_CONTROLLER_PATH, _JAVA_CONTROLLER)
+    eligibility = Sheet(JAVA_ELIGIBILITY_PATH, _JAVA_ELIGIBILITY)
+    service = Sheet(JAVA_SERVICE_PATH, _JAVA_SERVICE)
+    repository = Sheet(JAVA_REPOSITORY_PATH, _JAVA_REPOSITORY)
+    publisher = Sheet(JAVA_PUBLISHER_PATH, _JAVA_PUBLISHER)
+    suite = Sheet(JAVA_TEST_PATH, _JAVA_TEST)
+    config = Sheet(JAVA_CONFIG_PATH, _JAVA_CONFIG)
+    sheets = (controller, eligibility, service, repository, publisher, suite, config)
+    for sheet in sheets:
+        write(root / sheet.path, sheet.text())
+    for path, lines in _JAVA_SUPPORT.items():
+        write(root / path, "\n".join(lines) + "\n")
+    document = root / JAVA_CONTRADICTION_DOCUMENT
+    write_docx(
+        document,
+        _JAVA_DOCUMENT_PARAGRAPHS,
+        title="Contract Renewal Policy",
+        author="Contract Office",
+    )
+    truth = RepositoryTruth(
+        name="java",
+        language="java",
+        business_rules=(
+            RuleTruth(
+                key="renewal_blocked_by_outstanding_debt",
+                statement="renewal is blocked when the contract has outstanding debt",
+                key_terms=("outstandingDebt", "outstanding_debt", "blocked"),
+                conditions=("outstandingDebt greater than zero",),
+                effects=("blocked with reason outstanding_debt",),
+                anchors=(eligibility.span("debt", "debt_effect"),),
+            ),
+            RuleTruth(
+                key="renewal_window_of_thirty_days",
+                statement="renewal is only allowed inside a window of 30 days before expiry",
+                key_terms=("RENEWAL_WINDOW", "ofDays", "30", "outside_renewal_window"),
+                conditions=("remaining time greater than RENEWAL_WINDOW of 30 days",),
+                effects=("blocked with reason outside_renewal_window",),
+                anchors=(
+                    eligibility.line("window"),
+                    eligibility.span("window_check", "window_effect"),
+                ),
+            ),
+            RuleTruth(
+                key="premium_plan_exempt_from_window",
+                statement="premium plan contracts are exempt from the renewal window check",
+                key_terms=("premium", "plan", "allowed"),
+                conditions=("contract plan equals premium",),
+                effects=("allowed without evaluating the renewal window",),
+                anchors=(eligibility.span("premium", "premium_effect"),),
+            ),
+        ),
+        edge_cases=(
+            EdgeCaseTruth(
+                key="already_expired_contract",
+                statement="an already expired contract is blocked instead of renewed",
+                key_terms=("isNegative", "contract_expired", "remaining"),
+                condition="remaining duration is negative",
+                expected="blocked with reason contract_expired",
+                anchors=(eligibility.span("expired", "expired_effect"),),
+            ),
+            EdgeCaseTruth(
+                key="contract_not_found",
+                statement="a renewal for an unknown contract raises ContractNotFoundException",
+                key_terms=("ContractNotFoundException", "orElseThrow", "findByIdForUpdate"),
+                condition="findByIdForUpdate returns empty",
+                expected="ContractNotFoundException is thrown",
+                anchors=(service.span("load", "missing"),),
+            ),
+            EdgeCaseTruth(
+                key="publish_exhausts_attempts",
+                statement="when every publish attempt fails the renewal is reported as not notified",
+                key_terms=("MAX_ATTEMPTS", "RenewalNotNotifiedException", "attempt"),
+                condition="attempt equals MAX_ATTEMPTS and publish still fails",
+                expected="RenewalNotNotifiedException is thrown",
+                anchors=(service.span("exhausted", "rethrow"),),
+            ),
+        ),
+        invariants=(
+            InvariantTruth(
+                key="renewal_row_locked_for_update",
+                statement="the contract row is locked for update while the renewal runs",
+                key_terms=("PESSIMISTIC_WRITE", "Lock", "findByIdForUpdate"),
+                anchors=(repository.span("lock", "find"),),
+            ),
+            InvariantTruth(
+                key="renewal_is_transactional",
+                statement="the renewal executes inside a single transaction",
+                key_terms=("Transactional", "renew", "save"),
+                anchors=(service.span("renew", "persist"),),
+            ),
+        ),
+        integrations=(
+            IntegrationTruth(
+                key="kafka_renewal_performed_topic",
+                statement="the service publishes RenewalPerformed to the kafka topic contract.renewal.performed",
+                key_terms=("kafka", "contract.renewal.performed", "KafkaTemplate", "send"),
+                direction="outbound",
+                protocol="kafka",
+                anchors=(
+                    publisher.line("topic"),
+                    publisher.span("publish", "send"),
+                ),
+            ),
+            IntegrationTruth(
+                key="jpa_contract_repository",
+                statement="contracts are persisted through a JPA repository",
+                key_terms=("JpaRepository", "ContractRepository", "Query"),
+                direction="outbound",
+                protocol="jpa",
+                anchors=(repository.span("iface", "find"),),
+            ),
+        ),
+        entrypoints=(
+            EntryPointTruth(
+                key="post_contract_renewal",
+                statement="POST /contracts/{contractId}/renewals starts a renewal",
+                key_terms=("PostMapping", "renewals", "RestController", "renew"),
+                mechanism="http",
+                anchors=(controller.span("mapping", "handler"),),
+            ),
+        ),
+        failure_modes=(
+            FailureModeTruth(
+                key="publish_timeout",
+                statement="a publish that exceeds the timeout raises PublishFailedException publish_timeout",
+                key_terms=("TimeoutException", "publish_timeout", "PublishFailedException"),
+                trigger="kafka send exceeds the configured timeout",
+                effect="PublishFailedException with reason publish_timeout",
+                anchors=(publisher.span("timeout_catch", "timeout_effect"),),
+            ),
+            FailureModeTruth(
+                key="publish_retry_with_backoff",
+                statement="publish failures are retried up to three times with exponential backoff",
+                key_terms=("MAX_ATTEMPTS", "BACKOFF_MILLIS", "attempt", "sleepQuietly"),
+                trigger="PublishFailedException raised by the publisher",
+                effect="retry with doubled backoff until MAX_ATTEMPTS",
+                anchors=(
+                    service.span("attempts", "backoff"),
+                    service.span("loop", "sleep"),
+                ),
+            ),
+        ),
+        contradictions=(
+            ContradictionTruth(
+                key="window_days_contradiction",
+                document_claim="the renewal window is 45 days",
+                code_reality="the renewal window is 30 days",
+                key_terms=("45", "30", "window"),
+                code_anchors=(eligibility.line("window"), config.line("window_config")),
+                document_name=JAVA_CONTRADICTION_DOCUMENT,
+            ),
+        ),
+        symbols_by_path={
+            JAVA_CONTROLLER_PATH: ("RenewalController", "renew", "PostMapping"),
+            JAVA_ELIGIBILITY_PATH: ("EligibilityPolicy", "RENEWAL_WINDOW", "evaluate"),
+            JAVA_SERVICE_PATH: ("RenewalService", "publishWithRetry", "MAX_ATTEMPTS"),
+            JAVA_REPOSITORY_PATH: ("ContractRepository", "findByIdForUpdate"),
+            JAVA_PUBLISHER_PATH: ("RenewalEventPublisher", "publish", "TOPIC"),
+            JAVA_TEST_PATH: ("EligibilityPolicyTest", "blocksWhenOutstandingDebtExists"),
+        },
+    )
+    return GeneratedCorpus(root=root, truth=truth, documents=(document,))
+
+
+_JAVA_DOCUMENT_PARAGRAPHS = (
+    ("Title", "Contract Renewal Policy"),
+    ("Heading1", "Renewal window"),
+    ("", "A contract may be renewed at any moment inside the 45 days that precede its expiry date."),
+    ("", "The renewal window of 45 days applies to every plan without exception."),
+    ("Heading1", "Debt"),
+    ("", "A contract with outstanding debt cannot be renewed."),
+)

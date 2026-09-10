@@ -9,6 +9,7 @@ from tests.acceptance.scenarios import (
     CAPABILITY,
     MIGRATION_DOCX_BODY,
     NAMESPACE_OBJECTIVE,
+    assert_settled,
     java_acceptance_repo,
     java_scripts,
     scripted_registry,
@@ -132,7 +133,7 @@ def sources(tmp_path: Path) -> dict[str, Path]:
 def inception(tmp_path: Path, sources: dict[str, Path]) -> Path:
     repo = java_acceptance_repo(tmp_path / "repo")
     analyzed = api.analyze(repo, NAMESPACE_OBJECTIVE, registry=scripted_registry(java_scripts()))
-    assert analyzed.status == "ok", analyzed.to_dict()
+    assert_settled(analyzed)
     for key, findings in (
         ("transcript", [DECISION]),
         ("sheet", [SHEET_RULE]),

@@ -6,8 +6,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .comparison import ComparisonFinding, ComparisonReport
 from .comparison import compare as compare_repository
-from .gaps import blocking_gaps, open_gaps
+from .gaps import blocking_gaps, gaps_about, open_gaps
+from .gate import KnowledgeProvenance, provenance
 from .model import Confidence, Entity, EntityId, KnowledgeState, Evidence, Relation
+from .relations import neighbor_ids
 from .repository import ENTITY_COLUMNS, KnowledgeRepository
 from .taxonomy import EntityKind, RelationKind
 
@@ -18,6 +20,7 @@ __all__ = [
     "DEFAULT_LIMIT",
     "FlowStepView",
     "ImpactReport",
+    "KnowledgeProvenance",
     "KnowledgeQuery",
     "Page",
     "PathResult",
@@ -159,6 +162,19 @@ class KnowledgeQuery:
     @property
     def repository(self) -> KnowledgeRepository:
         return self._repo
+
+    def provenance(self) -> KnowledgeProvenance:
+        return provenance(self._repo)
+
+    def neighbor_ids(
+        self,
+        entity_id: EntityId,
+        relation_kind: str | RelationKind | Iterable[str | RelationKind] | None = None,
+        direction: str = DIRECTION_BOTH,
+    ) -> tuple[str, ...]:
+        return neighbor_ids(
+            self._repo.conn, entity_id, direction, _relation_values(relation_kind)
+        )
 
     def entities(
         self,
@@ -459,12 +475,23 @@ class KnowledgeQuery:
     def compare(self, limit: int = DEFAULT_LIMIT, offset: int = 0) -> ComparisonReport:
         page = Page(limit, offset)
         full = compare_repository(self._repo)
+        corroborated = {item.entity_id for item in full.corroborated()}
         return ComparisonReport(
-            declared_not_implemented=page.slice(full.declared_not_implemented),
-            implemented_not_documented=page.slice(full.implemented_not_documented),
-            proposal_conflicts=page.slice(full.proposal_conflicts),
-            decision_supersedes=page.slice(full.decision_supersedes),
-            source_contradicts_source=page.slice(full.source_contradicts_source),
+            declared_not_implemented=page.slice(
+                _corroborated_first(full.declared_not_implemented, corroborated)
+            ),
+            implemented_not_documented=page.slice(
+                _corroborated_first(full.implemented_not_documented, corroborated)
+            ),
+            proposal_conflicts=page.slice(
+                _corroborated_first(full.proposal_conflicts, corroborated)
+            ),
+            decision_supersedes=page.slice(
+                _corroborated_first(full.decision_supersedes, corroborated)
+            ),
+            source_contradicts_source=page.slice(
+                _corroborated_first(full.source_contradicts_source, corroborated)
+            ),
         )
 
     def _members(self, container_id: EntityId) -> tuple[Entity, ...]:
@@ -522,7 +549,7 @@ class KnowledgeQuery:
         return tuple(found)
 
     def _gaps_about(self, entity_id: EntityId) -> tuple[Entity, ...]:
-        return self._targets(entity_id, RelationKind.AFFECTS, DIRECTION_IN, EntityKind.GAP)
+        return gaps_about(self._repo, entity_id)
 
 
 _STORAGE_KIND_VALUES: frozenset[str] = frozenset(
@@ -558,6 +585,14 @@ def _merge(*groups: Sequence[Entity]) -> tuple[Entity, ...]:
             seen.add(entity.id.value)
             found.append(entity)
     return tuple(found)
+
+
+def _corroborated_first(
+    findings: Sequence[ComparisonFinding], corroborated: set[str]
+) -> tuple[ComparisonFinding, ...]:
+    return tuple(
+        sorted(findings, key=lambda item: 0 if item.entity_id in corroborated else 1)
+    )
 
 
 def _of_kind(entities: Sequence[Entity], kind: EntityKind) -> tuple[Entity, ...]:

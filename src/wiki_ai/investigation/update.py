@@ -17,7 +17,9 @@ from wiki_ai.repository.snapshot import RepositorySnapshot, SnapshotDiff, diff
 
 from wiki_ai.investigation.objective import Objective, ObjectiveKind, Scope, parse
 from wiki_ai.investigation.orchestrator import (
+    ABORT_SNAPSHOT_NOT_MATERIALIZED,
     InvestigationOutcomeData,
+    InvestigationStatus,
     Investigator,
     SessionProvider,
 )
@@ -100,15 +102,21 @@ class UpdateOutcome:
     invalidated: InvalidationReport
     reinvestigation: InvestigationOutcomeData | None = None
     skipped_reason: str = ""
+    status: InvestigationStatus = InvestigationStatus.COMPLETE
+    reason: str = SKIPPED_NO_DIFF
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "diff": dict(self.diff_summary),
             "invalidated": self.invalidated.to_dict(),
             "skipped_reason": self.skipped_reason,
+            "status": self.status.value,
+            "reason": self.reason,
         }
         if self.reinvestigation is not None:
             payload["reinvestigation"] = {
+                "status": self.reinvestigation.status.value,
+                "reason": self.reinvestigation.reason,
                 "objective": self.reinvestigation.objective,
                 "entities_written": self.reinvestigation.entities_written,
                 "relations_written": self.reinvestigation.relations_written,
@@ -318,6 +326,16 @@ class UpdateEngine:
                 diff_summary=summary,
                 invalidated=InvalidationReport(),
                 skipped_reason=SKIPPED_NO_DIFF,
+                status=InvestigationStatus.COMPLETE,
+                reason=SKIPPED_NO_DIFF,
+            )
+        if not current_snapshot.materialized:
+            return UpdateOutcome(
+                diff_summary=summary,
+                invalidated=InvalidationReport(),
+                skipped_reason=ABORT_SNAPSHOT_NOT_MATERIALIZED,
+                status=InvestigationStatus.FAILED,
+                reason=ABORT_SNAPSHOT_NOT_MATERIALIZED,
             )
         impacted = impacted_evidence(
             knowledge, previous_snapshot, current_snapshot, namespace
@@ -330,6 +348,8 @@ class UpdateEngine:
                 diff_summary=summary,
                 invalidated=report,
                 skipped_reason=SKIPPED_NO_PROVIDER,
+                status=InvestigationStatus.BLOCKED,
+                reason=SKIPPED_NO_PROVIDER,
             )
         objective = plan_reinvestigation(report, changes)
         outcome = self._investigator.run(
@@ -344,4 +364,6 @@ class UpdateEngine:
             invalidated=report,
             reinvestigation=outcome,
             skipped_reason="",
+            status=outcome.status,
+            reason=outcome.reason,
         )

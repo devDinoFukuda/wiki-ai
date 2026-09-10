@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from wiki_ai.agent.protocol import ProtocolError, ToolCall, ToolResult
@@ -20,7 +22,12 @@ from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind
 from wiki_ai.repository import schemas
 from wiki_ai.repository.harness import RepositoryHarness, ScopeFocus, ToolError
-from wiki_ai.repository.snapshot import RepositorySnapshot
+from wiki_ai.repository.snapshot import (
+    RepositorySnapshot,
+    SnapshotError,
+    SnapshotSpec,
+    observe,
+)
 from wiki_ai.repository.symbols import find_symbols
 
 from wiki_ai.investigation import (
@@ -35,9 +42,16 @@ from wiki_ai.investigation import (
 from wiki_ai.investigation.compaction import InvestigationState
 from wiki_ai.investigation.coverage import ENTRY_LIKE_SYMBOL_KINDS, CoverageState
 from wiki_ai.investigation.evidence import CaptureRegistry
-from wiki_ai.investigation.finding import finding_schema, parse_findings
+from wiki_ai.investigation.finding import finding_schema, parse_findings, with_owner
 from wiki_ai.investigation.objective import Objective, ObjectiveError, parse
-from wiki_ai.investigation.recovery import Failure, RetryPolicy, permanent, recover, transient
+from wiki_ai.investigation.recovery import (
+    Failure,
+    RetryPolicy,
+    permanent,
+    recover,
+    stale,
+    transient,
+)
 from wiki_ai.investigation.strategy import (
     Phase,
     Step,
@@ -45,9 +59,19 @@ from wiki_ai.investigation.strategy import (
     StrategyState,
     default_strategy,
 )
-from wiki_ai.investigation.tasks import Task, TaskState, acquire, transition
+from wiki_ai.investigation.tasks import (
+    TERMINAL_STATES,
+    Lease,
+    Task,
+    TaskState,
+    acquire,
+    holds,
+    renew,
+    transition,
+)
 
 __all__ = [
+    "InvestigationStatus",
     "InvestigationOutcomeData",
     "RoundReport",
     "Investigator",
@@ -55,7 +79,27 @@ __all__ = [
     "HarnessFactory",
     "DEFAULT_ROUND_BUDGET",
     "DEFAULT_TOTAL_TOOL_CALLS",
+    "ABORT_SNAPSHOT_CHANGED",
+    "ABORT_SNAPSHOT_NOT_MATERIALIZED",
+    "REASON_BUDGET_EXHAUSTED",
+    "REASON_NO_PROVIDER",
+    "REASON_COMPLETE",
 ]
+
+
+class InvestigationStatus(Enum):
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
+_TASK_STATE_BY_STATUS: Mapping[InvestigationStatus, TaskState] = {
+    InvestigationStatus.COMPLETE: TaskState.SUCCEEDED,
+    InvestigationStatus.PARTIAL: TaskState.PARTIAL,
+    InvestigationStatus.BLOCKED: TaskState.BLOCKED,
+    InvestigationStatus.FAILED: TaskState.FAILED,
+}
 
 DEFAULT_ROUND_BUDGET = 40
 DEFAULT_TOTAL_TOOL_CALLS = 200
@@ -64,6 +108,10 @@ LEASE_TTL_SECONDS = 300.0
 STATE_CHARS = 8000
 
 ABORT_SNAPSHOT_CHANGED = "snapshot_changed_during_run"
+ABORT_SNAPSHOT_NOT_MATERIALIZED = "snapshot_not_materialized"
+REASON_BUDGET_EXHAUSTED = "budget_exhausted_with_open_frontier"
+REASON_NO_PROVIDER = "agent_provider_unavailable"
+REASON_COMPLETE = "objective_covered"
 
 
 @runtime_checkable
@@ -124,6 +172,8 @@ class InvestigationOutcomeData:
     evidence_written: int
     unresolved: tuple[str, ...]
     details: Mapping[str, Any]
+    status: InvestigationStatus = InvestigationStatus.COMPLETE
+    reason: str = REASON_COMPLETE
 
 
 class _HarnessBridge:
@@ -184,14 +234,26 @@ class Investigator:
         objective: str | Objective,
         snapshot: RepositorySnapshot,
         knowledge: KnowledgeRepository,
-        provider: SessionProvider,
+        provider: SessionProvider | None,
         namespace: str,
+        spec: SnapshotSpec | None = None,
     ) -> InvestigationOutcomeData:
         parsed = _resolve_objective(objective)
+        if provider is None:
+            return _aborted(
+                parsed, snapshot, InvestigationStatus.BLOCKED, REASON_NO_PROVIDER
+            )
+        if not snapshot.materialized:
+            return _aborted(
+                parsed,
+                snapshot,
+                InvestigationStatus.FAILED,
+                ABORT_SNAPSHOT_NOT_MATERIALIZED,
+            )
         focus = _focus_of(parsed)
         harness = self._build_harness(snapshot, focus)
         registry = CaptureRegistry()
-        task = _lease_task(parsed, snapshot, self._clock)
+        task, lease = _lease_task(parsed, snapshot, self._clock)
         state = coverage.initial_state(
             files_total=_focused_total(snapshot, focus),
             entrypoints=_discover_entrypoints(snapshot),
@@ -201,6 +263,7 @@ class Investigator:
         rounds: list[RoundReport] = []
         totals = {"entities": 0, "relations": 0, "evidence": 0, "tool_calls": 0}
         failures: list[str] = []
+        fingerprints: list[str] = []
         gaps: list[str] = []
         flows: list[dict[str, Any]] = []
         aggregate = verifier.VerificationReport()
@@ -213,10 +276,13 @@ class Investigator:
         analyzed: set[str] = set()
         files_read: list[str] = []
         outside = 0
+        exhausted = False
+        watched = spec if spec is not None else _spec_of(snapshot)
 
         while True:
             remaining = self._total_tool_calls - totals["tool_calls"]
             if remaining <= 0:
+                exhausted = True
                 break
             strategy_state = replace(
                 strategy_state, coverage=state, spent_budget=totals["tool_calls"]
@@ -245,13 +311,19 @@ class Investigator:
             while step_calls < step.tool_budget:
                 remaining = self._total_tool_calls - totals["tool_calls"]
                 if remaining <= 0:
+                    exhausted = True
                     break
-                harness = self._build_harness(snapshot, step_focus)
-                if snapshot.digest != harness.snapshot.digest:
+                if _source_changed(watched, snapshot):
+                    failures.append(f"stale:{ABORT_SNAPSHOT_CHANGED}")
+                    fingerprints.append(
+                        stale(ABORT_SNAPSHOT_CHANGED, snapshot.digest).fingerprint
+                    )
                     abort_reason = ABORT_SNAPSHOT_CHANGED
                     break
+                harness = self._build_harness(snapshot, step_focus)
                 round_number += 1
                 step_rounds += 1
+                lease = _keep_lease(lease, self._clock)
                 if task.state is TaskState.PENDING:
                     task = transition(task, TaskState.READY, "retrying after recovery")
                 if task.state is TaskState.READY:
@@ -276,6 +348,7 @@ class Investigator:
                 run, failure = _invoke(provider, session)
                 if failure is not None:
                     task = recover(task, failure, self._retry_policy).task
+                    fingerprints.append(failure.fingerprint)
                     failures.append(f"{failure.kind.value}:{failure.code}")
                     if task.state is TaskState.FAILED:
                         abort_reason = failure.code
@@ -288,11 +361,14 @@ class Investigator:
                 for path in stats.files_read:
                     if path not in files_read:
                         files_read.append(path)
-                if self._build_harness(snapshot, step_focus).snapshot.digest != snapshot.digest:
+                if _source_changed(watched, snapshot):
                     abort_reason = ABORT_SNAPSHOT_CHANGED
                     break
-                findings, rejected = parse_findings(run.findings)
-                report = verifier.verify(findings, registry, snapshot)
+                parsed_findings, rejected = parse_findings(run.findings)
+                findings = tuple(
+                    with_owner(item, step.subject) for item in parsed_findings
+                )
+                report = verifier.verify(findings, registry, snapshot, namespace)
                 aggregate = _merge(aggregate, report)
                 written = normalizer.normalize(
                     items=report.verified,
@@ -352,10 +428,19 @@ class Investigator:
                 break
 
         completeness = state.completeness()
-        task = _seal(task, abort_reason, parsed.hash)
         unresolved = tuple(
             dict.fromkeys(completeness.outstanding + tuple(state.frontier_keys()))
         )
+        blocking = tuple(item for item in gaps if item in set(unresolved))
+        status, reason = _status_of(
+            abort_reason,
+            exhausted,
+            unresolved,
+            blocking,
+            totals["tool_calls"],
+            self._total_tool_calls,
+        )
+        task = _seal(task, status, reason, parsed.hash)
         details: dict[str, Any] = {
             "objective": parsed.to_dict(),
             "objective_hash": parsed.hash,
@@ -368,12 +453,15 @@ class Investigator:
             "gaps_opened": list(dict.fromkeys(gaps)),
             "captures": list(registry.identifiers()),
             "failures": failures,
+            "failure_fingerprints": list(dict.fromkeys(fingerprints)),
             "task_state": task.state.value,
             "steps": executed,
             "flows": flows,
             "focus_paths": list(focus.paths) if focus is not None else [],
             "outside_focus_reads": outside,
             "files_read": files_read,
+            "status": status.value,
+            "reason": reason,
         }
         if abort_reason:
             details["aborted"] = abort_reason
@@ -384,6 +472,8 @@ class Investigator:
             evidence_written=totals["evidence"],
             unresolved=unresolved,
             details=details,
+            status=status,
+            reason=reason,
         )
 
 
@@ -467,28 +557,119 @@ def _focused_total(snapshot: RepositorySnapshot, focus: ScopeFocus | None) -> in
 
 def _lease_task(
     objective: Objective, snapshot: RepositorySnapshot, clock: Callable[[], float]
-) -> Task:
+) -> tuple[Task, Lease]:
     task = Task(
         task_id=uuid.uuid4().hex,
         objective_hash=objective.hash,
         snapshot_hash=snapshot.digest,
         state=TaskState.READY,
     )
-    acquire(
+    lease = acquire(
         task.task_id,
         normalizer.AUTHOR,
         ttl_seconds=LEASE_TTL_SECONDS,
         clock=clock,
     )
-    return transition(task, TaskState.LEASED, "investigation round loop started")
+    leased = transition(task, TaskState.LEASED, "investigation round loop started")
+    return leased, lease
 
 
-def _seal(task: Task, abort_reason: str, result_hash: str) -> Task:
-    if task.state in (TaskState.FAILED, TaskState.BLOCKED, TaskState.SUCCEEDED):
-        return task
+def _keep_lease(lease: Lease, clock: Callable[[], float]) -> Lease:
+    if holds(lease, lease.token, clock()):
+        return renew(lease, lease.token, ttl_seconds=LEASE_TTL_SECONDS, clock=clock)
+    return acquire(
+        lease.task_id,
+        normalizer.AUTHOR,
+        ttl_seconds=LEASE_TTL_SECONDS,
+        clock=clock,
+        current=lease,
+        token=lease.token,
+    )
+
+
+def _status_of(
+    abort_reason: str,
+    exhausted: bool,
+    unresolved: Sequence[str],
+    blocking: Sequence[str],
+    spent: int,
+    budget: int,
+) -> tuple[InvestigationStatus, str]:
     if abort_reason:
-        return transition(task, TaskState.FAILED, abort_reason)
-    return transition(task, TaskState.SUCCEEDED, "investigation finished", result_hash=result_hash)
+        return InvestigationStatus.FAILED, abort_reason
+    if exhausted and (unresolved or blocking):
+        return InvestigationStatus.PARTIAL, REASON_BUDGET_EXHAUSTED
+    if spent >= budget and (unresolved or blocking):
+        return InvestigationStatus.PARTIAL, REASON_BUDGET_EXHAUSTED
+    if unresolved or blocking:
+        return InvestigationStatus.PARTIAL, "open_frontier_or_blocking_gaps"
+    return InvestigationStatus.COMPLETE, REASON_COMPLETE
+
+
+def _seal(
+    task: Task, status: InvestigationStatus, reason: str, result_hash: str
+) -> Task:
+    if task.state in TERMINAL_STATES:
+        return task
+    target = _TASK_STATE_BY_STATUS[status]
+    return transition(task, target, reason, result_hash=result_hash)
+
+
+def _spec_of(snapshot: RepositorySnapshot) -> SnapshotSpec:
+    return SnapshotSpec(root=Path(snapshot.root), excludes=_untracked_roots(snapshot))
+
+
+def _untracked_roots(snapshot: RepositorySnapshot) -> tuple[str, ...]:
+    try:
+        present = observe(SnapshotSpec(root=Path(snapshot.root))).file_map()
+    except SnapshotError:
+        return ()
+    tracked = snapshot.file_map()
+    roots: list[str] = []
+    for path in present:
+        if path in tracked:
+            continue
+        head = path.split("/", 1)[0]
+        if head and head not in roots and not any(
+            item.startswith(head + "/") or item == head for item in tracked
+        ):
+            roots.append(head)
+    return tuple(roots)
+
+
+def _source_changed(spec: SnapshotSpec, snapshot: RepositorySnapshot) -> bool:
+    try:
+        return observe(spec).digest != snapshot.digest
+    except SnapshotError:
+        return True
+
+
+def _aborted(
+    objective: Objective,
+    snapshot: RepositorySnapshot,
+    status: InvestigationStatus,
+    reason: str,
+) -> InvestigationOutcomeData:
+    return InvestigationOutcomeData(
+        objective=objective.goal,
+        entities_written=0,
+        relations_written=0,
+        evidence_written=0,
+        unresolved=(),
+        details={
+            "objective": objective.to_dict(),
+            "objective_hash": objective.hash,
+            "snapshot_id": snapshot.digest,
+            "rounds": [],
+            "round_count": 0,
+            "tool_calls": 0,
+            "status": status.value,
+            "reason": reason,
+            "aborted": reason,
+        },
+        status=status,
+        reason=reason,
+    )
 
 
 def _build_session(

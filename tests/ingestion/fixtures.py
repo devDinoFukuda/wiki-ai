@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import zipfile
 import zlib
 from pathlib import Path
@@ -299,39 +300,51 @@ def drawio_document() -> str:
 
 def minimal_pdf(text: str = "Politica de credito aprovada") -> bytes:
     content = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("latin-1")
-    stream = zlib.compress(content)
     objects: list[bytes] = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+        b"/Resources << /Font << /F1 5 0 R >> >> >>",
         b"<< /Length "
-        + str(len(stream)).encode("ascii")
-        + b" /Filter /FlateDecode >>\nstream\n"
-        + stream
+        + str(len(content)).encode("ascii")
+        + b" >>\nstream\n"
+        + content
         + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Title (Politica de Credito) /Author (Comite) /Producer (fixture) >>",
+        b"<< /Title (Politica de Credito) /Author (Comite) >>",
     ]
-    payload = b"%PDF-1.4\n"
+    return assemble_pdf(objects, info=6)
+
+
+def assemble_pdf(objects: list[bytes], info: int | None = None) -> bytes:
+    payload = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
     for number, body in enumerate(objects, start=1):
-        payload += str(number).encode("ascii") + b" 0 obj\n" + body + b"\nendobj\n"
-    payload += b"trailer\n<< /Root 1 0 R /Info 6 0 R >>\n%%EOF\n"
-    return payload
+        offsets.append(len(payload))
+        payload += str(number).encode("ascii") + b" 0 obj\n"
+        payload += body + b"\nendobj\n"
+    xref_at = len(payload)
+    payload += b"xref\n0 " + str(len(objects) + 1).encode("ascii") + b"\n"
+    payload += b"0000000000 65535 f \n"
+    for offset in offsets:
+        payload += f"{offset:010d} 00000 n \n".encode("ascii")
+    trailer = b"<< /Size " + str(len(objects) + 1).encode("ascii") + b" /Root 1 0 R"
+    if info is not None:
+        trailer += b" /Info " + str(info).encode("ascii") + b" 0 R"
+    payload += b"trailer\n" + trailer + b" >>\nstartxref\n"
+    payload += str(xref_at).encode("ascii") + b"\n%%EOF\n"
+    return bytes(payload)
 
 
 def image_only_pdf() -> bytes:
-    objects: list[bytes] = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 4 0 R >> >> >>",
-        b"<< /Type /XObject /Subtype /Image /Width 10 /Height 10 /Length 4 >>\nstream\n"
-        b"\x00\x01\x02\x03\nendstream",
-    ]
-    payload = b"%PDF-1.4\n"
-    for number, body in enumerate(objects, start=1):
-        payload += str(number).encode("ascii") + b" 0 obj\n" + body + b"\nendobj\n"
-    payload += b"trailer\n<< /Root 1 0 R >>\n%%EOF\n"
-    return payload
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_metadata({"/Title": "Digitalizado"})
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
 
 
 VTT = """WEBVTT

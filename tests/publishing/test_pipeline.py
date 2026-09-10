@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 import pytest
 
 from wiki_ai.knowledge.repository import DATABASE_FILENAME, KnowledgeRepository
+from wiki_ai.publishing import pipeline as pipeline_module
 from wiki_ai.publishing import release, render_docx as render_docx_module
 from wiki_ai.publishing.docx import package as docx_package
 from wiki_ai.publishing.docx.inspect import read_package
-from wiki_ai.publishing.manifest import ArtifactKind
-from wiki_ai.publishing.model import CAPABILITY_SECTIONS
+from wiki_ai.publishing.gate import PublishingRule
+from wiki_ai.publishing.manifest import MANIFEST_FILENAME, ArtifactKind
+from wiki_ai.publishing.model import (
+    CAPABILITY_SECTIONS,
+    GAPS_SECTION_TITLE,
+    NarrativeKind,
+)
 from wiki_ai.publishing.pipeline import (
     BlockReason,
     PublicationBlocked,
@@ -141,3 +148,114 @@ def test_docx_structure_problems_accepts_a_good_file(graph, publications_dir):
     published = release.current(publications_dir)
     path = published.directory / published.manifest.artifacts[0].relative_path
     assert docx_structure_problems(path) == []
+
+
+def _staging_entries(publications_dir):
+    staging = publications_dir / release.STAGING_DIRNAME
+    if not staging.is_dir():
+        return ()
+    return tuple(sorted(entry.name for entry in staging.iterdir() if entry.is_dir()))
+
+
+def test_gate_blocks_when_narrative_hides_a_blocking_gap(
+    graph, publications_dir, silent_narrative
+):
+    with pytest.raises(PublicationBlocked) as caught:
+        Publisher().run(graph.repository, publications_dir, "ns")
+    assert any(
+        BlockReason.GATE_REFUSED.value in reason for reason in caught.value.reasons
+    )
+    assert any(
+        PublishingRule.COMPLETENESS_HIDES_BLOCKING_GAPS.value in reason
+        for reason in caught.value.reasons
+    )
+
+
+def test_gate_block_promotes_nothing_and_keeps_current_untouched(
+    graph, publications_dir, silent_narrative
+):
+    with pytest.raises(PublicationBlocked):
+        Publisher().run(graph.repository, publications_dir, "ns")
+    assert release.list_publications(publications_dir) == ()
+    assert release.current(publications_dir) is None
+
+
+def test_gate_block_preserves_the_staging_directory(
+    graph, publications_dir, silent_narrative
+):
+    with pytest.raises(PublicationBlocked):
+        Publisher().run(graph.repository, publications_dir, "ns")
+    staged = _staging_entries(publications_dir)
+    assert len(staged) == 1
+    directory = publications_dir / release.STAGING_DIRNAME / staged[0]
+    assert (directory / MANIFEST_FILENAME).is_file()
+    assert any(directory.glob("*.docx"))
+
+
+def test_gate_block_names_every_offending_document(
+    graph, publications_dir, silent_narrative
+):
+    with pytest.raises(PublicationBlocked) as caught:
+        Publisher().run(graph.repository, publications_dir, "ns")
+    assert len(caught.value.reasons) >= 1
+    assert all(".docx" in reason for reason in caught.value.reasons)
+
+
+def test_gate_blocks_when_the_gaps_heading_is_absent_from_the_docx(
+    graph, publications_dir, monkeypatch
+):
+    original = render_docx_module.render_document
+
+    def without_gaps_heading(document, out_path):
+        stripped = replace(
+            document,
+            body=tuple(
+                block
+                for block in document.body
+                if not (
+                    block.kind is NarrativeKind.SECTION
+                    and block.title == GAPS_SECTION_TITLE
+                )
+            ),
+        )
+        return original(stripped, out_path)
+
+    monkeypatch.setattr(pipeline_module, "render_document", without_gaps_heading)
+    with pytest.raises(PublicationBlocked) as caught:
+        Publisher().run(graph.repository, publications_dir, "ns")
+    assert any(
+        BlockReason.GATE_REFUSED.value in reason for reason in caught.value.reasons
+    )
+    assert release.current(publications_dir) is None
+
+
+def test_a_blocked_run_can_be_retried_after_the_narrative_is_repaired(
+    graph, publications_dir, monkeypatch
+):
+    import wiki_ai.publishing.narrative as narrative_module
+
+    monkeypatch.setattr(
+        narrative_module.NarrativeBuilder, "_gap_assertions", lambda self, gaps: ()
+    )
+    monkeypatch.setattr(
+        narrative_module.NarrativeBuilder,
+        "_reserved_assertions",
+        lambda self, entities: (),
+    )
+    with pytest.raises(PublicationBlocked):
+        Publisher().run(graph.repository, publications_dir, "ns")
+    monkeypatch.undo()
+    outcome = _publish(graph, publications_dir)
+    assert release.current(publications_dir).publication_id == outcome.publication_id
+
+
+def test_happy_path_leaves_no_staging_directory_behind(graph, publications_dir):
+    _publish(graph, publications_dir)
+    assert _staging_entries(publications_dir) == ()
+
+
+def test_idempotent_rerun_still_passes_the_gate(graph, publications_dir):
+    first = _publish(graph, publications_dir)
+    second = _publish(graph, publications_dir)
+    assert first == second
+    assert release.list_publications(publications_dir) == (first.publication_id,)

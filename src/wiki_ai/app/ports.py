@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -10,6 +11,7 @@ from wiki_ai.repository.snapshot import RepositorySnapshot
 
 __all__ = [
     "CapabilityUnavailable",
+    "OutcomeStatus",
     "InvestigationOutcome",
     "IngestionOutcome",
     "UpdateOutcome",
@@ -30,12 +32,22 @@ class CapabilityUnavailable(Exception):
         self.action = action
 
 
+class OutcomeStatus(Enum):
+    COMPLETE = "complete"
+    STRUCTURAL_ONLY = "structural_only"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class InvestigationOutcome:
     objective: str
     entities_written: int
     relations_written: int
     evidence_written: int
+    status: OutcomeStatus = OutcomeStatus.COMPLETE
+    reason: str = ""
     unresolved: tuple[str, ...] = ()
     details: Mapping[str, Any] = field(default_factory=dict)
 
@@ -45,6 +57,8 @@ class InvestigationOutcome:
             "entities_written": self.entities_written,
             "relations_written": self.relations_written,
             "evidence_written": self.evidence_written,
+            "status": self.status.value,
+            "reason": self.reason,
             "unresolved": list(self.unresolved),
             "details": dict(self.details),
         }
@@ -56,6 +70,8 @@ class IngestionOutcome:
     version_hash: str
     blocks: int
     entities_written: int
+    status: OutcomeStatus = OutcomeStatus.COMPLETE
+    reason: str = ""
     diagnostics: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +80,8 @@ class IngestionOutcome:
             "version_hash": self.version_hash,
             "blocks": self.blocks,
             "entities_written": self.entities_written,
+            "status": self.status.value,
+            "reason": self.reason,
             "diagnostics": list(self.diagnostics),
         }
 
@@ -72,6 +90,8 @@ class IngestionOutcome:
 class UpdateOutcome:
     diff: Mapping[str, Any]
     invalidated: int
+    status: OutcomeStatus = OutcomeStatus.COMPLETE
+    reason: str = ""
     reinvestigated: Mapping[str, Any] | None = None
     skipped_reason: str = ""
     gaps: tuple[str, ...] = ()
@@ -80,6 +100,8 @@ class UpdateOutcome:
         payload: dict[str, Any] = {
             "diff": dict(self.diff),
             "invalidated": self.invalidated,
+            "status": self.status.value,
+            "reason": self.reason,
             "skipped_reason": self.skipped_reason,
             "gaps": list(self.gaps),
         }
@@ -92,6 +114,8 @@ class UpdateOutcome:
 class AnswerOutcome:
     question: str
     answer: str
+    mode: str = ""
+    reason: str = ""
     evidence_ids: tuple[str, ...] = ()
     entity_ids: tuple[str, ...] = ()
     unresolved: tuple[str, ...] = ()
@@ -100,6 +124,8 @@ class AnswerOutcome:
         return {
             "question": self.question,
             "answer": self.answer,
+            "mode": self.mode,
+            "reason": self.reason,
             "evidence_ids": list(self.evidence_ids),
             "entity_ids": list(self.entity_ids),
             "unresolved": list(self.unresolved),

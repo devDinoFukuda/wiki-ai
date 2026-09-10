@@ -7,7 +7,12 @@ from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from wiki_ai.agent.protocol import ToolCall, ToolResult
 from wiki_ai.agent.session import AgentRun, AgentSession, Budget, RunStatus, ToolSpec
-from wiki_ai.knowledge.errors import InvalidRelationPair, KnowledgeError
+from wiki_ai.knowledge.errors import (
+    IdentityCollision,
+    InvalidRelationPair,
+    KnowledgeError,
+)
+from wiki_ai.knowledge.identity import contextual_key
 from wiki_ai.knowledge.evidence import locator_from_dict, make_evidence
 from wiki_ai.knowledge.gaps import open_gap
 from wiki_ai.knowledge.model import (
@@ -23,6 +28,7 @@ from wiki_ai.knowledge.taxonomy import REQUIRED_ATTRIBUTES, EntityKind, Relation
 
 from wiki_ai.ingestion import briefing
 from wiki_ai.ingestion.finding import (
+    DEFAULT_NAMESPACE,
     DocumentEvidenceRef,
     DocumentFinding,
     DocumentFindingError,
@@ -40,7 +46,8 @@ from wiki_ai.ingestion.harness import (
     DocumentHarness,
     DocumentToolError,
 )
-from wiki_ai.ingestion.hints import normalize_text, stable_key
+from wiki_ai.ingestion.hints import normalize_text
+from wiki_ai.ingestion.outcome import SemanticFault
 from wiki_ai.ingestion.pipeline import IngestedSource
 
 __all__ = [
@@ -54,6 +61,7 @@ __all__ = [
     "DocumentRelationClaim",
     "Rejection",
     "VerifiedDocumentFinding",
+    "SemanticFault",
     "SemanticOutcome",
     "SessionProvider",
     "document_finding_schema",
@@ -82,6 +90,7 @@ class SemanticOutcome:
     evidence_written: int = 0
     gaps_opened: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    faults: tuple[SemanticFault, ...] = ()
     rounds: int = 0
     tool_calls: int = 0
     verified: tuple[VerifiedDocumentFinding, ...] = ()
@@ -93,6 +102,7 @@ class SemanticOutcome:
             "evidence_written": self.evidence_written,
             "gaps_opened": list(self.gaps_opened),
             "diagnostics": list(self.diagnostics),
+            "faults": [item.value for item in self.faults],
             "rounds": self.rounds,
             "tool_calls": self.tool_calls,
         }
@@ -136,7 +146,9 @@ class _HarnessBridge:
 
 
 def _entity_of(
-    item: VerifiedDocumentFinding, source_version_key: str
+    item: VerifiedDocumentFinding,
+    source_version_key: str,
+    owner_id: EntityId | None = None,
 ) -> Entity:
     payload: dict[str, Any] = {}
     for key, value in item.finding.attributes.items():
@@ -144,6 +156,8 @@ def _entity_of(
     if item.reasons:
         payload["verification_notes"] = list(item.reasons)
     payload["origin"] = "document"
+    if item.finding.owner:
+        payload["owner"] = item.finding.owner
     return Entity.create(
         kind=item.finding.type.value,
         name=item.finding.subject,
@@ -151,6 +165,21 @@ def _entity_of(
         attributes=payload,
         state=item.state,
         confidence=item.confidence,
+        source_versions=(source_version_key,),
+        owner_id=owner_id,
+    )
+
+
+def _owner_entity(
+    owner: str, namespace: str, uri: str, source_version_key: str
+) -> Entity:
+    return Entity.create(
+        kind=EntityKind.SOURCE.value,
+        name=owner,
+        stable_key=contextual_key(namespace, EntityKind.SOURCE.value, None, owner),
+        attributes={"origin": "document", "locator_root": uri},
+        state=KnowledgeState.DECLARED,
+        confidence=Confidence.UNRESOLVED,
         source_versions=(source_version_key,),
     )
 
@@ -198,12 +227,14 @@ class SemanticInvestigator:
         totals = {"entities": 0, "relations": 0, "evidence": 0, "tool_calls": 0}
         diagnostics: list[str] = []
         opened: list[str] = []
+        faults: list[SemanticFault] = []
         verified: list[VerifiedDocumentFinding] = []
         rounds = 0
         while frontier or rounds == 0:
             remaining = self._total_tool_calls - totals["tool_calls"]
             if remaining <= 0:
-                diagnostics.append("semantic_investigation_budget_exhausted")
+                diagnostics.append(SemanticFault.BUDGET_EXHAUSTED.value)
+                faults.append(SemanticFault.BUDGET_EXHAUSTED)
                 break
             rounds += 1
             bridge = _HarnessBridge(harness)
@@ -220,10 +251,11 @@ class SemanticInvestigator:
             totals["tool_calls"] += run.usage.tool_calls
             if run.status is not RunStatus.COMPLETED:
                 diagnostics.append(f"semantic_round_{run.status.value}:{run.reason}")
+                faults.append(SemanticFault.PROVIDER_RUN_ABORTED)
                 break
             findings, rejected = parse_findings(run.findings)
             diagnostics.extend(rejected)
-            checked, gaps = verify(findings, harness)
+            checked, gaps = verify(findings, harness, namespace)
             verified.extend(checked)
             written = self._persist(
                 [item for item in checked if item.persistable],
@@ -238,13 +270,15 @@ class SemanticInvestigator:
             totals["evidence"] += written.evidence_written
             opened.extend(written.gaps_opened)
             diagnostics.extend(written.diagnostics)
+            faults.extend(written.faults)
             for marker in bridge.covered:
                 if marker not in covered:
                     covered.append(marker)
             previous = tuple(frontier)
             frontier = [item for item in frontier if item not in covered]
             if frontier and totals["tool_calls"] >= self._total_tool_calls:
-                diagnostics.append("semantic_investigation_budget_exhausted")
+                diagnostics.append(SemanticFault.BUDGET_EXHAUSTED.value)
+                faults.append(SemanticFault.BUDGET_EXHAUSTED)
                 break
             if tuple(frontier) == previous and not run.findings:
                 break
@@ -254,6 +288,7 @@ class SemanticInvestigator:
             evidence_written=totals["evidence"],
             gaps_opened=tuple(dict.fromkeys(opened)),
             diagnostics=tuple(dict.fromkeys(diagnostics)),
+            faults=tuple(dict.fromkeys(faults)),
             rounds=rounds,
             tool_calls=totals["tool_calls"],
             verified=tuple(verified),
@@ -326,37 +361,80 @@ class SemanticInvestigator:
         relations: set[str] = set()
         diagnostics: list[str] = []
         opened: list[str] = []
+        faults: list[SemanticFault] = []
+        collisions: list[str] = []
         with knowledge.begin_revision(
             author=AUTHOR, summary=f"{namespace}:{harness.source_id}"
         ) as transaction:
             transaction.put_source_version(version)
+            owners = self._owner_ids(
+                transaction, by_key, namespace, ingested.uri, version.key, collisions
+            )
+            written_keys: list[str] = []
             for key in sorted(by_key):
-                entity = _entity_of(by_key[key], version.key)
-                transaction.put_entity(entity)
+                item = by_key[key]
+                entity = _entity_of(item, version.key, owners.get(item.finding.owner))
+                try:
+                    transaction.put_entity(entity)
+                except IdentityCollision as exc:
+                    collisions.append(str(exc))
+                    continue
                 entity_ids[key] = entity.id
+                written_keys.append(key)
+            persisted = {key: by_key[key] for key in written_keys}
             self._link_evidence(
-                transaction, by_key, entity_ids, version, evidence_written
+                transaction, persisted, entity_ids, version, evidence_written
             )
             relations.update(
                 self._write_relations(
                     transaction,
-                    by_key,
+                    persisted,
                     entity_ids,
                     subject_index,
                     version,
                     diagnostics,
+                    namespace,
                 )
             )
-            for question in dict.fromkeys(item for item in gaps if item):
-                open_gap(transaction, question, blocking=False)
+            for question in dict.fromkeys(
+                tuple(item for item in gaps if item) + tuple(collisions)
+            ):
+                open_gap(transaction, question, blocking=bool(collisions))
                 opened.append(question)
+        if collisions:
+            faults.append(SemanticFault.IDENTITY_COLLISION)
+            diagnostics.extend(collisions)
         return SemanticOutcome(
             entities_written=len(entity_ids),
             relations_written=len(relations),
             evidence_written=len(evidence_written),
             gaps_opened=tuple(opened),
             diagnostics=tuple(diagnostics),
+            faults=tuple(faults),
         )
+
+    def _owner_ids(
+        self,
+        transaction: RevisionTransaction,
+        by_key: Mapping[str, VerifiedDocumentFinding],
+        namespace: str,
+        uri: str,
+        source_version_key: str,
+        collisions: list[str],
+    ) -> dict[str, EntityId]:
+        found: dict[str, EntityId] = {}
+        names = sorted(
+            {item.finding.owner for item in by_key.values() if item.finding.owner}
+        )
+        for name in names:
+            entity = _owner_entity(name, namespace, uri, source_version_key)
+            try:
+                transaction.put_entity(entity)
+            except IdentityCollision as exc:
+                collisions.append(str(exc))
+                continue
+            found[name] = entity.id
+        return found
 
     def _link_evidence(
         self,
@@ -394,8 +472,10 @@ class SemanticInvestigator:
         subject_index: Mapping[str, str],
         version: SourceVersion,
         diagnostics: list[str],
+        namespace: str = DEFAULT_NAMESPACE,
     ) -> set[str]:
         written: set[str] = set()
+        kinds = {key: item.finding.type.value for key, item in by_key.items()}
         for key in sorted(by_key):
             item = by_key[key]
             for claim in item.finding.relations:
@@ -405,7 +485,10 @@ class SemanticInvestigator:
                     kind = claim.target_type or _DEFAULT_TARGET_KIND.get(
                         claim.kind.value, EntityKind.CAPABILITY
                     )
-                    target_key = stable_key(kind.value, claim.target_subject)
+                    target_key = contextual_key(
+                        namespace, kind.value, item.finding.owner, claim.target_subject
+                    )
+                    kinds.setdefault(target_key, kind.value)
                     if target_key not in entity_ids:
                         placeholder = Entity.create(
                             kind=kind.value,
@@ -419,13 +502,17 @@ class SemanticInvestigator:
                             confidence=Confidence.UNRESOLVED,
                             source_versions=(version.key,),
                         )
-                        transaction.put_entity(placeholder)
+                        try:
+                            transaction.put_entity(placeholder)
+                        except IdentityCollision as exc:
+                            diagnostics.append(str(exc))
+                            continue
                         entity_ids[target_key] = placeholder.id
                 try:
                     validate_pair(
                         claim.kind,
                         item.finding.type.value,
-                        target_key.split("::", 1)[0],
+                        kinds[target_key],
                     )
                 except InvalidRelationPair as exc:
                     diagnostics.append(str(exc))

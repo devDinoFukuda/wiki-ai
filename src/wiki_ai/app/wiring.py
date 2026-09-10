@@ -11,6 +11,7 @@ from wiki_ai.app.ports import (
     IngestionRunner,
     InvestigationOutcome,
     InvestigationRunner,
+    OutcomeStatus,
     PublicationOutcome,
     PublicationRunner,
     QueryRunner,
@@ -29,6 +30,8 @@ from wiki_ai.repository.snapshot import RepositorySnapshot
 
 __all__ = [
     "DETAIL_KEYS",
+    "status_of",
+    "reason_of",
     "IngestionAdapter",
     "InvestigationAdapter",
     "PublicationAdapter",
@@ -56,12 +59,36 @@ def _summary(details: Mapping[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def status_of(data: Any) -> OutcomeStatus:
+    produced = getattr(data, "status", None)
+    if produced is None:
+        return OutcomeStatus.COMPLETE
+    name = getattr(produced, "name", str(produced))
+    try:
+        return OutcomeStatus[str(name)]
+    except KeyError:
+        return OutcomeStatus.FAILED
+
+
+def reason_of(data: Any) -> str:
+    return str(getattr(data, "reason", "") or "")
+
+
+def _mode_of(data: Any) -> str:
+    produced = getattr(data, "mode", "")
+    if not produced:
+        return ""
+    return str(getattr(produced, "value", produced))
+
+
 def _investigation_outcome(data: InvestigationOutcomeData) -> InvestigationOutcome:
     return InvestigationOutcome(
         objective=data.objective,
         entities_written=data.entities_written,
         relations_written=data.relations_written,
         evidence_written=data.evidence_written,
+        status=status_of(data),
+        reason=reason_of(data),
         unresolved=tuple(data.unresolved),
         details=_summary(data.details),
     )
@@ -75,6 +102,8 @@ def _update_outcome(data: UpdateOutcomeData) -> UpdateOutcome:
     return UpdateOutcome(
         diff=dict(data.diff_summary),
         invalidated=data.invalidated.total,
+        status=status_of(data),
+        reason=reason_of(data),
         reinvestigated=reinvestigated,
         skipped_reason=data.skipped_reason,
         gaps=tuple(data.invalidated.gaps),
@@ -128,6 +157,8 @@ class IngestionAdapter:
             version_hash=produced.version_hash,
             blocks=produced.blocks,
             entities_written=produced.entities_written,
+            status=status_of(produced),
+            reason=reason_of(produced),
             diagnostics=tuple(produced.diagnostics),
         )
 
@@ -187,6 +218,8 @@ class QueryAdapter:
         return AnswerOutcome(
             question=produced.question,
             answer=produced.answer,
+            mode=_mode_of(produced),
+            reason=reason_of(produced),
             evidence_ids=tuple(produced.evidence_ids),
             entity_ids=tuple(produced.entity_ids),
             unresolved=tuple(produced.unresolved),

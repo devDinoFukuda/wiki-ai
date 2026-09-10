@@ -363,11 +363,17 @@ class RepositoryHarness:
                 return True
             return path == normalized_prefix or path.startswith(normalized_prefix + "/")
 
-        imports = [
-            item
-            for item in report.imports
-            if keep(item.path) and (scope is None or item.scope.value == scope)
-        ]
+        if scope == DependencyScope.INTERNAL.value:
+            candidates = report.internal_imports()
+        elif scope == DependencyScope.EXTERNAL.value:
+            candidates = report.external_imports()
+        else:
+            candidates = tuple(
+                item
+                for item in report.imports
+                if scope is None or item.scope.value == scope
+            )
+        imports = [item for item in candidates if keep(item.path)]
         return {
             "snapshot_id": self._snapshot.digest,
             "imports": [item.to_dict() for item in imports[:limit]],

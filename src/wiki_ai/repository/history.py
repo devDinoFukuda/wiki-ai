@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Sequence
 
-from wiki_ai.repository.reader import PathOutsideSnapshot, resolve_within
 from wiki_ai.repository.snapshot import RepositorySnapshot, normalize_path
 
 __all__ = [
@@ -189,6 +188,12 @@ def _parse_blame(path: str, raw: str) -> tuple[BlameSpan, ...]:
     return tuple(spans[:_MAX_BLAME_LINES])
 
 
+def _escapes_root(relative: str) -> bool:
+    if PurePosixPath(relative).is_absolute():
+        return True
+    return any(segment == ".." for segment in relative.split("/"))
+
+
 def history(
     snapshot: RepositorySnapshot,
     path: str | None = None,
@@ -200,9 +205,7 @@ def history(
         relative = normalize_path(path)
         if not relative or relative not in snapshot.file_map():
             return _unavailable("path_not_in_snapshot", snapshot.git_head, relative)
-        try:
-            resolve_within(Path(snapshot.root), relative)
-        except PathOutsideSnapshot:
+        if _escapes_root(relative):
             return _unavailable("path_outside_snapshot", snapshot.git_head, relative)
     if not snapshot.git_head:
         return _unavailable("not_a_git_repository", None, relative)
