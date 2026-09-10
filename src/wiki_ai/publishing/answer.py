@@ -6,8 +6,23 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
+from wiki_ai.knowledge.evidence import (
+    CodeLocator,
+    DiagramLocator,
+    DocumentLocator,
+    SpreadsheetLocator,
+    TranscriptLocator,
+    locator_from_dict,
+)
 from wiki_ai.knowledge.gaps import GAP_QUESTION, is_blocking
-from wiki_ai.knowledge.model import Entity, EntityId
+from wiki_ai.knowledge.matching import score_names, tokens
+from wiki_ai.knowledge.model import (
+    Entity,
+    EntityId,
+    EpistemicStatus,
+    Evidence,
+    Locator,
+)
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -25,6 +40,7 @@ __all__ = [
 ]
 
 ANSWER_LIMIT = 200
+MIRROR_THRESHOLD = 0.9
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 _STOPWORDS = frozenset(
@@ -78,6 +94,7 @@ _STOPWORDS = frozenset(
 
 
 class Intent(str, enum.Enum):
+    INCEPTION = "inception"
     DEEP_ANALYSIS = "deep_analysis"
     CAPABILITY_PROFILE = "capability_profile"
     BUSINESS_RULES = "business_rules"
@@ -127,6 +144,10 @@ def _terms(question: str) -> tuple[str, ...]:
 
 
 _INTENT_MARKERS: tuple[tuple[Intent, tuple[str, ...]], ...] = (
+    (
+        Intent.INCEPTION,
+        ("complexa", "complexo", "complexidade", "tornam", "torna", "dificultam"),
+    ),
     (Intent.PUBLICATION, ("sharepoint", "publicacao", "publicar")),
     (Intent.COMPARISON, ("compare", "comparar", "inception", "decisao", "decidido")),
     (Intent.IMPACT, ("quebrar", "quebra", "impacto", "mudar", "afetado")),
@@ -191,6 +212,103 @@ def _gap_lines(gaps: Sequence[Entity]) -> tuple[str, ...]:
     )
 
 
+def provenance(locator: Locator) -> str:
+    if isinstance(locator, CodeLocator):
+        symbol = f", {locator.symbol}" if locator.symbol else ""
+        return (
+            f"código {locator.path}{symbol}, linhas "
+            f"{locator.line_start}-{locator.line_end}"
+        )
+    if isinstance(locator, TranscriptLocator):
+        return (
+            f"transcrição de {locator.speaker}, de {locator.time_start:.0f}s a "
+            f"{locator.time_end:.0f}s"
+        )
+    if isinstance(locator, SpreadsheetLocator):
+        return (
+            f"planilha {locator.workbook}, aba {locator.worksheet}, intervalo "
+            f"{locator.cell_range}"
+        )
+    if isinstance(locator, DiagramLocator):
+        return (
+            f"diagrama {locator.diagram}, página {locator.page}, elemento "
+            f"{locator.node}"
+        )
+    if isinstance(locator, DocumentLocator):
+        heading = " > ".join(locator.heading_path)
+        anchor = heading or (locator.block_id or "")
+        return f"documento, trecho {anchor}"
+    return locator.kind
+
+
+def _provenance_lines(evidences: Sequence[Evidence]) -> tuple[str, ...]:
+    found: list[str] = []
+    for evidence in evidences:
+        text = provenance(evidence.locator)
+        if text not in found:
+            found.append(text)
+    return tuple(found)
+
+
+def _refs(refs: Sequence[Any]) -> tuple[str, ...]:
+    found: list[str] = []
+    for ref in refs:
+        text = provenance(locator_from_dict(ref.locator))
+        if text not in found:
+            found.append(text)
+    return tuple(found)
+
+
+def _sides(left: Sequence[Any], right: Sequence[Any]) -> str:
+    parts: list[str] = []
+    for label, refs in (("de um lado", left), ("do outro", right)):
+        rendered = _refs(refs)
+        if rendered:
+            parts.append(f"{label}, {'; '.join(rendered)}")
+    if not parts:
+        return "."
+    return "; " + "; ".join(parts) + "."
+
+
+_INCEPTION_GROUPS: tuple[tuple[str, tuple[EntityKind, ...]], ...] = (
+    (
+        "Os sistemas e capacidades envolvidos são:",
+        (EntityKind.SYSTEM, EntityKind.MODULE, EntityKind.CAPABILITY),
+    ),
+    ("As regras de negócio afetadas são:", (EntityKind.BUSINESS_RULE,)),
+    (
+        "As integrações e eventos alcançados são:",
+        (
+            EntityKind.INTEGRATION,
+            EntityKind.TOPIC,
+            EntityKind.EVENT,
+            EntityKind.QUEUE,
+        ),
+    ),
+)
+
+
+def _names_meet(name: str, text: str) -> bool:
+    if score_names(name, text) >= MIRROR_THRESHOLD:
+        return True
+    wanted = tuple(part for part in tokens(name) if len(part) > 3)
+    if not wanted:
+        return False
+    present = set(tokens(text))
+    return all(part in present for part in wanted)
+
+
+def _counterparts(query: KnowledgeQuery, finding: Any) -> tuple[Entity, ...]:
+    found: list[Entity] = []
+    for identifier in (finding.entity_id, finding.counterpart_id):
+        if not identifier:
+            continue
+        node = query.repository.get_entity(EntityId(identifier))
+        if node is not None:
+            found.append(node)
+    return tuple(found)
+
+
 def _unique(entities: Sequence[Entity]) -> tuple[Entity, ...]:
     seen: set[str] = set()
     found: list[Entity] = []
@@ -222,6 +340,7 @@ class Answerer:
         intent = classify(question)
         terms = _terms(question)
         handlers = {
+            Intent.INCEPTION: self._inception,
             Intent.DEEP_ANALYSIS: self._deep,
             Intent.PUBLICATION: self._publication,
             Intent.COMPARISON: self._comparison,
@@ -261,6 +380,151 @@ class Answerer:
         self, query: KnowledgeQuery, terms: Sequence[str]
     ) -> Entity | None:
         return _best_subject(query, terms, (EntityKind.CAPABILITY,))
+
+    def _inception(
+        self, query: KnowledgeQuery, terms: Sequence[str]
+    ) -> tuple[list[str], tuple[Entity, ...], tuple[str, ...]]:
+        drivers = _unique(
+            query.entities(EntityKind.PROPOSAL, limit=ANSWER_LIMIT)
+            + query.entities(EntityKind.INITIATIVE, limit=ANSWER_LIMIT)
+            + query.entities(EntityKind.DECISION_RECORD, limit=ANSWER_LIMIT)
+        )
+        entities: list[Entity] = []
+        lines: list[str] = []
+        if not drivers:
+            return (
+                [
+                    "Não há proposta ou decisão de migração registrada com evidência "
+                    "para avaliar a complexidade."
+                ],
+                (),
+                _gap_lines(query.gaps(limit=ANSWER_LIMIT)),
+            )
+        lines.append("Esta migração parte dos seguintes registros de inception:")
+        for driver in drivers:
+            entities.append(driver)
+            lines.append(
+                f"- {driver.name} ({epistemic_phrase(driver)}), registrado em "
+                + (self._origins(query, driver) or "fonte sem localizador")
+                + "."
+            )
+        reached: list[Entity] = []
+        for driver in drivers:
+            for _label, group in self._reached(query, driver):
+                for entity in group:
+                    if entity.id.value not in {node.id.value for node in reached}:
+                        reached.append(entity)
+        for label, kinds in _INCEPTION_GROUPS:
+            allowed = {kind.value for kind in kinds}
+            group = _unique(
+                tuple(entity for entity in reached if entity.kind in allowed)
+            )
+            if not group:
+                continue
+            lines.append(label)
+            for entity in group:
+                entities.append(entity)
+                origins = self._origins(query, entity)
+                lines.append(
+                    f"- {entity.name}: {epistemic_phrase(entity)}"
+                    + (f"; consta em {origins}." if origins else ".")
+                )
+        mirrors = self._mirrors(query, reached, drivers)
+        if mirrors:
+            lines.append("As mesmas peças aparecem descritas nestas fontes:")
+        for entity in mirrors:
+            entities.append(entity)
+            origins = self._origins(query, entity)
+            lines.append(
+                f"- {entity.name}: {epistemic_phrase(entity)}"
+                + (f"; consta em {origins}." if origins else ".")
+            )
+        conflicts = query.compare(limit=ANSWER_LIMIT)
+        contradictions = conflicts.source_contradicts_source
+        if contradictions:
+            lines.append("As fontes divergem nos pontos abaixo:")
+        for finding in contradictions:
+            lines.append(
+                f"- {finding.entity_name} contra {finding.counterpart_name}: "
+                f"{finding.detail}" + _sides(finding.left_evidence, finding.right_evidence)
+            )
+            entities.extend(_counterparts(query, finding))
+        declared = conflicts.declared_not_implemented
+        if declared:
+            lines.append("Foi declarado mas não foi encontrado no código:")
+        for finding in declared:
+            lines.append(
+                f"- {finding.entity_name}: {finding.detail}"
+                + _sides(finding.left_evidence, finding.right_evidence)
+            )
+            entities.extend(_counterparts(query, finding))
+        gaps = _unique(query.gaps(limit=ANSWER_LIMIT))
+        lines.append("Sem evidência:")
+        for gap in gaps:
+            severity = "bloqueante" if is_blocking(gap) else "não bloqueante"
+            lines.append(
+                f"- {str(gap.attributes.get(GAP_QUESTION, gap.name)).strip()} "
+                f"({severity})."
+            )
+        if not gaps:
+            lines.append("- Nenhum ponto pendente de evidência foi registrado.")
+        unresolved = _gap_lines(gaps) + tuple(
+            f"{finding.entity_name}: {finding.detail}" for finding in declared
+        )
+        return lines, _unique(entities) + gaps, unresolved
+
+    def _mirrors(
+        self,
+        query: KnowledgeQuery,
+        reached: Sequence[Entity],
+        drivers: Sequence[Entity],
+    ) -> tuple[Entity, ...]:
+        known = {entity.id.value for entity in reached}
+        anchors = tuple(entity.name for entity in reached) + tuple(
+            str(driver.attributes.get("statement") or driver.name)
+            for driver in drivers
+        )
+        found: list[Entity] = []
+        for _label, kinds in _INCEPTION_GROUPS:
+            for kind in kinds:
+                for candidate in query.entities(kind, limit=ANSWER_LIMIT):
+                    if candidate.id.value in known:
+                        continue
+                    if candidate.epistemic is EpistemicStatus.IMPLEMENTED:
+                        continue
+                    if not query.evidence_of(candidate.id, limit=1):
+                        continue
+                    if any(_names_meet(candidate.name, text) for text in anchors):
+                        found.append(candidate)
+        return _unique(found)
+
+    def _origins(self, query: KnowledgeQuery, entity: Entity) -> str:
+        return "; ".join(
+            _provenance_lines(query.evidence_of(entity.id, limit=ANSWER_LIMIT))
+        )
+
+    def _reached(
+        self, query: KnowledgeQuery, driver: Entity
+    ) -> tuple[tuple[str, tuple[Entity, ...]], ...]:
+        affected = tuple(
+            node
+            for _relation, node in query.neighbors(
+                driver.id, RelationKind.AFFECTS, "out", limit=ANSWER_LIMIT
+            )
+        )
+        impacted = query.impact(driver.id, limit=ANSWER_LIMIT).impacted
+        pool = _unique(affected + impacted)
+        return tuple(
+            (
+                label,
+                tuple(
+                    entity
+                    for entity in pool
+                    if entity.kind in {kind.value for kind in kinds}
+                ),
+            )
+            for label, kinds in _INCEPTION_GROUPS
+        )
 
     def _deep(
         self, query: KnowledgeQuery, terms: Sequence[str]
@@ -318,15 +582,31 @@ class Answerer:
                 continue
             lines.append(f"{label}:")
             for finding in findings:
-                lines.append(f"- {finding.entity_name}: {finding.detail}.")
-                node = query.repository.get_entity(EntityId(finding.entity_id))
-                if node is not None:
-                    entities.append(node)
+                lines.append(
+                    f"- {finding.entity_name}: {finding.detail}"
+                    + _sides(finding.left_evidence, finding.right_evidence)
+                )
+                for identifier in (finding.entity_id, finding.counterpart_id):
+                    node = (
+                        query.repository.get_entity(EntityId(identifier))
+                        if identifier
+                        else None
+                    )
+                    if node is not None:
+                        entities.append(node)
                 if findings is report.declared_not_implemented or findings is (
                     report.source_contradicts_source
                 ):
                     unresolved.append(f"{finding.entity_name}: {finding.detail}")
-        return lines, _unique(entities), tuple(unresolved)
+        gaps = _unique(query.gaps(limit=ANSWER_LIMIT))
+        lines.append("Sem evidência:")
+        for gap in gaps:
+            lines.append(
+                f"- {str(gap.attributes.get(GAP_QUESTION, gap.name)).strip()}."
+            )
+        if not gaps:
+            lines.append("- Nenhum ponto pendente de evidência foi registrado.")
+        return lines, _unique(entities) + gaps, tuple(unresolved) + _gap_lines(gaps)
 
     def _impact(
         self, query: KnowledgeQuery, terms: Sequence[str]

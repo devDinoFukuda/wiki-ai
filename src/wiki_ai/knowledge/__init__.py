@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from .comparison import ComparisonFinding, ComparisonReport
+from .comparison import ComparisonFinding, ComparisonReport, EvidenceRef
+from .contradiction import Contradiction, contradiction_between
+from .correlation import CorrelatedRelation, CorrelationReport, correlate
 from .errors import (
     FormatVersionMismatch,
     GapNotFound,
@@ -67,6 +69,9 @@ __all__ = [
     "CodeLocator",
     "ComparisonFinding",
     "ComparisonReport",
+    "Contradiction",
+    "CorrelatedRelation",
+    "CorrelationReport",
     "Confidence",
     "DiagramLocator",
     "DocumentLocator",
@@ -75,6 +80,7 @@ __all__ = [
     "EntityKind",
     "EpistemicStatus",
     "Evidence",
+    "EvidenceRef",
     "FORMAT_VERSION",
     "FlowStepView",
     "FormatVersionMismatch",
@@ -110,6 +116,8 @@ __all__ = [
     "blocking_gaps",
     "close_gap",
     "content_hash",
+    "contradiction_between",
+    "correlate",
     "invalidate",
     "is_blocking",
     "knowledge_gate",

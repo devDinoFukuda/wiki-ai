@@ -31,13 +31,21 @@ def ids(findings):
     return sorted(finding.entity_id for finding in findings)
 
 
+def _correlated(findings):
+    return [item for item in findings if item.counterpart_id is not None]
+
+
 def test_declared_but_not_implemented(report, graph):
-    assert ids(report.declared_not_implemented) == [
+    assert ids(_correlated(report.declared_not_implemented)) == [
         graph.id("capability_declared").value
     ]
-    finding = report.declared_not_implemented[0]
+    finding = _correlated(report.declared_not_implemented)[0]
     assert finding.category == DECLARED_NOT_IMPLEMENTED
     assert finding.counterpart_id == graph.id("requirement").value
+
+
+def test_declarer_without_correlation_is_reported(report, graph):
+    assert graph.id("decision").value in ids(report.declared_not_implemented)
 
 
 def test_declared_and_implemented_is_not_reported(graph):
@@ -48,7 +56,7 @@ def test_declared_and_implemented_is_not_reported(graph):
                 "implements", graph.id("capability"), graph.id("capability_declared")
             )
         )
-    assert compare(repo).declared_not_implemented == ()
+    assert _correlated(compare(repo).declared_not_implemented) == []
 
 
 def test_declared_entity_already_implemented_is_not_reported(graph):
@@ -65,7 +73,7 @@ def test_declared_entity_already_implemented_is_not_reported(graph):
                 confidence=stored.confidence,
             )
         )
-    assert compare(repo).declared_not_implemented == ()
+    assert _correlated(compare(repo).declared_not_implemented) == []
 
 
 def test_implemented_but_not_documented(report, graph):
