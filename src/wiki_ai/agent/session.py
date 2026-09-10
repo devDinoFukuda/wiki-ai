@@ -3,9 +3,14 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
-from wiki_ai.agent.protocol import ProtocolError, ToolCall, ToolResult
+from wiki_ai.agent.protocol import (
+    AgentCapabilities,
+    ProtocolError,
+    ToolCall,
+    ToolResult,
+)
 
 __all__ = [
     "SessionError",
@@ -21,6 +26,7 @@ __all__ = [
     "ToolExecutor",
     "FINDING_SCHEMA",
     "AgentSession",
+    "AgentProvider",
 ]
 
 ToolExecutor = Callable[[ToolCall], ToolResult]
@@ -367,3 +373,14 @@ class AgentSession:
             "usage": self.usage(now).to_dict(),
             "transcript": [entry.to_dict() for entry in self._transcript],
         }
+
+
+@runtime_checkable
+class AgentProvider(Protocol):
+    def connect(self) -> None: ...
+
+    def capabilities(self) -> AgentCapabilities: ...
+
+    def run(self, session: AgentSession) -> AgentRun: ...
+
+    def cancel(self) -> None: ...

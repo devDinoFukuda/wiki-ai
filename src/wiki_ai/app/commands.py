@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn, Sequence, TextIO
 
+from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.app import api
 from wiki_ai.app.wiring import Wiring
 
@@ -110,8 +111,13 @@ def _guarded(
     return _emit(payload, _exit_code(payload), stream)
 
 
-def _run(command: str, parsed: argparse.Namespace, stream: TextIO) -> int:
-    wiring = Wiring()
+def _run(
+    command: str,
+    parsed: argparse.Namespace,
+    stream: TextIO,
+    registry: ProviderRegistry | None,
+) -> int:
+    wiring = Wiring() if registry is None else Wiring(registry)
     if command == COMMANDS[0]:
         repo = Path(parsed.repo)
         return _guarded(
@@ -146,7 +152,11 @@ def _run(command: str, parsed: argparse.Namespace, stream: TextIO) -> int:
     )
 
 
-def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    stream: TextIO | None = None,
+    registry: ProviderRegistry | None = None,
+) -> int:
     output = stream if stream is not None else sys.stdout
     arguments = list(argv) if argv is not None else sys.argv[1:]
     try:
@@ -159,4 +169,4 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
             "commands": list(COMMANDS),
         }
         return _emit(payload, EXIT_ERROR, output)
-    return _run(str(parsed.command), parsed, output)
+    return _run(str(parsed.command), parsed, output, registry)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from wiki_ai.agent.protocol import AgentProvider
+from wiki_ai.agent.session import AgentProvider
 from wiki_ai.agent.registry import ProviderRegistry, ProviderUnavailable
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.repository.snapshot import RepositorySnapshot

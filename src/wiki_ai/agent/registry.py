@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 from typing import Callable
 
-from wiki_ai.agent.protocol import AgentProvider
+from wiki_ai.agent.session import AgentProvider
 
 __all__ = [
     "RegistryError",

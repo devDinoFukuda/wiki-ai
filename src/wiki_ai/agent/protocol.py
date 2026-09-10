@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping
 
-from wiki_ai.agent.envelope import ResultEnvelope
+__all__ = [
+    "ProtocolError",
+    "ToolCall",
+    "ToolResult",
+    "AgentCapabilities",
+]
 
 
 class ProtocolError(Exception):
@@ -52,14 +57,3 @@ class AgentCapabilities:
         missing = tuple(t for t in tools if t not in self.tools)
         if missing:
             raise ProtocolError(f"ferramentas ausentes no agente: {sorted(missing)}")
-
-
-@runtime_checkable
-class AgentProvider(Protocol):
-    def connect(self) -> None: ...
-
-    def capabilities(self) -> AgentCapabilities: ...
-
-    def run(self, session: Any) -> ResultEnvelope: ...
-
-    def cancel(self) -> None: ...

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
 
-from wiki_ai.agent.protocol import AgentProvider
+from wiki_ai.agent.session import AgentProvider
 from wiki_ai.knowledge.repository import KnowledgeRepository
 from wiki_ai.repository.snapshot import RepositorySnapshot
 
@@ -12,10 +12,12 @@ __all__ = [
     "CapabilityUnavailable",
     "InvestigationOutcome",
     "IngestionOutcome",
+    "UpdateOutcome",
     "AnswerOutcome",
     "PublicationOutcome",
     "InvestigationRunner",
     "IngestionRunner",
+    "UpdateRunner",
     "QueryRunner",
     "PublicationRunner",
 ]
@@ -64,6 +66,26 @@ class IngestionOutcome:
             "entities_written": self.entities_written,
             "diagnostics": list(self.diagnostics),
         }
+
+
+@dataclass(frozen=True)
+class UpdateOutcome:
+    diff: Mapping[str, Any]
+    invalidated: int
+    reinvestigated: Mapping[str, Any] | None = None
+    skipped_reason: str = ""
+    gaps: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "diff": dict(self.diff),
+            "invalidated": self.invalidated,
+            "skipped_reason": self.skipped_reason,
+            "gaps": list(self.gaps),
+        }
+        if self.reinvestigated is not None:
+            payload["reinvestigated"] = dict(self.reinvestigated)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -119,6 +141,18 @@ class IngestionRunner(Protocol):
         knowledge: KnowledgeRepository,
         namespace: str,
     ) -> IngestionOutcome: ...
+
+
+@runtime_checkable
+class UpdateRunner(Protocol):
+    def run(
+        self,
+        previous_snapshot: RepositorySnapshot,
+        current_snapshot: RepositorySnapshot,
+        knowledge: KnowledgeRepository,
+        provider: AgentProvider | None,
+        namespace: str,
+    ) -> UpdateOutcome: ...
 
 
 @runtime_checkable

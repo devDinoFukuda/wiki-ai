@@ -6,8 +6,8 @@ from typing import Any
 
 import pytest
 
-from wiki_ai.agent.envelope import ResultEnvelope
-from wiki_ai.agent.protocol import AgentCapabilities, AgentProvider
+from wiki_ai.agent.protocol import AgentCapabilities
+from wiki_ai.agent.session import AgentProvider, AgentRun, AgentSession
 from wiki_ai.agent.registry import (
     DEFAULT_PROVIDER_MODULES,
     ProviderAlreadyRegistered,
@@ -27,14 +27,8 @@ class _Reachable:
     def capabilities(self) -> AgentCapabilities:
         return AgentCapabilities(tools=("repo.read",))
 
-    def run(self, session: Any) -> ResultEnvelope:
-        return ResultEnvelope(
-            envelope_id="env_0",
-            task_id="t",
-            produced_for_snapshot=session.snapshot_id,
-            payload_hash="0" * 64,
-            produced_at=0.0,
-        )
+    def run(self, session: AgentSession) -> AgentRun:
+        return session.finish([])
 
     def cancel(self) -> None:
         return None

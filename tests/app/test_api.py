@@ -89,11 +89,11 @@ def test_analyze_persists_the_snapshot_and_latest_pointer(tmp_path: Path) -> Non
     assert Session.open(tmp_path).current_snapshot_id() == report.snapshot_digest
 
 
-def test_analyze_with_a_provider_is_blocked_by_the_missing_engine(tmp_path: Path) -> None:
+def test_analyze_with_a_provider_reaches_the_wired_investigation(tmp_path: Path) -> None:
     _repo(tmp_path)
     report = api.analyze(tmp_path, wiring=_WiringWithProvider())
-    assert report.status == "blocked"
-    assert report.reason == "investigation_engine_unavailable"
+    assert report.status == "ok"
+    assert report.details["objective"] == api.DEFAULT_OBJECTIVE
 
 
 def test_analyze_delegates_to_the_investigation_runner(tmp_path: Path) -> None:
@@ -117,20 +117,25 @@ def test_analyze_excludes_the_state_directory_from_the_snapshot(tmp_path: Path) 
     assert first.snapshot_digest == second.snapshot_digest
 
 
-def test_ingest_registers_a_source_version_and_blocks_honestly(tmp_path: Path) -> None:
+def test_ingest_without_a_provider_is_ok_and_honest(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     source = tmp_path / "notes.md"
     source.write_text("# renewal\n", encoding="utf-8")
     report = api.ingest(source, repo, Wiring())
-    assert report.status == "blocked"
-    assert report.reason == "ingestion_pipeline_unavailable"
+    assert report.status == "ok"
+    assert report.reason == ""
+    assert (
+        "semantic_investigation_skipped:agent_provider_unavailable"
+        in report.details["diagnostics"]
+    )
+    assert report.details["entities_written"] == 0
     assert report.registered is True
     assert report.kind == SourceKind.MARKDOWN.value
     assert len(report.version_hash) == 64
     with Session.open(repo).open_knowledge() as knowledge:
         versions = knowledge.source_versions()
-    assert len(versions) == 1
-    assert versions[0].version_hash == report.version_hash
+    assert versions
+    assert report.version_hash in {item.version_hash for item in versions}
 
 
 def test_ingest_reports_a_missing_source(tmp_path: Path) -> None:
@@ -172,14 +177,14 @@ def test_ask_on_empty_knowledge_is_blocked(tmp_path: Path) -> None:
     }
 
 
-def test_ask_after_ingest_is_blocked_by_the_query_engine(tmp_path: Path) -> None:
+def test_ask_after_ingest_reaches_the_wired_query_engine(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     source = tmp_path / "notes.md"
     source.write_text("# renewal\n", encoding="utf-8")
     api.ingest(source, repo, Wiring())
     report = api.ask("what changed", repo, Wiring())
-    assert report.status == "blocked"
-    assert report.reason == "query_engine_unavailable"
+    assert report.status == "ok"
+    assert report.answer
 
 
 def test_publish_on_empty_knowledge_is_blocked(tmp_path: Path) -> None:
@@ -201,7 +206,9 @@ def test_status_of_a_new_repository(tmp_path: Path) -> None:
     assert payload["entities"] == 0
     assert payload["relations"] == 0
     assert payload["evidence"] == 0
-    assert payload["sources"] == 0
+    assert payload["sources"] == {}
+    assert payload["source_versions"] == 0
+    assert payload["pending_update"] is False
     assert payload["last_publication"] is None
     assert payload["provider_available"] is False
 
@@ -215,6 +222,8 @@ def test_status_reflects_analyze_and_ingest(tmp_path: Path) -> None:
     report = api.status(repo, _WiringWithProvider())
     assert report.snapshot_digest == analyzed.snapshot_digest
     assert report.sources == 1
+    assert dict(report.sources_by_kind)["markdown"] == 1
+    assert report.pending_update is False
     assert report.provider_available is True
 
 

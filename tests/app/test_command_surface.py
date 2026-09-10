@@ -114,13 +114,13 @@ def test_publish_on_empty_knowledge_exits_two(tmp_path: Path) -> None:
     assert payload["reason"] == "nothing_to_publish"
 
 
-def test_ingest_exits_two_and_registers_the_source(tmp_path: Path) -> None:
+def test_ingest_exits_zero_and_registers_the_source(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     source = tmp_path / "notes.md"
     source.write_text("# renewal\n", encoding="utf-8")
     code, payload = _run("ingest", str(source), "--repo", str(repo))
-    assert code == EXIT_BLOCKED
-    assert payload["reason"] == "ingestion_pipeline_unavailable"
+    assert code == EXIT_OK
+    assert payload["status"] == "ok"
     assert payload["registered"] is True
     assert payload["kind"] == "markdown"
 

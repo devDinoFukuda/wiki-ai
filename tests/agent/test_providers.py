@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from tests.agent import fake_cli
-from wiki_ai.agent.protocol import AgentProvider, ToolCall, ToolResult
+from wiki_ai.agent.protocol import ToolCall, ToolResult
 from wiki_ai.agent.providers.bridge import FINISH_TOOL
 from wiki_ai.agent.providers.broker import ToolBrokerServer
 from wiki_ai.agent.providers.claude import (
@@ -21,7 +21,13 @@ from wiki_ai.agent.providers.claude import (
 from wiki_ai.agent.providers.cli_common import BinaryMissing, CliRunner, minimal_env
 from wiki_ai.agent.providers.codex import CodexProvider, config_document
 from wiki_ai.agent.registry import ProviderRegistry
-from wiki_ai.agent.session import AgentSession, Budget, RunStatus, ToolSpec
+from wiki_ai.agent.session import (
+    AgentProvider,
+    AgentSession,
+    Budget,
+    RunStatus,
+    ToolSpec,
+)
 
 READ = ToolSpec(
     name="repo.read",

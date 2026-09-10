@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from wiki_ai.agent.envelope import EnvelopeIdentity, ResultEnvelope, seal
 from wiki_ai.agent.protocol import (
     AgentCapabilities,
-    AgentProvider,
     ProtocolError,
     ToolCall,
     ToolResult,
+)
+from wiki_ai.agent.session import (
+    AgentProvider,
+    AgentRun,
+    AgentSession,
+    Budget,
+    ToolSpec,
 )
 
 
@@ -23,10 +28,8 @@ class Recorder:
     def capabilities(self) -> AgentCapabilities:
         return AgentCapabilities(tools=("read_file",), max_context_tokens=1000)
 
-    def run(self, session: object) -> ResultEnvelope:
-        return seal(
-            EnvelopeIdentity("t1", "snap", "obj", "in"), payload={"ok": True}, produced_at=1.0
-        )
+    def run(self, session: AgentSession) -> AgentRun:
+        return session.finish([])
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -70,7 +73,13 @@ def test_any_object_with_the_four_methods_is_a_provider():
     recorder.connect()
     recorder.cancel()
     assert recorder.connected and recorder.cancelled
-    assert recorder.run(object()).task_id == "t1"
+    session = AgentSession(
+        objective="probe",
+        tools={"repo.read": ToolSpec("repo.read", "read a file")},
+        budget=Budget(max_tool_calls=1, max_seconds=1.0),
+        snapshot_id="snap",
+    )
+    assert isinstance(recorder.run(session), AgentRun)
 
 
 def test_incomplete_object_is_not_a_provider():

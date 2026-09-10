@@ -5,7 +5,6 @@ import pytest
 from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.app.ports import (
     AnswerOutcome,
-    CapabilityUnavailable,
     IngestionOutcome,
     IngestionRunner,
     InvestigationOutcome,
@@ -13,31 +12,30 @@ from wiki_ai.app.ports import (
     PublicationOutcome,
     PublicationRunner,
     QueryRunner,
+    UpdateRunner,
 )
 from wiki_ai.app.wiring import Wiring, default_wiring
 
-RUNNER_FACTORIES = (
-    ("investigation_runner", "investigation_engine_unavailable"),
-    ("ingestion_runner", "ingestion_pipeline_unavailable"),
-    ("query_runner", "query_engine_unavailable"),
-    ("publication_runner", "publication_engine_unavailable"),
+WIRED_RUNNERS = (
+    ("investigation_runner", InvestigationRunner),
+    ("ingestion_runner", IngestionRunner),
+    ("update_runner", UpdateRunner),
+    ("query_runner", QueryRunner),
+    ("publication_runner", PublicationRunner),
 )
 
 
-@pytest.mark.parametrize("attribute,reason", RUNNER_FACTORIES)
-def test_wiring_declares_every_capability_unavailable(attribute: str, reason: str) -> None:
-    wiring = default_wiring()
-    with pytest.raises(CapabilityUnavailable) as caught:
-        getattr(wiring, attribute)()
-    assert caught.value.reason == reason
-    assert caught.value.action
+@pytest.mark.parametrize("attribute,protocol", WIRED_RUNNERS)
+def test_wiring_provides_every_wired_capability(attribute: str, protocol: type) -> None:
+    runner = getattr(default_wiring(), attribute)()
+    assert isinstance(runner, protocol)
 
 
 def test_wiring_owns_a_provider_registry() -> None:
     registry = ProviderRegistry()
     wiring = Wiring(registry)
     assert wiring.registry is registry
-    assert default_wiring().registry.available() == ()
+    assert set(default_wiring().registry.registered()) >= {"claude", "codex"}
 
 
 def test_runner_protocols_are_runtime_checkable() -> None:
