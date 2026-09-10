@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TextIO
 
-from tests.benchmark import metrics
+from tests.benchmark import metrics, thresholds
 from tests.benchmark.ground_truth import corpora
 from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.app import api
@@ -26,6 +26,10 @@ __all__ = [
     "EXIT_ERROR",
     "EXIT_SKIPPED",
     "SKIP_REASON",
+    "STATUS_PROVIDER_MISMATCH",
+    "PROVIDER_MISMATCH_REASON",
+    "LEVEL_CHOICES",
+    "stage_providers",
     "QUESTION_BY_REPO",
     "OBJECTIVE_BY_REPO",
     "RunResult",
@@ -43,6 +47,10 @@ EXIT_ERROR = 1
 EXIT_SKIPPED = 3
 SKIP_REASON = "provider_binary_unavailable"
 STATUS_SKIPPED = "skipped"
+STATUS_PROVIDER_MISMATCH = "provider_mismatch"
+PROVIDER_MISMATCH_REASON = "resolved_provider_differs_from_requested"
+PROVIDER_FIELD = "provider"
+LEVEL_CHOICES: tuple[str, ...] = thresholds.LEVELS
 
 PROVIDER_BINARIES: Mapping[str, str] = {"claude": "claude", "codex": "codex"}
 PROVIDER_CHOICES: tuple[str, ...] = tuple(sorted(PROVIDER_BINARIES)) + (ALL,)
@@ -69,20 +77,32 @@ class RunResult:
     report: metrics.BenchmarkReport | None = None
     stages: Mapping[str, Any] = field(default_factory=dict)
     reason: str = ""
+    actual_provider: str = ""
+    level: str = thresholds.DEFAULT_LEVEL
+
+    def provider_matches(self) -> bool:
+        return self.actual_provider == self.provider
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "provider": self.provider,
+            "requested_provider": self.provider,
+            "actual_provider": self.actual_provider,
             "repository": self.repository,
             "status": self.status,
+            "level": self.level,
         }
         if self.reason:
             payload["reason"] = self.reason
         if self.stages:
             payload["stages"] = dict(self.stages)
         if self.report is not None:
-            payload["metrics"] = self.report.to_dict()["metrics"]
-            payload["items"] = self.report.to_dict()["items"]
+            rendered = self.report.to_dict()
+            payload["metrics"] = thresholds.evaluate_metrics(
+                rendered["metrics"], self.level
+            )
+            payload["raw_metrics"] = rendered["metrics"]
+            payload["items"] = rendered["items"]
             payload["entities"] = self.report.entity_total
             payload["supported_entities"] = self.report.supported_total
         return payload
@@ -109,18 +129,64 @@ def _registry(provider: str) -> ProviderRegistry:
     return registry
 
 
+def stage_providers(stages: Mapping[str, Any]) -> tuple[str, ...]:
+    observed: list[str] = []
+    for payload in stages.values():
+        entries = payload if isinstance(payload, list) else [payload]
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            if PROVIDER_FIELD not in entry:
+                continue
+            observed.append(str(entry[PROVIDER_FIELD]))
+    return tuple(observed)
+
+
+def _observed_provider(stages: Mapping[str, Any], requested: str) -> str:
+    reported = [name for name in stage_providers(stages) if name]
+    divergent = [name for name in reported if name != requested]
+    if divergent:
+        return divergent[0]
+    return requested
+
+
 def _prepare(name: str, workspace: Path) -> corpora.GeneratedCorpus:
     root = workspace / name
     return corpora.materialize(name, root)
 
 
-def run_repository(name: str, provider: str, workspace: Path) -> RunResult:
+def _mismatch(
+    name: str, provider: str, stages: Mapping[str, Any], level: str
+) -> RunResult | None:
+    observed = _observed_provider(stages, provider)
+    if observed == provider:
+        return None
+    return RunResult(
+        provider=provider,
+        repository=name,
+        status=STATUS_PROVIDER_MISMATCH,
+        stages=dict(stages),
+        reason=PROVIDER_MISMATCH_REASON,
+        actual_provider=observed,
+        level=level,
+    )
+
+
+def run_repository(
+    name: str,
+    provider: str,
+    workspace: Path,
+    level: str = thresholds.DEFAULT_LEVEL,
+) -> RunResult:
     corpus = _prepare(name, workspace)
     registry = _registry(provider)
-    wiring = Wiring(registry)
+    wiring = Wiring(registry, provider=provider)
     stages: dict[str, Any] = {}
     analyzed = api.analyze(corpus.root, OBJECTIVE_BY_REPO[name], wiring=wiring)
     stages["analyze"] = analyzed.to_dict()
+    diverged = _mismatch(name, provider, stages, level)
+    if diverged is not None:
+        return diverged
     if analyzed.status != "ok":
         return RunResult(
             provider=provider,
@@ -128,14 +194,25 @@ def run_repository(name: str, provider: str, workspace: Path) -> RunResult:
             status=analyzed.status,
             stages=stages,
             reason=analyzed.reason,
+            actual_provider=provider,
+            level=level,
         )
     ingested: list[dict[str, Any]] = []
     for document in corpus.documents:
         ingested.append(api.ingest(document, corpus.root, wiring=wiring).to_dict())
     if ingested:
         stages["ingest"] = ingested
+        diverged = _mismatch(name, provider, stages, level)
+        if diverged is not None:
+            return diverged
     stages["ask"] = api.ask(QUESTION_BY_REPO[name], corpus.root, wiring=wiring).to_dict()
+    diverged = _mismatch(name, provider, stages, level)
+    if diverged is not None:
+        return diverged
     stages["publish"] = api.publish(corpus.root, wiring=wiring).to_dict()
+    diverged = _mismatch(name, provider, stages, level)
+    if diverged is not None:
+        return diverged
     session = Session.open(corpus.root)
     with session.open_knowledge() as knowledge:
         report = metrics.evaluate(knowledge, corpus.truth)
@@ -145,10 +222,17 @@ def run_repository(name: str, provider: str, workspace: Path) -> RunResult:
         status="ok",
         report=report,
         stages=stages,
+        actual_provider=provider,
+        level=level,
     )
 
 
-def run(provider: str, repository: str, workspace: Path | None = None) -> dict[str, Any]:
+def run(
+    provider: str,
+    repository: str,
+    workspace: Path | None = None,
+    level: str = thresholds.DEFAULT_LEVEL,
+) -> dict[str, Any]:
     providers = _selected(provider, PROVIDER_CHOICES)
     repositories = _selected(repository, REPO_CHOICES)
     absent = missing_binaries(providers)
@@ -167,10 +251,12 @@ def run(provider: str, repository: str, workspace: Path | None = None) -> dict[s
         holder.mkdir(parents=True, exist_ok=True)
     for name in providers:
         for repo in repositories:
-            results.append(run_repository(repo, name, holder / name))
+            results.append(run_repository(repo, name, holder / name, level))
     blocked = [entry for entry in results if entry.status != "ok"]
     return {
         "status": "ok" if not blocked else "partial",
+        "level": level,
+        "thresholds": thresholds.THRESHOLDS[level].to_dict(),
         "providers": list(providers),
         "repositories": list(repositories),
         "workspace": holder.as_posix(),
@@ -230,6 +316,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", choices=REPO_CHOICES, default=ALL)
     parser.add_argument("--out", default=None)
     parser.add_argument("--workspace", default=None)
+    parser.add_argument(
+        "--level", choices=LEVEL_CHOICES, default=thresholds.DEFAULT_LEVEL
+    )
     return parser
 
 
@@ -239,7 +328,7 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
     output = stream if stream is not None else sys.stdout
     workspace = Path(arguments.workspace) if arguments.workspace else None
     try:
-        payload = run(arguments.provider, arguments.repo, workspace)
+        payload = run(arguments.provider, arguments.repo, workspace, arguments.level)
     except (LookupError, OSError) as failure:
         payload = {"status": "error", "reason": type(failure).__name__, "detail": str(failure)}
     text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)

@@ -417,14 +417,15 @@ def cobol_discovery() -> Script:
             ("repo.search", {"pattern": "EXEC PGM"}),
             ("repo.read", {"path": COBOL}),
             capture(COBOL, 2, 2, "PAYRUN"),
-            capture(JCL, 2, 2, "STEP01"),
+            capture(COBOL, 7, 10, "PAYRUN"),
+            capture(JCL, 1, 2, "PAYJOB"),
         ),
         findings=[
             {
                 "type": "capability",
                 "subject": PAYROLL,
-                "statement": "PAYRUN computes the payroll gross and calls TAXCALC",
-                "evidence": [ref(COBOL, 2, 2)],
+                "statement": "PAYRUN performs CALC-TOTAL and calls TAXCALC then stops the run",
+                "evidence": [ref(COBOL, 7, 10)],
                 "confidence": "supported",
             },
             {
@@ -440,7 +441,7 @@ def cobol_discovery() -> Script:
                 "subject": "PAYJOB STEP01",
                 "statement": "STEP01 EXEC PGM=PAYRUN starts PAYRUN from the JCL",
                 "attributes": {"mechanism": "jcl", "location": "PAYJOB.STEP01"},
-                "evidence": [ref(JCL, 2, 2)],
+                "evidence": [ref(JCL, 1, 2)],
                 "confidence": "supported",
                 "relations": [rel("belongs_to", PAYROLL, "capability")],
             },

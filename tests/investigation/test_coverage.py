@@ -168,3 +168,60 @@ def test_contradicted_finding_is_not_counted_as_resolved(tmp_path: Path) -> None
     )
     assert Confidence.CONTRADICTED.value not in updated.resolved_subjects
     assert "order place" not in updated.resolved_subjects
+
+
+def owned_rule(owner: str, relations=()) -> Finding:
+    return Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="Eligibility",
+        statement="place saves the reference through the repository",
+        conditions=("a reference is given",),
+        effects=("repository save is called with the reference",),
+        owner=owner,
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+        relations=relations,
+    )
+
+
+def test_a_target_under_another_owner_stays_on_the_frontier(tmp_path: Path) -> None:
+    claim = RelationClaim(
+        kind=RelationKind.SUPERSEDES,
+        target_subject="Eligibility",
+        target_type=EntityKind.BUSINESS_RULE,
+        target_owner="Billing",
+    )
+    report = verified_report([owned_rule("Ordering", (claim,))], tmp_path)
+    updated = update(CoverageState(files_total=7), report)
+    assert [item.subject for item in updated.frontier] == ["Eligibility"]
+
+
+def test_a_target_under_the_same_owner_never_reaches_the_frontier(
+    tmp_path: Path,
+) -> None:
+    claim = RelationClaim(
+        kind=RelationKind.SUPERSEDES,
+        target_subject="Eligibility",
+        target_type=EntityKind.BUSINESS_RULE,
+        target_owner="Ordering",
+    )
+    report = verified_report([owned_rule("Ordering", (claim,))], tmp_path)
+    updated = update(CoverageState(files_total=7), report)
+    assert not updated.frontier
+
+
+def test_a_target_named_by_id_is_matched_by_the_explicit_id(tmp_path: Path) -> None:
+    claim = RelationClaim(kind=RelationKind.SUPERSEDES, target_id="RULE-7")
+    identified = Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="Eligibility",
+        statement="place saves the reference through the repository",
+        conditions=("a reference is given",),
+        effects=("repository save is called with the reference",),
+        explicit_id="RULE-7",
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+    )
+    report = verified_report(
+        [identified, owned_rule("Ordering", (claim,))], tmp_path
+    )
+    updated = update(CoverageState(files_total=7), report)
+    assert not updated.frontier

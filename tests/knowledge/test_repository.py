@@ -485,7 +485,7 @@ def test_supported_relation_with_own_evidence_is_accepted(repository):
     assert len(repository.evidence_for_relation(relation.id)) == 1
 
 
-def test_supported_relation_with_supported_endpoints_is_accepted(repository):
+def test_supported_endpoints_do_not_support_the_relation_between_them(repository):
     version = a_source_version()
     left = an_entity(
         name="A",
@@ -502,13 +502,44 @@ def test_supported_relation_with_supported_endpoints_is_accepted(repository):
     relation = Relation.create(
         "calls", left.id, right.id, confidence=Confidence.SUPPORTED
     )
-    with repository.begin_revision("pipeline", "extremos supported") as revision:
+    with pytest.raises(UnsupportedEvidence):
+        with repository.begin_revision("pipeline", "extremos supported") as revision:
+            revision.put_source_version(version)
+            revision.put_entity(left)
+            revision.put_entity(right)
+            revision.put_evidence(code_evidence(version, "src/a.py"), [left.id])
+            revision.put_evidence(code_evidence(version, "src/b.py"), [right.id])
+            revision.put_relation(relation)
+    assert repository.relation_count() == 0
+
+
+def test_supported_relation_is_accepted_with_its_own_evidence(repository):
+    version = a_source_version()
+    left = an_entity(
+        name="A",
+        kind="capability",
+        state=KnowledgeState.IMPLEMENTED,
+        confidence=Confidence.SUPPORTED,
+    )
+    right = an_entity(
+        name="B",
+        kind="capability",
+        state=KnowledgeState.IMPLEMENTED,
+        confidence=Confidence.SUPPORTED,
+    )
+    relation = Relation.create(
+        "calls", left.id, right.id, confidence=Confidence.SUPPORTED
+    )
+    with repository.begin_revision("pipeline", "aresta com lastro") as revision:
         revision.put_source_version(version)
         revision.put_entity(left)
         revision.put_entity(right)
         revision.put_evidence(code_evidence(version, "src/a.py"), [left.id])
         revision.put_evidence(code_evidence(version, "src/b.py"), [right.id])
         revision.put_relation(relation)
+        revision.put_evidence(
+            code_evidence(version, "src/edge.py"), relation_ids=(relation.id,)
+        )
     assert repository.get_relation(relation.id).confidence is Confidence.SUPPORTED
 
 

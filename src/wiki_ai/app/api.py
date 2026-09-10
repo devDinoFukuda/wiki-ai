@@ -9,13 +9,15 @@ from typing import Any, Mapping
 
 from wiki_ai import __version__
 from wiki_ai.agent.registry import ProviderRegistry
-from wiki_ai.agent.session import AgentProvider
 from wiki_ai.app.ports import CapabilityUnavailable, OutcomeStatus
 from wiki_ai.app.session import (
+    PREFERENCE_SOURCES,
     STATE_DIR_NAME,
     AnalysisStatus,
+    ResolvedProvider,
     Session,
     detect_outdated_store,
+    objective_hash,
 )
 from wiki_ai.app.wiring import Wiring, default_wiring
 from wiki_ai.ingestion.source import SourceKind
@@ -45,6 +47,7 @@ __all__ = [
     "AskReport",
     "PublishReport",
     "StatusReport",
+    "ProviderReport",
     "DEFAULT_EXCLUDES",
     "DEFAULT_OBJECTIVE",
     "UP_TO_DATE",
@@ -61,6 +64,8 @@ __all__ = [
     "ask",
     "publish",
     "status",
+    "provider_show",
+    "provider_set",
 ]
 
 DEFAULT_EXCLUDES = (STATE_DIR_NAME,)
@@ -69,6 +74,8 @@ PUBLICATION_ACTION = "resolve the listed publication issues"
 UP_TO_DATE = "up_to_date"
 PROVIDER_ACTION = "configure a supported provider"
 PROVIDER_UNAVAILABLE = "agent_provider_unavailable"
+UNKNOWN_PROVIDER = "unknown_provider"
+UNKNOWN_PROVIDER_ACTION = "choose one of the registered providers"
 STRUCTURAL_ONLY = "structural_only"
 INCOMPLETE_ACTION = "review the reported gaps and run again"
 CORRELATION_DETAIL = "correlation"
@@ -155,6 +162,7 @@ class AnalyzeReport:
     analyzable_files: int
     analysis_status: str = AnalysisStatus.NEVER.value
     analyzed_digest: str = ""
+    provider: str = ""
     reason: str = ""
     action: str = ""
     details: Mapping[str, Any] = field(default_factory=dict)
@@ -166,6 +174,7 @@ class AnalyzeReport:
             "analyzable_files": self.analyzable_files,
             "analysis_status": self.analysis_status,
             "analyzed_digest": self.analyzed_digest,
+            "provider": self.provider,
         }
         if self.reason:
             payload["reason"] = self.reason
@@ -184,6 +193,7 @@ class IngestReport:
     version_hash: str
     registered: bool
     ingestion_status: str = OutcomeStatus.COMPLETE.value
+    provider: str = ""
     reason: str = ""
     action: str = ""
     details: Mapping[str, Any] = field(default_factory=dict)
@@ -196,6 +206,7 @@ class IngestReport:
             "version_hash": self.version_hash,
             "registered": self.registered,
             "ingestion_status": self.ingestion_status,
+            "provider": self.provider,
         }
         if self.reason:
             payload["reason"] = self.reason
@@ -215,11 +226,16 @@ class AskReport:
     evidence_ids: tuple[str, ...] = ()
     entity_ids: tuple[str, ...] = ()
     unresolved: tuple[str, ...] = ()
+    provider: str = ""
     reason: str = ""
     action: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"status": self.status, "question": self.question}
+        payload: dict[str, Any] = {
+            "status": self.status,
+            "question": self.question,
+            "provider": self.provider,
+        }
         if self.answer:
             payload["answer"] = self.answer
         if self.mode:
@@ -300,6 +316,30 @@ class StatusReport:
             "publication_artifacts": self.publication_artifacts,
             "provider_available": self.provider_available,
         }
+
+
+@dataclass(frozen=True)
+class ProviderReport:
+    status: str
+    provider: str = ""
+    source: str = ""
+    registered: tuple[str, ...] = ()
+    reason: str = ""
+    action: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "status": self.status,
+            "provider": self.provider,
+            "registered": list(self.registered),
+        }
+        if self.source:
+            payload["source"] = self.source
+        if self.reason:
+            payload["reason"] = self.reason
+        if self.action:
+            payload["action"] = self.action
+        return payload
 
 
 def version() -> str:
@@ -412,6 +452,7 @@ def _blocked_analysis(
     analyzable: int,
     reason: str,
     action: str,
+    provider_name: str = "",
     details: Mapping[str, Any] | None = None,
 ) -> AnalyzeReport:
     state = session.record_analysis(digest, AnalysisStatus.BLOCKED, reason)
@@ -421,6 +462,7 @@ def _blocked_analysis(
         analyzable_files=analyzable,
         analysis_status=state.analysis_status.value,
         analyzed_digest=state.analyzed_digest,
+        provider=provider_name,
         reason=reason,
         action=action,
         details=dict(details) if details else {},
@@ -434,9 +476,11 @@ def _settled_analysis(
     outcome_status: OutcomeStatus,
     reason: str,
     payload: Mapping[str, Any],
+    objective_key: str,
+    provider_name: str,
 ) -> AnalyzeReport:
     analysis_status = ANALYSIS_STATUS_BY_OUTCOME[outcome_status]
-    state = session.record_analysis(digest, analysis_status, reason)
+    state = session.record_analysis(digest, analysis_status, reason, objective_key)
     report_status = REPORT_STATUS_BY_OUTCOME[outcome_status]
     action = "" if report_status == "ok" else INCOMPLETE_ACTION
     if report_status == "blocked" and reason == PROVIDER_UNAVAILABLE:
@@ -447,6 +491,7 @@ def _settled_analysis(
         analyzable_files=analyzable,
         analysis_status=state.analysis_status.value,
         analyzed_digest=state.analyzed_digest,
+        provider=provider_name,
         reason=reason,
         action=action,
         details=dict(payload),
@@ -459,31 +504,42 @@ def _update_report(
     previous: RepositorySnapshot,
     snapshot: RepositorySnapshot,
     analyzable: int,
-    provider: AgentProvider | None,
+    resolved: ResolvedProvider,
+    objective_key: str,
 ) -> AnalyzeReport:
     try:
         runner = composition.update_runner()
     except CapabilityUnavailable as exc:
         return _blocked_analysis(
-            session, snapshot.digest, analyzable, exc.reason, exc.action
+            session, snapshot.digest, analyzable, exc.reason, exc.action, resolved.name
         )
     with session.open_knowledge() as knowledge:
-        outcome = runner.run(previous, snapshot, knowledge, provider, session.namespace)
+        outcome = runner.run(
+            previous, snapshot, knowledge, resolved.provider, session.namespace
+        )
         payload = outcome.to_dict()
         if _wrote_entities(outcome.reinvestigated):
             payload = _correlated(knowledge, session.namespace, payload)
     session.save_snapshot(snapshot)
-    if provider is None:
+    if resolved.provider is None:
         return _blocked_analysis(
             session,
             snapshot.digest,
             analyzable,
             PROVIDER_UNAVAILABLE,
             PROVIDER_ACTION,
+            resolved.name,
             payload,
         )
     return _settled_analysis(
-        session, snapshot.digest, analyzable, outcome.status, outcome.reason, payload
+        session,
+        snapshot.digest,
+        analyzable,
+        outcome.status,
+        outcome.reason,
+        payload,
+        objective_key,
+        resolved.name,
     )
 
 
@@ -496,45 +552,63 @@ def analyze(
     root = _checked_root(repo)
     composition = _composition(wiring, registry)
     session = Session.open(root)
+    goal = objective.strip() if objective and objective.strip() else DEFAULT_OBJECTIVE
+    objective_key = objective_hash(goal)
     spec = SnapshotSpec(root=root, excludes=DEFAULT_EXCLUDES)
     observation = observe(spec)
     state = session.record_observation(observation.digest)
-    if state.is_current_for(observation.digest):
+    resolved = session.resolve_provider(
+        composition.registry, composition.provider
+    )
+    if state.is_current_for(observation.digest, objective_key):
         return AnalyzeReport(
             status="ok",
             snapshot_digest=observation.digest,
             analyzable_files=_analyzable_count(observation),
             analysis_status=state.analysis_status.value,
             analyzed_digest=state.analyzed_digest,
+            provider=resolved.name,
             reason=UP_TO_DATE,
         )
     snapshot = take_snapshot(spec, store=session.snapshot_store)
     analyzable = len(build_inventory(snapshot).analyzable())
     previous = session.current_snapshot()
-    provider = session.resolve_provider(composition.registry)
     if previous is not None and not diff(previous, snapshot).is_empty():
         return _update_report(
-            session, composition, previous, snapshot, analyzable, provider
+            session, composition, previous, snapshot, analyzable, resolved, objective_key
         )
     session.save_snapshot(snapshot)
-    if provider is None:
+    if resolved.provider is None:
         return _blocked_analysis(
-            session, snapshot.digest, analyzable, PROVIDER_UNAVAILABLE, PROVIDER_ACTION
+            session,
+            snapshot.digest,
+            analyzable,
+            PROVIDER_UNAVAILABLE,
+            PROVIDER_ACTION,
+            resolved.name,
         )
-    goal = objective.strip() if objective and objective.strip() else DEFAULT_OBJECTIVE
     try:
         runner = composition.investigation_runner()
     except CapabilityUnavailable as exc:
         return _blocked_analysis(
-            session, snapshot.digest, analyzable, exc.reason, exc.action
+            session, snapshot.digest, analyzable, exc.reason, exc.action, resolved.name
         )
     with session.open_knowledge() as knowledge:
-        outcome = runner.run(goal, snapshot, knowledge, provider, session.namespace)
+        outcome = runner.run(
+            goal, snapshot, knowledge, resolved.provider, session.namespace
+        )
         payload = outcome.to_dict()
         if outcome.entities_written:
             payload = _correlated(knowledge, session.namespace, payload)
     return _settled_analysis(
-        session, snapshot.digest, analyzable, outcome.status, outcome.reason, payload
+        session,
+        snapshot.digest,
+        analyzable,
+        outcome.status,
+        outcome.reason,
+        payload,
+        objective_key,
+        resolved.name,
     )
 
 
@@ -552,6 +626,9 @@ def ingest(
     session = Session.open(root)
     kind = source_kind_for(source)
     version_hash = _file_hash(source)
+    provider_name = session.resolve_provider(
+        composition.registry, composition.provider
+    ).name
     resolved = source.resolve()
     with session.open_knowledge() as knowledge:
         try:
@@ -574,6 +651,7 @@ def ingest(
                 version_hash=version_hash,
                 registered=True,
                 ingestion_status=OutcomeStatus.BLOCKED.value,
+                provider=provider_name,
                 reason=exc.reason,
                 action=exc.action,
             )
@@ -596,6 +674,7 @@ def ingest(
         version_hash=outcome.version_hash,
         registered=registered,
         ingestion_status=outcome.status.value,
+        provider=provider_name,
         reason=reason,
         action=action,
         details=payload,
@@ -611,12 +690,14 @@ def ask(
     root = _checked_root(repo)
     composition = _composition(wiring, registry)
     session = Session.open(root)
+    resolved = session.resolve_provider(composition.registry, composition.provider)
     with session.open_knowledge() as knowledge:
         entities, _, evidence, sources = _knowledge_counts(knowledge)
         if entities == 0 and evidence == 0 and sources == 0:
             return AskReport(
                 status="blocked",
                 question=question,
+                provider=resolved.name,
                 reason="knowledge_empty",
                 action="run analyze or ingest first",
             )
@@ -626,16 +707,19 @@ def ask(
             return AskReport(
                 status="blocked",
                 question=question,
+                provider=resolved.name,
                 reason=exc.reason,
                 action=exc.action,
             )
-        provider = session.resolve_provider(composition.registry)
-        outcome = runner.run(question, knowledge, provider, session.namespace)
+        outcome = runner.run(
+            question, knowledge, resolved.provider, session.namespace
+        )
     return AskReport(
         status="ok",
         question=question,
         answer=outcome.answer,
         mode=outcome.mode,
+        provider=resolved.name,
         reason=outcome.reason,
         evidence_ids=outcome.evidence_ids,
         entity_ids=outcome.entity_ids,
@@ -681,6 +765,51 @@ def publish(
     )
 
 
+def provider_show(
+    repo: Path,
+    wiring: Wiring | None = None,
+    registry: ProviderRegistry | None = None,
+) -> ProviderReport:
+    root = _checked_root(repo)
+    composition = _composition(wiring, registry)
+    session = Session.open(root)
+    chosen, origin = session.preference_origin(composition.provider)
+    return ProviderReport(
+        status="ok",
+        provider=chosen or "",
+        source=origin,
+        registered=composition.registry.registered(),
+    )
+
+
+def provider_set(
+    name: str,
+    repo: Path,
+    wiring: Wiring | None = None,
+    registry: ProviderRegistry | None = None,
+) -> ProviderReport:
+    root = _checked_root(repo)
+    composition = _composition(wiring, registry)
+    session = Session.open(root)
+    known = composition.registry.registered()
+    chosen = str(name).strip()
+    if chosen not in known:
+        return ProviderReport(
+            status="error",
+            provider=chosen,
+            registered=known,
+            reason=UNKNOWN_PROVIDER,
+            action=UNKNOWN_PROVIDER_ACTION,
+        )
+    stored = session.write_provider_preference(chosen)
+    return ProviderReport(
+        status="ok",
+        provider=stored,
+        source=PREFERENCE_SOURCES[2],
+        registered=known,
+    )
+
+
 def _sources_by_kind(
     knowledge: KnowledgeRepository, namespace: str
 ) -> tuple[tuple[str, int], ...]:
@@ -721,7 +850,7 @@ def status(
         sources=sources,
         sources_by_kind=by_kind,
         pending_update=state.analysis_status is not AnalysisStatus.NEVER
-        and not state.is_current_for(observed),
+        and not state.is_current_for(observed, state.analyzed_objective_hash),
         last_publication=publication.publication_id if publication else None,
         publication_artifacts=len(publication.manifest.relative_paths) if publication else 0,
         provider_available=bool(composition.registry.available()),

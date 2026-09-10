@@ -17,12 +17,23 @@ __all__ = [
     "EXIT_OK",
     "EXIT_ERROR",
     "EXIT_BLOCKED",
+    "PROVIDER_ACTIONS",
     "build_parser",
     "main",
 ]
 
 PROGRAM_NAME = "wiki-ai"
-COMMANDS = ("analyze", "ingest", "ask", "publish", "status", "version", "inspect")
+COMMANDS = (
+    "analyze",
+    "ingest",
+    "ask",
+    "publish",
+    "status",
+    "version",
+    "inspect",
+    "provider",
+)
+PROVIDER_ACTIONS = ("set", "show")
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_BLOCKED = 2
@@ -69,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_parser = subparsers.add_parser(COMMANDS[6], add_help=False)
     inspect_parser.add_argument("repo", nargs="?", default=_DEFAULT_REPO)
+
+    provider_parser = subparsers.add_parser(COMMANDS[7], add_help=False)
+    provider_actions = provider_parser.add_subparsers(dest="action", required=True)
+    provider_set = provider_actions.add_parser(PROVIDER_ACTIONS[0], add_help=False)
+    provider_set.add_argument("name")
+    provider_set.add_argument(_REPO_OPTION, default=_DEFAULT_REPO)
+    provider_show = provider_actions.add_parser(PROVIDER_ACTIONS[1], add_help=False)
+    provider_show.add_argument(_REPO_OPTION, default=_DEFAULT_REPO)
 
     return parser
 
@@ -146,10 +165,19 @@ def _run(
             EXIT_OK,
             stream,
         )
+    if command == COMMANDS[6]:
+        repo = Path(parsed.repo)
+        return _guarded(
+            command, lambda: {"status": "ok", **api.inspect(repo).to_dict()}, stream
+        )
     repo = Path(parsed.repo)
-    return _guarded(
-        command, lambda: {"status": "ok", **api.inspect(repo).to_dict()}, stream
-    )
+    if str(parsed.action) == PROVIDER_ACTIONS[0]:
+        return _guarded(
+            command,
+            lambda: api.provider_set(parsed.name, repo, wiring).to_dict(),
+            stream,
+        )
+    return _guarded(command, lambda: api.provider_show(repo, wiring).to_dict(), stream)
 
 
 def main(

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from wiki_ai.app.session import (
+    ANALYSIS_CONTRACT_VERSION,
     ANALYSIS_STATE_FILE,
     CODESCAN_DIRECTORY,
     COMPANION_DIRECTORIES,
@@ -22,6 +23,7 @@ from wiki_ai.app.session import (
     SessionError,
     SnapshotNotStored,
     detect_outdated_store,
+    objective_hash,
 )
 from wiki_ai.repository.snapshot import SnapshotSpec, take_snapshot
 
@@ -141,7 +143,7 @@ def test_analysis_state_starts_empty(tmp_path: Path) -> None:
     assert state.analysis_status is AnalysisStatus.NEVER
     assert state.analyzed_digest == ""
     assert state.observed_digest == ""
-    assert not state.is_current_for("a" * 64)
+    assert not state.is_current_for("a" * 64, objective_hash("goal"))
 
 
 def test_recording_an_observation_never_marks_an_analysis(tmp_path: Path) -> None:
@@ -160,21 +162,26 @@ def test_only_a_complete_analysis_advances_the_analyzed_digest(tmp_path: Path) -
     )
     assert blocked.analyzed_digest == ""
     assert blocked.observed_digest == "a" * 64
-    assert not blocked.is_current_for("a" * 64)
-    complete = session.record_analysis("a" * 64, AnalysisStatus.COMPLETE)
+    assert not blocked.is_current_for("a" * 64, objective_hash("goal"))
+    complete = session.record_analysis(
+        "a" * 64, AnalysisStatus.COMPLETE, "", objective_hash("goal")
+    )
     assert complete.analyzed_digest == "a" * 64
     assert complete.analyzed_at
-    assert complete.is_current_for("a" * 64)
+    assert complete.analyzed_objective_hash == objective_hash("goal")
+    assert complete.contract_version == ANALYSIS_CONTRACT_VERSION
+    assert complete.is_current_for("a" * 64, objective_hash("goal"))
+    assert not complete.is_current_for("a" * 64, objective_hash("other goal"))
 
 
 def test_a_partial_analysis_keeps_the_last_complete_digest(tmp_path: Path) -> None:
     session = Session.open(tmp_path)
-    session.record_analysis("a" * 64, AnalysisStatus.COMPLETE)
+    session.record_analysis("a" * 64, AnalysisStatus.COMPLETE, "", objective_hash("goal"))
     partial = session.record_analysis("b" * 64, AnalysisStatus.PARTIAL, "budget_exhausted")
     assert partial.analyzed_digest == "a" * 64
     assert partial.observed_digest == "b" * 64
     assert partial.analysis_status is AnalysisStatus.PARTIAL
-    assert not partial.is_current_for("b" * 64)
+    assert not partial.is_current_for("b" * 64, objective_hash("goal"))
 
 
 def test_analysis_state_survives_a_truncated_file(tmp_path: Path) -> None:
@@ -284,4 +291,6 @@ def test_resolve_provider_returns_none_without_providers(tmp_path: Path) -> None
     from wiki_ai.agent.registry import ProviderRegistry
 
     session = Session.open(tmp_path)
-    assert session.resolve_provider(ProviderRegistry()) is None
+    resolved = session.resolve_provider(ProviderRegistry())
+    assert resolved.provider is None
+    assert resolved.name == ""

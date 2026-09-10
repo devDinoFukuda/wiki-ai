@@ -254,6 +254,54 @@ def test_happy_path_leaves_no_staging_directory_behind(graph, publications_dir):
     assert _staging_entries(publications_dir) == ()
 
 
+def test_a_corrupted_release_blocks_the_rerun_instead_of_being_reused(
+    graph, publications_dir
+):
+    first = _publish(graph, publications_dir)
+    published = release.current(publications_dir)
+    target = published.directory / published.manifest.artifacts[0].relative_path
+    target.write_bytes(b"nao e mais um docx")
+    with pytest.raises(PublicationBlocked) as caught:
+        Publisher().run(graph.repository, publications_dir, "ns")
+    assert any(
+        BlockReason.EXISTING_INVALID.value in reason for reason in caught.value.reasons
+    )
+    assert release.list_publications(publications_dir) == (first.publication_id,)
+    assert release.current(publications_dir).publication_id == first.publication_id
+    assert target.read_bytes() == b"nao e mais um docx"
+
+
+def test_a_release_missing_an_artifact_blocks_the_rerun(graph, publications_dir):
+    _publish(graph, publications_dir)
+    published = release.current(publications_dir)
+    (published.directory / published.manifest.artifacts[0].relative_path).unlink()
+    with pytest.raises(PublicationBlocked) as caught:
+        Publisher().run(graph.repository, publications_dir, "ns")
+    assert any(
+        BlockReason.EXISTING_INVALID.value in reason for reason in caught.value.reasons
+    )
+
+
+def test_an_intact_release_is_reused_without_being_rewritten(graph, publications_dir):
+    first = _publish(graph, publications_dir)
+    published = release.current(publications_dir)
+    before = {
+        artifact.relative_path: (
+            published.directory / artifact.relative_path
+        ).read_bytes()
+        for artifact in published.manifest.artifacts
+    }
+    second = Publisher().run(graph.repository, publications_dir, "ns")
+    after = {
+        artifact.relative_path: (
+            published.directory / artifact.relative_path
+        ).read_bytes()
+        for artifact in published.manifest.artifacts
+    }
+    assert first == second
+    assert before == after
+
+
 def test_idempotent_rerun_still_passes_the_gate(graph, publications_dir):
     first = _publish(graph, publications_dir)
     second = _publish(graph, publications_dir)

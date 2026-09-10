@@ -13,9 +13,9 @@ from .errors import (
     FormatVersionMismatch,
     IdentityCollision,
     IdentityFacts,
+    RelationEvidenceRequired,
     RevisionClosed,
     UnknownReference,
-    UnsupportedEvidence,
 )
 from .evidence import assert_supports_implemented, locator_from_dict
 from .identity import canonical_name, new_revision_id
@@ -35,6 +35,11 @@ from .taxonomy import validate_attributes, validate_pair
 FORMAT_VERSION = "4"
 FORMAT_VERSION_KEY = "format_version"
 DATABASE_FILENAME = "state.db"
+NAMESPACE_ATTRIBUTE = "namespace"
+ADDITIVE_ENTITY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("namespace", "TEXT NOT NULL DEFAULT ''"),
+    ("canonical", "TEXT NOT NULL DEFAULT ''"),
+)
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -67,6 +72,8 @@ CREATE TABLE IF NOT EXISTS entities (
     state           TEXT NOT NULL,
     confidence      TEXT NOT NULL,
     owner_id        TEXT,
+    namespace       TEXT NOT NULL DEFAULT '',
+    canonical       TEXT NOT NULL DEFAULT '',
     revision_id     TEXT NOT NULL REFERENCES revisions(revision_id)
 );
 
@@ -119,6 +126,7 @@ CREATE TABLE IF NOT EXISTS invalidations (
 );
 
 CREATE INDEX IF NOT EXISTS ix_entities_kind    ON entities(kind);
+CREATE INDEX IF NOT EXISTS ix_entities_named   ON entities(namespace, canonical);
 CREATE INDEX IF NOT EXISTS ix_entities_owner   ON entities(owner_id);
 CREATE INDEX IF NOT EXISTS ix_entities_rev     ON entities(revision_id);
 CREATE INDEX IF NOT EXISTS ix_entsrc_version   ON entity_source_versions(source_version_key);
@@ -202,8 +210,22 @@ def connect(path: str, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
     _ensure_wal(conn, busy_timeout_ms)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(DDL)
+    _apply_additive_columns(conn)
     _apply_format_version(conn)
     return conn
+
+
+def _apply_additive_columns(conn: sqlite3.Connection) -> None:
+    present = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(entities)").fetchall()
+    }
+    for column, definition in ADDITIVE_ENTITY_COLUMNS:
+        if column in present:
+            continue
+        conn.execute(f"ALTER TABLE entities ADD COLUMN {column} {definition}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_entities_named ON entities(namespace, canonical)"
+    )
 
 
 class RevisionTransaction:
@@ -297,10 +319,12 @@ class RevisionTransaction:
                 )
         self._conn.execute(
             "INSERT INTO entities(entity_id, kind, name, attributes_json, state, "
-            "confidence, owner_id, revision_id) VALUES (?,?,?,?,?,?,?,?) "
+            "confidence, owner_id, namespace, canonical, revision_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(entity_id) DO UPDATE SET kind=excluded.kind, name=excluded.name, "
             "attributes_json=excluded.attributes_json, state=excluded.state, "
             "confidence=excluded.confidence, owner_id=excluded.owner_id, "
+            "namespace=excluded.namespace, canonical=excluded.canonical, "
             "revision_id=excluded.revision_id",
             (
                 entity.id.value,
@@ -310,6 +334,8 @@ class RevisionTransaction:
                 entity.state.value,
                 entity.confidence.value,
                 entity.owner_id.value if entity.owner_id is not None else None,
+                canonical_name(str(entity.attributes.get(NAMESPACE_ATTRIBUTE) or "")),
+                entity.canonical_name,
                 self._revision.id,
             ),
         )
@@ -476,19 +502,11 @@ class RevisionTransaction:
                 continue
             if self._repository.evidence_for_relation(relation_id):
                 continue
-            endpoints = (
-                self._repository.get_entity(relation.source_id),
-                self._repository.get_entity(relation.target_id),
-            )
-            if all(
-                node is not None and node.confidence is Confidence.SUPPORTED
-                for node in endpoints
-            ):
-                continue
-            raise UnsupportedEvidence(
-                f"relação {relation.kind} {relation.source_id.value} -> "
-                f"{relation.target_id.value} marcada supported sem evidência própria "
-                "e sem extremos supported"
+            raise RelationEvidenceRequired(
+                relation_id=relation.id,
+                kind=relation.kind,
+                source_id=relation.source_id.value,
+                target_id=relation.target_id.value,
             )
 
 
@@ -572,6 +590,33 @@ class KnowledgeRepository:
             params.append(validate_kind(kind))
         sql += " ORDER BY entity_id"
         return [self.row_to_entity(row) for row in self.conn.execute(sql, params)]
+
+    def entities_named(
+        self,
+        namespace: str,
+        name: str,
+        kind: str | None = None,
+        owner_id: EntityId | None = None,
+    ) -> tuple[Entity, ...]:
+        canonical = canonical_name(name)
+        if not canonical:
+            return ()
+        scope = canonical_name(namespace)
+        sql = (
+            f"SELECT {ENTITY_COLUMNS} FROM entities "
+            "WHERE canonical=? AND namespace IN (?, '')"
+        )
+        params: list[Any] = [canonical, scope]
+        if kind is not None:
+            sql += " AND kind=?"
+            params.append(validate_kind(kind))
+        if owner_id is not None:
+            sql += " AND owner_id=?"
+            params.append(owner_id.value)
+        sql += " ORDER BY entity_id"
+        return tuple(
+            self.row_to_entity(row) for row in self.conn.execute(sql, params)
+        )
 
     def entity_count(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0])

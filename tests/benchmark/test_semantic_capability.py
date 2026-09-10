@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.benchmark import metrics, runner
+from tests.benchmark import metrics, runner, thresholds
 from tests.benchmark.ground_truth import corpora
 
 MISSING_BY_PROVIDER = {
@@ -20,30 +20,50 @@ NO_PROVIDER_REASON = (
 )
 requires_a_provider = pytest.mark.skipif(not ANY_PROVIDER, reason=NO_PROVIDER_REASON)
 
-MINIMUM_RULE_RECALL = 0.5
-MAXIMUM_UNSUPPORTED_CLAIM_RATE = 0.5
+LEVEL = thresholds.BOOTSTRAP
+BOOTSTRAP_THRESHOLDS = thresholds.THRESHOLDS[LEVEL]
 
 
 @requires_a_provider
 @pytest.mark.parametrize("name", corpora.CORPUS_NAMES)
-def test_real_provider_recovers_the_ground_truth(tmp_path: Path, name: str) -> None:
+def test_real_provider_recovers_the_ground_truth_at_bootstrap_level(
+    tmp_path: Path, name: str
+) -> None:
     provider = AVAILABLE[0]
-    result = runner.run_repository(name, provider, tmp_path / provider)
+    result = runner.run_repository(name, provider, tmp_path / provider, LEVEL)
     assert result.status == "ok", result.reason
+    assert result.level == LEVEL
+    assert result.actual_provider == provider
     assert result.report is not None
-    assert result.report.value("rule_recall") >= MINIMUM_RULE_RECALL
-    assert result.report.value("unsupported_claim_rate") <= MAXIMUM_UNSUPPORTED_CLAIM_RATE
+    for metric in ("rule_recall", "unsupported_claim_rate"):
+        value = result.report.value(metric)
+        assert BOOTSTRAP_THRESHOLDS.passed(metric, value), (LEVEL, metric, value)
 
 
 @requires_a_provider
-def test_real_provider_detects_the_planted_contradiction(tmp_path: Path) -> None:
+def test_real_provider_detects_the_planted_contradiction_at_bootstrap_level(
+    tmp_path: Path,
+) -> None:
     provider = AVAILABLE[0]
-    result = runner.run_repository("java", provider, tmp_path / provider)
+    result = runner.run_repository("java", provider, tmp_path / provider, LEVEL)
     assert result.status == "ok", result.reason
+    assert result.level == LEVEL
     assert result.report is not None
     score = result.report.score("contradiction_detection")
     assert score.denominator == 1
-    assert score.value == 1.0
+    assert BOOTSTRAP_THRESHOLDS.passed("contradiction_detection", score.value)
+
+
+@requires_a_provider
+def test_bootstrap_report_names_its_level_and_thresholds(tmp_path: Path) -> None:
+    provider = AVAILABLE[0]
+    result = runner.run_repository("java", provider, tmp_path / provider, LEVEL)
+    payload = result.to_dict()
+    assert payload["level"] == LEVEL
+    assert payload["requested_provider"] == provider
+    assert payload["actual_provider"] == provider
+    for entry in payload.get("metrics", {}).values():
+        assert set(entry) == {"value", "threshold", "passed"}
 
 
 FORBIDDEN_PROVIDER_TOKENS = ("Script" + "edProvider", "Fake" + "Provider", "fake_" + "provider")
@@ -59,7 +79,7 @@ def test_the_benchmark_never_uses_a_simulated_provider() -> None:
         text = module.read_text(encoding="utf-8")
         for token in FORBIDDEN_PROVIDER_TOKENS:
             assert token not in text, f"{module.name}: {token}"
-    assert checked >= 6
+    assert checked >= 7
 
 
 def test_metrics_module_declares_every_required_metric() -> None:

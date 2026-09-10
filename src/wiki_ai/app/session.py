@@ -22,13 +22,19 @@ __all__ = [
     "FormatUnsupported",
     "AnalysisStatus",
     "AnalysisState",
+    "ResolvedProvider",
     "FORMAT_VERSION",
+    "ANALYSIS_CONTRACT_VERSION",
     "STATE_DIR_NAME",
     "SUBDIRECTORIES",
     "FORMAT_FILE",
     "DATABASE_FILE",
     "LATEST_FILE",
     "ANALYSIS_STATE_FILE",
+    "PREFERENCES_FILE",
+    "PROVIDER_VARIABLE",
+    "PROVIDER_KEY",
+    "PREFERENCE_SOURCES",
     "IGNORE_FILE",
     "IGNORE_CONTENT",
     "HOME_VARIABLE",
@@ -37,18 +43,24 @@ __all__ = [
     "DOCX_DIRECTORY",
     "COMPANION_DIRECTORIES",
     "detect_outdated_store",
+    "objective_hash",
     "repository_identity",
     "state_dir_for",
     "Session",
 ]
 
 FORMAT_VERSION = 2
+ANALYSIS_CONTRACT_VERSION = "1"
 STATE_DIR_NAME = ".wiki-ai"
 SUBDIRECTORIES = ("snapshots", "publications")
 FORMAT_FILE = "format.json"
 DATABASE_FILE = "state.db"
 LATEST_FILE = "latest.json"
 ANALYSIS_STATE_FILE = "analysis_state.json"
+PREFERENCES_FILE = "preferences.json"
+PROVIDER_VARIABLE = "WIKI_AI_PROVIDER"
+PROVIDER_KEY = "provider"
+PREFERENCE_SOURCES = ("argument", "environment", "preferences", "none")
 IGNORE_FILE = ".gitignore"
 IGNORE_CONTENT = "*\n"
 HOME_VARIABLE = "WIKI_AI_HOME"
@@ -146,6 +158,17 @@ def state_dir_for(repo: Path, identity: str, home: str | None = None) -> Path:
     return Path(repo).resolve() / STATE_DIR_NAME
 
 
+def objective_hash(objective: str) -> str:
+    normalized = " ".join(str(objective).split()).lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ResolvedProvider:
+    name: str
+    provider: AgentProvider | None = None
+
+
 @dataclass(frozen=True)
 class AnalysisState:
     observed_digest: str = ""
@@ -153,6 +176,8 @@ class AnalysisState:
     analysis_status: AnalysisStatus = AnalysisStatus.NEVER
     analyzed_at: str = ""
     reason: str = ""
+    analyzed_objective_hash: str = ""
+    contract_version: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -161,6 +186,8 @@ class AnalysisState:
             "analysis_status": self.analysis_status.value,
             "analyzed_at": self.analyzed_at,
             "reason": self.reason,
+            "analyzed_objective_hash": self.analyzed_objective_hash,
+            "contract_version": self.contract_version,
         }
 
     @classmethod
@@ -176,12 +203,17 @@ class AnalysisState:
             analysis_status=status,
             analyzed_at=str(payload.get("analyzed_at", "")),
             reason=str(payload.get("reason", "")),
+            analyzed_objective_hash=str(payload.get("analyzed_objective_hash", "")),
+            contract_version=str(payload.get("contract_version", "")),
         )
 
-    def is_current_for(self, digest: str) -> bool:
+    def is_current_for(self, digest: str, objective_key: str) -> bool:
         return (
             bool(digest)
             and digest == self.analyzed_digest
+            and bool(objective_key)
+            and objective_key == self.analyzed_objective_hash
+            and self.contract_version == ANALYSIS_CONTRACT_VERSION
             and self.analysis_status is AnalysisStatus.COMPLETE
         )
 
@@ -344,12 +376,18 @@ class Session:
             analysis_status=state.analysis_status,
             analyzed_at=state.analyzed_at,
             reason=state.reason,
+            analyzed_objective_hash=state.analyzed_objective_hash,
+            contract_version=state.contract_version,
         )
         self._save_analysis_state(updated)
         return updated
 
     def record_analysis(
-        self, digest: str, status: AnalysisStatus, reason: str = ""
+        self,
+        digest: str,
+        status: AnalysisStatus,
+        reason: str = "",
+        objective_key: str = "",
     ) -> AnalysisState:
         state = self.analysis_state()
         complete = status is AnalysisStatus.COMPLETE
@@ -359,6 +397,12 @@ class Session:
             analysis_status=status,
             analyzed_at=_utc_now() if complete else state.analyzed_at,
             reason=reason,
+            analyzed_objective_hash=(
+                objective_key if complete else state.analyzed_objective_hash
+            ),
+            contract_version=(
+                ANALYSIS_CONTRACT_VERSION if complete else state.contract_version
+            ),
         )
         self._save_analysis_state(updated)
         return updated
@@ -372,13 +416,64 @@ class Session:
     def open_knowledge(self) -> KnowledgeRepository:
         return KnowledgeRepository.open(str(self.database_path))
 
+    @property
+    def preferences_path(self) -> Path:
+        return self.state_dir / PREFERENCES_FILE
+
+    def read_preferences(self) -> Mapping[str, Any]:
+        try:
+            payload = json.loads(self.preferences_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        return payload
+
+    def stored_provider_preference(self) -> str | None:
+        value = str(self.read_preferences().get(PROVIDER_KEY, "")).strip()
+        return value or None
+
+    def write_provider_preference(self, name: str) -> str:
+        chosen = str(name).strip()
+        payload = dict(self.read_preferences())
+        payload[PROVIDER_KEY] = chosen
+        self._write_atomic(
+            self.preferences_path,
+            json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n",
+        )
+        return chosen
+
+    def provider_preference(self, preference: str | None = None) -> str | None:
+        return self.preference_origin(preference)[0]
+
+    def preference_origin(
+        self, preference: str | None = None
+    ) -> tuple[str | None, str]:
+        if preference is not None and preference.strip():
+            return preference.strip(), PREFERENCE_SOURCES[0]
+        from_environment = os.environ.get(PROVIDER_VARIABLE, "").strip()
+        if from_environment:
+            return from_environment, PREFERENCE_SOURCES[1]
+        stored = self.stored_provider_preference()
+        if stored:
+            return stored, PREFERENCE_SOURCES[2]
+        return None, PREFERENCE_SOURCES[3]
+
     def resolve_provider(
         self, registry: ProviderRegistry, preference: str | None = None
-    ) -> AgentProvider | None:
-        try:
-            return registry.resolve(preference)
-        except ProviderUnavailable:
-            return None
+    ) -> ResolvedProvider:
+        wanted = self.provider_preference(preference)
+        if wanted:
+            try:
+                return ResolvedProvider(name=wanted, provider=registry.resolve(wanted))
+            except ProviderUnavailable:
+                return ResolvedProvider(name="")
+        for name in registry.registered():
+            try:
+                return ResolvedProvider(name=name, provider=registry.resolve(name))
+            except ProviderUnavailable:
+                continue
+        return ResolvedProvider(name="")
 
 
 def _utc_now() -> str:

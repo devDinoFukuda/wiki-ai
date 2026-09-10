@@ -19,13 +19,26 @@ from wiki_ai.knowledge.model import (
     Relation,
     SourceVersion,
 )
-from wiki_ai.knowledge.repository import KnowledgeRepository, RevisionTransaction
+from wiki_ai.knowledge.repository import (
+    NAMESPACE_ATTRIBUTE,
+    KnowledgeRepository,
+    RevisionTransaction,
+)
 from wiki_ai.knowledge.taxonomy import REQUIRED_ATTRIBUTES, EntityKind, validate_pair
 from wiki_ai.repository.snapshot import RepositorySnapshot
 
 from wiki_ai.investigation.evidence import to_knowledge
 from wiki_ai.investigation.finding import RelationClaim
-from wiki_ai.investigation.verifier import VerifiedFinding
+from wiki_ai.investigation.target import (
+    RoundIndex,
+    TargetResolution,
+    ambiguity_diagnostic,
+    ambiguity_question,
+    index_of,
+    placeholder_kind,
+    resolve_target,
+)
+from wiki_ai.investigation.verifier import RelationCheck, VerifiedFinding
 
 __all__ = [
     "NormalizationResult",
@@ -41,30 +54,6 @@ _STATE_BY_CONFIDENCE: Mapping[Confidence, KnowledgeState] = {
     Confidence.INFERRED: KnowledgeState.IMPLEMENTED,
     Confidence.CONTRADICTED: KnowledgeState.DECLARED,
     Confidence.UNRESOLVED: KnowledgeState.DECLARED,
-}
-
-_DEFAULT_TARGET_KIND: Mapping[str, EntityKind] = {
-    "calls": EntityKind.OPERATION,
-    "consumes": EntityKind.INPUT,
-    "publishes": EntityKind.EVENT,
-    "reads": EntityKind.PERSISTENCE,
-    "writes": EntityKind.PERSISTENCE,
-    "persists_to": EntityKind.PERSISTENCE,
-    "validates": EntityKind.INPUT,
-    "implements": EntityKind.CAPABILITY,
-    "belongs_to": EntityKind.CAPABILITY,
-    "triggers": EntityKind.FLOW,
-    "handles": EntityKind.FAILURE_MODE,
-    "transitions_to": EntityKind.STATE,
-    "depends_on": EntityKind.DEPENDENCY,
-    "tests": EntityKind.CAPABILITY,
-    "affects": EntityKind.CAPABILITY,
-    "contradicts": EntityKind.BUSINESS_RULE,
-    "supersedes": EntityKind.BUSINESS_RULE,
-    "retries": EntityKind.OPERATION,
-    "falls_back_to": EntityKind.FALLBACK,
-    "declares": EntityKind.CAPABILITY,
-    "proposes_change_to": EntityKind.CAPABILITY,
 }
 
 
@@ -109,12 +98,15 @@ def entity_of(
     source_version_key: str,
     stable_key: str,
     owner_id: EntityId | None = None,
+    namespace: str = "",
 ) -> Entity:
+    attributes = _attribute_payload(item)
+    attributes[NAMESPACE_ATTRIBUTE] = namespace
     return Entity.create(
         kind=item.finding.type.value,
         name=item.finding.subject,
         stable_key=stable_key,
-        attributes=_attribute_payload(item),
+        attributes=attributes,
         state=_STATE_BY_CONFIDENCE[item.confidence],
         confidence=item.confidence,
         source_versions=(source_version_key,),
@@ -122,18 +114,8 @@ def entity_of(
     )
 
 
-def _placeholder_kind(claim: RelationClaim) -> EntityKind:
-    if claim.target_type is not None:
-        return claim.target_type
-    return _DEFAULT_TARGET_KIND.get(claim.kind.value, EntityKind.CAPABILITY)
-
-
 def _placeholder_attributes(kind: EntityKind, subject: str) -> dict[str, Any]:
     return {name: subject for name in REQUIRED_ATTRIBUTES.get(kind, ())}
-
-
-def _stable_key(namespace: str, kind: EntityKind, subject: str) -> str:
-    return contextual_key(namespace, kind.value, None, subject)
 
 
 def _owner_entity_id(
@@ -168,14 +150,13 @@ def normalize(
     by_key: dict[str, VerifiedFinding] = {}
     for item in items:
         by_key[item.finding.stable_key(namespace)] = item
-    subject_index: dict[str, str] = {}
-    for key, item in by_key.items():
-        subject_index.setdefault(item.finding.subject.strip().lower(), key)
 
     entity_ids: dict[str, EntityId] = {}
+    written_entities: set[str] = set()
     written_evidence: set[str] = set()
     relation_ids: set[str] = set()
     unresolved_relations: list[str] = []
+    ambiguous_questions: list[str] = []
     diagnostics: list[str] = []
     opened_gaps: list[str] = []
     collisions: list[str] = []
@@ -186,7 +167,7 @@ def normalize(
         for key in _ownership_order(by_key):
             item = by_key[key]
             owner_id = _owner_entity_id(namespace, item.finding.owner, entity_ids)
-            entity = entity_of(item, version.key, key, owner_id)
+            entity = entity_of(item, version.key, key, owner_id, namespace)
             try:
                 transaction.put_entity(entity)
             except IdentityCollision as exc:
@@ -199,10 +180,18 @@ def normalize(
                     collisions.append(message)
                 continue
             entity_ids[key] = entity.id
+            written_entities.add(entity.id.value)
         for key in rejected:
             by_key.pop(key, None)
         _link_evidence(
             transaction, by_key, entity_ids, snapshot, namespace, stamp, written_evidence
+        )
+        index = index_of(
+            namespace,
+            tuple(
+                (key, item.finding.type, item.finding.subject)
+                for key, item in by_key.items()
+            ),
         )
         relation_ids.update(
             _write_relations(
@@ -210,14 +199,22 @@ def normalize(
                 knowledge,
                 by_key,
                 entity_ids,
-                subject_index,
+                index,
                 version,
+                snapshot,
+                stamp,
                 unresolved_relations,
+                ambiguous_questions,
                 diagnostics,
+                written_entities,
+                written_evidence,
             )
         )
         for question in _unique(tuple(gaps) + tuple(collisions)):
             open_gap(transaction, question, blocking=bool(question in collisions))
+            opened_gaps.append(question)
+        for question in _unique(ambiguous_questions):
+            open_gap(transaction, question, blocking=False)
             opened_gaps.append(question)
         for subject in _unique(unresolved_relations):
             question = f"relation target not found in this run: {subject}"
@@ -225,7 +222,7 @@ def normalize(
             opened_gaps.append(question)
 
     return NormalizationResult(
-        entities_written=len(entity_ids),
+        entities_written=len(written_entities),
         relations_written=len(relation_ids),
         evidence_written=len(written_evidence),
         gaps_opened=tuple(opened_gaps),
@@ -260,78 +257,119 @@ def _link_evidence(
         written.add(evidence_id)
 
 
+def _placeholder_entity(
+    claim: RelationClaim, target: TargetResolution, version: SourceVersion
+) -> Entity:
+    kind = target.kind or placeholder_kind(claim)
+    name = claim.target_subject or claim.label
+    attributes = _placeholder_attributes(kind, name)
+    attributes[NAMESPACE_ATTRIBUTE] = version.source_id
+    return Entity.create(
+        kind=kind.value,
+        name=name,
+        stable_key=target.stable_key,
+        attributes=attributes,
+        state=KnowledgeState.DECLARED,
+        confidence=Confidence.UNRESOLVED,
+        source_versions=(version.key,),
+    )
+
+
+def _relation_confidence(
+    check: RelationCheck, target: TargetResolution, source: Confidence
+) -> Confidence:
+    if not target.resolved:
+        return Confidence.UNRESOLVED
+    if source is Confidence.CONTRADICTED:
+        return Confidence.CONTRADICTED
+    if check.confidence is Confidence.SUPPORTED and source is Confidence.SUPPORTED:
+        return Confidence.SUPPORTED
+    if check.confidence is Confidence.UNRESOLVED:
+        return Confidence.UNRESOLVED
+    return Confidence.INFERRED
+
+
 def _write_relations(
     transaction: RevisionTransaction,
     knowledge: KnowledgeRepository,
     by_key: Mapping[str, VerifiedFinding],
     entity_ids: dict[str, EntityId],
-    subject_index: Mapping[str, str],
+    index: RoundIndex,
     version: SourceVersion,
+    snapshot: RepositorySnapshot,
+    stamp: str,
     unresolved: list[str],
+    ambiguous: list[str],
     diagnostics: list[str],
+    written_entities: set[str],
+    written_evidence: set[str],
 ) -> set[str]:
     written: set[str] = set()
     for key in sorted(by_key):
         item = by_key[key]
-        for claim in item.finding.relations:
-            target = claim.target_subject.strip().lower()
-            target_key = subject_index.get(target)
-            if target_key is None:
-                kind = _placeholder_kind(claim)
-                target_key = _stable_key(version.source_id, kind, claim.target_subject)
-                if target_key not in entity_ids:
-                    placeholder = Entity.create(
-                        kind=kind.value,
-                        name=claim.target_subject,
-                        stable_key=target_key,
-                        attributes=_placeholder_attributes(kind, claim.target_subject),
-                        state=KnowledgeState.DECLARED,
-                        confidence=Confidence.UNRESOLVED,
-                        source_versions=(version.key,),
-                    )
-                    known = knowledge.get_entity(placeholder.id)
-                    if known is None:
+        for position, claim in enumerate(item.finding.relations):
+            target = resolve_target(claim, item.finding.owner, index, knowledge)
+            if target.ambiguous:
+                unresolved.append(claim.label)
+                ambiguous.append(ambiguity_question(claim, target.candidates))
+                diagnostics.append(ambiguity_diagnostic(claim))
+                continue
+            target_id = target.entity_id
+            if target_id is None:
+                continue
+            if not target.resolved:
+                if target.stable_key not in entity_ids:
+                    placeholder = _placeholder_entity(claim, target, version)
+                    if knowledge.get_entity(placeholder.id) is None:
                         transaction.put_entity(placeholder)
-                        unresolved.append(claim.target_subject)
-                    entity_ids[target_key] = placeholder.id
-                else:
-                    unresolved.append(claim.target_subject)
-            source_kind = item.finding.type
-            target_kind_value = _kind_of_key(target_key, by_key, claim)
+                    entity_ids[target.stable_key] = placeholder.id
+                    written_entities.add(placeholder.id.value)
+                unresolved.append(claim.label)
+            target_kind = _kind_of(target, by_key)
             try:
-                validate_pair(claim.kind, source_kind.value, target_kind_value)
+                validate_pair(claim.kind, item.finding.type.value, target_kind)
             except InvalidRelationPair as exc:
                 diagnostics.append(str(exc))
                 continue
+            check = item.relation_check(position)
             relation = Relation.create(
                 kind=claim.kind.value,
                 source_id=entity_ids[key],
-                target_id=entity_ids[target_key],
+                target_id=target_id,
                 attributes=dict(claim.attributes),
-                confidence=_relation_confidence(item.confidence, target_key, by_key),
+                confidence=_relation_confidence(check, target, item.confidence),
             )
             try:
                 transaction.put_relation(relation)
             except KnowledgeError as exc:
                 diagnostics.append(str(exc))
                 continue
+            _link_relation_evidence(
+                transaction,
+                check,
+                relation.id,
+                snapshot,
+                version.source_id,
+                stamp,
+                written_evidence,
+            )
             written.add(relation.id)
     return written
 
 
-def _relation_confidence(
-    source_confidence: Confidence,
-    target_key: str,
-    by_key: Mapping[str, VerifiedFinding],
-) -> Confidence:
-    target = by_key.get(target_key)
-    if target is None:
-        return Confidence.INFERRED
-    if source_confidence is Confidence.SUPPORTED and target.confidence is Confidence.SUPPORTED:
-        return Confidence.SUPPORTED
-    if Confidence.CONTRADICTED in (source_confidence, target.confidence):
-        return Confidence.CONTRADICTED
-    return Confidence.INFERRED
+def _link_relation_evidence(
+    transaction: RevisionTransaction,
+    check: RelationCheck,
+    relation_id: str,
+    snapshot: RepositorySnapshot,
+    namespace: str,
+    stamp: str,
+    written: set[str],
+) -> None:
+    for resolved in check.evidence:
+        _version, evidence = to_knowledge(resolved.capture, snapshot, namespace, stamp)
+        transaction.put_evidence(evidence, relation_ids=(relation_id,))
+        written.add(evidence.id)
 
 
 def _ownership_order(by_key: Mapping[str, VerifiedFinding]) -> tuple[str, ...]:
@@ -350,15 +388,13 @@ def _ownership_order(by_key: Mapping[str, VerifiedFinding]) -> tuple[str, ...]:
     return tuple(first) + tuple(rest)
 
 
-def _kind_of_key(
-    target_key: str,
-    by_key: Mapping[str, VerifiedFinding],
-    claim: RelationClaim,
-) -> str:
-    found = by_key.get(target_key)
+def _kind_of(target: TargetResolution, by_key: Mapping[str, VerifiedFinding]) -> str:
+    found = by_key.get(target.stable_key)
     if found is not None:
         return found.finding.type.value
-    return _placeholder_kind(claim).value
+    if target.kind is not None:
+        return target.kind.value
+    return EntityKind.CAPABILITY.value
 
 
 def _unique(values: Sequence[str]) -> tuple[str, ...]:

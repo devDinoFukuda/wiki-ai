@@ -63,6 +63,7 @@ class BlockReason(str, enum.Enum):
     MANIFEST_DIVERGES = "manifest_diverges_from_package"
     REQUIRED_DOCUMENT_MISSING = "required_document_missing"
     GATE_REFUSED = "publishing_gate_refused"
+    EXISTING_INVALID = "existing_release_invalid"
 
 
 @dataclass(frozen=True)
@@ -174,6 +175,9 @@ class Publisher:
         publication_id = _publication_id(snapshot, _plan_hash(plan))
         existing = _existing(publications_dir, publication_id)
         if existing is not None:
+            problems = _existing_problems(existing, knowledge)
+            if problems:
+                raise PublicationBlocked(problems)
             return PublicationOutcome(
                 publication_id=existing.publication_id,
                 artifacts=existing.manifest.relative_paths,
@@ -264,6 +268,22 @@ def _breach_reasons(breaches: Sequence[PublishingViolation]) -> list[str]:
         f"{BlockReason.GATE_REFUSED.value}: {item.rule.value}: "
         f"{item.relative_path}: {item.detail}"
         for item in breaches
+    ]
+
+
+def _existing_problems(
+    existing: Publication, knowledge: KnowledgeRepository
+) -> list[str]:
+    violations = validate_package(
+        existing.directory, existing.manifest, docx_validator=docx_structure_problems
+    )
+    breaches = gate_check(existing.directory, knowledge)
+    if not violations and not breaches:
+        return []
+    detail = _violation_reasons(violations) + _breach_reasons(breaches)
+    return [
+        f"{BlockReason.EXISTING_INVALID.value}: {existing.publication_id}: {item}"
+        for item in detail
     ]
 
 

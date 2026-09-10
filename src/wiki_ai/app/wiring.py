@@ -132,15 +132,17 @@ class IngestionAdapter:
         self,
         registry: ProviderRegistry,
         engine: IngestionEngine | None = None,
+        preference: str | None = None,
     ) -> None:
         self._registry = registry
+        self._preference = preference
         self._engine = engine if engine is not None else IngestionEngine(
             provider_resolver=self._provider
         )
 
     def _provider(self) -> AgentProvider | None:
         try:
-            return self._registry.resolve()
+            return self._registry.resolve(self._preference)
         except ProviderUnavailable:
             return None
 
@@ -227,18 +229,28 @@ class QueryAdapter:
 
 
 class Wiring:
-    def __init__(self, registry: ProviderRegistry | None = None) -> None:
+    def __init__(
+        self,
+        registry: ProviderRegistry | None = None,
+        provider: str | None = None,
+    ) -> None:
         self._registry = registry if registry is not None else ProviderRegistry(adapters=True)
+        wanted = provider.strip() if provider is not None else ""
+        self._provider = wanted or None
 
     @property
     def registry(self) -> ProviderRegistry:
         return self._registry
 
+    @property
+    def provider(self) -> str | None:
+        return self._provider
+
     def investigation_runner(self) -> InvestigationRunner:
         return InvestigationAdapter()
 
     def ingestion_runner(self) -> IngestionRunner:
-        return IngestionAdapter(self._registry)
+        return IngestionAdapter(self._registry, preference=self._provider)
 
     def update_runner(self) -> UpdateRunner:
         return UpdateAdapter()

@@ -10,6 +10,7 @@ from wiki_ai.ingestion.source import SourceKind
 __all__ = [
     "METHOD_STEPS",
     "EVIDENCE_RULES",
+    "RELATION_RULES",
     "ALLOWED_TYPES_BY_KIND",
     "ALLOWED_RELATIONS_BY_KIND",
     "allowed_types",
@@ -38,6 +39,17 @@ EVIDENCE_RULES: tuple[str, ...] = (
     "the statement must use terms that appear in the captured text",
     "doc.hints are cheap guesses: they never raise confidence and never stand alone",
     "contradicting a hint is allowed and expected whenever the text says otherwise",
+)
+
+RELATION_RULES: tuple[str, ...] = (
+    "a relation names its target the same way a finding names itself: "
+    "target_subject plus target_owner, or target_id when the source spells an id out",
+    "two findings may share a subject under different owners: without target_owner or "
+    "target_id such a relation is ambiguous and is dropped as a gap, never guessed",
+    "a relation carries its own evidence: the capture whose text states that the "
+    "source and the target are connected",
+    "a relation without its own capture is recorded as inferred, never as supported, "
+    "however well evidenced its two ends are",
 )
 
 _TRANSCRIPT_TYPES: tuple[EntityKind, ...] = (
@@ -216,6 +228,7 @@ def build(
         f"Round: {round_number}",
         "Method:\n" + _bullets(METHOD_STEPS),
         "Evidence rules:\n" + _bullets(EVIDENCE_RULES),
+        "Relation rules:\n" + _bullets(RELATION_RULES),
         "Tools available:\n" + _bullets(tuple(tool_names)),
         "Allowed finding types:\n"
         + _bullets(tuple(_type_line(item) for item in allowed_types(kind))),

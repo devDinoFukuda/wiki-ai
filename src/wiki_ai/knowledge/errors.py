@@ -59,6 +59,21 @@ class GapNotFound(KnowledgeError):
     pass
 
 
+class RelationEvidenceRequired(UnsupportedEvidence):
+    def __init__(
+        self, relation_id: str, kind: str, source_id: str, target_id: str
+    ) -> None:
+        super().__init__(
+            f"relação {kind} {source_id} -> {target_id} ({relation_id}) marcada "
+            "supported sem evidência própria; ligue evidência com "
+            "put_evidence(..., relation_ids=(relation.id,))"
+        )
+        self.relation_id = relation_id
+        self.kind = kind
+        self.source_id = source_id
+        self.target_id = target_id
+
+
 @dataclass(frozen=True)
 class IdentityFacts:
     entity_id: str

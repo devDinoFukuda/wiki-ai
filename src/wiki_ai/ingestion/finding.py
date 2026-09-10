@@ -34,6 +34,7 @@ __all__ = [
     "document_finding_schema",
     "parse_finding",
     "parse_findings",
+    "resolve_captures",
     "state_for",
     "verify",
     "owner_from_captures",
@@ -64,18 +65,37 @@ class DocumentEvidenceRef:
 @dataclass(frozen=True)
 class DocumentRelationClaim:
     kind: RelationKind
-    target_subject: str
+    target_subject: str = ""
     target_type: EntityKind | None = None
+    target_owner: str | None = None
+    target_id: str | None = None
+    evidence: tuple[DocumentEvidenceRef, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         target = str(self.target_subject or "").strip()
-        if not target:
+        explicit = str(self.target_id or "").strip()
+        owner = str(self.target_owner or "").strip()
+        if not target and not explicit:
             raise DocumentFindingError(
                 f"relation {self.kind.value} claimed without a target subject"
             )
         object.__setattr__(self, "target_subject", target)
+        object.__setattr__(self, "target_id", explicit or None)
+        object.__setattr__(self, "target_owner", owner or None)
+        object.__setattr__(self, "evidence", tuple(self.evidence))
         object.__setattr__(self, "attributes", dict(self.attributes))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "target_subject": self.target_subject,
+            "target_type": None if self.target_type is None else self.target_type.value,
+            "target_owner": self.target_owner,
+            "target_id": self.target_id,
+            "evidence": [item.to_dict() for item in self.evidence],
+            "attributes": dict(self.attributes),
+        }
 
 
 @dataclass(frozen=True)
@@ -160,6 +180,7 @@ class DocumentFinding:
             "conditions": list(self.conditions),
             "effects": list(self.effects),
             "evidence": [item.to_dict() for item in self.evidence],
+            "relations": [item.to_dict() for item in self.relations],
             "proposed": self.proposed,
             "gap_question": self.gap_question,
         }
@@ -225,6 +246,21 @@ def _texts(value: Any) -> tuple[str, ...]:
     return (str(value),)
 
 
+def _evidence_array_schema() -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["capture_id"],
+            "additionalProperties": False,
+            "properties": {
+                "capture_id": {"type": "string"},
+                "excerpt_hash": {"type": "string"},
+            },
+        },
+    }
+
+
 def document_finding_schema(kind: SourceKind | None = None) -> dict[str, Any]:
     allowed_types = (
         sorted(item.value for item in briefing.allowed_types(kind))
@@ -251,18 +287,7 @@ def document_finding_schema(kind: SourceKind | None = None) -> dict[str, Any]:
             "effects": {"type": "array", "items": {"type": "string"}},
             "proposed": {"type": "boolean"},
             "gap_question": {"type": "string"},
-            "evidence": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["capture_id"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "capture_id": {"type": "string"},
-                        "excerpt_hash": {"type": "string"},
-                    },
-                },
-            },
+            "evidence": _evidence_array_schema(),
             "relations": {
                 "type": "array",
                 "items": {
@@ -273,6 +298,9 @@ def document_finding_schema(kind: SourceKind | None = None) -> dict[str, Any]:
                         "kind": {"type": "string", "enum": allowed_relations},
                         "target_subject": {"type": "string"},
                         "target_type": {"type": "string", "enum": allowed_types},
+                        "target_owner": {"type": "string"},
+                        "target_id": {"type": "string"},
+                        "evidence": _evidence_array_schema(),
                         "attributes": {"type": "object"},
                     },
                 },
@@ -317,6 +345,11 @@ def _relation_claim(payload: Any) -> DocumentRelationClaim:
         kind=relation_kind(str(raw_kind)),
         target_subject=str(payload.get("target_subject") or ""),
         target_type=entity_kind(str(raw_target)) if raw_target else None,
+        target_owner=str(payload.get("target_owner") or "") or None,
+        target_id=str(payload.get("target_id") or "") or None,
+        evidence=tuple(
+            _evidence_ref(item) for item in payload.get("evidence") or ()
+        ),
         attributes=dict(payload.get("attributes") or {}),
     )
 
@@ -413,6 +446,34 @@ def owner_from_captures(captures: Sequence[DocumentEvidenceCapture]) -> str:
     return ""
 
 
+def resolve_captures(
+    refs: Sequence[DocumentEvidenceRef], harness: DocumentHarness
+) -> tuple[
+    tuple[DocumentEvidenceCapture, ...], tuple[Rejection, ...], tuple[str, ...]
+]:
+    captures: list[DocumentEvidenceCapture] = []
+    rejections: list[Rejection] = []
+    reasons: list[str] = []
+    for ref in refs:
+        capture = harness.capture(ref.capture_id)
+        if capture is None:
+            rejections.append(Rejection.EVIDENCE_UNRESOLVED)
+            reasons.append(f"capture {ref.capture_id} was never produced in this run")
+            continue
+        if ref.excerpt_hash and ref.excerpt_hash != capture.excerpt_hash:
+            rejections.append(Rejection.EVIDENCE_TAMPERED)
+            reasons.append(
+                f"capture {ref.capture_id} does not match the text of its blocks"
+            )
+            continue
+        if capture.excerpt_hash != excerpt_hash(capture.excerpt):
+            rejections.append(Rejection.EVIDENCE_TAMPERED)
+            reasons.append(f"capture {ref.capture_id} carries a broken hash")
+            continue
+        captures.append(capture)
+    return tuple(captures), tuple(rejections), tuple(reasons)
+
+
 def verify(
     findings: Sequence[DocumentFinding],
     harness: DocumentHarness,
@@ -422,28 +483,12 @@ def verify(
     results: list[VerifiedDocumentFinding] = []
     gaps: list[str] = []
     for finding in findings:
-        rejections: list[Rejection] = []
-        reasons: list[str] = []
-        captures: list[DocumentEvidenceCapture] = []
-        for ref in finding.evidence:
-            capture = harness.capture(ref.capture_id)
-            if capture is None:
-                rejections.append(Rejection.EVIDENCE_UNRESOLVED)
-                reasons.append(
-                    f"capture {ref.capture_id} was never produced in this run"
-                )
-                continue
-            if ref.excerpt_hash and ref.excerpt_hash != capture.excerpt_hash:
-                rejections.append(Rejection.EVIDENCE_TAMPERED)
-                reasons.append(
-                    f"capture {ref.capture_id} does not match the text of its blocks"
-                )
-                continue
-            if capture.excerpt_hash != excerpt_hash(capture.excerpt):
-                rejections.append(Rejection.EVIDENCE_TAMPERED)
-                reasons.append(f"capture {ref.capture_id} carries a broken hash")
-                continue
-            captures.append(capture)
+        found, found_rejections, found_reasons = resolve_captures(
+            finding.evidence, harness
+        )
+        captures = list(found)
+        rejections: list[Rejection] = list(found_rejections)
+        reasons: list[str] = list(found_reasons)
         if finding.type not in allowed:
             rejections.append(Rejection.TYPE_OUTSIDE_SOURCE_KIND)
             reasons.append(

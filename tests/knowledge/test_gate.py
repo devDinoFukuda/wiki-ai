@@ -84,7 +84,7 @@ def test_supported_relation_without_evidence_is_a_violation(graph):
     assert found[0].target_id == relation.id
 
 
-def test_supported_relation_with_supported_endpoints_passes(graph):
+def test_supported_endpoints_do_not_excuse_a_relation_without_evidence(graph):
     repo = graph.repository
     relation = Relation.create(
         "calls", graph.id("capability"), graph.id("integration")
@@ -94,6 +94,31 @@ def test_supported_relation_with_supported_endpoints_passes(graph):
         revision.put_evidence(
             code_evidence(graph.code_version, "src/integration.py"),
             [graph.id("integration")],
+        )
+    repo.conn.execute(
+        "UPDATE relations SET confidence='supported' WHERE relation_id=?",
+        (relation.id,),
+    )
+    repo.conn.execute("UPDATE entities SET confidence='supported' WHERE entity_id IN (?,?)",
+                      (graph.id("capability").value, graph.id("integration").value))
+    found = [item for item in check(repo, current()) if item.target_id == relation.id]
+    assert rules(found) == [KnowledgeRule.SUPPORTED_WITHOUT_EVIDENCE]
+
+
+def test_supported_relation_with_its_own_evidence_passes(graph):
+    repo = graph.repository
+    relation = Relation.create(
+        "calls", graph.id("capability"), graph.id("integration")
+    )
+    with repo.begin_revision("pipeline", "relacao") as revision:
+        revision.put_relation(relation)
+        revision.put_evidence(
+            code_evidence(graph.code_version, "src/integration.py"),
+            [graph.id("integration")],
+        )
+        revision.put_evidence(
+            code_evidence(graph.code_version, "src/edge.py"),
+            relation_ids=(relation.id,),
         )
     repo.conn.execute(
         "UPDATE relations SET confidence='supported' WHERE relation_id=?",

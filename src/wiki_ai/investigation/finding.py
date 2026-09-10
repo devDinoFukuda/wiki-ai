@@ -22,6 +22,7 @@ __all__ = [
     "MalformedEvidenceRef",
     "EvidenceRef",
     "RelationClaim",
+    "EXPLICIT_TARGET_PREFIX",
     "Finding",
     "parse_finding",
     "parse_findings",
@@ -48,6 +49,9 @@ class MalformedEvidenceRef(FindingError):
 
 class MalformedRelationClaim(FindingError):
     pass
+
+
+EXPLICIT_TARGET_PREFIX = "id:"
 
 
 @dataclass(frozen=True)
@@ -95,26 +99,46 @@ class EvidenceRef:
 @dataclass(frozen=True)
 class RelationClaim:
     kind: RelationKind
-    target_subject: str
+    target_subject: str = ""
     target_type: EntityKind | None = None
+    target_owner: str | None = None
+    target_id: str | None = None
+    evidence: tuple[EvidenceRef, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         target = (self.target_subject or "").strip()
-        if not target:
+        explicit = (self.target_id or "").strip()
+        if not target and not explicit:
             raise MalformedRelationClaim(
-                f"relation {self.kind.value} claimed without a target subject"
+                f"relation {self.kind.value} claimed without a target subject "
+                "and without a target id"
             )
         object.__setattr__(self, "target_subject", target)
+        object.__setattr__(self, "target_id", explicit or None)
+        owner = (self.target_owner or "").strip()
+        object.__setattr__(self, "target_owner", owner or None)
+        object.__setattr__(self, "evidence", tuple(self.evidence))
         object.__setattr__(self, "attributes", dict(self.attributes))
+
+    @property
+    def label(self) -> str:
+        return self.target_subject or f"{EXPLICIT_TARGET_PREFIX}{self.target_id}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind.value,
             "target_subject": self.target_subject,
             "target_type": None if self.target_type is None else self.target_type.value,
+            "target_owner": self.target_owner,
+            "target_id": self.target_id,
+            "evidence": [ref.to_dict() for ref in self.evidence],
             "attributes": dict(self.attributes),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RelationClaim":
+        return _relation_claim(payload)
 
 
 @dataclass(frozen=True)
@@ -241,6 +265,11 @@ def _relation_claim(payload: Any) -> RelationClaim:
         kind=relation_kind(str(raw_kind)),
         target_subject=str(payload.get("target_subject") or ""),
         target_type=entity_kind(str(raw_target_type)) if raw_target_type else None,
+        target_owner=str(payload.get("target_owner") or "") or None,
+        target_id=str(payload.get("target_id") or "") or None,
+        evidence=tuple(
+            _evidence_ref(item) for item in payload.get("evidence") or ()
+        ),
         attributes=dict(payload.get("attributes") or {}),
     )
 
@@ -320,6 +349,41 @@ def parse_findings(
     return tuple(accepted), tuple(rejected)
 
 
+def _evidence_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "capture_id": {"type": "string"},
+            "path": {"type": "string"},
+            "line_start": {"type": "integer"},
+            "line_end": {"type": "integer"},
+            "symbol": {"type": "string"},
+        },
+    }
+
+
+def _relation_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["kind"],
+        "additionalProperties": False,
+        "anyOf": [
+            {"required": ["target_subject"]},
+            {"required": ["target_id"]},
+        ],
+        "properties": {
+            "kind": {"type": "string", "enum": sorted(RELATION_KIND_VALUES)},
+            "target_subject": {"type": "string"},
+            "target_type": {"type": "string", "enum": sorted(ENTITY_KIND_VALUES)},
+            "target_owner": {"type": "string"},
+            "target_id": {"type": "string"},
+            "evidence": {"type": "array", "items": _evidence_schema()},
+            "attributes": {"type": "object"},
+        },
+    }
+
+
 def _type_entries() -> list[dict[str, Any]]:
     return [
         {
@@ -344,40 +408,14 @@ def finding_schema() -> dict[str, Any]:
             "attributes": {"type": "object"},
             "conditions": {"type": "array", "items": {"type": "string"}},
             "effects": {"type": "array", "items": {"type": "string"}},
-            "evidence": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "capture_id": {"type": "string"},
-                        "path": {"type": "string"},
-                        "line_start": {"type": "integer"},
-                        "line_end": {"type": "integer"},
-                        "symbol": {"type": "string"},
-                    },
-                },
-            },
+            "evidence": {"type": "array", "items": _evidence_schema()},
             "confidence": {
                 "type": "string",
                 "enum": [item.value for item in Confidence],
             },
             "relations": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["kind", "target_subject"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "kind": {"type": "string", "enum": sorted(RELATION_KIND_VALUES)},
-                        "target_subject": {"type": "string"},
-                        "target_type": {
-                            "type": "string",
-                            "enum": sorted(ENTITY_KIND_VALUES),
-                        },
-                        "attributes": {"type": "object"},
-                    },
-                },
+                "items": _relation_schema(),
             },
             "contradicts": {"type": "array", "items": {"type": "string"}},
         },

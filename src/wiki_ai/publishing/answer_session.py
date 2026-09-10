@@ -14,6 +14,8 @@ from wiki_ai.agent.session import (
     ToolSpec,
 )
 
+from wiki_ai.knowledge.grounding import check_component
+
 from .answer_fallback import provenance
 from .query_harness import (
     KnowledgeQueryHarness,
@@ -28,6 +30,7 @@ __all__ = [
     "ANSWER_ROUND_CALLS",
     "ANSWER_MAX_SECONDS",
     "ClaimVerdict",
+    "RejectionReason",
     "ValidatedClaim",
     "ValidatedAnswer",
     "AnswerHarnessBridge",
@@ -67,15 +70,32 @@ ANSWER_RULES: tuple[str, ...] = (
     "answering from general reasoning",
     "the answer text is read by a person: no identifiers, no store internals, no "
     "tool names",
+    "an evidence identifier only counts when it is attached to one of the entities "
+    "or relations the same claim cites; evidence borrowed from another entity is "
+    "refused",
+    "the wording of a claim must be sustained by what its evidence and its entities "
+    "actually say; wording the knowledge does not carry is refused",
+    "the free answer text is a draft kept only for audit: the delivered answer is "
+    "assembled from the claims that survive validation, so everything that must be "
+    "read has to live inside a claim",
 )
+
+CLAIM_COMPONENT = "claim"
 
 
 class ClaimVerdict(Enum):
     VALID = "valid"
-    UNGROUNDED = "ungrounded"
+    REJECTED = "rejected"
+
+
+class RejectionReason(Enum):
+    NONE = ""
+    MALFORMED = "malformed_claim"
+    NO_EVIDENCE = "no_evidence"
     UNKNOWN_ENTITY = "unknown_entity"
     UNKNOWN_EVIDENCE = "unknown_evidence"
-    MALFORMED = "malformed"
+    EVIDENCE_NOT_LINKED = "evidence_not_linked"
+    NOT_GROUNDED = "claim_not_grounded"
 
 
 @dataclass(frozen=True)
@@ -85,8 +105,10 @@ class ValidatedClaim:
     evidence_ids: tuple[str, ...]
     confidence: str
     verdict: ClaimVerdict
+    reason: RejectionReason = RejectionReason.NONE
     rejected_entity_ids: tuple[str, ...] = ()
     rejected_evidence_ids: tuple[str, ...] = ()
+    missing_terms: tuple[str, ...] = ()
 
     @property
     def supported(self) -> bool:
@@ -99,8 +121,10 @@ class ValidatedClaim:
             "evidence_ids": list(self.evidence_ids),
             "confidence": self.confidence,
             "verdict": self.verdict.value,
+            "reason": self.reason.value,
             "rejected_entity_ids": list(self.rejected_entity_ids),
             "rejected_evidence_ids": list(self.rejected_evidence_ids),
+            "missing_terms": list(self.missing_terms),
         }
 
 
@@ -187,9 +211,10 @@ def build_briefing(
             "Rules:",
             _numbered("", ANSWER_RULES),
             "",
-            "Return one finding shaped by the declared schema: the answer text, the "
-            "claims it is made of with their entity and evidence identifiers, and "
-            "what stayed unresolved.",
+            "Return one finding shaped by the declared schema: the draft answer "
+            "text, the claims it is made of with their entity and evidence "
+            "identifiers, and what stayed unresolved. Only validated claims reach "
+            "the reader.",
         )
     )
 
@@ -255,53 +280,103 @@ def _identifiers(value: Any) -> tuple[str, ...]:
     return tuple(found)
 
 
+def _rejected(
+    statement: str,
+    entity_ids: tuple[str, ...],
+    evidence_ids: tuple[str, ...],
+    confidence: str,
+    reason: RejectionReason,
+    rejected_entity_ids: tuple[str, ...] = (),
+    rejected_evidence_ids: tuple[str, ...] = (),
+    missing_terms: tuple[str, ...] = (),
+) -> ValidatedClaim:
+    return ValidatedClaim(
+        statement=statement,
+        entity_ids=entity_ids,
+        evidence_ids=evidence_ids,
+        confidence=confidence,
+        verdict=ClaimVerdict.REJECTED,
+        reason=reason,
+        rejected_entity_ids=rejected_entity_ids,
+        rejected_evidence_ids=rejected_evidence_ids,
+        missing_terms=missing_terms,
+    )
+
+
 def _validate_claim(
     raw: Any, harness: KnowledgeQueryHarness
 ) -> ValidatedClaim:
     if not isinstance(raw, Mapping):
-        return ValidatedClaim(
-            statement=str(raw).strip(),
-            entity_ids=(),
-            evidence_ids=(),
-            confidence="",
-            verdict=ClaimVerdict.MALFORMED,
-        )
+        return _rejected(str(raw).strip(), (), (), "", RejectionReason.MALFORMED)
     statement = str(raw.get("statement", "")).strip()
     entity_ids = _identifiers(raw.get("entity_ids"))
     evidence_ids = _identifiers(raw.get("evidence_ids"))
     confidence = str(raw.get("confidence", "")).strip()
     if not statement:
-        return ValidatedClaim(
-            statement=statement,
-            entity_ids=entity_ids,
-            evidence_ids=evidence_ids,
-            confidence=confidence,
-            verdict=ClaimVerdict.MALFORMED,
+        return _rejected(
+            statement, entity_ids, evidence_ids, confidence, RejectionReason.MALFORMED
         )
-    unknown_entities = tuple(
-        identifier for identifier in entity_ids if not harness.entity_exists(identifier)
-    )
     unknown_evidence = tuple(
         identifier
         for identifier in evidence_ids
         if not harness.evidence_exists(identifier)
     )
     if unknown_evidence:
-        verdict = ClaimVerdict.UNKNOWN_EVIDENCE
-    elif unknown_entities:
-        verdict = ClaimVerdict.UNKNOWN_ENTITY
-    elif not evidence_ids:
-        verdict = ClaimVerdict.UNGROUNDED
-    else:
-        verdict = ClaimVerdict.VALID
+        return _rejected(
+            statement,
+            entity_ids,
+            evidence_ids,
+            confidence,
+            RejectionReason.UNKNOWN_EVIDENCE,
+            rejected_evidence_ids=unknown_evidence,
+        )
+    unknown_entities = tuple(
+        identifier for identifier in entity_ids if not harness.entity_exists(identifier)
+    )
+    if unknown_entities:
+        return _rejected(
+            statement,
+            entity_ids,
+            evidence_ids,
+            confidence,
+            RejectionReason.UNKNOWN_ENTITY,
+            rejected_entity_ids=unknown_entities,
+        )
+    if not evidence_ids or not entity_ids:
+        return _rejected(
+            statement, entity_ids, evidence_ids, confidence, RejectionReason.NO_EVIDENCE
+        )
+    unlinked = tuple(
+        identifier
+        for identifier in evidence_ids
+        if not harness.evidence_linked_to(identifier, entity_ids)
+    )
+    if unlinked:
+        return _rejected(
+            statement,
+            entity_ids,
+            evidence_ids,
+            confidence,
+            RejectionReason.EVIDENCE_NOT_LINKED,
+            rejected_evidence_ids=unlinked,
+        )
+    vocabulary = harness.grounding_vocabulary(entity_ids, evidence_ids)
+    grounding = check_component(CLAIM_COMPONENT, statement, vocabulary)
+    if not grounding.ok:
+        return _rejected(
+            statement,
+            entity_ids,
+            evidence_ids,
+            confidence,
+            RejectionReason.NOT_GROUNDED,
+            missing_terms=grounding.required_missing or grounding.terms_missing,
+        )
     return ValidatedClaim(
         statement=statement,
         entity_ids=entity_ids,
         evidence_ids=evidence_ids,
         confidence=confidence,
-        verdict=verdict,
-        rejected_entity_ids=unknown_entities,
-        rejected_evidence_ids=unknown_evidence,
+        verdict=ClaimVerdict.VALID,
     )
 
 
@@ -351,7 +426,16 @@ def provenance_appendix(
 def compose_answer(
     validated: ValidatedAnswer, harness: KnowledgeQueryHarness
 ) -> str:
-    parts = [validated.answer] if validated.answer else []
+    statements: list[str] = []
+    for claim in validated.supported_claims:
+        sentence = claim.statement.rstrip()
+        if not sentence.endswith((".", "!", "?", ":")):
+            sentence = f"{sentence}."
+        if sentence not in statements:
+            statements.append(sentence)
+    if not statements:
+        return ""
+    parts = [" ".join(statements)]
     appendix = provenance_appendix(validated, harness)
     if appendix:
         parts.append("Proveniência:")

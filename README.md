@@ -26,6 +26,8 @@
 | Flags — Codex | `agent/providers/codex.py::_argv` | `exec --sandbox read-only -C <workspace> --skip-git-repo-check --json` + config TOML com `enabled_tools` (allowlist) e `shell_environment_policy.inherit = "none"` |
 | Allowlist MCP | `agent/providers/bridge.py` (`SERVER_NAME = "wiki"`) | Cada provider só habilita as ferramentas MCP do namespace `wiki.*` construídas pela sessão (`session.tool_names()` + `wiki.finish`) |
 | Variável de ambiente | `app/session.py::HOME_VARIABLE = "WIKI_AI_HOME"` | Se definida, o estado do repositório fica em `<WIKI_AI_HOME>/<identity>` em vez de `<repo>/.wiki-ai/` |
+| Preferência de provider | `app/session.py::preference_origin`, `PROVIDER_VARIABLE = "WIKI_AI_PROVIDER"`, `PREFERENCES_FILE = "preferences.json"` | Ordem de precedência: argumento (`Wiring(registry, provider=...)`) → env `WIKI_AI_PROVIDER` → `.wiki-ai/preferences.json` → nenhuma. Sem preferência, `registry.resolve(None)` escolhe o primeiro provider alcançável em ordem alfabética |
+| Provider efetivamente usado | `app/api.py::analyze/ingest/ask` | Todo relatório traz `provider: <nome resolvido>` (`""` quando nenhum provider foi resolvido) — nenhum comando aceita flag de provider; use `wiki-ai provider set` |
 | Timeout padrão | `claude.py`/`codex.py` | `_DEFAULT_TIMEOUT = 900.0` segundos por execução do agente |
 
 ## 4. Fluxo de uso
@@ -39,6 +41,8 @@
 | `wiki-ai status --repo <repo>` | Ver estado atual sem alterar nada | Lê contadores do knowledge store e da última publicação | `entities`, `relations`, `evidence`, `sources`, `pending_update`, `last_publication`, `provider_available` | 0 (sempre `ok`) | Sempre retorna; `pending_update: true` indica que `analyze` deve rodar de novo |
 | `wiki-ai inspect [<repo>]` | Ver inventário de arquivos sem tocar no knowledge store | Faz snapshot + inventário (classificação/linguagem), sem investigar | `total_files`, `analyzable_files`, `by_classification`, `by_language` | 0/1/2 | JSON com `total_files` |
 | `wiki-ai version` | Checar versão instalada | Retorna `__version__` do pacote | `status`, `version` | 0 | `status: "ok"` |
+| `wiki-ai provider show --repo <repo>` | Ver qual provider será usado e de onde veio a preferência | Lê a preferência (argumento → `WIKI_AI_PROVIDER` → `.wiki-ai/preferences.json`) e lista os providers registrados | `status`, `provider` (`""` se não há preferência), `source` (`argument`/`environment`/`preferences`/`none`), `registered` | 0 | `status: "ok"` |
+| `wiki-ai provider set <name> --repo <repo>` | Fixar o provider usado por `analyze`/`ingest`/`ask` | Valida `<name>` contra `registry.registered()` e grava em `.wiki-ai/preferences.json` | `status`, `provider`, `registered`; inválido → `status:"error"`, `reason:"unknown_provider"`, `action` | 0 ok / 1 nome desconhecido | `status: "ok"` e `provider` igual ao nome pedido |
 
 Exit codes (`app/commands.py`): `EXIT_OK=0`, `EXIT_ERROR=1` (payload `status:"error"`), `EXIT_BLOCKED=2` (payload `status:"blocked"`, sempre com `reason`/`action`).
 
@@ -47,7 +51,8 @@ Exit codes (`app/commands.py`): `EXIT_OK=0`, `EXIT_ERROR=1` (payload `status:"er
 | Etapa | Evidência | Comportamento |
 |---|---|---|
 | 1ª execução de `analyze` | `app/api.py::analyze` | Não há snapshot anterior → investigação completa com o `objective` informado (ou `DEFAULT_OBJECTIVE = "describe how this system works"`) |
-| Execução repetida sem mudanças | `analyze`, condição `previous.digest == snapshot.digest` | Retorna `status:"ok"`, `reason:"up_to_date"`, sem rodar o agente |
+| Execução repetida sem mudanças e com o mesmo objective | `analyze`, `state.is_current_for(observation.digest, objective_hash)` | Retorna `status:"ok"`, `reason:"up_to_date"`, sem rodar o agente |
+| Execução repetida sem mudanças mas com outro `--objective` | `analyze`, mesmo teste com `objective_hash` diferente | Não é `up_to_date`: roda investigação nova para o novo objective |
 | Execução após mudanças no repo | `analyze`, `diff(previous, snapshot).is_empty()` falso | Roda `_update_report` → `UpdateEngine` (investigação incremental sobre o diff), invalida conhecimento afetado |
 
 ### Estados tipados de saída
@@ -78,7 +83,7 @@ Como interpretar cada estado / o que fazer:
 | `mode: agentic` | `ask` usou o agente para responder | — |
 | `mode: deterministic_fallback` | `ask` respondeu sem agente, só com dados determinísticos do knowledge store | Configurar provider para respostas mais completas, se necessário |
 
-`up_to_date` (`reason` de `analyze`) só é retornado quando o `analysis_status` da última execução é `complete` para o mesmo `snapshot_digest` (`app/session.py::AnalysisState.is_current_for`) — uma análise `partial`/`blocked`/`failed` não marca o repositório como atualizado, mesmo sem mudanças no digest.
+`up_to_date` (`reason` de `analyze`) só é retornado quando o `analysis_status` da última execução é `complete` **e** o snapshot, o objective e a versão do contrato de análise batem (`app/session.py::AnalysisState.is_current_for(digest, objective_hash)`). A chave de análise é `snapshot_digest` + `objective_hash` (SHA-256 do objective normalizado; o `DEFAULT_OBJECTIVE` tem hash próprio) + `ANALYSIS_CONTRACT_VERSION`, persistidos em `analysis_state.json` como `analyzed_objective_hash` e `contract_version`. Consequências: o mesmo snapshot com um `--objective` diferente **roda uma nova investigação**; um estado gravado antes desses campos, ou com `contract_version` antiga, nunca é considerado atualizado; e uma análise `partial`/`blocked`/`failed` continua não marcando o repositório como atualizado.
 
 ## 5. Formatos de fonte suportados
 

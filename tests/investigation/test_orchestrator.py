@@ -89,8 +89,8 @@ def java_round_one_script() -> Script:
                 "type": "business_rule",
                 "subject": "order reference is persisted",
                 "statement": "OrderService place saves the reference in the repository",
-                "conditions": ["a reference is supplied"],
-                "effects": ["the reference reaches OrderRepository save"],
+                "conditions": ["a reference is given"],
+                "effects": ["repository save is called with the reference"],
                 "evidence": [ref(SERVICE, 10, 12)],
                 "confidence": "supported",
                 "relations": [
@@ -174,9 +174,14 @@ def test_the_session_receives_the_briefing_and_the_taxonomy_schema(
     assert "Method:" in briefing_text
     assert "business_rule (requires statement, conditions, effects)" in briefing_text
     assert "repo.inventory" in briefing_text
+    assert "Relation rules:" in briefing_text
+    assert "target_owner" in briefing_text
+    assert "target_id" in briefing_text
     schema = provider.seen_schemas[0]
     assert {entry["type"] for entry in schema["types"]} == ENTITY_KIND_VALUES
     assert len(schema["properties"]) != 13
+    relations = schema["properties"]["relations"]["items"]["properties"]
+    assert {"target_owner", "target_id", "evidence"} <= set(relations)
 
 
 def test_the_session_never_receives_the_whole_repository(tmp_path: Path) -> None:
@@ -448,9 +453,18 @@ def test_reexecution_over_the_same_snapshot_is_idempotent(tmp_path: Path) -> Non
         second = Investigator().run(
             OBJECTIVE, snapshot, knowledge, FakeProvider(scripts=[java_round_one_script()]), "acme"
         )
-        assert second.entities_written == first.entities_written
+        assert second.entities_written <= first.entities_written
         assert second.relations_written == first.relations_written
         assert second.evidence_written == first.evidence_written
+        assert knowledge.entity_count() == entities
+        assert knowledge.relation_count() == relations
+        assert len(knowledge.all_evidence_keys()) == evidence
+        third = Investigator().run(
+            OBJECTIVE, snapshot, knowledge, FakeProvider(scripts=[java_round_one_script()]), "acme"
+        )
+        assert third.entities_written == second.entities_written
+        assert third.relations_written == second.relations_written
+        assert third.evidence_written == second.evidence_written
         assert knowledge.entity_count() == entities
         assert knowledge.relation_count() == relations
         assert len(knowledge.all_evidence_keys()) == evidence

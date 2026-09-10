@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 from wiki_ai.knowledge.gaps import GAP_BLOCKING, GAP_QUESTION, GAP_STATUS
+from wiki_ai.knowledge.grounding import excerpt_vocabulary
 from wiki_ai.knowledge.model import Entity, EntityId, Evidence, Locator
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
@@ -543,6 +544,16 @@ def build_specs(limits: QueryLimits) -> tuple[QueryToolSpec, ...]:
     )
 
 
+def _flatten(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return " ".join(
+            f"{key} {_flatten(item)}" for key, item in sorted(value.items())
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return " ".join(_flatten(item) for item in value)
+    return str(value)
+
+
 def where_of(locator: Locator) -> str:
     payload = locator.to_dict() if hasattr(locator, "to_dict") else {}
     parts = [
@@ -625,6 +636,52 @@ class KnowledgeQueryHarness:
 
     def evidence_by_id(self, evidence_id: str) -> Evidence | None:
         return self._knowledge.get_evidence(str(evidence_id))
+
+    def entity_by_id(self, entity_id: str) -> Entity | None:
+        return self._knowledge.get_entity(EntityId(str(entity_id)))
+
+    def evidence_linked_to(self, evidence_id: str, entity_ids: Sequence[str]) -> bool:
+        wanted = str(evidence_id)
+        for identifier in entity_ids:
+            owner = EntityId(str(identifier))
+            if any(item.id == wanted for item in self._knowledge.evidence_for(owner)):
+                return True
+            for relation in self._knowledge.relations_of(owner):
+                linked = self._knowledge.evidence_for_relation(relation.id)
+                if any(item.id == wanted for item in linked):
+                    return True
+        return False
+
+    def grounding_vocabulary(
+        self, entity_ids: Sequence[str], evidence_ids: Sequence[str]
+    ) -> frozenset[str]:
+        vocabulary: set[str] = set()
+        for identifier in evidence_ids:
+            evidence = self.evidence_by_id(identifier)
+            if evidence is None:
+                continue
+            vocabulary |= excerpt_vocabulary(where_of(evidence.locator))
+            vocabulary |= excerpt_vocabulary(evidence.source_id)
+        for identifier in entity_ids:
+            entity = self.entity_by_id(identifier)
+            if entity is None:
+                continue
+            vocabulary |= excerpt_vocabulary(entity.name)
+            vocabulary |= excerpt_vocabulary(entity.kind)
+            for key, value in entity.attributes.items():
+                vocabulary |= excerpt_vocabulary(str(key))
+                vocabulary |= excerpt_vocabulary(_flatten(value))
+            for relation in self._knowledge.relations_of(entity.id):
+                vocabulary |= excerpt_vocabulary(relation.kind)
+                other = (
+                    relation.target_id
+                    if relation.source_id == entity.id
+                    else relation.source_id
+                )
+                neighbour = self._knowledge.get_entity(other)
+                if neighbour is not None:
+                    vocabulary |= excerpt_vocabulary(neighbour.name)
+        return frozenset(vocabulary)
 
     def _known(self, entity_id: Any) -> EntityId:
         identifier = EntityId(str(entity_id))

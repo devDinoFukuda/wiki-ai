@@ -16,6 +16,7 @@ from .errors import (
     MissingRequiredAttribute,
     PayloadInvalid,
     RelationCycle,
+    RelationEvidenceRequired,
     RevisionClosed,
     UnknownKind,
     UnknownReference,
@@ -34,6 +35,14 @@ from .evidence import (
 from .gaps import blocking_gaps, close_gap, is_blocking, open_gap, open_gaps
 from .gate import KnowledgeProvenance, KnowledgeRule, KnowledgeViolation
 from .gate import check as knowledge_gate
+from .grounding import (
+    GroundingCheck,
+    check_component,
+    excerpt_vocabulary,
+    key_terms,
+    mandatory_terms,
+    symbol_defined_or_referenced,
+)
 from .identity import canonical_name, content_hash, contextual_key, entity_id
 from .invalidation import Invalidation, invalidate
 from .model import (
@@ -87,6 +96,7 @@ __all__ = [
     "FlowStepView",
     "FormatVersionMismatch",
     "GapNotFound",
+    "GroundingCheck",
     "IdentityCollision",
     "IdentityFacts",
     "ImpactReport",
@@ -108,6 +118,7 @@ __all__ = [
     "REQUIRED_ATTRIBUTES",
     "Relation",
     "RelationCycle",
+    "RelationEvidenceRequired",
     "RelationKind",
     "Revision",
     "RevisionClosed",
@@ -120,19 +131,24 @@ __all__ = [
     "UnsupportedEvidence",
     "blocking_gaps",
     "canonical_name",
+    "check_component",
     "close_gap",
     "content_hash",
     "contextual_key",
     "contradiction_between",
     "correlate",
     "entity_id",
+    "excerpt_vocabulary",
     "invalidate",
     "is_blocking",
+    "key_terms",
     "knowledge_gate",
     "locator_from_dict",
     "make_evidence",
+    "mandatory_terms",
     "open_gap",
     "open_gaps",
+    "symbol_defined_or_referenced",
     "validate_attributes",
     "validate_pair",
 ]

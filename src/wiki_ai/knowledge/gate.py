@@ -85,23 +85,14 @@ def _supported_without_evidence(
             continue
         if repository.evidence_for_relation(relation.id):
             continue
-        endpoints = (
-            repository.get_entity(relation.source_id),
-            repository.get_entity(relation.target_id),
-        )
-        if all(
-            node is not None and node.confidence is Confidence.SUPPORTED
-            for node in endpoints
-        ):
-            continue
         found.append(
             KnowledgeViolation(
                 rule=KnowledgeRule.SUPPORTED_WITHOUT_EVIDENCE,
                 target_kind=RELATION_TARGET,
                 target_id=relation.id,
                 detail=(
-                    f"relação {relation.kind} supported sem evidência própria "
-                    "e sem extremos supported"
+                    f"relação {relation.kind} {relation.source_id.value} -> "
+                    f"{relation.target_id.value} supported sem evidência própria"
                 ),
             )
         )

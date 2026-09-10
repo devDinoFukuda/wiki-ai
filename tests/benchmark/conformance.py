@@ -17,6 +17,10 @@ from wiki_ai.knowledge.taxonomy import EntityKind
 __all__ = [
     "PROGRAM_NAME",
     "PAIR",
+    "STATUS_PROVIDER_MISMATCH",
+    "MISMATCH_REASON",
+    "EXIT_PROVIDER_MISMATCH",
+    "comparable",
     "KnowledgeShape",
     "ShapeDiff",
     "shape_of",
@@ -29,6 +33,9 @@ __all__ = [
 
 PROGRAM_NAME = "tests.benchmark.conformance"
 PAIR: tuple[str, str] = ("claude", "codex")
+STATUS_PROVIDER_MISMATCH = runner.STATUS_PROVIDER_MISMATCH
+MISMATCH_REASON = "compared_runs_used_a_different_provider"
+EXIT_PROVIDER_MISMATCH = 4
 
 
 @dataclass(frozen=True)
@@ -175,13 +182,26 @@ def _run_one(repository: str, provider: str, workspace: Path) -> tuple[
     runner.RunResult, KnowledgeShape | None
 ]:
     result = runner.run_repository(repository, provider, workspace / provider)
-    if result.status != "ok":
+    if result.status != "ok" or not result.provider_matches():
         return result, None
     corpus_root = workspace / provider / repository
     session = Session.open(corpus_root)
     with session.open_knowledge() as knowledge:
         shape = shape_of(knowledge, provider)
     return result, shape
+
+
+def comparable(first: runner.RunResult, second: runner.RunResult) -> bool:
+    return first.provider_matches() and second.provider_matches()
+
+
+def _mismatch_entry(result: runner.RunResult) -> dict[str, Any]:
+    return {
+        "provider": result.provider,
+        "requested_provider": result.provider,
+        "actual_provider": result.actual_provider,
+        "status": result.status,
+    }
 
 
 def run(repository: str, workspace: Path | None = None) -> dict[str, Any]:
@@ -203,6 +223,7 @@ def run(repository: str, workspace: Path | None = None) -> dict[str, Any]:
     )
     holder.mkdir(parents=True, exist_ok=True)
     comparisons: list[dict[str, Any]] = []
+    mismatched: list[dict[str, Any]] = []
     for name in repositories:
         first_result, first_shape = _run_one(name, PAIR[0], holder / name)
         second_result, second_shape = _run_one(name, PAIR[1], holder / name)
@@ -211,6 +232,22 @@ def run(repository: str, workspace: Path | None = None) -> dict[str, Any]:
             PAIR[0]: first_result.to_dict(),
             PAIR[1]: second_result.to_dict(),
         }
+        if not comparable(first_result, second_result):
+            entry["comparable"] = False
+            entry["reason"] = MISMATCH_REASON
+            mismatched.append(
+                {
+                    "repository": name,
+                    "runs": [
+                        _mismatch_entry(result)
+                        for result in (first_result, second_result)
+                        if not result.provider_matches()
+                    ],
+                }
+            )
+            comparisons.append(entry)
+            continue
+        entry["comparable"] = True
         if first_shape is not None and second_shape is not None:
             entry["knowledge_diff"] = compare_shapes(first_shape, second_shape).to_dict()
         if first_result.report is not None and second_result.report is not None:
@@ -218,6 +255,15 @@ def run(repository: str, workspace: Path | None = None) -> dict[str, Any]:
                 first_result.report, second_result.report
             )
         comparisons.append(entry)
+    if mismatched:
+        return {
+            "status": STATUS_PROVIDER_MISMATCH,
+            "reason": MISMATCH_REASON,
+            "providers": list(PAIR),
+            "workspace": holder.as_posix(),
+            "mismatched": mismatched,
+            "comparisons": comparisons,
+        }
     failed = [entry for entry in comparisons if "knowledge_diff" not in entry]
     return {
         "status": "ok" if not failed else "partial",
@@ -230,6 +276,11 @@ def run(repository: str, workspace: Path | None = None) -> dict[str, Any]:
 def render_table(payload: Mapping[str, Any]) -> str:
     if payload.get("status") == "skipped":
         return f"skipped: {payload.get('reason')} ({', '.join(payload.get('missing', []))})"
+    if payload.get("status") == STATUS_PROVIDER_MISMATCH:
+        names = sorted(
+            str(entry.get("repository", "")) for entry in payload.get("mismatched", ())
+        )
+        return f"{STATUS_PROVIDER_MISMATCH}: {payload.get('reason')} ({', '.join(names)})"
     rows = [["repository", "identical", "entity_kind_diffs", "relation_kind_diffs"]]
     for entry in payload.get("comparisons", ()):
         diff = entry.get("knowledge_diff")
@@ -281,6 +332,8 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
     print(render_table(payload), file=output)
     if payload.get("status") == "skipped":
         return runner.EXIT_SKIPPED
+    if payload.get("status") == STATUS_PROVIDER_MISMATCH:
+        return EXIT_PROVIDER_MISMATCH
     if payload.get("status") == "error":
         return runner.EXIT_ERROR
     return runner.EXIT_OK

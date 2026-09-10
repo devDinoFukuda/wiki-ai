@@ -168,6 +168,7 @@ def test_no_codescan_no_sbindex_and_no_monolithic_command_line() -> None:
         "status",
         "version",
         "inspect",
+        "provider",
     )
     surface = root / "src" / "wiki_ai" / "app" / "commands.py"
     assert len(surface.read_text(encoding="utf-8").splitlines()) < 500

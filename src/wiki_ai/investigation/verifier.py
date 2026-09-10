@@ -12,8 +12,8 @@ from wiki_ai.repository.evidence import EvidenceCapture, verify as verify_captur
 from wiki_ai.repository.snapshot import RepositorySnapshot
 
 from wiki_ai.investigation.evidence import CaptureRegistry, capture_id, detect_content
-from wiki_ai.investigation.finding import EvidenceRef, Finding
-from wiki_ai.investigation.grounding import (
+from wiki_ai.investigation.finding import EvidenceRef, Finding, RelationClaim
+from wiki_ai.knowledge.grounding import (
     GroundingCheck,
     check_component,
     excerpt_vocabulary,
@@ -24,6 +24,8 @@ __all__ = [
     "Rejection",
     "ResolvedEvidence",
     "GroundingCheck",
+    "RelationCheck",
+    "verify_relation",
     "VerifiedFinding",
     "VerificationReport",
     "DECOMPOSED_KINDS",
@@ -87,6 +89,28 @@ class ResolvedEvidence:
 
 
 @dataclass(frozen=True)
+class RelationCheck:
+    index: int
+    evidence_valid: bool = False
+    claim_supported: bool = False
+    confidence: Confidence = Confidence.INFERRED
+    evidence: tuple[ResolvedEvidence, ...] = ()
+    grounding: tuple[GroundingCheck, ...] = ()
+    reasons: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "evidence_valid": self.evidence_valid,
+            "claim_supported": self.claim_supported,
+            "confidence": self.confidence.value,
+            "evidence": [item.to_dict() for item in self.evidence],
+            "grounding": [item.to_dict() for item in self.grounding],
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass(frozen=True)
 class VerifiedFinding:
     finding: Finding
     confidence: Confidence
@@ -96,7 +120,14 @@ class VerifiedFinding:
     evidence_valid: bool = False
     claim_supported: bool = False
     grounding: tuple[GroundingCheck, ...] = ()
+    relation_checks: tuple[RelationCheck, ...] = ()
     stable_key: str = ""
+
+    def relation_check(self, index: int) -> RelationCheck:
+        for item in self.relation_checks:
+            if item.index == index:
+                return item
+        return RelationCheck(index=index)
 
     @property
     def subject(self) -> str:
@@ -115,6 +146,7 @@ class VerifiedFinding:
             "claim_supported": self.claim_supported,
             "grounding": [item.to_dict() for item in self.grounding],
             "evidence": [item.to_dict() for item in self.evidence],
+            "relation_checks": [item.to_dict() for item in self.relation_checks],
             "rejections": [item.value for item in self.rejections],
             "reasons": list(self.reasons),
         }
@@ -222,6 +254,84 @@ def ground(
     decomposed = tuple(item for item in checks if item.component != "symbol")
     supported = bool(decomposed) and all(item.ok for item in decomposed)
     return tuple(checks), supported and symbol.ok
+
+
+def _relation_grounding(
+    finding: Finding,
+    claim: RelationClaim,
+    resolved: Sequence[ResolvedEvidence],
+) -> tuple[tuple[GroundingCheck, ...], bool]:
+    executable = _executable_vocabulary(resolved)
+    if not executable:
+        return (), False
+    source = symbol_defined_or_referenced(finding.subject, executable)
+    target_text = claim.target_subject or claim.target_id or ""
+    target = check_component("relation_target", target_text, executable)
+    checks = (source, target)
+    return checks, source.ok and target.ok
+
+
+def verify_relation(
+    finding: Finding,
+    claim: RelationClaim,
+    index: int,
+    registry: CaptureRegistry,
+    snapshot: RepositorySnapshot,
+) -> RelationCheck:
+    resolved: list[ResolvedEvidence] = []
+    reasons: list[str] = []
+    for ref in claim.evidence:
+        item, rejection, reason = _resolve(ref, registry, snapshot)
+        if item is not None:
+            resolved.append(item)
+            continue
+        if reason:
+            reasons.append(reason)
+        if rejection is Rejection.EVIDENCE_TAMPERED:
+            return RelationCheck(
+                index=index,
+                confidence=Confidence.UNRESOLVED,
+                reasons=tuple(reasons),
+            )
+    if not claim.evidence:
+        return RelationCheck(
+            index=index,
+            confidence=Confidence.INFERRED,
+            reasons=(
+                f"relation {claim.kind.value} to {claim.label!r} carries no evidence "
+                "of its own",
+            ),
+        )
+    if not resolved:
+        return RelationCheck(
+            index=index,
+            confidence=Confidence.INFERRED,
+            reasons=tuple(reasons),
+        )
+    grounding, grounded = _relation_grounding(finding, claim, resolved)
+    executable = any(item.executable for item in resolved)
+    if not grounded or not executable:
+        reasons.append(
+            f"relation {claim.kind.value} to {claim.label!r} is not grounded in an "
+            f"executable excerpt naming both {finding.subject!r} and the target"
+        )
+        return RelationCheck(
+            index=index,
+            evidence_valid=True,
+            confidence=Confidence.INFERRED,
+            evidence=tuple(resolved),
+            grounding=grounding,
+            reasons=tuple(reasons),
+        )
+    return RelationCheck(
+        index=index,
+        evidence_valid=True,
+        claim_supported=True,
+        confidence=Confidence.SUPPORTED,
+        evidence=tuple(resolved),
+        grounding=grounding,
+        reasons=tuple(reasons),
+    )
 
 
 def _resolve(
@@ -348,6 +458,10 @@ def verify(
             if Rejection.CONTRADICTED_BY_PEER not in rejections:
                 rejections.append(Rejection.CONTRADICTED_BY_PEER)
             reasons.extend(contradiction)
+        relation_checks = tuple(
+            verify_relation(finding, claim, index, registry, snapshot)
+            for index, claim in enumerate(finding.relations)
+        )
         item = VerifiedFinding(
             finding=finding,
             confidence=confidence,
@@ -357,6 +471,7 @@ def verify(
             evidence_valid=assessment.evidence_valid,
             claim_supported=assessment.claim_supported,
             grounding=assessment.grounding,
+            relation_checks=relation_checks,
             stable_key=stable_key,
         )
         counts[confidence.value] = counts.get(confidence.value, 0) + 1

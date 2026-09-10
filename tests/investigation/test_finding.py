@@ -148,3 +148,73 @@ def test_schema_exposes_owner_and_explicit_id() -> None:
     properties = finding_schema()["properties"]
     assert "owner" in properties
     assert "explicit_id" in properties
+
+
+def relation_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "kind": "calls",
+        "target_subject": "Eligibility",
+        "target_type": "business_rule",
+        "target_owner": "Billing",
+        "target_id": "RULE-7",
+        "evidence": [
+            {
+                "capture_id": "",
+                "path": "src/Order.java",
+                "line_start": 3,
+                "line_end": 5,
+                "symbol": "",
+            }
+        ],
+        "attributes": {"note": "wired in the constructor"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_relation_claim_carries_owner_id_and_its_own_evidence() -> None:
+    claim = RelationClaim.from_dict(relation_payload())
+    assert claim.target_owner == "Billing"
+    assert claim.target_id == "RULE-7"
+    assert claim.evidence[0].path == "src/Order.java"
+    assert claim.to_dict() == relation_payload()
+
+
+def test_a_relation_claim_may_be_identified_only_by_target_id() -> None:
+    claim = RelationClaim.from_dict(
+        {"kind": "calls", "target_id": "RULE-7"}
+    )
+    assert claim.target_subject == ""
+    assert claim.target_id == "RULE-7"
+    assert claim.label == "id:RULE-7"
+
+
+def test_a_relation_claim_without_subject_and_without_id_is_rejected() -> None:
+    with pytest.raises(Exception):
+        RelationClaim(kind=RelationKind.CALLS, target_subject="  ")
+
+
+def test_the_schema_offered_to_the_provider_exposes_the_relation_fields() -> None:
+    relations = finding_schema()["properties"]["relations"]["items"]
+    assert set(relations["properties"]) == {
+        "kind",
+        "target_subject",
+        "target_type",
+        "target_owner",
+        "target_id",
+        "evidence",
+        "attributes",
+    }
+    assert relations["required"] == ["kind"]
+    assert {"required": ["target_subject"]} in relations["anyOf"]
+    assert {"required": ["target_id"]} in relations["anyOf"]
+    assert relations["properties"]["evidence"]["items"]["properties"]["capture_id"]
+
+
+def test_a_parsed_finding_keeps_the_relation_owner_id_and_evidence() -> None:
+    parsed = parse_finding(rule_payload(relations=[relation_payload()]))
+    claim = parsed.relations[0]
+    assert claim.target_owner == "Billing"
+    assert claim.target_id == "RULE-7"
+    assert claim.evidence[0].line_start == 3
+    assert parsed.to_dict()["relations"][0] == relation_payload()

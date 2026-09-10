@@ -68,10 +68,13 @@ def loaded(tmp_path):
         revision.put_entity(intact)
         revision.put_evidence(changed_evidence, [changed.id])
         revision.put_evidence(intact_evidence, [intact.id])
-        revision.put_relation(
-            Relation.create(
-                "contradicts", changed.id, intact.id, confidence=Confidence.SUPPORTED
-            )
+        contradiction = Relation.create(
+            "contradicts", changed.id, intact.id, confidence=Confidence.SUPPORTED
+        )
+        revision.put_relation(contradiction)
+        revision.put_evidence(
+            evidence_of(previous, "src/Contradiction.java", "clash"),
+            relation_ids=(contradiction.id,),
         )
     yield repository, previous, changed, intact, changed_evidence, intact_evidence
     repository.close()

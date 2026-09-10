@@ -13,6 +13,7 @@ from wiki_ai.agent.session import AgentRun, BudgetUsage, RunStatus
 from wiki_ai.app import api
 from wiki_ai.app.ports import InvestigationOutcome, OutcomeStatus
 from wiki_ai.app.session import (
+    ANALYSIS_CONTRACT_VERSION,
     ANALYSIS_STATE_FILE,
     CODESCAN_DIRECTORY,
     COMPANION_DIRECTORIES,
@@ -21,6 +22,7 @@ from wiki_ai.app.session import (
     STATE_DIR_NAME,
     AnalysisStatus,
     Session,
+    objective_hash,
 )
 from wiki_ai.app.wiring import Wiring
 from wiki_ai.ingestion.source import SourceKind
@@ -186,6 +188,7 @@ def test_ask_on_empty_knowledge_is_blocked(tmp_path: Path) -> None:
     assert report.to_dict() == {
         "status": "blocked",
         "question": "how does renewal work",
+        "provider": "",
         "reason": "knowledge_empty",
         "action": "run analyze or ingest first",
     }
@@ -399,11 +402,15 @@ def test_the_analysis_state_file_holds_the_documented_fields(tmp_path: Path) -> 
         "analysis_status",
         "analyzed_at",
         "reason",
+        "analyzed_objective_hash",
+        "contract_version",
     }
     assert payload["analyzed_digest"] == report.snapshot_digest
     assert payload["observed_digest"] == report.snapshot_digest
     assert payload["analysis_status"] == AnalysisStatus.COMPLETE.value
     assert payload["analyzed_at"]
+    assert payload["analyzed_objective_hash"] == objective_hash(api.DEFAULT_OBJECTIVE)
+    assert payload["contract_version"] == ANALYSIS_CONTRACT_VERSION
 
 
 def test_analyze_materializes_the_snapshot_in_the_session_store(tmp_path: Path) -> None:
@@ -465,3 +472,149 @@ def test_ask_reports_the_answer_mode(tmp_path: Path) -> None:
     report = api.ask("what changed", repo, Wiring())
     assert report.status == "ok"
     assert report.to_dict().get("mode", "") == report.mode
+
+
+def test_a_different_objective_reruns_the_investigation(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    first = api.analyze(tmp_path, "how does renewal work", _WiringWithInvestigation())
+    assert first.status == "ok"
+    assert first.reason != api.UP_TO_DATE
+    repeated = api.analyze(tmp_path, "how does renewal work", _WiringWithInvestigation())
+    assert repeated.reason == api.UP_TO_DATE
+    other = api.analyze(tmp_path, "how does billing work", _WiringWithInvestigation())
+    assert other.reason != api.UP_TO_DATE
+    assert other.details["objective"] == "how does billing work"
+
+
+def test_the_default_objective_has_its_own_analysis_key(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    api.analyze(tmp_path, wiring=_WiringWithInvestigation())
+    repeated = api.analyze(tmp_path, wiring=_WiringWithInvestigation())
+    assert repeated.reason == api.UP_TO_DATE
+    explicit = api.analyze(tmp_path, api.DEFAULT_OBJECTIVE, _WiringWithInvestigation())
+    assert explicit.reason == api.UP_TO_DATE
+    other = api.analyze(tmp_path, "how does renewal work", _WiringWithInvestigation())
+    assert other.reason != api.UP_TO_DATE
+
+
+def test_a_state_without_the_analysis_contract_fields_is_not_current(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    api.analyze(tmp_path, "how does renewal work", _WiringWithInvestigation())
+    state_path = tmp_path / STATE_DIR_NAME / ANALYSIS_STATE_FILE
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    del payload["analyzed_objective_hash"]
+    del payload["contract_version"]
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    report = api.analyze(tmp_path, "how does renewal work", _WiringWithInvestigation())
+    assert report.reason != api.UP_TO_DATE
+
+
+def test_a_contract_version_bump_reinvestigates(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    api.analyze(tmp_path, "how does renewal work", _WiringWithInvestigation())
+    state_path = tmp_path / STATE_DIR_NAME / ANALYSIS_STATE_FILE
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["contract_version"] = ANALYSIS_CONTRACT_VERSION + "0"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    report = api.analyze(tmp_path, "how does renewal work", _WiringWithInvestigation())
+    assert report.reason != api.UP_TO_DATE
+    assert report.status == "ok"
+
+
+def test_analyze_reports_the_resolved_provider(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    report = api.analyze(tmp_path, "how does renewal work", _WiringWithInvestigation())
+    assert report.provider == "probe"
+    assert report.to_dict()["provider"] == "probe"
+
+
+def test_analyze_without_a_provider_reports_an_empty_provider(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    report = api.analyze(tmp_path, wiring=Wiring())
+    assert report.provider == ""
+    assert report.to_dict()["provider"] == ""
+
+
+def test_ingest_reports_the_resolved_provider(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    source = tmp_path / "notes.md"
+    source.write_text("# renewal\n", encoding="utf-8")
+    report = api.ingest(source, repo, _WiringWithProvider())
+    assert report.provider == "probe"
+    assert report.to_dict()["provider"] == "probe"
+
+
+def test_ask_reports_the_resolved_provider(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    source = tmp_path / "notes.md"
+    source.write_text("# renewal\n", encoding="utf-8")
+    api.ingest(source, repo, Wiring())
+    report = api.ask("what changed", repo, _WiringWithProvider())
+    assert report.provider == "probe"
+    assert report.to_dict()["provider"] == "probe"
+
+
+def test_the_provider_preference_is_read_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo(tmp_path)
+    monkeypatch.setenv("WIKI_AI_PROVIDER", "absent")
+    report = api.analyze(tmp_path, wiring=_WiringWithInvestigation())
+    assert report.status == "blocked"
+    assert report.reason == "agent_provider_unavailable"
+    assert report.provider == ""
+
+
+def test_an_explicit_wiring_preference_outranks_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo(tmp_path)
+    monkeypatch.setenv("WIKI_AI_PROVIDER", "absent")
+    registry = ProviderRegistry()
+    registry.register("probe", _Provider)
+    report = api.provider_show(tmp_path, Wiring(registry, provider="probe"))
+    assert report.provider == "probe"
+    assert report.source == "argument"
+
+
+def test_provider_set_persists_and_is_honoured(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    registry = ProviderRegistry()
+    registry.register("probe", _Provider)
+    written = api.provider_set("probe", tmp_path, Wiring(registry))
+    assert written.status == "ok"
+    assert written.provider == "probe"
+    shown = api.provider_show(tmp_path, Wiring(registry))
+    assert shown.provider == "probe"
+    assert shown.source == "preferences"
+    assert "probe" in shown.registered
+
+
+def test_provider_set_rejects_an_unregistered_name(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    registry = ProviderRegistry()
+    registry.register("probe", _Provider)
+    report = api.provider_set("absent", tmp_path, Wiring(registry))
+    assert report.status == "error"
+    assert report.reason == "unknown_provider"
+    assert report.registered == ("probe",)
+    assert api.provider_show(tmp_path, Wiring(registry)).provider == ""
+
+
+def test_the_stored_preference_selects_the_provider_used_by_analyze(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    registry = ProviderRegistry()
+    registry.register("probe", _Provider)
+    registry.register("aardvark", _Provider)
+    api.provider_set("probe", tmp_path, Wiring(registry))
+
+    class _Wired(Wiring):
+        def investigation_runner(self) -> Any:
+            return _Investigation()
+
+    report = api.analyze(tmp_path, "how does renewal work", _Wired(registry))
+    assert report.provider == "probe"

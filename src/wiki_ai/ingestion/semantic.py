@@ -23,10 +23,19 @@ from wiki_ai.knowledge.model import (
     Relation,
     SourceVersion,
 )
-from wiki_ai.knowledge.repository import KnowledgeRepository, RevisionTransaction
-from wiki_ai.knowledge.taxonomy import REQUIRED_ATTRIBUTES, EntityKind, RelationKind, validate_pair
+from wiki_ai.knowledge.repository import (
+    NAMESPACE_ATTRIBUTE,
+    KnowledgeRepository,
+    RevisionTransaction,
+)
+from wiki_ai.knowledge.taxonomy import (
+    REQUIRED_ATTRIBUTES,
+    EntityKind,
+    entity_kind,
+    validate_pair,
+)
 
-from wiki_ai.ingestion import briefing
+from wiki_ai.ingestion import briefing, relations
 from wiki_ai.ingestion.finding import (
     DEFAULT_NAMESPACE,
     DocumentEvidenceRef,
@@ -39,6 +48,7 @@ from wiki_ai.ingestion.finding import (
     state_for,
     parse_finding,
     parse_findings,
+    resolve_captures,
     verify,
 )
 from wiki_ai.ingestion.harness import (
@@ -46,7 +56,6 @@ from wiki_ai.ingestion.harness import (
     DocumentHarness,
     DocumentToolError,
 )
-from wiki_ai.ingestion.hints import normalize_text
 from wiki_ai.ingestion.outcome import SemanticFault
 from wiki_ai.ingestion.pipeline import IngestedSource
 
@@ -156,6 +165,7 @@ def _entity_of(
     if item.reasons:
         payload["verification_notes"] = list(item.reasons)
     payload["origin"] = "document"
+    payload[NAMESPACE_ATTRIBUTE] = item.finding.namespace
     if item.finding.owner:
         payload["owner"] = item.finding.owner
     return Entity.create(
@@ -177,28 +187,15 @@ def _owner_entity(
         kind=EntityKind.SOURCE.value,
         name=owner,
         stable_key=contextual_key(namespace, EntityKind.SOURCE.value, None, owner),
-        attributes={"origin": "document", "locator_root": uri},
+        attributes={
+            "origin": "document",
+            "locator_root": uri,
+            NAMESPACE_ATTRIBUTE: namespace,
+        },
         state=KnowledgeState.DECLARED,
         confidence=Confidence.UNRESOLVED,
         source_versions=(source_version_key,),
     )
-
-
-_DEFAULT_TARGET_KIND: Mapping[str, EntityKind] = {
-    RelationKind.CALLS.value: EntityKind.MODULE,
-    RelationKind.CONSUMES.value: EntityKind.INTEGRATION,
-    RelationKind.PUBLISHES.value: EntityKind.EVENT,
-    RelationKind.DEPENDS_ON.value: EntityKind.DEPENDENCY,
-    RelationKind.VALIDATES.value: EntityKind.DATA_FIELD,
-    RelationKind.TRANSITIONS_TO.value: EntityKind.STATE,
-    RelationKind.PERSISTS_TO.value: EntityKind.PERSISTENCE,
-    RelationKind.BELONGS_TO.value: EntityKind.MODULE,
-    RelationKind.DECLARES.value: EntityKind.BUSINESS_RULE,
-    RelationKind.AFFECTS.value: EntityKind.CAPABILITY,
-    RelationKind.PROPOSES_CHANGE_TO.value: EntityKind.CAPABILITY,
-    RelationKind.SUPERSEDES.value: EntityKind.DECISION_RECORD,
-    RelationKind.CONTRADICTS.value: EntityKind.BUSINESS_RULE,
-}
 
 
 class SemanticInvestigator:
@@ -353,16 +350,14 @@ class SemanticInvestigator:
             captured_at=ingested.source.captured_at.isoformat(),
         )
         by_key = {item.stable_key: item for item in items}
-        subject_index: dict[str, str] = {}
-        for key, item in by_key.items():
-            subject_index.setdefault(normalize_text(item.finding.subject), key)
         entity_ids: dict[str, EntityId] = {}
         evidence_written: set[str] = set()
-        relations: set[str] = set()
+        written_relations: set[str] = set()
         diagnostics: list[str] = []
         opened: list[str] = []
         faults: list[SemanticFault] = []
         collisions: list[str] = []
+        raised: list[str] = list(gaps)
         with knowledge.begin_revision(
             author=AUTHOR, summary=f"{namespace}:{harness.source_id}"
         ) as transaction:
@@ -385,19 +380,21 @@ class SemanticInvestigator:
             self._link_evidence(
                 transaction, persisted, entity_ids, version, evidence_written
             )
-            relations.update(
+            written_relations.update(
                 self._write_relations(
                     transaction,
                     persisted,
                     entity_ids,
-                    subject_index,
+                    harness,
+                    knowledge,
                     version,
                     diagnostics,
+                    raised,
                     namespace,
                 )
             )
             for question in dict.fromkeys(
-                tuple(item for item in gaps if item) + tuple(collisions)
+                tuple(item for item in raised if item) + tuple(collisions)
             ):
                 open_gap(transaction, question, blocking=bool(collisions))
                 opened.append(question)
@@ -406,7 +403,7 @@ class SemanticInvestigator:
             diagnostics.extend(collisions)
         return SemanticOutcome(
             entities_written=len(entity_ids),
-            relations_written=len(relations),
+            relations_written=len(written_relations),
             evidence_written=len(evidence_written),
             gaps_opened=tuple(opened),
             diagnostics=tuple(diagnostics),
@@ -469,9 +466,11 @@ class SemanticInvestigator:
         transaction: RevisionTransaction,
         by_key: Mapping[str, VerifiedDocumentFinding],
         entity_ids: dict[str, EntityId],
-        subject_index: Mapping[str, str],
+        harness: DocumentHarness,
+        knowledge: KnowledgeRepository,
         version: SourceVersion,
         diagnostics: list[str],
+        gaps: list[str],
         namespace: str = DEFAULT_NAMESPACE,
     ) -> set[str]:
         written: set[str] = set()
@@ -479,68 +478,141 @@ class SemanticInvestigator:
         for key in sorted(by_key):
             item = by_key[key]
             for claim in item.finding.relations:
-                target = normalize_text(claim.target_subject)
-                target_key = subject_index.get(target)
-                if target_key is None:
-                    kind = claim.target_type or _DEFAULT_TARGET_KIND.get(
-                        claim.kind.value, EntityKind.CAPABILITY
+                resolution = relations.resolve_target(
+                    claim, item, namespace, by_key, entity_ids, knowledge
+                )
+                if resolution.outcome is relations.TargetOutcome.AMBIGUOUS:
+                    diagnostics.append(relations.ambiguity_diagnostic(claim))
+                    gaps.append(
+                        relations.ambiguity_gap(claim, resolution.candidates)
                     )
-                    target_key = contextual_key(
-                        namespace, kind.value, item.finding.owner, claim.target_subject
-                    )
-                    kinds.setdefault(target_key, kind.value)
-                    if target_key not in entity_ids:
-                        placeholder = Entity.create(
-                            kind=kind.value,
-                            name=claim.target_subject,
-                            stable_key=target_key,
-                            attributes={
-                                name: claim.target_subject
-                                for name in REQUIRED_ATTRIBUTES.get(kind, ())
-                            },
-                            state=KnowledgeState.DECLARED,
-                            confidence=Confidence.UNRESOLVED,
-                            source_versions=(version.key,),
-                        )
-                        try:
-                            transaction.put_entity(placeholder)
-                        except IdentityCollision as exc:
-                            diagnostics.append(str(exc))
-                            continue
-                        entity_ids[target_key] = placeholder.id
+                    continue
+                target_id = self._target_id(
+                    claim,
+                    resolution,
+                    transaction,
+                    entity_ids,
+                    kinds,
+                    version,
+                    diagnostics,
+                    namespace,
+                )
+                if target_id is None:
+                    continue
                 try:
                     validate_pair(
                         claim.kind,
                         item.finding.type.value,
-                        kinds[target_key],
+                        kinds[resolution.key],
                     )
                 except InvalidRelationPair as exc:
                     diagnostics.append(str(exc))
                     continue
+                captures, rejections, reasons = resolve_captures(
+                    claim.evidence, harness
+                )
+                verdict = relations.assess_relation(
+                    claim,
+                    item,
+                    resolution,
+                    _target_name(claim, resolution, by_key, knowledge),
+                    captures,
+                    bool(rejections),
+                )
+                diagnostics.extend(reasons)
+                diagnostics.extend(verdict.reasons)
                 relation = Relation.create(
                     kind=claim.kind.value,
                     source_id=entity_ids[key],
-                    target_id=entity_ids[target_key],
+                    target_id=target_id,
                     attributes=dict(claim.attributes),
-                    confidence=_relation_confidence(item, by_key.get(target_key)),
+                    confidence=verdict.confidence,
                 )
                 try:
                     transaction.put_relation(relation)
                 except KnowledgeError as exc:
                     diagnostics.append(str(exc))
                     continue
+                self._link_relation_evidence(
+                    transaction, relation.id, verdict.captures, version
+                )
                 written.add(relation.id)
         return written
 
+    def _target_id(
+        self,
+        claim: DocumentRelationClaim,
+        resolution: relations.TargetResolution,
+        transaction: RevisionTransaction,
+        entity_ids: dict[str, EntityId],
+        kinds: dict[str, str],
+        version: SourceVersion,
+        diagnostics: list[str],
+        namespace: str,
+    ) -> EntityId | None:
+        if resolution.entity_id is not None:
+            kinds.setdefault(resolution.key, resolution.kind)
+            entity_ids.setdefault(resolution.key, resolution.entity_id)
+            return resolution.entity_id
+        kinds.setdefault(resolution.key, resolution.kind)
+        known = entity_ids.get(resolution.key)
+        if known is not None:
+            return known
+        kind = entity_kind(resolution.kind)
+        placeholder = Entity.create(
+            kind=resolution.kind,
+            name=claim.target_subject or str(claim.target_id),
+            stable_key=resolution.key,
+            attributes={
+                **{
+                    name: claim.target_subject or str(claim.target_id)
+                    for name in REQUIRED_ATTRIBUTES.get(kind, ())
+                },
+                NAMESPACE_ATTRIBUTE: namespace,
+            },
+            state=KnowledgeState.DECLARED,
+            confidence=Confidence.UNRESOLVED,
+            source_versions=(version.key,),
+        )
+        try:
+            transaction.put_entity(placeholder)
+        except IdentityCollision as exc:
+            diagnostics.append(str(exc))
+            return None
+        entity_ids[resolution.key] = placeholder.id
+        return placeholder.id
 
-def _relation_confidence(
-    source: VerifiedDocumentFinding, target: VerifiedDocumentFinding | None
-) -> Confidence:
-    if target is None:
-        return Confidence.INFERRED
-    if (
-        source.confidence is Confidence.SUPPORTED
-        and target.confidence is Confidence.SUPPORTED
-    ):
-        return Confidence.SUPPORTED
-    return Confidence.INFERRED
+    def _link_relation_evidence(
+        self,
+        transaction: RevisionTransaction,
+        relation_id: str,
+        captures: Sequence[DocumentEvidenceCapture],
+        version: SourceVersion,
+    ) -> None:
+        for capture in captures:
+            evidence = make_evidence(
+                source_id=version.source_id,
+                version_hash=version.version_hash,
+                locator=locator_from_dict(capture.locator),
+                excerpt=capture.excerpt,
+                captured_at=version.captured_at,
+            )
+            transaction.put_evidence(evidence, relation_ids=(relation_id,))
+
+
+def _target_name(
+    claim: DocumentRelationClaim,
+    resolution: relations.TargetResolution,
+    by_key: Mapping[str, VerifiedDocumentFinding],
+    knowledge: KnowledgeRepository,
+) -> str:
+    item = by_key.get(resolution.key)
+    if item is not None:
+        return item.finding.subject
+    if resolution.entity_id is not None:
+        stored = knowledge.get_entity(resolution.entity_id)
+        if stored is not None:
+            return stored.name
+    return claim.target_subject
+
+

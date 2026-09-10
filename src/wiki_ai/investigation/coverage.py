@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
+from wiki_ai.knowledge.identity import canonical_name
 from wiki_ai.knowledge.model import Confidence
 from wiki_ai.knowledge.taxonomy import EntityKind
 from wiki_ai.repository.symbols import SymbolKind
 
+from wiki_ai.investigation.finding import RelationClaim
 from wiki_ai.investigation.verifier import VerificationReport, VerifiedFinding
 
 __all__ = [
@@ -18,6 +20,8 @@ __all__ = [
     "CoverageState",
     "CompletenessReport",
     "initial_state",
+    "target_identity",
+    "entity_identities",
     "update",
     "with_sections",
     "sections_of",
@@ -115,6 +119,7 @@ class CoverageState:
     files_covered: tuple[str, ...] = ()
     frontier: tuple[FrontierItem, ...] = ()
     resolved_subjects: tuple[str, ...] = ()
+    known_identities: tuple[str, ...] = ()
     missing_evidence: tuple[str, ...] = ()
     explicit_gaps: tuple[str, ...] = ()
     rounds: int = 0
@@ -195,17 +200,45 @@ def initial_state(
     )
 
 
+def target_identity(claim: RelationClaim, source_owner: str | None) -> str:
+    if claim.target_id:
+        return f"{EXPLICIT_PREFIX}{claim.target_id}"
+    owner = claim.target_owner or source_owner or ""
+    kind = "" if claim.target_type is None else claim.target_type.value
+    return "::".join(
+        (
+            canonical_name(kind),
+            canonical_name(owner) or GLOBAL_OWNER,
+            canonical_name(claim.target_subject),
+        )
+    )
+
+
+def entity_identities(item: VerifiedFinding) -> tuple[str, ...]:
+    name = canonical_name(item.finding.subject)
+    owner = canonical_name(item.finding.owner or "") or GLOBAL_OWNER
+    kind = canonical_name(item.finding.type.value)
+    found = [
+        f"{kind}::{owner}::{name}",
+        f"::{owner}::{name}",
+        f"{kind}::{GLOBAL_OWNER}::{name}",
+        f"::{GLOBAL_OWNER}::{name}",
+    ]
+    if item.finding.explicit_id:
+        found.append(f"{EXPLICIT_PREFIX}{item.finding.explicit_id}")
+    return tuple(dict.fromkeys(found))
+
+
 def _relation_frontier(item: VerifiedFinding, known: set[str]) -> list[FrontierItem]:
     found: list[FrontierItem] = []
     for claim in item.finding.relations:
-        target = claim.target_subject.strip().lower()
-        if target in known:
+        if target_identity(claim, item.finding.owner) in known:
             continue
         kind = "integration" if claim.kind.value in _INTEGRATION_RELATIONS else "call"
         found.append(
             FrontierItem(
                 kind,
-                claim.target_subject,
+                claim.label,
                 f"{item.finding.subject} {claim.kind.value} an unknown target",
             )
         )
@@ -215,6 +248,9 @@ def _relation_frontier(item: VerifiedFinding, known: set[str]) -> list[FrontierI
 _INTEGRATION_RELATIONS = frozenset(
     {"publishes", "consumes", "persists_to", "reads", "writes"}
 )
+
+EXPLICIT_PREFIX = "explicit::"
+GLOBAL_OWNER = "global"
 
 _INCOMPLETE_KINDS = frozenset({"effect", "branch"})
 
@@ -290,6 +326,9 @@ def update(
     known |= {name.strip().lower() for name in entrypoints}
     known |= {name.strip().lower() for name in capabilities}
     known |= set(integrations)
+    identities = set(state.known_identities)
+    for item in report.verified:
+        identities |= set(entity_identities(item))
 
     round_subjects = {
         item.finding.subject.strip().lower() for item in report.verified
@@ -307,7 +346,7 @@ def update(
             continue
         frontier.append(item)
     for item in report.verified:
-        for candidate in _relation_frontier(item, known):
+        for candidate in _relation_frontier(item, identities):
             if candidate.key not in {existing.key for existing in frontier}:
                 frontier.append(candidate)
         for candidate in _effect_frontier(item) + _branch_frontier(item):
@@ -321,6 +360,7 @@ def update(
         files_covered=tuple(files),
         frontier=tuple(frontier),
         resolved_subjects=tuple(resolved),
+        known_identities=tuple(sorted(identities)),
         missing_evidence=tuple(missing),
         explicit_gaps=tuple(gaps),
         rounds=state.rounds + 1,

@@ -12,9 +12,11 @@ from wiki_ai.publishing.answer import (
     FALLBACK_NOTE,
     AnswerMode,
     Answerer,
+    AnswerStatus,
 )
 from wiki_ai.publishing.answer_session import (
     ClaimVerdict,
+    RejectionReason,
     answer_schema,
     build_briefing,
     validate_envelope,
@@ -242,7 +244,7 @@ def test_a_claim_citing_a_forged_evidence_is_discarded(graph):
                         "evidence_ids": [forged],
                     },
                     {
-                        "statement": "A renovação é uma capacidade implementada",
+                        "statement": "A capability Renovacao chama a Billing API",
                         "entity_ids": [_capability_id(graph)],
                         "evidence_ids": [_capability_evidence(graph)],
                     },
@@ -254,8 +256,11 @@ def test_a_claim_citing_a_forged_evidence_is_discarded(graph):
     outcome = Answerer().run(ARCHITECTURAL, graph.repository, provider, "ns")
     assert outcome.mode is AnswerMode.AGENTIC
     assert forged not in outcome.evidence_ids
-    assert any("descartada" in item for item in outcome.unresolved)
-    assert "A chamada ao billing é síncrona" not in outcome.answer.split("Proveniência:")[-1]
+    assert any(
+        RejectionReason.UNKNOWN_EVIDENCE.value in item for item in outcome.unresolved
+    )
+    assert outcome.status is AnswerStatus.PARTIAL
+    assert "A chamada ao billing é síncrona" not in outcome.answer
 
 
 def test_a_claim_citing_a_forged_entity_is_discarded(harness, graph):
@@ -272,7 +277,8 @@ def test_a_claim_citing_a_forged_entity_is_discarded(harness, graph):
         },
         harness,
     )
-    assert validated.claims[0].verdict is ClaimVerdict.UNKNOWN_ENTITY
+    assert validated.claims[0].verdict is ClaimVerdict.REJECTED
+    assert validated.claims[0].reason is RejectionReason.UNKNOWN_ENTITY
     assert not validated.supported_claims
 
 
@@ -286,7 +292,171 @@ def test_a_claim_without_evidence_is_not_supported(harness):
         },
         harness,
     )
-    assert validated.claims[0].verdict is ClaimVerdict.UNGROUNDED
+    assert validated.claims[0].verdict is ClaimVerdict.REJECTED
+    assert validated.claims[0].reason is RejectionReason.NO_EVIDENCE
+
+
+def _rule_evidence(graph) -> str:
+    return graph.repository.evidence_for(graph.id("rule"))[0].id
+
+
+def _validate_one(harness, statement, entity_ids, evidence_ids):
+    validated = validate_envelope(
+        {
+            "answer": "rascunho",
+            "claims": [
+                {
+                    "statement": statement,
+                    "entity_ids": list(entity_ids),
+                    "evidence_ids": list(evidence_ids),
+                }
+            ],
+        },
+        harness,
+    )
+    return validated.claims[0]
+
+
+def test_evidence_of_another_entity_does_not_sustain_the_claim(harness, graph):
+    claim = _validate_one(
+        harness,
+        "A capability Renovacao chama a Billing API",
+        [_capability_id(graph)],
+        [_rule_evidence(graph)],
+    )
+    assert claim.verdict is ClaimVerdict.REJECTED
+    assert claim.reason is RejectionReason.EVIDENCE_NOT_LINKED
+    assert claim.rejected_evidence_ids == (_rule_evidence(graph),)
+
+
+def test_the_same_evidence_sustains_the_entity_it_is_linked_to(harness, graph):
+    claim = _validate_one(
+        harness,
+        "A capability Renovacao chama a Billing API",
+        [_capability_id(graph)],
+        [_capability_evidence(graph)],
+    )
+    assert claim.verdict is ClaimVerdict.VALID
+    assert claim.reason is RejectionReason.NONE
+
+
+def test_a_claim_the_evidence_does_not_sustain_is_rejected(harness, graph):
+    claim = _validate_one(
+        harness,
+        "O sistema deleta todos os clientes aos domingos",
+        [_capability_id(graph)],
+        [_capability_evidence(graph)],
+    )
+    assert claim.verdict is ClaimVerdict.REJECTED
+    assert claim.reason is RejectionReason.NOT_GROUNDED
+
+
+def test_an_ungrounded_claim_names_the_terms_without_backing(harness, graph):
+    claim = _validate_one(
+        harness,
+        "O sistema deleta todos os clientes aos domingos",
+        [_capability_id(graph)],
+        [_capability_evidence(graph)],
+    )
+    assert claim.reason is RejectionReason.NOT_GROUNDED
+    assert "domingos" in claim.missing_terms
+    assert "domingos" in claim.to_dict()["missing_terms"]
+
+
+def test_the_free_answer_text_never_reaches_the_reader(graph):
+    def build(_captures):
+        return (
+            {
+                "answer": "O sistema deleta todos os clientes aos domingos",
+                "claims": [
+                    {
+                        "statement": "A Renovacao existe",
+                        "entity_ids": [_capability_id(graph)],
+                        "evidence_ids": [_capability_evidence(graph)],
+                    }
+                ],
+            },
+        )
+
+    provider = FakeProvider(scripts=[Script(build_findings=build)])
+    outcome = Answerer().run(ARCHITECTURAL, graph.repository, provider, "ns")
+    assert outcome.mode is AnswerMode.AGENTIC
+    assert outcome.status is AnswerStatus.ANSWERED
+    assert "deleta todos os clientes" not in outcome.answer
+    assert "domingos" not in outcome.answer
+    assert "A Renovacao existe" in outcome.answer
+    assert outcome.draft == "O sistema deleta todos os clientes aos domingos"
+
+
+def test_only_validated_claims_are_assembled_into_the_answer(graph):
+    def build(_captures):
+        return (
+            {
+                "answer": "O sistema deleta todos os clientes aos domingos",
+                "claims": [
+                    {
+                        "statement": "A Renovacao existe",
+                        "entity_ids": [_capability_id(graph)],
+                        "evidence_ids": [_capability_evidence(graph)],
+                    },
+                    {
+                        "statement": "A Renovacao apaga o cadastro aos domingos",
+                        "entity_ids": [_capability_id(graph)],
+                        "evidence_ids": [_capability_evidence(graph)],
+                    },
+                ],
+            },
+        )
+
+    provider = FakeProvider(scripts=[Script(build_findings=build)])
+    outcome = Answerer().run(ARCHITECTURAL, graph.repository, provider, "ns")
+    assert outcome.status is AnswerStatus.PARTIAL
+    assert "A Renovacao existe" in outcome.answer
+    assert "apaga o cadastro" not in outcome.answer
+    assert any(
+        RejectionReason.NOT_GROUNDED.value in item for item in outcome.unresolved
+    )
+
+
+def test_no_validated_claim_blocks_the_agentic_answer(graph):
+    def build(_captures):
+        return (
+            {
+                "answer": "O sistema deleta todos os clientes aos domingos",
+                "claims": [
+                    {
+                        "statement": "A Renovacao apaga o cadastro aos domingos",
+                        "entity_ids": [_capability_id(graph)],
+                        "evidence_ids": [_capability_evidence(graph)],
+                    }
+                ],
+            },
+        )
+
+    provider = FakeProvider(scripts=[Script(build_findings=build)])
+    outcome = Answerer().run(ARCHITECTURAL, graph.repository, provider, "ns")
+    assert outcome.status is AnswerStatus.BLOCKED
+    assert outcome.reason == "no_validated_claims"
+    assert "deleta todos os clientes" not in outcome.answer
+    assert "apaga o cadastro" not in outcome.answer
+    assert outcome.draft == "O sistema deleta todos os clientes aos domingos"
+
+
+def test_the_briefing_states_that_the_free_answer_is_only_a_draft(harness):
+    briefing = build_briefing(ARCHITECTURAL, harness.names(), "ns")
+    assert "draft" in briefing
+    assert "borrowed from another entity is refused" in briefing
+
+
+def test_a_rejected_claim_is_reported_with_its_typed_reason(harness, graph):
+    claim = _validate_one(
+        harness,
+        "A capability Renovacao chama a Billing API",
+        [_capability_id(graph)],
+        [_rule_evidence(graph)],
+    )
+    assert claim.to_dict()["reason"] == "evidence_not_linked"
+    assert claim.to_dict()["verdict"] == "rejected"
 
 
 def test_every_claim_forged_falls_back_to_the_deterministic_engine(graph):
@@ -309,8 +479,10 @@ def test_every_claim_forged_falls_back_to_the_deterministic_engine(graph):
     provider = FakeProvider(scripts=[Script(build_findings=build)])
     outcome = Answerer().run(ARCHITECTURAL, graph.repository, provider, "ns")
     assert outcome.mode is AnswerMode.DETERMINISTIC_FALLBACK
-    assert outcome.reason == "no_claim_with_valid_evidence"
+    assert outcome.status is AnswerStatus.BLOCKED
+    assert outcome.reason == "no_validated_claims"
     assert "inventado" not in outcome.answer
+    assert outcome.draft == "inventado"
 
 
 def test_without_a_provider_the_answer_is_an_explicit_fallback(graph):

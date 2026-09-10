@@ -13,6 +13,7 @@ __all__ = [
     "REPOSITORY_FOCUS",
     "METHOD_STEPS",
     "EVIDENCE_RULES",
+    "RELATION_RULES",
     "SECTION_QUESTIONS",
     "SECTION_FRAMING",
     "allowed_finding_types",
@@ -58,6 +59,10 @@ METHOD_STEPS: tuple[str, ...] = (
     "read the executable lines with repo.read until the behavior is decided by code",
     "capture the exact lines that decide it with evidence.capture and keep the capture id",
     "relate the finding to other subjects with typed relations",
+    "identify every relation target by target_owner or target_id whenever the name "
+    "alone can match more than one subject",
+    "capture the lines that decide the relation itself and pass them as the "
+    "relation evidence",
     "declare a gap whenever the code does not answer the question",
 )
 
@@ -67,6 +72,19 @@ EVIDENCE_RULES: tuple[str, ...] = (
     "a finding without evidence stays unresolved and becomes an explicit gap",
     "the statement must use terms that appear in the captured excerpt or its path",
     "never claim behavior you did not read in this snapshot",
+)
+
+RELATION_RULES: tuple[str, ...] = (
+    "target_subject alone identifies a target only when a single subject in the "
+    "repository carries that name",
+    "target_owner names the subject that owns the target when the same name is "
+    "used under more than one owner",
+    "target_id points at the identifier the code itself declares and wins over "
+    "target_subject and target_owner",
+    "an ambiguous target is never guessed: the relation is dropped and the "
+    "question is raised as a gap",
+    "a relation is supported only when its own evidence excerpt names both the "
+    "finding subject and the target; endpoints being supported never suffices",
 )
 
 _HEADING = "Objective"
@@ -147,6 +165,7 @@ def build(
     blocks.append("Tools available:\n" + _bullets(tool_names))
     blocks.append("Allowed finding types:\n" + _bullets(allowed_finding_types()))
     blocks.append("Allowed relation kinds:\n" + _bullets(allowed_relation_kinds()))
+    blocks.append("Relation rules:\n" + _bullets(RELATION_RULES))
     rendered = render(state)
     if rendered:
         blocks.append(rendered)

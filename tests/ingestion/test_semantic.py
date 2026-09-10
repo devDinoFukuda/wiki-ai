@@ -17,7 +17,7 @@ from wiki_ai.ingestion.source import SourceKind
 from wiki_ai.knowledge.evidence import DiagramLocator, SpreadsheetLocator, TranscriptLocator
 from wiki_ai.knowledge.gaps import GAP_KIND, questions
 from wiki_ai.knowledge.model import Confidence, KnowledgeState
-from wiki_ai.knowledge.repository import KnowledgeRepository
+from wiki_ai.knowledge.repository import NAMESPACE_ATTRIBUTE, KnowledgeRepository
 
 from tests.ingestion import fixtures
 from tests.ingestion.fake_provider import FakeProvider, Payloads, Script, evidence_of
@@ -180,7 +180,7 @@ def test_diagram_yields_modules_and_a_calls_relation(
                     {
                         "kind": "calls",
                         "target_subject": "Banco",
-                        "target_type": "persistence",
+                        "target_type": "integration",
                     }
                 ],
             },
@@ -213,6 +213,9 @@ def test_diagram_yields_modules_and_a_calls_relation(
     assert module.state is KnowledgeState.DECLARED
     relation = knowledge.find_relations("calls")[0]
     assert relation.source_id == module.id
+    assert relation.target_id == _entities(knowledge, "integration")[0].id
+    assert relation.confidence is Confidence.INFERRED
+    assert knowledge.evidence_for_relation(relation.id) == []
 
     locator = knowledge.evidence_for(module.id)[0].locator
     assert isinstance(locator, DiagramLocator)
@@ -622,3 +625,470 @@ def test_stable_keys_carry_namespace_kind_and_owner(
         "reuniao::decision_record::speaker_ana::corte_no_dia_5"
     )
     assert outcome.verified[0].finding.owner == "speaker:Ana"
+
+
+def _homonym_findings(
+    payloads: Payloads, relation: Mapping[str, Any]
+) -> list[Mapping[str, Any]]:
+    return [
+        {
+            "type": "decision_record",
+            "subject": "corte no dia 5",
+            "statement": "Decidimos manter o corte no dia 5",
+            "owner": "section:Ata",
+            "evidence": evidence_of(payloads, 0),
+            "relations": [relation],
+        },
+        {
+            "type": "requirement",
+            "subject": "limite",
+            "statement": "O time financeiro confirma amanha o limite",
+            "owner": "speaker:Ana",
+            "evidence": evidence_of(payloads, 0),
+        },
+        {
+            "type": "requirement",
+            "subject": "limite",
+            "statement": "Preciso do limite de 500 documentado",
+            "owner": "speaker:Bruno",
+            "evidence": evidence_of(payloads, 1),
+        },
+    ]
+
+
+def _homonym_provider(
+    relation: Mapping[str, Any], ana: str, bruno: str
+) -> FakeProvider:
+    def build(payloads: Payloads) -> list[Mapping[str, Any]]:
+        return _homonym_findings(payloads, relation)
+
+    return FakeProvider(
+        scripts=[
+            Script(
+                steps=(
+                    ("evidence.capture", {"block_ids": [ana]}),
+                    ("evidence.capture", {"block_ids": [bruno]}),
+                ),
+                build_findings=build,
+            )
+        ]
+    )
+
+
+def _speaker_blocks(ingested: Any) -> tuple[str, str]:
+    harness = DocumentHarness(ingested.document)
+    ana = harness.invoke("doc.blocks", {"speaker": "Ana"})["blocks"][0]["block_id"]
+    bruno = harness.invoke("doc.blocks", {"speaker": "Bruno"})["blocks"][0]["block_id"]
+    return ana, bruno
+
+
+def test_two_homonym_targets_under_different_owners_open_a_gap_and_write_no_relation(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+    provider = _homonym_provider(
+        {"kind": "declares", "target_subject": "limite", "target_type": "requirement"},
+        ana,
+        bruno,
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    assert outcome.relations_written == 0
+    assert knowledge.find_relations("declares") == []
+    assert "relation_target_ambiguous:limite" in outcome.diagnostics
+    opened = questions(tuple(_entities(knowledge, GAP_KIND)))
+    assert any(item.startswith("ambiguous_relation_target:") for item in opened)
+
+
+def test_target_owner_resolves_a_homonym_target(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+    provider = _homonym_provider(
+        {
+            "kind": "declares",
+            "target_subject": "limite",
+            "target_type": "requirement",
+            "target_owner": "speaker:Bruno",
+        },
+        ana,
+        bruno,
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    assert outcome.relations_written == 1
+    assert "relation_target_ambiguous:limite" not in outcome.diagnostics
+    relation = knowledge.find_relations("declares")[0]
+    target = knowledge.get_entity(relation.target_id)
+    assert target is not None
+    assert target.attributes["owner"] == "speaker:Bruno"
+    assert target.attributes["statement"] == "Preciso do limite de 500 documentado"
+
+
+def test_target_id_resolves_a_homonym_target(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+
+    def build(payloads: Payloads) -> list[Mapping[str, Any]]:
+        findings = list(
+            _homonym_findings(
+                payloads,
+                {
+                    "kind": "declares",
+                    "target_subject": "limite",
+                    "target_type": "requirement",
+                    "target_id": "REQ-500",
+                },
+            )
+        )
+        findings[2] = dict(findings[2], explicit_id="REQ-500")
+        return findings
+
+    provider = FakeProvider(
+        scripts=[
+            Script(
+                steps=(
+                    ("evidence.capture", {"block_ids": [ana]}),
+                    ("evidence.capture", {"block_ids": [bruno]}),
+                ),
+                build_findings=build,
+            )
+        ]
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    assert outcome.relations_written == 1
+    assert "relation_target_ambiguous:limite" not in outcome.diagnostics
+    relation = knowledge.find_relations("declares")[0]
+    target = knowledge.get_entity(relation.target_id)
+    assert target is not None
+    assert target.attributes["statement"] == "Preciso do limite de 500 documentado"
+
+
+def test_a_relation_between_supported_endpoints_without_evidence_is_inferred(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+    provider = _homonym_provider(
+        {
+            "kind": "declares",
+            "target_subject": "limite",
+            "target_type": "requirement",
+            "target_owner": "speaker:Bruno",
+        },
+        ana,
+        bruno,
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    relation = knowledge.find_relations("declares")[0]
+    source = knowledge.get_entity(relation.source_id)
+    target = knowledge.get_entity(relation.target_id)
+    assert source is not None and source.confidence is Confidence.SUPPORTED
+    assert target is not None and target.confidence is Confidence.SUPPORTED
+    assert relation.confidence is Confidence.INFERRED
+    assert knowledge.evidence_for_relation(relation.id) == []
+    assert outcome.relations_written == 1
+
+
+def test_a_relation_with_its_own_grounded_evidence_is_supported(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+
+    def build(payloads: Payloads) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "type": "decision_record",
+                "subject": "corte no dia 5",
+                "statement": "Decidimos manter o corte no dia 5",
+                "owner": "speaker:Ana",
+                "evidence": evidence_of(payloads, 0),
+                "relations": [
+                    {
+                        "kind": "declares",
+                        "target_subject": "limite de 500 documentado",
+                        "target_type": "business_rule",
+                        "target_owner": "speaker:Bruno",
+                        "evidence": evidence_of(payloads, 2),
+                    }
+                ],
+            },
+            {
+                "type": "business_rule",
+                "subject": "limite de 500 documentado",
+                "statement": "Preciso do limite de 500 documentado",
+                "owner": "speaker:Bruno",
+                "conditions": ["limite de 500"],
+                "effects": ["documentado"],
+                "evidence": evidence_of(payloads, 1),
+            },
+        ]
+
+    provider = FakeProvider(
+        scripts=[
+            Script(
+                steps=(
+                    ("evidence.capture", {"block_ids": [ana]}),
+                    ("evidence.capture", {"block_ids": [bruno]}),
+                    ("evidence.capture", {"block_ids": [ana, bruno]}),
+                ),
+                build_findings=build,
+            )
+        ]
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    assert outcome.relations_written == 1
+    relation = knowledge.find_relations("declares")[0]
+    assert relation.confidence is Confidence.SUPPORTED
+    linked = knowledge.evidence_for_relation(relation.id)
+    assert len(linked) == 1
+    assert linked[0].excerpt_hash
+
+
+def test_a_relation_citing_a_capture_of_another_run_stays_inferred(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+    provider = _homonym_provider(
+        {
+            "kind": "declares",
+            "target_subject": "limite",
+            "target_type": "requirement",
+            "target_owner": "speaker:Bruno",
+            "evidence": [{"capture_id": "cap-000000000000000000000000"}],
+        },
+        ana,
+        bruno,
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    relation = knowledge.find_relations("declares")[0]
+    assert relation.confidence is Confidence.INFERRED
+    assert knowledge.evidence_for_relation(relation.id) == []
+    assert any("cap-000000000000000000000000" in item for item in outcome.diagnostics)
+
+
+def test_a_relation_target_no_finding_states_stays_unresolved(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    harness = DocumentHarness(ingested.document)
+    ana = harness.invoke("doc.blocks", {"speaker": "Ana"})["blocks"][0]["block_id"]
+
+    def build(payloads: Payloads) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "type": "decision_record",
+                "subject": "corte no dia 5",
+                "statement": "Decidimos manter o corte no dia 5",
+                "evidence": evidence_of(payloads, 0),
+                "relations": [
+                    {
+                        "kind": "declares",
+                        "target_subject": "politica de cobranca",
+                        "target_type": "business_rule",
+                    }
+                ],
+            }
+        ]
+
+    provider = FakeProvider(
+        scripts=[
+            Script(
+                steps=(("evidence.capture", {"block_ids": [ana]}),),
+                build_findings=build,
+            )
+        ]
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    assert outcome.relations_written == 1
+    relation = knowledge.find_relations("declares")[0]
+    assert relation.confidence is Confidence.UNRESOLVED
+    placeholder = knowledge.get_entity(relation.target_id)
+    assert placeholder is not None
+    assert placeholder.name == "politica de cobranca"
+    assert placeholder.confidence is Confidence.UNRESOLVED
+
+
+def test_the_relation_schema_asks_the_provider_for_owner_id_and_evidence() -> None:
+    schema = document_finding_schema(SourceKind.TRANSCRIPT)
+    relation = schema["properties"]["relations"]["items"]["properties"]
+    assert set(relation) == {
+        "kind",
+        "target_subject",
+        "target_type",
+        "target_owner",
+        "target_id",
+        "evidence",
+        "attributes",
+    }
+    assert relation["evidence"] == schema["properties"]["evidence"]
+
+
+def test_the_briefing_tells_the_provider_how_to_name_and_evidence_a_relation(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    provider = FakeProvider(scripts=[Script()])
+    _investigator().run(ingested, knowledge, provider, "reuniao")
+    objective = provider.seen_objectives[0]
+    assert "target_owner" in objective
+    assert "target_id" in objective
+    assert "inferred, never as supported" in objective
+
+
+def test_the_owner_of_the_source_disambiguates_before_candidate_search(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+
+    def build(payloads: Payloads) -> list[Mapping[str, Any]]:
+        findings = list(
+            _homonym_findings(
+                payloads,
+                {
+                    "kind": "declares",
+                    "target_subject": "limite",
+                    "target_type": "requirement",
+                },
+            )
+        )
+        findings[0] = dict(findings[0], owner="speaker:Ana")
+        return findings
+
+    provider = FakeProvider(
+        scripts=[
+            Script(
+                steps=(
+                    ("evidence.capture", {"block_ids": [ana]}),
+                    ("evidence.capture", {"block_ids": [bruno]}),
+                ),
+                build_findings=build,
+            )
+        ]
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    assert outcome.relations_written == 1
+    assert "relation_target_ambiguous:limite" not in outcome.diagnostics
+    relation = knowledge.find_relations("declares")[0]
+    target = knowledge.get_entity(relation.target_id)
+    assert target is not None
+    assert target.attributes["owner"] == "speaker:Ana"
+
+
+def test_a_target_only_a_previous_round_stated_resolves_from_stored_knowledge(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(fixtures.write_xlsx(tmp_path / "planilha.xlsx"))
+    harness = DocumentHarness(ingested.document)
+    regras = harness.invoke("doc.table", {"worksheet": "Regras", "cell_range": "B13:F13"})
+    resumo = harness.invoke("doc.blocks", {"worksheet": "Resumo"})["blocks"][0]
+
+    def first(payloads: Payloads) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "type": "data_field",
+                "subject": "Desconto A",
+                "statement": "Desconto A aplica quando valor > 100",
+                "attributes": {"data_type": "decimal"},
+                "evidence": evidence_of(payloads),
+            }
+        ]
+
+    def second(payloads: Payloads) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "type": "validation",
+                "subject": "Catalogo do desconto",
+                "statement": "o Catalogo guarda o Desconto A",
+                "attributes": {"rule": "valor > 100"},
+                "evidence": evidence_of(payloads),
+                "relations": [
+                    {
+                        "kind": "validates",
+                        "target_subject": "Desconto A",
+                        "target_type": "data_field",
+                    }
+                ],
+            }
+        ]
+
+    provider = FakeProvider(
+        scripts=[
+            Script(
+                steps=(("evidence.capture", {"block_ids": regras["block_ids"]}),),
+                build_findings=first,
+            ),
+            Script(
+                steps=(("evidence.capture", {"block_ids": [resumo["block_id"]]}),),
+                build_findings=second,
+            ),
+        ]
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "planilha")
+
+    assert outcome.relations_written == 1
+    assert "relation_target_ambiguous:Desconto A" not in outcome.diagnostics
+    fields = _entities(knowledge, "data_field")
+    assert len(fields) == 1
+    relation = knowledge.find_relations("validates")[0]
+    assert relation.target_id == fields[0].id
+    assert relation.confidence is Confidence.INFERRED
+
+
+def test_every_entity_ingestion_writes_carries_its_namespace(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    ingested = pipeline.ingest(_transcript(tmp_path))
+    harness = DocumentHarness(ingested.document)
+    ana = harness.invoke("doc.blocks", {"speaker": "Ana"})["blocks"][0]["block_id"]
+
+    def build(payloads: Payloads) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "type": "decision_record",
+                "subject": "corte no dia 5",
+                "statement": "Decidimos manter o corte no dia 5",
+                "evidence": evidence_of(payloads, 0),
+                "relations": [
+                    {
+                        "kind": "declares",
+                        "target_subject": "politica de cobranca",
+                        "target_type": "business_rule",
+                    }
+                ],
+            }
+        ]
+
+    provider = FakeProvider(
+        scripts=[
+            Script(
+                steps=(("evidence.capture", {"block_ids": [ana]}),),
+                build_findings=build,
+            )
+        ]
+    )
+    _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    written = [
+        entity
+        for entity in knowledge.find_entities()
+        if entity.kind != GAP_KIND
+    ]
+    assert written
+    for entity in written:
+        assert entity.attributes[NAMESPACE_ATTRIBUTE] == "reuniao"
+    assert knowledge.entities_named("reuniao", "politica de cobranca")
+    assert knowledge.entities_named("outro", "politica de cobranca") == ()

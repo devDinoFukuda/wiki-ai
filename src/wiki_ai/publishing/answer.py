@@ -26,6 +26,7 @@ from .answer_fallback import (
 from .answer_session import (
     ANSWER_MAX_SECONDS,
     ANSWER_ROUND_CALLS,
+    RejectionReason,
     ValidatedAnswer,
     ValidatedClaim,
     build_session,
@@ -40,8 +41,10 @@ __all__ = [
     "AnswerEnricher",
     "AnswerMode",
     "AnswerOutcome",
+    "AnswerStatus",
     "Answerer",
     "Intent",
+    "RejectionReason",
     "ValidatedClaim",
     "classify",
     "normalize",
@@ -54,13 +57,19 @@ FALLBACK_NOTE = (
 )
 NO_PROVIDER = "provider_unavailable"
 EMPTY_ANSWER = "agent_answer_empty"
-NO_SUPPORTED_CLAIM = "no_claim_with_valid_evidence"
-DISCARDED_PREFIX = "Afirmação descartada por citar evidência inexistente: "
+NO_VALIDATED_CLAIM = "no_validated_claims"
+DISCARDED_PREFIX = "Afirmação descartada"
 
 
 class AnswerMode(str, Enum):
     AGENTIC = "agentic"
     DETERMINISTIC_FALLBACK = "deterministic_fallback"
+
+
+class AnswerStatus(str, Enum):
+    ANSWERED = "answered"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,8 @@ class AnswerOutcome:
     unresolved: tuple[str, ...] = ()
     mode: AnswerMode = AnswerMode.DETERMINISTIC_FALLBACK
     reason: str = ""
+    status: AnswerStatus = AnswerStatus.ANSWERED
+    draft: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,7 +93,22 @@ class AnswerOutcome:
             "unresolved": list(self.unresolved),
             "mode": self.mode.value,
             "reason": self.reason,
+            "status": self.status.value,
+            "draft": self.draft,
         }
+
+
+def _discard_notes(validated: ValidatedAnswer) -> tuple[str, ...]:
+    notes: list[str] = []
+    for claim in validated.discarded_claims:
+        if not claim.statement:
+            continue
+        note = f"{DISCARDED_PREFIX} ({claim.reason.value}): {claim.statement}"
+        if claim.missing_terms:
+            note = f"{note} [sem lastro para: {', '.join(claim.missing_terms)}]"
+        if note not in notes:
+            notes.append(note)
+    return tuple(notes)
 
 
 @runtime_checkable
@@ -137,7 +163,7 @@ class Answerer:
             return self._fallback(question, knowledge, EMPTY_ANSWER)
         validated = validate_envelope(envelope, harness)
         if not validated.supported_claims:
-            return self._fallback(question, knowledge, NO_SUPPORTED_CLAIM)
+            return self._blocked(question, knowledge, validated)
         return self._agentic(question, validated, harness)
 
     def _invoke(
@@ -161,10 +187,10 @@ class Answerer:
         validated: ValidatedAnswer,
         harness: KnowledgeQueryHarness,
     ) -> AnswerOutcome:
+        discarded = _discard_notes(validated)
         unresolved = list(validated.unresolved)
-        for claim in validated.discarded_claims:
-            note = DISCARDED_PREFIX + claim.statement
-            if claim.statement and note not in unresolved:
+        for note in discarded:
+            if note not in unresolved:
                 unresolved.append(note)
         return AnswerOutcome(
             question=str(question),
@@ -173,6 +199,36 @@ class Answerer:
             entity_ids=validated.entity_ids,
             unresolved=tuple(unresolved),
             mode=AnswerMode.AGENTIC,
+            status=(
+                AnswerStatus.PARTIAL if discarded else AnswerStatus.ANSWERED
+            ),
+            draft=validated.answer,
+        )
+
+    def _blocked(
+        self,
+        question: str,
+        knowledge: KnowledgeRepository,
+        validated: ValidatedAnswer,
+    ) -> AnswerOutcome:
+        produced: FallbackAnswer = self._deterministic.run(question, knowledge)
+        unresolved = list(validated.unresolved)
+        for note in _discard_notes(validated):
+            if note not in unresolved:
+                unresolved.append(note)
+        for note in produced.unresolved:
+            if note not in unresolved:
+                unresolved.append(note)
+        return AnswerOutcome(
+            question=str(question),
+            answer=f"{produced.answer}\n\n{FALLBACK_NOTE}".strip(),
+            evidence_ids=produced.evidence_ids,
+            entity_ids=produced.entity_ids,
+            unresolved=tuple(unresolved),
+            mode=AnswerMode.DETERMINISTIC_FALLBACK,
+            reason=NO_VALIDATED_CLAIM,
+            status=AnswerStatus.BLOCKED,
+            draft=validated.answer,
         )
 
     def _fallback(

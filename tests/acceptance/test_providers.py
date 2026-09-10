@@ -25,7 +25,7 @@ from wiki_ai.app import api
 from wiki_ai.app.session import Session
 from wiki_ai.app.wiring import InvestigationAdapter, Wiring
 from wiki_ai.investigation.orchestrator import Investigator
-from wiki_ai.knowledge.repository import KnowledgeRepository
+from wiki_ai.knowledge.repository import NAMESPACE_ATTRIBUTE, KnowledgeRepository
 from wiki_ai.repository.harness import RepositoryHarness
 from wiki_ai.repository.schemas import TOOL_NAMES
 from wiki_ai.repository.snapshot import SnapshotSpec, take_snapshot
@@ -113,7 +113,7 @@ def _knowledge_shape(repo: Path) -> list[dict[str, Any]]:
         return _entities(knowledge)
 
 
-IDENTIFIED_ATTRIBUTES = ("capability",)
+IDENTIFIED_ATTRIBUTES = ("capability", NAMESPACE_ATTRIBUTE)
 
 
 def _comparable(attributes: Mapping[str, Any]) -> dict[str, Any]:

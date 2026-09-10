@@ -3,10 +3,14 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from wiki_ai import __version__
+from wiki_ai.agent.protocol import AgentCapabilities
+from wiki_ai.agent.registry import ProviderRegistry
+from wiki_ai.agent.session import AgentRun, BudgetUsage, RunStatus
 from wiki_ai.app import api
 from wiki_ai.app.commands import COMMANDS, EXIT_BLOCKED, EXIT_ERROR, EXIT_OK, main
 from wiki_ai.app.session import (
@@ -132,3 +136,84 @@ def test_api_inspect_is_pure(tmp_path: Path) -> None:
 
 def test_api_version_matches_package() -> None:
     assert api.version() == __version__
+
+
+class _CliProvider:
+    def connect(self) -> None:
+        return None
+
+    def capabilities(self) -> AgentCapabilities:
+        return AgentCapabilities(tools=("repo.read",))
+
+    def run(self, session: Any) -> AgentRun:
+        return AgentRun(
+            status=RunStatus.COMPLETED,
+            findings=(),
+            transcript=(),
+            usage=BudgetUsage(tool_calls=0, tokens=0, seconds=0.0),
+        )
+
+    def cancel(self) -> None:
+        return None
+
+
+def _cli_registry() -> ProviderRegistry:
+    registry = ProviderRegistry()
+    registry.register("probe", _CliProvider)
+    return registry
+
+
+def _run_with(registry: ProviderRegistry, *argv: str) -> tuple[int, dict]:
+    stream = io.StringIO()
+    code = main(list(argv), stream=stream, registry=registry)
+    return code, json.loads(stream.getvalue())
+
+
+def test_provider_show_reports_no_preference_by_default(tmp_path: Path) -> None:
+    _mixed_repo(tmp_path)
+    code, payload = _run_with(_cli_registry(), "provider", "show", "--repo", str(tmp_path))
+    assert code == EXIT_OK
+    assert payload["status"] == "ok"
+    assert payload["provider"] == ""
+    assert payload["registered"] == ["probe"]
+    assert payload["command"] == "provider"
+
+
+def test_provider_set_then_show_round_trips(tmp_path: Path) -> None:
+    _mixed_repo(tmp_path)
+    registry = _cli_registry()
+    code, payload = _run_with(
+        registry, "provider", "set", "probe", "--repo", str(tmp_path)
+    )
+    assert code == EXIT_OK
+    assert payload["provider"] == "probe"
+    code, shown = _run_with(registry, "provider", "show", "--repo", str(tmp_path))
+    assert code == EXIT_OK
+    assert shown["provider"] == "probe"
+    assert shown["source"] == "preferences"
+
+
+def test_provider_set_rejects_an_unknown_name(tmp_path: Path) -> None:
+    _mixed_repo(tmp_path)
+    code, payload = _run_with(
+        _cli_registry(), "provider", "set", "absent", "--repo", str(tmp_path)
+    )
+    assert code == EXIT_ERROR
+    assert payload["status"] == "error"
+    assert payload["reason"] == "unknown_provider"
+    assert payload["registered"] == ["probe"]
+
+
+def test_provider_requires_an_action() -> None:
+    code, payload = _run("provider")
+    assert code == EXIT_ERROR
+    assert payload["reason"] == "invalid_arguments"
+
+
+def test_the_stored_preference_reaches_analyze(tmp_path: Path) -> None:
+    _mixed_repo(tmp_path)
+    registry = _cli_registry()
+    _run_with(registry, "provider", "set", "probe", "--repo", str(tmp_path))
+    code, payload = _run_with(registry, "analyze", str(tmp_path))
+    assert payload["provider"] == "probe"
+    assert code in (EXIT_OK, EXIT_BLOCKED)
