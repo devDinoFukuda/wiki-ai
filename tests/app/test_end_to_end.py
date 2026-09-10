@@ -19,7 +19,7 @@ from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.agent.session import AgentRun, AgentSession
 from wiki_ai.app import api
 from wiki_ai.app.commands import EXIT_BLOCKED, EXIT_OK, main
-from wiki_ai.app.session import Session
+from wiki_ai.app.session import AnalysisStatus, Session, objective_hash
 from wiki_ai.app.wiring import DETAIL_KEYS, InvestigationAdapter, Wiring
 from wiki_ai.ingestion import pipeline
 from wiki_ai.investigation.orchestrator import Investigator
@@ -481,9 +481,20 @@ def test_a_second_analyze_without_changes_is_up_to_date_without_a_provider_call(
     assert provider.calls > before
 
 
+def _completed_baseline(repo: Path, registry: ProviderRegistry) -> str:
+    report = api.analyze(repo, OBJECTIVE, registry=registry)
+    session = Session.open(repo)
+    session.record_analysis(
+        report.snapshot_digest,
+        AnalysisStatus.COMPLETE,
+        "",
+        objective_hash(OBJECTIVE),
+    )
+    return report.snapshot_digest
+
+
 def test_analyze_after_a_change_updates_only_the_touched_path(repo: Path) -> None:
-    registry = _registry()
-    first = api.analyze(repo, OBJECTIVE, registry=registry)
+    baseline = _completed_baseline(repo, _registry())
     with Session.open(repo).open_knowledge() as knowledge:
         before = {
             entity.id: entity.confidence.value
@@ -495,7 +506,7 @@ def test_analyze_after_a_change_updates_only_the_touched_path(repo: Path) -> Non
     update_registry.register("scripted", lambda: updater)
     report = api.analyze(repo, OBJECTIVE, registry=update_registry)
     assert report.status in {"ok", "partial"}
-    assert report.snapshot_digest != first.snapshot_digest
+    assert report.snapshot_digest != baseline
     assert report.details["diff"]["changed"] == [SERVICE]
     assert report.details["invalidated"] > 0
     assert report.details["reinvestigated"]["entities_written"] > 0
@@ -512,7 +523,7 @@ def test_analyze_after_a_change_updates_only_the_touched_path(repo: Path) -> Non
 def test_analyze_after_a_change_without_a_provider_invalidates_and_blocks(
     repo: Path,
 ) -> None:
-    api.analyze(repo, OBJECTIVE, registry=_registry())
+    _completed_baseline(repo, _registry())
     (repo / SERVICE).write_text(_CHANGED_SERVICE, encoding="utf-8")
     report = api.analyze(repo, OBJECTIVE, wiring=Wiring(ProviderRegistry()))
     assert report.status == "blocked"
@@ -540,7 +551,7 @@ def test_status_reports_sources_by_kind_and_a_pending_update(
 
 def test_the_command_line_reports_an_update_with_clean_json(repo: Path) -> None:
     registry = _registry()
-    _cli("analyze", str(repo), "--objective", OBJECTIVE, registry=registry)
+    _completed_baseline(repo, registry)
     (repo / SERVICE).write_text(_CHANGED_SERVICE, encoding="utf-8")
     update_registry = ProviderRegistry()
     update_registry.register("scripted", lambda: _UpdateProvider(scripts=[_update_script()]))
@@ -584,7 +595,7 @@ class _FocusProbingProvider(FakeProvider):
 
 
 def test_an_update_focuses_the_reinvestigation_on_the_changed_path(repo: Path) -> None:
-    api.analyze(repo, OBJECTIVE, registry=_registry())
+    _completed_baseline(repo, _registry())
     (repo / SERVICE).write_text(_CHANGED_SERVICE, encoding="utf-8")
     provider = _FocusProbingProvider(scripts=[_update_script()])
     registry = ProviderRegistry()
@@ -618,3 +629,21 @@ def test_a_short_budget_reports_partial_and_never_marks_the_snapshot_analyzed(
     repeated = api.analyze(repo, OBJECTIVE, wiring=wiring)
     assert repeated.reason != "up_to_date"
     assert repeated.analysis_status == "partial"
+
+
+def test_a_partial_baseline_is_reinvestigated_in_full_after_a_change(
+    repo: Path,
+) -> None:
+    first = api.analyze(repo, OBJECTIVE, registry=_registry())
+    assert first.analysis_status == "partial"
+    (repo / SERVICE).write_text(_CHANGED_SERVICE, encoding="utf-8")
+    registry = ProviderRegistry()
+    registry.register("scripted", lambda: _UpdateProvider(scripts=[_update_script()]))
+    report = api.analyze(repo, OBJECTIVE, registry=registry)
+    assert report.snapshot_digest != first.snapshot_digest
+    assert "diff" not in report.details
+    assert "reinvestigated" not in report.details
+    assert report.details["objective"] == OBJECTIVE
+    assert report.details["entities_written"] > 0
+    state = Session.open(repo).analysis_state()
+    assert state.analyzed_digest in {"", report.snapshot_digest}

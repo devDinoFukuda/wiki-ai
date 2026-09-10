@@ -36,15 +36,24 @@ from .gaps import blocking_gaps, close_gap, is_blocking, open_gap, open_gaps
 from .gate import KnowledgeProvenance, KnowledgeRule, KnowledgeViolation
 from .gate import check as knowledge_gate
 from .grounding import (
+    INVOCATION_MARKER,
     GroundingCheck,
     check_component,
+    check_relation_predicate,
     excerpt_vocabulary,
     key_terms,
     mandatory_terms,
+    relation_predicate_terms,
     symbol_defined_or_referenced,
 )
 from .identity import canonical_name, content_hash, contextual_key, entity_id
-from .invalidation import Invalidation, invalidate
+from .invalidation import (
+    Invalidation,
+    TargetedInvalidation,
+    apply_targeted,
+    invalidate,
+    relations_of_evidence,
+)
 from .model import (
     Confidence,
     Entity,
@@ -75,6 +84,7 @@ from .taxonomy import (
 
 __all__ = [
     "ALLOWED_PAIRS",
+    "INVOCATION_MARKER",
     "CapabilityProfile",
     "CodeContent",
     "CodeLocator",
@@ -125,13 +135,16 @@ __all__ = [
     "RevisionTransaction",
     "SourceVersion",
     "SpreadsheetLocator",
+    "TargetedInvalidation",
     "TranscriptLocator",
     "UnknownKind",
     "UnknownReference",
     "UnsupportedEvidence",
+    "apply_targeted",
     "blocking_gaps",
     "canonical_name",
     "check_component",
+    "check_relation_predicate",
     "close_gap",
     "content_hash",
     "contextual_key",
@@ -148,6 +161,8 @@ __all__ = [
     "mandatory_terms",
     "open_gap",
     "open_gaps",
+    "relation_predicate_terms",
+    "relations_of_evidence",
     "symbol_defined_or_referenced",
     "validate_attributes",
     "validate_pair",

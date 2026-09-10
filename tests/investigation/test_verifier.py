@@ -328,3 +328,138 @@ def test_the_verifier_grounds_on_the_same_excerpt_the_evidence_persists(
     assert evidence.excerpt == resolved.capture.excerpt
     assert evidence.excerpt
     assert excerpt_digest(evidence.excerpt) == evidence.excerpt_hash
+
+
+CONFIGURES = (
+    "public class OrderService {\n"
+    "    private final OrderRepository repository;\n"
+    "    public OrderService(OrderRepository repository) {\n"
+    "        this.repository = repository;\n"
+    "    }\n"
+    "}\n"
+)
+
+DELEGATES = (
+    "public class OrderService {\n"
+    "    private final OrderRepository repository;\n"
+    "    public String place(String order) {\n"
+    "        return repository.save(order);\n"
+    "    }\n"
+    "}\n"
+)
+
+READS_ONLY = (
+    "public class OrderService {\n"
+    "    public Order load(String id) {\n"
+    "        return jdbc.select(\"select * from orders where id = ?\", id);\n"
+    "    }\n"
+    "}\n"
+)
+
+SERVICE_PATH = "src/OrderService.java"
+
+
+def relation_report(tmp_path: Path, body: str, claim: RelationClaim):
+    write(tmp_path, SERVICE_PATH, body)
+    snapshot = snapshot_of(tmp_path)
+    lines = body.rstrip("\n").split("\n")
+    item = capture(snapshot, SERVICE_PATH, 1, len(lines), symbol="OrderService")
+    finding = Finding(
+        type=EntityKind.CAPABILITY,
+        subject="OrderService",
+        statement="OrderService holds the OrderRepository",
+        evidence=(EvidenceRef(path=SERVICE_PATH, line_start=1, line_end=len(lines)),),
+        relations=(claim,),
+    )
+    report = verify([finding], registry_with(item), snapshot)
+    return report.verified[0].relation_check(0)
+
+
+def relation_evidence(body: str) -> tuple[EvidenceRef, ...]:
+    lines = body.rstrip("\n").split("\n")
+    return (EvidenceRef(path=SERVICE_PATH, line_start=1, line_end=len(lines)),)
+
+
+def test_a_calls_relation_over_a_wiring_only_excerpt_stays_inferred(
+    tmp_path: Path,
+) -> None:
+    check = relation_report(
+        tmp_path,
+        CONFIGURES,
+        RelationClaim(
+            kind=RelationKind.CALLS,
+            target_subject="OrderRepository",
+            statement="OrderService configures OrderRepository",
+            evidence=relation_evidence(CONFIGURES),
+        ),
+    )
+    assert check.evidence_valid
+    assert not check.claim_supported
+    assert check.confidence is Confidence.INFERRED
+    predicate = [
+        item for item in check.grounding if item.component == "relation_predicate"
+    ]
+    assert predicate and not predicate[0].ok
+
+
+def test_a_calls_relation_over_an_invocation_excerpt_is_supported(
+    tmp_path: Path,
+) -> None:
+    check = relation_report(
+        tmp_path,
+        DELEGATES,
+        RelationClaim(
+            kind=RelationKind.CALLS,
+            target_subject="OrderRepository",
+            statement="OrderService delegates persistence to repository save",
+            evidence=relation_evidence(DELEGATES),
+        ),
+    )
+    assert check.claim_supported
+    assert check.confidence is Confidence.SUPPORTED
+    predicate = [
+        item for item in check.grounding if item.component == "relation_predicate"
+    ]
+    assert predicate and predicate[0].ok
+
+
+def test_a_writes_relation_over_a_select_only_excerpt_stays_inferred(
+    tmp_path: Path,
+) -> None:
+    check = relation_report(
+        tmp_path,
+        READS_ONLY,
+        RelationClaim(
+            kind=RelationKind.WRITES,
+            target_subject="orders",
+            statement="OrderService writes the orders table",
+            evidence=relation_evidence(READS_ONLY),
+        ),
+    )
+    assert check.evidence_valid
+    assert not check.claim_supported
+    assert check.confidence is Confidence.INFERRED
+    predicate = [
+        item for item in check.grounding if item.component == "relation_predicate"
+    ]
+    assert predicate and not predicate[0].ok
+
+
+def test_the_relation_grounding_reports_source_target_and_predicate(
+    tmp_path: Path,
+) -> None:
+    check = relation_report(
+        tmp_path,
+        DELEGATES,
+        RelationClaim(
+            kind=RelationKind.CALLS,
+            target_subject="OrderRepository",
+            statement="OrderService delegates persistence to repository save",
+            evidence=relation_evidence(DELEGATES),
+        ),
+    )
+    assert [item.component for item in check.grounding] == [
+        "symbol",
+        "relation_target",
+        "relation_predicate",
+    ]

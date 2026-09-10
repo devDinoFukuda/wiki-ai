@@ -357,3 +357,139 @@ def test_evaluate_metrics_ignores_unknown_entries() -> None:
     )
     assert set(evaluated) == {"rule_recall"}
     assert evaluated["rule_recall"]["passed"] is True
+
+
+def test_failed_metrics_lists_only_the_names_that_did_not_pass() -> None:
+    evaluated = thresholds.evaluate_metrics(
+        {
+            "rule_recall": {"value": 0.9},
+            "unsupported_claim_rate": {"value": 0.1},
+        },
+        thresholds.TARGET,
+    )
+    assert runner.failed_metrics(evaluated) == ("unsupported_claim_rate",)
+
+
+def test_failed_metrics_is_empty_when_every_metric_passes() -> None:
+    evaluated = thresholds.evaluate_metrics(
+        {"rule_recall": {"value": 0.9}}, thresholds.BOOTSTRAP
+    )
+    assert runner.failed_metrics(evaluated) == ()
+
+
+def test_a_metric_below_threshold_marks_the_run_below_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install(monkeypatch, tmp_path, REQUESTED)
+    result = runner.run_repository("java", REQUESTED, tmp_path, thresholds.TARGET)
+    assert result.status == runner.STATUS_BELOW_THRESHOLD
+    assert result.reason == runner.BELOW_THRESHOLD_REASON
+    assert result.failed_metrics == ("unsupported_claim_rate",)
+    payload = result.to_dict()
+    assert payload["status"] == runner.STATUS_BELOW_THRESHOLD
+    assert payload["failed_metrics"] == ["unsupported_claim_rate"]
+
+
+def test_every_metric_above_threshold_keeps_the_run_ok(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install(monkeypatch, tmp_path, REQUESTED)
+    result = runner.run_repository("java", REQUESTED, tmp_path, thresholds.BOOTSTRAP)
+    assert result.status == "ok"
+    assert result.failed_metrics == ()
+    assert "failed_metrics" not in result.to_dict()
+
+
+def test_main_exits_five_when_a_run_is_below_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "missing_binaries", lambda providers: ())
+    monkeypatch.setattr(
+        runner,
+        "run_repository",
+        lambda repo, name, workspace, level: runner.RunResult(
+            provider=name,
+            repository=repo,
+            status=runner.STATUS_BELOW_THRESHOLD,
+            report=_report(),
+            reason=runner.BELOW_THRESHOLD_REASON,
+            actual_provider=name,
+            level=level,
+            failed_metrics=("unsupported_claim_rate",),
+        ),
+    )
+    stream = io.StringIO()
+    code = runner.main(["--provider", "claude", "--repo", "java", "--level", "target"], stream)
+    assert code == runner.EXIT_BELOW_THRESHOLD
+    assert code not in {runner.EXIT_OK, runner.EXIT_SKIPPED, runner.EXIT_ERROR}
+
+
+def test_main_stays_ok_when_every_metric_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "missing_binaries", lambda providers: ())
+    monkeypatch.setattr(
+        runner,
+        "run_repository",
+        lambda repo, name, workspace, level: runner.RunResult(
+            provider=name,
+            repository=repo,
+            status="ok",
+            report=_report(),
+            actual_provider=name,
+            level=level,
+        ),
+    )
+    stream = io.StringIO()
+    code = runner.main(["--provider", "claude", "--repo", "java"], stream)
+    assert code == runner.EXIT_OK
+
+
+def test_conformance_reports_below_threshold_distinct_from_provider_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "missing_binaries", lambda providers: ())
+
+    def _below(repository: str, provider: str, workspace: Path) -> runner.RunResult:
+        return runner.RunResult(
+            provider=provider,
+            repository=repository,
+            status=runner.STATUS_BELOW_THRESHOLD,
+            report=_report(),
+            reason=runner.BELOW_THRESHOLD_REASON,
+            actual_provider=provider,
+            failed_metrics=("unsupported_claim_rate",),
+        )
+
+    monkeypatch.setattr(runner, "run_repository", _below)
+    payload = conformance.run("java", tmp_path)
+    assert payload["status"] == conformance.STATUS_BELOW_THRESHOLD
+    assert payload["status"] != conformance.STATUS_PROVIDER_MISMATCH
+    assert payload["below_threshold"][0]["repository"] == "java"
+    entry = payload["comparisons"][0]
+    assert entry["comparable"] is False
+    assert "knowledge_diff" not in entry
+
+
+def test_conformance_main_exits_five_on_below_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "missing_binaries", lambda providers: ())
+    monkeypatch.setattr(
+        runner,
+        "run_repository",
+        lambda repository, provider, workspace: runner.RunResult(
+            provider=provider,
+            repository=repository,
+            status=runner.STATUS_BELOW_THRESHOLD,
+            report=_report(),
+            reason=runner.BELOW_THRESHOLD_REASON,
+            actual_provider=provider,
+            failed_metrics=("unsupported_claim_rate",),
+        ),
+    )
+    stream = io.StringIO()
+    code = conformance.main(["--repo", "java", "--workspace", str(tmp_path)], stream)
+    assert code == conformance.EXIT_BELOW_THRESHOLD
+    assert code != conformance.EXIT_PROVIDER_MISMATCH
+    assert code not in {runner.EXIT_OK, runner.EXIT_SKIPPED, runner.EXIT_ERROR}

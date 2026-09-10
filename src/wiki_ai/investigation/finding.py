@@ -103,6 +103,7 @@ class RelationClaim:
     target_type: EntityKind | None = None
     target_owner: str | None = None
     target_id: str | None = None
+    statement: str = ""
     evidence: tuple[EvidenceRef, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
@@ -118,6 +119,7 @@ class RelationClaim:
         object.__setattr__(self, "target_id", explicit or None)
         owner = (self.target_owner or "").strip()
         object.__setattr__(self, "target_owner", owner or None)
+        object.__setattr__(self, "statement", (self.statement or "").strip())
         object.__setattr__(self, "evidence", tuple(self.evidence))
         object.__setattr__(self, "attributes", dict(self.attributes))
 
@@ -132,6 +134,7 @@ class RelationClaim:
             "target_type": None if self.target_type is None else self.target_type.value,
             "target_owner": self.target_owner,
             "target_id": self.target_id,
+            "statement": self.statement,
             "evidence": [ref.to_dict() for ref in self.evidence],
             "attributes": dict(self.attributes),
         }
@@ -267,6 +270,7 @@ def _relation_claim(payload: Any) -> RelationClaim:
         target_type=entity_kind(str(raw_target_type)) if raw_target_type else None,
         target_owner=str(payload.get("target_owner") or "") or None,
         target_id=str(payload.get("target_id") or "") or None,
+        statement=str(payload.get("statement") or ""),
         evidence=tuple(
             _evidence_ref(item) for item in payload.get("evidence") or ()
         ),
@@ -366,7 +370,7 @@ def _evidence_schema() -> dict[str, Any]:
 def _relation_schema() -> dict[str, Any]:
     return {
         "type": "object",
-        "required": ["kind"],
+        "required": ["kind", "statement"],
         "additionalProperties": False,
         "anyOf": [
             {"required": ["target_subject"]},
@@ -378,6 +382,7 @@ def _relation_schema() -> dict[str, Any]:
             "target_type": {"type": "string", "enum": sorted(ENTITY_KIND_VALUES)},
             "target_owner": {"type": "string"},
             "target_id": {"type": "string"},
+            "statement": {"type": "string"},
             "evidence": {"type": "array", "items": _evidence_schema()},
             "attributes": {"type": "object"},
         },

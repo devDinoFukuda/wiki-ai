@@ -13,6 +13,7 @@ from wiki_ai.app.ports import CapabilityUnavailable, OutcomeStatus
 from wiki_ai.app.session import (
     PREFERENCE_SOURCES,
     STATE_DIR_NAME,
+    AnalysisState,
     AnalysisStatus,
     ResolvedProvider,
     Session,
@@ -53,6 +54,7 @@ __all__ = [
     "UP_TO_DATE",
     "REPORT_STATUS_BY_OUTCOME",
     "ANALYSIS_STATUS_BY_OUTCOME",
+    "ASK_STATUS_BY_ANSWER",
     "SOURCE_KIND_BY_EXTENSION",
     "CORRELATION_DETAIL",
     "source_kind_for",
@@ -78,6 +80,7 @@ UNKNOWN_PROVIDER = "unknown_provider"
 UNKNOWN_PROVIDER_ACTION = "choose one of the registered providers"
 STRUCTURAL_ONLY = "structural_only"
 INCOMPLETE_ACTION = "review the reported gaps and run again"
+ANSWER_ACTION = "review the unresolved notes and add evidence"
 CORRELATION_DETAIL = "correlation"
 _HASH_CHUNK = 65536
 _NON_WORD = re.compile(r"[^a-z0-9]+")
@@ -88,6 +91,12 @@ REPORT_STATUS_BY_OUTCOME: Mapping[OutcomeStatus, str] = {
     OutcomeStatus.PARTIAL: "partial",
     OutcomeStatus.BLOCKED: "blocked",
     OutcomeStatus.FAILED: "error",
+}
+
+ASK_STATUS_BY_ANSWER: Mapping[str, str] = {
+    "answered": "ok",
+    "partial": "partial",
+    "blocked": "blocked",
 }
 
 ANALYSIS_STATUS_BY_OUTCOME: Mapping[OutcomeStatus, AnalysisStatus] = {
@@ -446,6 +455,14 @@ def _composition(wiring: Wiring | None, registry: ProviderRegistry | None) -> Wi
     return default_wiring()
 
 
+def _settled_baseline(state: AnalysisState, objective_key: str) -> bool:
+    return (
+        state.analysis_status is AnalysisStatus.COMPLETE
+        and bool(objective_key)
+        and objective_key == state.analyzed_objective_hash
+    )
+
+
 def _blocked_analysis(
     session: Session,
     digest: str,
@@ -573,7 +590,11 @@ def analyze(
     snapshot = take_snapshot(spec, store=session.snapshot_store)
     analyzable = len(build_inventory(snapshot).analyzable())
     previous = session.current_snapshot()
-    if previous is not None and not diff(previous, snapshot).is_empty():
+    if (
+        previous is not None
+        and _settled_baseline(state, objective_key)
+        and not diff(previous, snapshot).is_empty()
+    ):
         return _update_report(
             session, composition, previous, snapshot, analyzable, resolved, objective_key
         )
@@ -626,9 +647,8 @@ def ingest(
     session = Session.open(root)
     kind = source_kind_for(source)
     version_hash = _file_hash(source)
-    provider_name = session.resolve_provider(
-        composition.registry, composition.provider
-    ).name
+    chosen = session.resolve_provider(composition.registry, composition.provider)
+    provider_name = chosen.name
     resolved = source.resolve()
     with session.open_knowledge() as knowledge:
         try:
@@ -655,7 +675,9 @@ def ingest(
                 reason=exc.reason,
                 action=exc.action,
             )
-        outcome = runner.run(source, "", knowledge, session.namespace)
+        outcome = runner.run(
+            source, "", knowledge, session.namespace, provider=chosen.provider
+        )
         registered = bool(knowledge.source_versions(outcome.source_id))
         payload = outcome.to_dict()
         if outcome.entities_written:
@@ -714,13 +736,15 @@ def ask(
         outcome = runner.run(
             question, knowledge, resolved.provider, session.namespace
         )
+    report_status = ASK_STATUS_BY_ANSWER.get(outcome.status, "partial")
     return AskReport(
-        status="ok",
+        status=report_status,
         question=question,
         answer=outcome.answer,
         mode=outcome.mode,
         provider=resolved.name,
         reason=outcome.reason,
+        action="" if report_status == "ok" else ANSWER_ACTION,
         evidence_ids=outcome.evidence_ids,
         entity_ids=outcome.entity_ids,
         unresolved=outcome.unresolved,

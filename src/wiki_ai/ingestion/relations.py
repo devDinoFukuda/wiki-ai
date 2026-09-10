@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
-from wiki_ai.knowledge.grounding import check_component, excerpt_vocabulary
+from wiki_ai.knowledge.grounding import (
+    check_component,
+    check_relation_predicate,
+    excerpt_vocabulary,
+)
 from wiki_ai.knowledge.identity import canonical_name, contextual_key
 from wiki_ai.knowledge.model import Confidence, Entity, EntityId
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
@@ -232,6 +236,7 @@ def resolve_target(
 
 
 def _grounded(
+    claim: DocumentRelationClaim,
     source: VerifiedDocumentFinding,
     target_name: str,
     captures: Sequence[DocumentEvidenceCapture],
@@ -242,7 +247,10 @@ def _grounded(
             "relation_source", source.finding.subject, vocabulary
         )
         target_side = check_component("relation_target", target_name, vocabulary)
-        if source_side.ok and target_side.ok:
+        predicate = check_relation_predicate(
+            claim.kind.value, claim.statement, vocabulary
+        )
+        if source_side.ok and target_side.ok and predicate.ok:
             return True
     return False
 
@@ -279,13 +287,13 @@ def assess_relation(
                 "cites a capture this run cannot verify",
             ),
         )
-    if not _grounded(source, target_name, captures):
+    if not _grounded(claim, source, target_name, captures):
         return RelationVerdict(
             confidence=Confidence.INFERRED,
             captures=tuple(captures),
             reasons=(
-                f"the captured text of relation {claim.kind.value} names neither "
-                f"{source.finding.subject!r} nor {claim.target_subject!r}",
+                f"the captured text of relation {claim.kind.value} does not state "
+                f"{source.finding.subject!r} acting on {claim.target_subject!r}",
             ),
         )
     return RelationVerdict(confidence=Confidence.SUPPORTED, captures=tuple(captures))

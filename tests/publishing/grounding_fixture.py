@@ -6,10 +6,12 @@ from typing import Mapping
 from wiki_ai.knowledge import (
     CodeContent,
     CodeLocator,
+    Confidence,
     Entity,
     EntityId,
     Evidence,
     KnowledgeRepository,
+    KnowledgeState,
     Relation,
     SourceVersion,
     make_evidence,
@@ -34,6 +36,23 @@ RULE_EXCERPT = (
 )
 
 BLANK_EXCERPT = ""
+
+GRAPH_CAPABILITY_EXCERPT = (
+    "class Renovacao:\n"
+    "    def renew(self, contrato):\n"
+    "        resposta = self.billing_api.charge(contrato)\n"
+    "        self.eventos.publish('renewal-events', RenewalCompleted(contrato.id))\n"
+    "        return resposta"
+)
+
+INFERRED_STATEMENT = "OrderService deletes every order after 7 retries"
+
+INFERRED_EXCERPT = (
+    "class OrderService:\n"
+    "    def close(self, order):\n"
+    "        self.repository.save(order)\n"
+    "        return order\n"
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +110,22 @@ def build_with_excerpt(tmp_path, excerpt: str) -> GroundingGraph:
     return build(tmp_path, capability_excerpt=excerpt)
 
 
+def enrich_capability_excerpt(graph) -> str:
+    entity_id = graph.id("capability")
+    stored = graph.repository.evidence_for(entity_id)[0]
+    version = graph.code_version
+    enriched = make_evidence(
+        version.source_id,
+        version.version_hash,
+        stored.locator,
+        GRAPH_CAPABILITY_EXCERPT,
+        CAPTURED,
+    )
+    with graph.repository.begin_revision("pipeline", "excerpt real") as revision:
+        revision.put_evidence(enriched, [entity_id])
+    return enriched.id
+
+
 def build(tmp_path, capability_excerpt: str = CAPABILITY_EXCERPT) -> GroundingGraph:
     repository = KnowledgeRepository.open(str(tmp_path / DATABASE_FILENAME))
     nodes = {
@@ -116,11 +151,24 @@ def build(tmp_path, capability_excerpt: str = CAPABILITY_EXCERPT) -> GroundingGr
         "silent": Entity.create(
             kind="capability", name="Cancelamento", stable_key="cap/cancel"
         ),
+        "inferred": Entity.create(
+            kind="business_rule",
+            name="OrderService",
+            stable_key="rule/order-service",
+            attributes={
+                "statement": INFERRED_STATEMENT,
+                "conditions": ["after 7 retries"],
+                "effects": ["deletes every order"],
+            },
+            state=KnowledgeState.DECLARED,
+            confidence=Confidence.INFERRED,
+        ),
     }
     evidences = {
         "capability": _evidence("src/renewal.py", "renew", capability_excerpt),
         "rule": _evidence("src/rules.py", "eligible", RULE_EXCERPT),
         "silent": _blank_evidence("src/cancel.py", "cancel"),
+        "inferred": _evidence("src/orders.py", "close", INFERRED_EXCERPT),
     }
     with repository.begin_revision("pipeline", "grafo de grounding") as revision:
         revision.put_source_version(_version())
@@ -137,6 +185,7 @@ def build(tmp_path, capability_excerpt: str = CAPABILITY_EXCERPT) -> GroundingGr
         revision.put_evidence(evidences["capability"], [nodes["capability"].id])
         revision.put_evidence(evidences["rule"], [nodes["rule"].id])
         revision.put_evidence(evidences["silent"], [nodes["silent"].id])
+        revision.put_evidence(evidences["inferred"], [nodes["inferred"].id])
     return GroundingGraph(
         repository=repository, nodes=nodes, evidences=evidences
     )

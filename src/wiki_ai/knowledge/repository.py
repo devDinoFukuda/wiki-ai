@@ -42,6 +42,7 @@ ADDITIVE_ENTITY_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 ADDITIVE_EVIDENCE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("excerpt", "TEXT NOT NULL DEFAULT ''"),
+    ("invalidated_at", "TEXT NOT NULL DEFAULT ''"),
 )
 
 DDL = """
@@ -106,7 +107,8 @@ CREATE TABLE IF NOT EXISTS evidence (
     excerpt_hash       TEXT NOT NULL,
     captured_at        TEXT NOT NULL,
     revision_id        TEXT NOT NULL REFERENCES revisions(revision_id),
-    excerpt            TEXT NOT NULL DEFAULT ''
+    excerpt            TEXT NOT NULL DEFAULT '',
+    invalidated_at     TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS evidence_links (
@@ -146,8 +148,9 @@ CREATE INDEX IF NOT EXISTS ix_srcver_source    ON source_versions(source_id);
 ENTITY_COLUMNS = "entity_id, kind, name, attributes_json, state, confidence, owner_id"
 EVIDENCE_COLUMNS = (
     "e.evidence_id, e.source_id, e.version_hash, e.locator_json, e.excerpt_hash, "
-    "e.captured_at, e.excerpt"
+    "e.captured_at, e.excerpt, e.invalidated_at"
 )
+ACTIVE_EVIDENCE_CLAUSE = "e.invalidated_at = ''"
 SOURCE_VERSION_COLUMNS = "source_id, version_hash, locator_root, captured_at"
 RELATION_COLUMNS = "relation_id, kind, source_id, target_id, attributes_json, confidence"
 
@@ -454,6 +457,37 @@ class RevisionTransaction:
                 self._touched_relations.append(relation_id)
         return evidence.id
 
+    def invalidate_evidence(self, evidence_ids: Sequence[str], at: str) -> tuple[str, ...]:
+        self._guard()
+        stamp = (at or "").strip() or utc_now()
+        touched: list[str] = []
+        for evidence_id in evidence_ids:
+            known = self._conn.execute(
+                "SELECT 1 FROM evidence WHERE evidence_id=?", (evidence_id,)
+            ).fetchone()
+            if known is None:
+                raise UnknownReference(f"evidência inexistente: {evidence_id}")
+            self._conn.execute(
+                "UPDATE evidence SET invalidated_at=? WHERE evidence_id=? "
+                "AND invalidated_at=''",
+                (stamp, evidence_id),
+            )
+            if evidence_id not in touched:
+                touched.append(evidence_id)
+            for (relation_id,) in self._conn.execute(
+                "SELECT relation_id FROM relation_evidence_links WHERE evidence_id=?",
+                (evidence_id,),
+            ).fetchall():
+                if str(relation_id) not in self._touched_relations:
+                    self._touched_relations.append(str(relation_id))
+            for (entity_id,) in self._conn.execute(
+                "SELECT entity_id FROM evidence_links WHERE evidence_id=?",
+                (evidence_id,),
+            ).fetchall():
+                if str(entity_id) not in self._touched_entities:
+                    self._touched_entities.append(str(entity_id))
+        return tuple(touched)
+
     def record_invalidation(self, target_kind: str, target_id: str, key: str) -> None:
         self._guard()
         self._conn.execute(
@@ -659,31 +693,51 @@ class KnowledgeRepository:
         sql += " ORDER BY relation_id"
         return [relation_store.row_to_relation(row) for row in self.conn.execute(sql, params)]
 
-    def evidence_for_relation(self, relation_id: str) -> list[Evidence]:
-        rows = self.conn.execute(
+    def evidence_for_relation(
+        self, relation_id: str, active_only: bool = True
+    ) -> list[Evidence]:
+        sql = (
             f"SELECT {EVIDENCE_COLUMNS} FROM evidence e JOIN relation_evidence_links l "
-            "ON l.evidence_id = e.evidence_id WHERE l.relation_id=? ORDER BY e.evidence_id",
-            (relation_id,),
-        ).fetchall()
+            "ON l.evidence_id = e.evidence_id WHERE l.relation_id=?"
+        )
+        if active_only:
+            sql += f" AND {ACTIVE_EVIDENCE_CLAUSE}"
+        sql += " ORDER BY e.evidence_id"
+        rows = self.conn.execute(sql, (relation_id,)).fetchall()
         return [self._row_to_evidence(row) for row in rows]
 
     def relation_count(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0])
 
-    def evidence_for(self, entity_id: EntityId) -> list[Evidence]:
-        rows = self.conn.execute(
+    def evidence_for(
+        self, entity_id: EntityId, active_only: bool = True
+    ) -> list[Evidence]:
+        sql = (
             f"SELECT {EVIDENCE_COLUMNS} FROM evidence e JOIN evidence_links l "
-            "ON l.evidence_id = e.evidence_id WHERE l.entity_id=? ORDER BY e.evidence_id",
-            (entity_id.value,),
-        ).fetchall()
+            "ON l.evidence_id = e.evidence_id WHERE l.entity_id=?"
+        )
+        if active_only:
+            sql += f" AND {ACTIVE_EVIDENCE_CLAUSE}"
+        sql += " ORDER BY e.evidence_id"
+        rows = self.conn.execute(sql, (entity_id.value,)).fetchall()
         return [self._row_to_evidence(row) for row in rows]
 
-    def get_evidence(self, evidence_id: str) -> Evidence | None:
-        row = self.conn.execute(
-            f"SELECT {EVIDENCE_COLUMNS} FROM evidence e WHERE e.evidence_id=?",
-            (evidence_id,),
-        ).fetchone()
+    def get_evidence(
+        self, evidence_id: str, active_only: bool = True
+    ) -> Evidence | None:
+        sql = f"SELECT {EVIDENCE_COLUMNS} FROM evidence e WHERE e.evidence_id=?"
+        if active_only:
+            sql += f" AND {ACTIVE_EVIDENCE_CLAUSE}"
+        row = self.conn.execute(sql, (evidence_id,)).fetchone()
         return self._row_to_evidence(row) if row else None
+
+    def relations_of_evidence(self, evidence_id: str) -> tuple[str, ...]:
+        rows = self.conn.execute(
+            "SELECT relation_id FROM relation_evidence_links WHERE evidence_id=? "
+            "ORDER BY relation_id",
+            (evidence_id,),
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows)
 
     def source_versions(self, source_id: str | None = None) -> list[SourceVersion]:
         sql = f"SELECT {SOURCE_VERSION_COLUMNS} FROM source_versions"
@@ -758,4 +812,5 @@ class KnowledgeRepository:
             excerpt_hash=str(row[4]),
             captured_at=str(row[5]),
             excerpt=str(row[6] or ""),
+            invalidated_at=str(row[7] or ""),
         )

@@ -20,6 +20,9 @@ __all__ = [
     "STATUS_PROVIDER_MISMATCH",
     "MISMATCH_REASON",
     "EXIT_PROVIDER_MISMATCH",
+    "STATUS_BELOW_THRESHOLD",
+    "BELOW_THRESHOLD_REASON",
+    "EXIT_BELOW_THRESHOLD",
     "comparable",
     "KnowledgeShape",
     "ShapeDiff",
@@ -36,6 +39,9 @@ PAIR: tuple[str, str] = ("claude", "codex")
 STATUS_PROVIDER_MISMATCH = runner.STATUS_PROVIDER_MISMATCH
 MISMATCH_REASON = "compared_runs_used_a_different_provider"
 EXIT_PROVIDER_MISMATCH = 4
+STATUS_BELOW_THRESHOLD = runner.STATUS_BELOW_THRESHOLD
+BELOW_THRESHOLD_REASON = "a_run_in_the_pair_is_below_threshold_at_level"
+EXIT_BELOW_THRESHOLD = 5
 
 
 @dataclass(frozen=True)
@@ -224,6 +230,7 @@ def run(repository: str, workspace: Path | None = None) -> dict[str, Any]:
     holder.mkdir(parents=True, exist_ok=True)
     comparisons: list[dict[str, Any]] = []
     mismatched: list[dict[str, Any]] = []
+    below_threshold: list[dict[str, Any]] = []
     for name in repositories:
         first_result, first_shape = _run_one(name, PAIR[0], holder / name)
         second_result, second_shape = _run_one(name, PAIR[1], holder / name)
@@ -247,6 +254,25 @@ def run(repository: str, workspace: Path | None = None) -> dict[str, Any]:
             )
             comparisons.append(entry)
             continue
+        below = [
+            result
+            for result in (first_result, second_result)
+            if result.status == STATUS_BELOW_THRESHOLD
+        ]
+        if below:
+            entry["comparable"] = False
+            entry["reason"] = BELOW_THRESHOLD_REASON
+            below_threshold.append(
+                {
+                    "repository": name,
+                    "runs": [_mismatch_entry(result) for result in below],
+                    "failed_metrics": sorted(
+                        {metric for result in below for metric in result.failed_metrics}
+                    ),
+                }
+            )
+            comparisons.append(entry)
+            continue
         entry["comparable"] = True
         if first_shape is not None and second_shape is not None:
             entry["knowledge_diff"] = compare_shapes(first_shape, second_shape).to_dict()
@@ -262,6 +288,15 @@ def run(repository: str, workspace: Path | None = None) -> dict[str, Any]:
             "providers": list(PAIR),
             "workspace": holder.as_posix(),
             "mismatched": mismatched,
+            "comparisons": comparisons,
+        }
+    if below_threshold:
+        return {
+            "status": STATUS_BELOW_THRESHOLD,
+            "reason": BELOW_THRESHOLD_REASON,
+            "providers": list(PAIR),
+            "workspace": holder.as_posix(),
+            "below_threshold": below_threshold,
             "comparisons": comparisons,
         }
     failed = [entry for entry in comparisons if "knowledge_diff" not in entry]
@@ -281,6 +316,11 @@ def render_table(payload: Mapping[str, Any]) -> str:
             str(entry.get("repository", "")) for entry in payload.get("mismatched", ())
         )
         return f"{STATUS_PROVIDER_MISMATCH}: {payload.get('reason')} ({', '.join(names)})"
+    if payload.get("status") == STATUS_BELOW_THRESHOLD:
+        names = sorted(
+            str(entry.get("repository", "")) for entry in payload.get("below_threshold", ())
+        )
+        return f"{STATUS_BELOW_THRESHOLD}: {payload.get('reason')} ({', '.join(names)})"
     rows = [["repository", "identical", "entity_kind_diffs", "relation_kind_diffs"]]
     for entry in payload.get("comparisons", ()):
         diff = entry.get("knowledge_diff")
@@ -334,6 +374,8 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
         return runner.EXIT_SKIPPED
     if payload.get("status") == STATUS_PROVIDER_MISMATCH:
         return EXIT_PROVIDER_MISMATCH
+    if payload.get("status") == STATUS_BELOW_THRESHOLD:
+        return EXIT_BELOW_THRESHOLD
     if payload.get("status") == "error":
         return runner.EXIT_ERROR
     return runner.EXIT_OK

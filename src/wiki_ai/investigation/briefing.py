@@ -63,6 +63,8 @@ METHOD_STEPS: tuple[str, ...] = (
     "alone can match more than one subject",
     "capture the lines that decide the relation itself and pass them as the "
     "relation evidence",
+    "describe in the relation statement what the executable code does between the "
+    "two subjects, using the terms the excerpt itself spells",
     "declare a gap whenever the code does not answer the question",
 )
 
@@ -85,6 +87,11 @@ RELATION_RULES: tuple[str, ...] = (
     "question is raised as a gap",
     "a relation is supported only when its own evidence excerpt names both the "
     "finding subject and the target; endpoints being supported never suffices",
+    "statement says what the code does in that relation, for example "
+    "'OrderService delegates persistence to OrderRepository.save'",
+    "the excerpt must spell the action the relation kind names: a calls relation "
+    "needs the invocation, a writes relation needs the write; wiring or "
+    "construction alone keeps the relation inferred",
 )
 
 _HEADING = "Objective"

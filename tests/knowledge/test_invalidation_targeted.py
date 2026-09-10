@@ -149,7 +149,7 @@ def test_apply_targeted_deletes_nothing(loaded):
     before = repository.entity_count()
     applied_update(repository, previous, changed, changed_evidence)
     assert repository.entity_count() >= before
-    assert repository.get_evidence(changed_evidence.id) is not None
+    assert repository.get_evidence(changed_evidence.id, active_only=False) is not None
 
 
 def test_apply_targeted_records_every_target_kind(loaded):
@@ -164,7 +164,7 @@ def test_apply_targeted_demotes_the_attached_relation(loaded):
     repository, previous, changed, _intact, changed_evidence, _other = loaded
     applied = applied_update(repository, previous, changed, changed_evidence)
     for relation_id in applied.relations:
-        assert repository.get_relation(relation_id).confidence is Confidence.UNRESOLVED
+        assert repository.get_relation(relation_id).confidence is not Confidence.SUPPORTED
 
 
 def test_apply_targeted_opens_the_gap_about_the_entity(loaded):

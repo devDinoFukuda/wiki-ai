@@ -44,7 +44,12 @@ from wiki_ai.app.ports import (
     QueryRunner,
     UpdateRunner,
 )
-from wiki_ai.app.session import STATE_DIR_NAME, Session
+from wiki_ai.app.session import (
+    STATE_DIR_NAME,
+    AnalysisStatus,
+    Session,
+    objective_hash,
+)
 from wiki_ai.app.wiring import Wiring
 from wiki_ai.ingestion.adapters import registry as adapters
 from wiki_ai.ingestion import pipeline
@@ -389,6 +394,13 @@ def test_an_update_invalidates_by_source_version(
     java: tuple[Path, ProviderRegistry]
 ) -> None:
     repo, _ = java
+    session = Session.open(repo)
+    session.record_analysis(
+        session.analysis_state().observed_digest,
+        AnalysisStatus.COMPLETE,
+        "",
+        objective_hash(NAMESPACE_OBJECTIVE),
+    )
     (repo / SERVICE).write_text(CHANGED_SERVICE, encoding="utf-8")
     registry = ProviderRegistry()
     registry.register("scripted", lambda: _UpdateProvider(scripts=[_update_script()]))

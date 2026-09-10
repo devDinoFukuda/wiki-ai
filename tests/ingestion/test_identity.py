@@ -174,12 +174,20 @@ def test_two_namespaces_never_overwrite_the_same_named_rule(
 ) -> None:
     credito = _transcript(tmp_path / "credito", "reuniao.vtt")
     cobranca = _transcript(tmp_path / "cobranca", "reuniao.vtt")
-    IngestionEngine(
-        provider_resolver=lambda: _rule_provider(credito, "Ana", "Eligibility")
-    ).run(credito, "", knowledge, "credito")
-    IngestionEngine(
-        provider_resolver=lambda: _rule_provider(cobranca, "Bruno", "Eligibility")
-    ).run(cobranca, "", knowledge, "cobranca")
+    IngestionEngine().run(
+        credito,
+        "",
+        knowledge,
+        "credito",
+        provider=_rule_provider(credito, "Ana", "Eligibility"),
+    )
+    IngestionEngine().run(
+        cobranca,
+        "",
+        knowledge,
+        "cobranca",
+        provider=_rule_provider(cobranca, "Bruno", "Eligibility"),
+    )
     rules = knowledge.find_entities("business_rule")
     assert len(rules) == 2
     assert {item.owner_id for item in rules} != {None}
@@ -190,11 +198,21 @@ def test_reingesting_the_same_source_stays_idempotent(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
     source = _transcript(tmp_path)
-    engine = IngestionEngine(
-        provider_resolver=lambda: _rule_provider(source, "Ana", "Eligibility")
+    engine = IngestionEngine()
+    first = engine.run(
+        source,
+        "",
+        knowledge,
+        "credito",
+        provider=_rule_provider(source, "Ana", "Eligibility"),
     )
-    first = engine.run(source, "", knowledge, "credito")
-    second = engine.run(source, first.version_hash, knowledge, "credito")
+    second = engine.run(
+        source,
+        first.version_hash,
+        knowledge,
+        "credito",
+        provider=_rule_provider(source, "Ana", "Eligibility"),
+    )
     assert first.status is IngestionStatus.COMPLETE
     assert second.status is IngestionStatus.COMPLETE
     assert len(knowledge.find_entities("business_rule")) == 1

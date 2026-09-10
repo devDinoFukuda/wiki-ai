@@ -257,6 +257,11 @@ class Evidence:
     excerpt_hash: str
     captured_at: str
     excerpt: str = ""
+    invalidated_at: str = ""
+
+    @property
+    def active(self) -> bool:
+        return not self.invalidated_at
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _required_text(self.id, "Evidence.id"))
@@ -288,6 +293,7 @@ class Evidence:
             "excerpt_hash": self.excerpt_hash,
             "captured_at": self.captured_at,
             "excerpt": self.excerpt,
+            "invalidated_at": self.invalidated_at,
         }
 
     @classmethod
@@ -300,6 +306,7 @@ class Evidence:
             excerpt_hash=str(data["excerpt_hash"]),
             captured_at=str(data["captured_at"]),
             excerpt=str(data.get("excerpt") or ""),
+            invalidated_at=str(data.get("invalidated_at") or ""),
         )
 
 

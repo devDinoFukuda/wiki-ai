@@ -106,6 +106,7 @@ class TargetedInvalidation:
     carried_over_entities: tuple[str, ...] = ()
     carried_over_evidence: tuple[str, ...] = ()
     gaps: tuple[str, ...] = ()
+    relation_ids: tuple[str, ...] = ()
 
     @property
     def total(self) -> int:
@@ -122,6 +123,15 @@ def entities_of_evidence(
             if item.id in wanted:
                 found.add(entity.id.value)
                 break
+    return tuple(sorted(found))
+
+
+def relations_of_evidence(
+    repository: KnowledgeRepository, evidence_ids: Sequence[str]
+) -> tuple[str, ...]:
+    found: set[str] = set()
+    for evidence_id in evidence_ids:
+        found.update(repository.relations_of_evidence(evidence_id))
     return tuple(sorted(found))
 
 
@@ -146,6 +156,26 @@ def surviving_evidence(
     )
 
 
+def _demotion_for_relation(
+    repository: KnowledgeRepository,
+    relation_id: str,
+    dropped: set[str],
+    current_key: str,
+) -> Confidence | None:
+    relation = repository.get_relation(relation_id)
+    if relation is None:
+        return None
+    physical = repository.evidence_for_relation(relation_id, active_only=False)
+    if not physical:
+        return None
+    surviving = [item for item in physical if item.active and item.id not in dropped]
+    if not surviving:
+        return Confidence.UNRESOLVED
+    if any(item.source_version_key == current_key for item in surviving):
+        return None
+    return Confidence.INFERRED
+
+
 def apply_targeted(
     repository: KnowledgeRepository,
     incoming: SourceVersion,
@@ -162,17 +192,31 @@ def apply_targeted(
 ) -> TargetedInvalidation:
     historical = set(historical_ids)
     opened: list[str] = []
+    touched_relations = tuple(
+        sorted(
+            set(relation_ids)
+            | set(relations_of_evidence(repository, tuple(evidence_ids)))
+        )
+    )
     with repository.begin_revision(author, summary) as revision:
         revision.put_source_version(incoming)
         for evidence_id in sorted(set(evidence_ids) | set(carried_evidence)):
             revision.record_invalidation(EVIDENCE_TARGET, evidence_id, obsolete_key)
         for entity_id in sorted(set(entity_ids) | set(carried_entities)):
             revision.record_invalidation(ENTITY_TARGET, entity_id, obsolete_key)
-        for relation_id in sorted(set(relation_ids)):
+        dropped = set(evidence_ids) | set(carried_evidence)
+        if evidence_ids:
+            revision.invalidate_evidence(sorted(set(evidence_ids)), incoming.captured_at)
+        for relation_id in touched_relations:
             relation = repository.get_relation(relation_id)
             if relation is None:
                 continue
-            revision.put_relation(relation.with_confidence(Confidence.UNRESOLVED))
+            demotion = _demotion_for_relation(
+                repository, relation_id, dropped, incoming.key
+            )
+            revision.put_relation(
+                relation.with_confidence(demotion or Confidence.UNRESOLVED)
+            )
             revision.record_invalidation(RELATION_TARGET, relation_id, obsolete_key)
         for entity_id in sorted(set(entity_ids)):
             entity = repository.get_entity(EntityId(entity_id))
@@ -191,7 +235,8 @@ def apply_targeted(
         revision_id=revision_id,
         source_version_key=obsolete_key,
         entities=tuple(sorted(set(entity_ids))),
-        relations=tuple(sorted(set(relation_ids))),
+        relations=touched_relations,
+        relation_ids=touched_relations,
         evidence=tuple(sorted(set(evidence_ids))),
         historical=tuple(sorted(historical & set(entity_ids))),
         carried_over_entities=tuple(sorted(set(carried_entities))),

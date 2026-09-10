@@ -61,8 +61,10 @@ def test_without_a_provider_the_outcome_is_honest(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
     source = _transcript(tmp_path)
-    engine = IngestionEngine(provider_resolver=lambda: None)
+    engine = IngestionEngine()
     outcome = engine.run(source, "", knowledge, "reuniao")
+    assert outcome.provider_used is False
+    assert outcome.status is IngestionStatus.STRUCTURAL_ONLY
     assert outcome.entities_written == 0
     assert outcome.blocks == 2
     assert PROVIDER_UNAVAILABLE in outcome.diagnostics
@@ -76,8 +78,9 @@ def test_a_provider_turns_blocks_into_entities(
 ) -> None:
     source = _transcript(tmp_path)
     provider = _decision_provider(source)
-    engine = IngestionEngine(provider_resolver=lambda: provider)
-    outcome = engine.run(source, "", knowledge, "reuniao")
+    engine = IngestionEngine()
+    outcome = engine.run(source, "", knowledge, "reuniao", provider=provider)
+    assert outcome.provider_used is True
     assert outcome.entities_written == 1
     assert PROVIDER_UNAVAILABLE not in outcome.diagnostics
     decision = knowledge.find_entities("decision_record")[0]
@@ -88,9 +91,17 @@ def test_reingesting_the_same_source_does_not_duplicate(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
     source = _transcript(tmp_path)
-    engine = IngestionEngine(provider_resolver=lambda: _decision_provider(source))
-    first = engine.run(source, "", knowledge, "reuniao")
-    second = engine.run(source, first.version_hash, knowledge, "reuniao")
+    engine = IngestionEngine()
+    first = engine.run(
+        source, "", knowledge, "reuniao", provider=_decision_provider(source)
+    )
+    second = engine.run(
+        source,
+        first.version_hash,
+        knowledge,
+        "reuniao",
+        provider=_decision_provider(source),
+    )
     assert first.source_id == second.source_id
     assert first.version_hash == second.version_hash
     assert len(knowledge.source_versions(first.source_id)) == 1
@@ -102,7 +113,7 @@ def test_a_declared_version_hash_that_disagrees_is_reported(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
     source = _transcript(tmp_path)
-    engine = IngestionEngine(provider_resolver=lambda: None)
+    engine = IngestionEngine()
     outcome = engine.run(source, "0" * 64, knowledge, "reuniao")
     assert VERSION_MISMATCH in outcome.diagnostics
 
@@ -112,7 +123,7 @@ def test_an_image_only_pdf_is_partial_with_an_explicit_gap(
 ) -> None:
     target = tmp_path / "digitalizado.pdf"
     target.write_bytes(fixtures.image_only_pdf())
-    engine = IngestionEngine(provider_resolver=lambda: None)
+    engine = IngestionEngine()
     outcome = engine.run(target, "", knowledge, "digitalizado")
     assert "warning:image_content_not_interpreted" in outcome.diagnostics
     assert "source_partially_interpreted" in outcome.diagnostics
@@ -123,7 +134,7 @@ def test_structure_alone_never_becomes_knowledge(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
     source = fixtures.write_xlsx(tmp_path / "planilha.xlsx")
-    engine = IngestionEngine(provider_resolver=lambda: None)
+    engine = IngestionEngine()
     outcome = engine.run(source, "", knowledge, "planilha")
     assert outcome.blocks > 0
     assert outcome.entities_written == 0
@@ -134,8 +145,11 @@ def test_a_silent_provider_writes_nothing_but_keeps_the_source(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
     source = _transcript(tmp_path)
-    engine = IngestionEngine(provider_resolver=lambda: FakeProvider(scripts=[Script()]))
-    outcome = engine.run(source, "", knowledge, "reuniao")
+    engine = IngestionEngine()
+    outcome = engine.run(
+        source, "", knowledge, "reuniao", provider=FakeProvider(scripts=[Script()])
+    )
+    assert outcome.provider_used is True
     assert outcome.entities_written == 0
     assert knowledge.source_versions(outcome.source_id)
 
@@ -146,7 +160,7 @@ def test_the_outcome_shape_matches_the_application_port(
     from wiki_ai.app.ports import IngestionOutcome, OutcomeStatus
 
     source = _transcript(tmp_path)
-    engine = IngestionEngine(provider_resolver=lambda: None)
+    engine = IngestionEngine()
     outcome = engine.run(source, "", knowledge, "reuniao")
     port = IngestionOutcome(
         source_id=outcome.source_id,
@@ -156,8 +170,29 @@ def test_the_outcome_shape_matches_the_application_port(
         status=OutcomeStatus(outcome.status.value),
         reason=outcome.reason,
         diagnostics=outcome.diagnostics,
+        provider_used=outcome.provider_used,
     )
     assert port.to_dict() == outcome.to_dict()
     assert {item.value for item in OutcomeStatus} == {
         item.value for item in IngestionStatus
     }
+
+
+def test_the_engine_never_resolves_a_provider_of_its_own(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
+    import inspect
+
+    from wiki_ai.ingestion import integration
+
+    assert "provider" in inspect.signature(IngestionEngine.run).parameters
+    assert not hasattr(integration, "ProviderResolver")
+    assert not any(
+        "provider" in name.lower()
+        for name in inspect.signature(IngestionEngine.__init__).parameters
+    )
+    source = _transcript(tmp_path)
+    outcome = IngestionEngine().run(source, "", knowledge, "reuniao")
+    assert outcome.provider_used is False
+    assert outcome.status is IngestionStatus.STRUCTURAL_ONLY
+    assert outcome.reason == PROVIDER_UNAVAILABLE

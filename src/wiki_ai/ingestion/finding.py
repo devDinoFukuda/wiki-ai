@@ -69,6 +69,7 @@ class DocumentRelationClaim:
     target_type: EntityKind | None = None
     target_owner: str | None = None
     target_id: str | None = None
+    statement: str = ""
     evidence: tuple[DocumentEvidenceRef, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
@@ -83,6 +84,7 @@ class DocumentRelationClaim:
         object.__setattr__(self, "target_subject", target)
         object.__setattr__(self, "target_id", explicit or None)
         object.__setattr__(self, "target_owner", owner or None)
+        object.__setattr__(self, "statement", str(self.statement or "").strip())
         object.__setattr__(self, "evidence", tuple(self.evidence))
         object.__setattr__(self, "attributes", dict(self.attributes))
 
@@ -93,6 +95,7 @@ class DocumentRelationClaim:
             "target_type": None if self.target_type is None else self.target_type.value,
             "target_owner": self.target_owner,
             "target_id": self.target_id,
+            "statement": self.statement,
             "evidence": [item.to_dict() for item in self.evidence],
             "attributes": dict(self.attributes),
         }
@@ -292,7 +295,7 @@ def document_finding_schema(kind: SourceKind | None = None) -> dict[str, Any]:
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["kind", "target_subject"],
+                    "required": ["kind", "target_subject", "statement"],
                     "additionalProperties": False,
                     "properties": {
                         "kind": {"type": "string", "enum": allowed_relations},
@@ -300,6 +303,7 @@ def document_finding_schema(kind: SourceKind | None = None) -> dict[str, Any]:
                         "target_type": {"type": "string", "enum": allowed_types},
                         "target_owner": {"type": "string"},
                         "target_id": {"type": "string"},
+                        "statement": {"type": "string"},
                         "evidence": _evidence_array_schema(),
                         "attributes": {"type": "object"},
                     },
@@ -347,6 +351,7 @@ def _relation_claim(payload: Any) -> DocumentRelationClaim:
         target_type=entity_kind(str(raw_target)) if raw_target else None,
         target_owner=str(payload.get("target_owner") or "") or None,
         target_id=str(payload.get("target_id") or "") or None,
+        statement=str(payload.get("statement") or ""),
         evidence=tuple(
             _evidence_ref(item) for item in payload.get("evidence") or ()
         ),

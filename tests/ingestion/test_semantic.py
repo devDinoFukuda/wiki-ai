@@ -46,6 +46,24 @@ def _transcript(tmp_path: Path) -> Path:
     return target
 
 
+DECLARING_VTT = """WEBVTT
+
+1
+00:00:12.000 --> 00:00:19.500
+<v Ana>Decidimos manter o corte no dia 5.</v>
+
+2
+00:00:24.000 --> 00:00:31.000
+<v Bruno>A ata define o limite de 500 documentado.</v>
+"""
+
+
+def _declaring_transcript(tmp_path: Path) -> Path:
+    target = tmp_path / "ata.vtt"
+    target.write_text(DECLARING_VTT, encoding="utf-8")
+    return target
+
+
 def _entities(repository: KnowledgeRepository, kind: str) -> list[Any]:
     return [item for item in repository.find_entities(kind)]
 
@@ -805,6 +823,66 @@ def test_a_relation_between_supported_endpoints_without_evidence_is_inferred(
 def test_a_relation_with_its_own_grounded_evidence_is_supported(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
+    ingested = pipeline.ingest(_declaring_transcript(tmp_path))
+    ana, bruno = _speaker_blocks(ingested)
+
+    def build(payloads: Payloads) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "type": "decision_record",
+                "subject": "corte no dia 5",
+                "statement": "Decidimos manter o corte no dia 5",
+                "owner": "speaker:Ana",
+                "evidence": evidence_of(payloads, 0),
+                "relations": [
+                    {
+                        "kind": "declares",
+                        "target_subject": "limite de 500 documentado",
+                        "target_type": "business_rule",
+                        "target_owner": "speaker:Bruno",
+                        "statement": (
+                            "a decisao define o limite de 500 documentado"
+                        ),
+                        "evidence": evidence_of(payloads, 2),
+                    }
+                ],
+            },
+            {
+                "type": "business_rule",
+                "subject": "limite de 500 documentado",
+                "statement": "A ata define o limite de 500 documentado",
+                "owner": "speaker:Bruno",
+                "conditions": ["limite de 500"],
+                "effects": ["documentado"],
+                "evidence": evidence_of(payloads, 1),
+            },
+        ]
+
+    provider = FakeProvider(
+        scripts=[
+            Script(
+                steps=(
+                    ("evidence.capture", {"block_ids": [ana]}),
+                    ("evidence.capture", {"block_ids": [bruno]}),
+                    ("evidence.capture", {"block_ids": [ana, bruno]}),
+                ),
+                build_findings=build,
+            )
+        ]
+    )
+    outcome = _investigator().run(ingested, knowledge, provider, "reuniao")
+
+    assert outcome.relations_written == 1
+    relation = knowledge.find_relations("declares")[0]
+    assert relation.confidence is Confidence.SUPPORTED
+    linked = knowledge.evidence_for_relation(relation.id)
+    assert len(linked) == 1
+    assert linked[0].excerpt_hash
+
+
+def test_a_relation_whose_capture_never_states_the_action_stays_inferred(
+    tmp_path: Path, knowledge: KnowledgeRepository
+) -> None:
     ingested = pipeline.ingest(_transcript(tmp_path))
     ana, bruno = _speaker_blocks(ingested)
 
@@ -822,6 +900,9 @@ def test_a_relation_with_its_own_grounded_evidence_is_supported(
                         "target_subject": "limite de 500 documentado",
                         "target_type": "business_rule",
                         "target_owner": "speaker:Bruno",
+                        "statement": (
+                            "a decisao define o limite de 500 documentado"
+                        ),
                         "evidence": evidence_of(payloads, 2),
                     }
                 ],
@@ -853,10 +934,9 @@ def test_a_relation_with_its_own_grounded_evidence_is_supported(
 
     assert outcome.relations_written == 1
     relation = knowledge.find_relations("declares")[0]
-    assert relation.confidence is Confidence.SUPPORTED
-    linked = knowledge.evidence_for_relation(relation.id)
-    assert len(linked) == 1
-    assert linked[0].excerpt_hash
+    assert relation.confidence is Confidence.INFERRED
+    assert knowledge.evidence_for_relation(relation.id)
+    assert any("acting on" in item for item in outcome.diagnostics)
 
 
 def test_a_relation_citing_a_capture_of_another_run_stays_inferred(
@@ -935,9 +1015,15 @@ def test_the_relation_schema_asks_the_provider_for_owner_id_and_evidence() -> No
         "target_type",
         "target_owner",
         "target_id",
+        "statement",
         "evidence",
         "attributes",
     }
+    assert schema["properties"]["relations"]["items"]["required"] == [
+        "kind",
+        "target_subject",
+        "statement",
+    ]
     assert relation["evidence"] == schema["properties"]["evidence"]
 
 
@@ -1103,7 +1189,7 @@ def test_every_entity_ingestion_writes_carries_its_namespace(
 def test_every_persisted_evidence_carries_a_real_excerpt_and_passes_the_gate(
     tmp_path: Path, knowledge: KnowledgeRepository
 ) -> None:
-    ingested = pipeline.ingest(_transcript(tmp_path))
+    ingested = pipeline.ingest(_declaring_transcript(tmp_path))
     ana, bruno = _speaker_blocks(ingested)
 
     def build(payloads: Payloads) -> list[Mapping[str, Any]]:
@@ -1120,6 +1206,9 @@ def test_every_persisted_evidence_carries_a_real_excerpt_and_passes_the_gate(
                         "target_subject": "limite de 500 documentado",
                         "target_type": "business_rule",
                         "target_owner": "speaker:Bruno",
+                        "statement": (
+                            "a decisao define o limite de 500 documentado"
+                        ),
                         "evidence": evidence_of(payloads, 2),
                     }
                 ],
@@ -1127,7 +1216,7 @@ def test_every_persisted_evidence_carries_a_real_excerpt_and_passes_the_gate(
             {
                 "type": "business_rule",
                 "subject": "limite de 500 documentado",
-                "statement": "Preciso do limite de 500 documentado",
+                "statement": "A ata define o limite de 500 documentado",
                 "owner": "speaker:Bruno",
                 "conditions": ["limite de 500"],
                 "effects": ["documentado"],

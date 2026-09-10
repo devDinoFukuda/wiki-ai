@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from tests.knowledge.graph_fixture import Graph, build
-from tests.publishing.grounding_fixture import GroundingGraph
+from tests.publishing.grounding_fixture import GroundingGraph, enrich_capability_excerpt
 from tests.publishing.grounding_fixture import build as build_grounding
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.publishing.query_harness import KnowledgeQueryHarness
@@ -11,7 +11,9 @@ from wiki_ai.publishing.query_harness import KnowledgeQueryHarness
 
 @pytest.fixture
 def graph(tmp_path) -> Graph:
-    return build(tmp_path / "knowledge")
+    built = build(tmp_path / "knowledge")
+    enrich_capability_excerpt(built)
+    return built
 
 
 @pytest.fixture

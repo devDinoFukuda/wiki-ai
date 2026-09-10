@@ -20,7 +20,7 @@ from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.app import api
 from wiki_ai.app.api import CORRELATION_DETAIL
 from wiki_ai.app.commands import EXIT_OK, main
-from wiki_ai.app.session import Session
+from wiki_ai.app.session import AnalysisStatus, Session, objective_hash
 from wiki_ai.app.wiring import Wiring
 from wiki_ai.knowledge.taxonomy import RelationKind
 
@@ -131,8 +131,20 @@ def test_a_repeated_analyze_over_the_same_snapshot_keeps_correlation_stable(
         assert knowledge.relation_count() == before
 
 
+def _completed_baseline(repo: Path, registry: ProviderRegistry) -> str:
+    report = api.analyze(repo, OBJECTIVE, registry=registry)
+    session = Session.open(repo)
+    session.record_analysis(
+        report.snapshot_digest,
+        AnalysisStatus.COMPLETE,
+        "",
+        objective_hash(OBJECTIVE),
+    )
+    return report.snapshot_digest
+
+
 def test_an_update_that_writes_entities_reports_correlation(repo: Path) -> None:
-    api.analyze(repo, OBJECTIVE, registry=_registry())
+    _completed_baseline(repo, _registry())
     (repo / SERVICE).write_text(_CHANGED_SERVICE, encoding="utf-8")
     registry = ProviderRegistry()
     registry.register("scripted", lambda: _UpdateProvider(scripts=[_update_script()]))
@@ -143,7 +155,7 @@ def test_an_update_that_writes_entities_reports_correlation(repo: Path) -> None:
 
 
 def test_an_update_without_a_provider_does_not_report_correlation(repo: Path) -> None:
-    api.analyze(repo, OBJECTIVE, registry=_registry())
+    _completed_baseline(repo, _registry())
     (repo / SERVICE).write_text(_CHANGED_SERVICE, encoding="utf-8")
     report = api.analyze(repo, OBJECTIVE, wiring=Wiring(ProviderRegistry()))
     assert report.status == "blocked"

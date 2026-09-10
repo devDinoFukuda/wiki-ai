@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Sequence
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+from .errors import PayloadInvalid
 
 __all__ = [
     "GroundingCheck",
@@ -11,12 +16,22 @@ __all__ = [
     "NEGATION_MARKER",
     "STOPWORDS",
     "MIN_TERM_LENGTH",
+    "INVOCATION_MARKER",
+    "RELATION_PREDICATES_PATH",
+    "RELATION_PREDICATE_COMPONENT",
+    "RELATION_STATEMENT_COMPONENT",
     "key_terms",
     "mandatory_terms",
     "excerpt_vocabulary",
     "check_component",
+    "check_relation_predicate",
+    "relation_predicate_terms",
     "symbol_defined_or_referenced",
 ]
+
+RELATION_PREDICATES_PATH = Path(__file__).with_name("relation_predicates.json")
+RELATION_PREDICATE_COMPONENT = "relation_predicate"
+RELATION_STATEMENT_COMPONENT = "relation_statement"
 
 MIN_TERM_LENGTH = 3
 
@@ -242,6 +257,12 @@ NEGATIONS: frozenset[str] = frozenset(
 )
 
 NEGATION_MARKER = "!negated"
+
+INVOCATION_MARKER = "!invocation"
+
+_INVOCATION = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*\s*[.:>-]{1,2}\s*[A-Za-z_][A-Za-z0-9_]*\s*\("
+)
 
 _ADVERB_SUFFIXES: tuple[str, ...] = ("mente", "ly")
 
@@ -573,6 +594,8 @@ def excerpt_vocabulary(excerpt: str) -> frozenset[str]:
         vocabulary.add(match.group(1).strip().lower())
     for match in _OPERATOR.finditer(folded):
         vocabulary.add(match.group(0))
+    if _INVOCATION.search(folded):
+        vocabulary.add(INVOCATION_MARKER)
     for token in tuple(vocabulary):
         if token.isalpha():
             vocabulary.add(_stem(token))
@@ -645,4 +668,64 @@ def symbol_defined_or_referenced(
         terms_found=found,
         ok=ok,
         required_terms=required if bare else (),
+    )
+
+
+@lru_cache(maxsize=1)
+def _relation_predicates() -> Mapping[str, tuple[str, ...]]:
+    try:
+        raw = RELATION_PREDICATES_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PayloadInvalid(f"{RELATION_PREDICATES_PATH}: {exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PayloadInvalid(f"{RELATION_PREDICATES_PATH}: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise PayloadInvalid(f"{RELATION_PREDICATES_PATH}: payload não é mapeamento")
+    lexicon: dict[str, tuple[str, ...]] = {}
+    for kind, terms in payload.items():
+        if not isinstance(terms, (list, tuple)):
+            raise PayloadInvalid(
+                f"{RELATION_PREDICATES_PATH}: {kind} exige sequência de termos"
+            )
+        lexicon[str(kind)] = tuple(dict.fromkeys(str(term).lower() for term in terms))
+    return lexicon
+
+
+def relation_predicate_terms(kind: str) -> tuple[str, ...]:
+    return _relation_predicates().get((kind or "").strip().lower(), ())
+
+
+def _lexicon_stems(kind: str) -> frozenset[str]:
+    stems: set[str] = set()
+    for term in relation_predicate_terms(kind):
+        stems.add(term)
+        if term.isalpha():
+            stems.add(_stem(term))
+    return frozenset(stems)
+
+
+def check_relation_predicate(
+    kind: str, statement: str, vocabulary: frozenset[str]
+) -> GroundingCheck:
+    required = relation_predicate_terms(kind)
+    found = tuple(
+        term for term in required if term in vocabulary or _stem(term) in vocabulary
+    )
+    statement_text = (statement or "").strip()
+    statement_ok = True
+    if statement_text:
+        widened = vocabulary
+        if found:
+            widened = vocabulary | _lexicon_stems(kind)
+        statement_ok = check_component(
+            RELATION_STATEMENT_COMPONENT, statement_text, widened
+        ).ok
+    return GroundingCheck(
+        component=RELATION_PREDICATE_COMPONENT,
+        terms_required=required,
+        terms_found=found,
+        ok=bool(required) and bool(found) and statement_ok,
+        required_terms=required[:1],
     )

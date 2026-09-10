@@ -217,3 +217,47 @@ def test_the_stored_preference_reaches_analyze(tmp_path: Path) -> None:
     code, payload = _run_with(registry, "analyze", str(tmp_path))
     assert payload["provider"] == "probe"
     assert code in (EXIT_OK, EXIT_BLOCKED)
+
+
+def test_a_blocked_answer_leaves_the_command_line_with_a_failing_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mixed_repo(tmp_path)
+
+    def _blocked(question: str, repo: Path, *args: Any, **kwargs: Any) -> api.AskReport:
+        return api.AskReport(
+            status="blocked",
+            question=question,
+            answer="nothing survived validation",
+            mode="deterministic_fallback",
+            reason="no_validated_claim",
+            action="review the unresolved notes and add evidence",
+        )
+
+    monkeypatch.setattr(api, "ask", _blocked)
+    code, payload = _run("ask", "what changed", "--repo", str(tmp_path))
+    assert code == EXIT_BLOCKED
+    assert code != EXIT_OK
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "no_validated_claim"
+    assert payload["command"] == "ask"
+
+
+def test_a_partial_answer_keeps_a_successful_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mixed_repo(tmp_path)
+
+    def _partial(question: str, repo: Path, *args: Any, **kwargs: Any) -> api.AskReport:
+        return api.AskReport(
+            status="partial",
+            question=question,
+            answer="half of it",
+            mode="agentic",
+            action="review the unresolved notes and add evidence",
+        )
+
+    monkeypatch.setattr(api, "ask", _partial)
+    code, payload = _run("ask", "what changed", "--repo", str(tmp_path))
+    assert code == EXIT_OK
+    assert payload["status"] == "partial"

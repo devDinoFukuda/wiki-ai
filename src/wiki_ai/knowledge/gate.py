@@ -35,6 +35,7 @@ def provenance(repository: KnowledgeRepository) -> KnowledgeProvenance:
 
 class KnowledgeRule(Enum):
     SUPPORTED_WITHOUT_EVIDENCE = "supported_without_evidence"
+    SUPPORTED_WITHOUT_ACTIVE_EVIDENCE = "supported_without_active_evidence"
     EVIDENCE_DOES_NOT_RESOLVE = "evidence_does_not_resolve"
     SOURCE_HASH_DIVERGES = "source_hash_diverges"
     OBSOLETE_WITHOUT_INVALIDATION = "obsolete_without_invalidation"
@@ -55,6 +56,7 @@ def check(
 ) -> tuple[KnowledgeViolation, ...]:
     found: list[KnowledgeViolation] = []
     found.extend(_supported_without_evidence(repository))
+    found.extend(_supported_without_active_evidence(repository))
     found.extend(_unresolvable_evidence(repository))
     found.extend(_evidence_without_excerpt(repository))
     diverged = _diverged_versions(repository, current_versions or {})
@@ -95,6 +97,48 @@ def _supported_without_evidence(
                 detail=(
                     f"relação {relation.kind} {relation.source_id.value} -> "
                     f"{relation.target_id.value} supported sem evidência própria"
+                ),
+            )
+        )
+    return found
+
+
+def _supported_without_active_evidence(
+    repository: KnowledgeRepository,
+) -> list[KnowledgeViolation]:
+    found: list[KnowledgeViolation] = []
+    for entity in repository.find_entities():
+        if entity.confidence is not Confidence.SUPPORTED:
+            continue
+        if repository.evidence_for(entity.id):
+            continue
+        if not repository.evidence_for(entity.id, active_only=False):
+            continue
+        found.append(
+            KnowledgeViolation(
+                rule=KnowledgeRule.SUPPORTED_WITHOUT_ACTIVE_EVIDENCE,
+                target_kind=ENTITY_TARGET,
+                target_id=entity.id.value,
+                detail=(
+                    f"{entity.kind} {entity.name} supported só com evidência invalidada"
+                ),
+            )
+        )
+    for relation in repository.find_relations():
+        if relation.confidence is not Confidence.SUPPORTED:
+            continue
+        if repository.evidence_for_relation(relation.id):
+            continue
+        if not repository.evidence_for_relation(relation.id, active_only=False):
+            continue
+        found.append(
+            KnowledgeViolation(
+                rule=KnowledgeRule.SUPPORTED_WITHOUT_ACTIVE_EVIDENCE,
+                target_kind=RELATION_TARGET,
+                target_id=relation.id,
+                detail=(
+                    f"relação {relation.kind} {relation.source_id.value} -> "
+                    f"{relation.target_id.value} supported só com evidência invalidada"
                 ),
             )
         )

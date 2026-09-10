@@ -384,7 +384,13 @@ class Investigator:
                 totals["evidence"] += written.evidence_written
                 gaps.extend(written.gaps_opened)
                 previous_frontier = state.frontier_keys()
-                state = coverage.update(state, report, bridge.paths)
+                state = coverage.update(
+                    state,
+                    report,
+                    bridge.paths,
+                    unresolved_relations=written.unresolved_relations,
+                    gaps=written.gaps_opened,
+                )
                 stalled = (
                     run.usage.tool_calls == 0
                     and not run.findings

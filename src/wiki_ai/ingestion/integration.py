@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Sequence
 
 from wiki_ai.knowledge.model import SourceVersion
 from wiki_ai.knowledge.repository import KnowledgeRepository
@@ -30,7 +30,6 @@ __all__ = [
     "VERSION_MISMATCH",
     "IngestionStatus",
     "IngestionResult",
-    "ProviderResolver",
     "IngestionEngine",
     "derive_status",
 ]
@@ -39,11 +38,6 @@ PROVIDER_UNAVAILABLE = SemanticFault.PROVIDER_UNAVAILABLE.value
 VERSION_MISMATCH = SemanticFault.VERSION_HASH_MISMATCH.value
 
 _NO_REASON = ""
-
-
-@runtime_checkable
-class ProviderResolver(Protocol):
-    def __call__(self) -> SessionProvider | None: ...
 
 
 @dataclass(frozen=True)
@@ -55,6 +49,7 @@ class IngestionResult:
     status: IngestionStatus = IngestionStatus.COMPLETE
     reason: str = _NO_REASON
     diagnostics: tuple[str, ...] = ()
+    provider_used: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +60,7 @@ class IngestionResult:
             "status": self.status.value,
             "reason": self.reason,
             "diagnostics": list(self.diagnostics),
+            "provider_used": self.provider_used,
         }
 
 
@@ -110,11 +106,9 @@ def _structural_diagnostics(ingested: IngestedSource) -> tuple[str, ...]:
 class IngestionEngine:
     def __init__(
         self,
-        provider_resolver: ProviderResolver | None = None,
         investigator: SemanticInvestigator | None = None,
         ingest: Callable[..., IngestedSource] | None = None,
     ) -> None:
-        self._resolve = provider_resolver
         self._investigator = investigator
         self._ingest = ingest or pipeline.ingest
 
@@ -125,6 +119,8 @@ class IngestionEngine:
         knowledge: KnowledgeRepository,
         namespace: str,
         metadata: Mapping[str, Any] | None = None,
+        *,
+        provider: SessionProvider | None = None,
     ) -> IngestionResult:
         try:
             ingested = self._ingest(source_path, metadata or {})
@@ -137,6 +133,7 @@ class IngestionEngine:
                 status=IngestionStatus.FAILED,
                 reason=StructuralFault.UNREADABLE_SOURCE.value,
                 diagnostics=(f"error:{StructuralFault.UNREADABLE_SOURCE.value}",),
+                provider_used=False,
             )
         diagnostics = list(_structural_diagnostics(ingested))
         semantic_faults: list[SemanticFault] = []
@@ -145,7 +142,6 @@ class IngestionEngine:
             diagnostics.append(VERSION_MISMATCH)
         faults = ingested.faults
         self._register(ingested, knowledge, namespace)
-        provider = self._resolve() if self._resolve is not None else None
         outcome = SemanticOutcome()
         if provider is not None and not faults:
             outcome = self._investigate(ingested, knowledge, provider, namespace)
@@ -168,6 +164,7 @@ class IngestionEngine:
             status=status,
             reason=reason,
             diagnostics=tuple(dict.fromkeys(diagnostics)),
+            provider_used=provider is not None,
         )
 
     def _investigate(

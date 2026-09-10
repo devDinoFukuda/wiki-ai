@@ -8,8 +8,10 @@ from wiki_ai.knowledge.model import Confidence
 from wiki_ai.knowledge.taxonomy import EntityKind, RelationKind
 from wiki_ai.repository.evidence import capture
 from wiki_ai.investigation.coverage import (
+    GLOBAL_OWNER,
     CoverageState,
     FrontierItem,
+    entity_identities,
     initial_state,
     update,
 )
@@ -225,3 +227,79 @@ def test_a_target_named_by_id_is_matched_by_the_explicit_id(tmp_path: Path) -> N
     )
     updated = update(CoverageState(files_total=7), report)
     assert not updated.frontier
+
+
+def test_two_owners_of_one_name_never_alias_into_the_global_owner(
+    tmp_path: Path,
+) -> None:
+    report = verified_report(
+        [owned_rule("Ordering"), owned_rule("Billing")], tmp_path
+    )
+    identities = set(entity_identities(report.verified[0]))
+    assert "business_rule::ordering::eligibility" in identities
+    assert f"business_rule::{GLOBAL_OWNER}::eligibility" not in identities
+    assert f"::{GLOBAL_OWNER}::eligibility" not in identities
+
+
+def test_an_unowned_finding_still_carries_the_global_alias(tmp_path: Path) -> None:
+    unowned = Finding(
+        type=EntityKind.BUSINESS_RULE,
+        subject="Eligibility",
+        statement="place saves the reference through the repository",
+        conditions=("a reference is given",),
+        effects=("repository save is called with the reference",),
+        evidence=(EvidenceRef(path=SERVICE, line_start=10, line_end=12),),
+    )
+    report = verified_report([unowned], tmp_path)
+    identities = set(entity_identities(report.verified[0]))
+    assert f"business_rule::{GLOBAL_OWNER}::eligibility" in identities
+
+
+def test_an_ambiguous_relation_keeps_the_frontier_open(tmp_path: Path) -> None:
+    claim = RelationClaim(
+        kind=RelationKind.SUPERSEDES,
+        target_subject="Eligibility",
+        target_type=EntityKind.BUSINESS_RULE,
+        statement="Ordering Eligibility supersedes the other Eligibility",
+    )
+    report = verified_report(
+        [owned_rule("Ordering", (claim,)), owned_rule("Billing")], tmp_path
+    )
+    updated = update(
+        CoverageState(files_total=7),
+        report,
+        unresolved_relations=("Eligibility",),
+    )
+    completeness = updated.completeness()
+    assert completeness.unresolved_relations == ("Eligibility",)
+    assert "Eligibility" in completeness.outstanding
+    assert completeness.score < 1.0
+
+
+def test_an_ambiguous_relation_survives_a_later_round_that_names_the_subject(
+    tmp_path: Path,
+) -> None:
+    report = verified_report([owned_rule("Ordering")], tmp_path)
+    first = update(
+        CoverageState(files_total=7),
+        report,
+        unresolved_relations=("Eligibility",),
+    )
+    second = update(first, report)
+    assert second.completeness().unresolved_relations == ("Eligibility",)
+
+
+def test_gaps_from_the_normalizer_reach_the_completeness_report(
+    tmp_path: Path,
+) -> None:
+    report = verified_report([owned_rule("Ordering")], tmp_path)
+    updated = update(
+        CoverageState(files_total=7),
+        report,
+        gaps=("ambiguous_relation_target: relation supersedes names Eligibility",),
+    )
+    completeness = updated.completeness()
+    assert completeness.explicit_gaps == (
+        "ambiguous_relation_target: relation supersedes names Eligibility",
+    )
+    assert completeness.outstanding

@@ -14,10 +14,11 @@ from wiki_ai.agent.session import (
     ToolSpec,
 )
 
-from wiki_ai.knowledge.grounding import check_component
+from wiki_ai.knowledge.grounding import GroundingCheck, check_component
 
 from .answer_fallback import provenance
 from .query_harness import (
+    GroundingVocabulary,
     KnowledgeQueryHarness,
     QueryToolError,
     TOOL_ENTITY,
@@ -37,6 +38,7 @@ __all__ = [
     "answer_schema",
     "build_briefing",
     "build_session",
+    "claim_grounding",
     "validate_envelope",
     "provenance_appendix",
     "compose_answer",
@@ -307,6 +309,49 @@ def _rejected(
     )
 
 
+def claim_grounding(
+    statement: str, vocabulary: GroundingVocabulary
+) -> GroundingCheck:
+    semantic = check_component(CLAIM_COMPONENT, statement, vocabulary.semantic)
+    if not semantic.terms_required:
+        return semantic
+    naming = tuple(
+        term
+        for term in semantic.terms_required
+        if term not in semantic.terms_found and term in vocabulary.referential
+    )
+    if not naming:
+        return semantic
+    required = tuple(
+        term for term in semantic.required_terms if term not in naming
+    )
+    universe = tuple(
+        term for term in semantic.terms_required if term not in naming
+    )
+    found = semantic.terms_found
+    if not universe or not found:
+        return GroundingCheck(
+            component=CLAIM_COMPONENT,
+            terms_required=semantic.terms_required,
+            terms_found=found,
+            ok=False,
+            required_terms=semantic.required_terms,
+        )
+    seen = set(found)
+    optional = tuple(term for term in universe if term not in required)
+    optional_ok = not optional or sum(
+        1 for term in optional if term in seen
+    ) * 2 >= len(optional)
+    ok = all(term in seen for term in required) and optional_ok
+    return GroundingCheck(
+        component=CLAIM_COMPONENT,
+        terms_required=semantic.terms_required,
+        terms_found=found,
+        ok=ok,
+        required_terms=semantic.required_terms,
+    )
+
+
 def _validate_claim(
     raw: Any, harness: KnowledgeQueryHarness
 ) -> ValidatedClaim:
@@ -375,7 +420,7 @@ def _validate_claim(
             rejected_evidence_ids=without_excerpt,
         )
     vocabulary = harness.grounding_vocabulary(entity_ids, evidence_ids)
-    grounding = check_component(CLAIM_COMPONENT, statement, vocabulary)
+    grounding = claim_grounding(statement, vocabulary)
     if not grounding.ok:
         return _rejected(
             statement,

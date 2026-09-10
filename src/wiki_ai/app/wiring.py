@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-from wiki_ai.agent.registry import ProviderRegistry, ProviderUnavailable
+from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.agent.session import AgentProvider
 from wiki_ai.app.ports import (
     AnswerOutcome,
@@ -74,6 +74,11 @@ def reason_of(data: Any) -> str:
     return str(getattr(data, "reason", "") or "")
 
 
+def _status_value(data: Any) -> str:
+    produced = getattr(data, "status", "")
+    return str(getattr(produced, "value", produced))
+
+
 def _mode_of(data: Any) -> str:
     produced = getattr(data, "mode", "")
     if not produced:
@@ -128,23 +133,8 @@ class InvestigationAdapter:
 
 
 class IngestionAdapter:
-    def __init__(
-        self,
-        registry: ProviderRegistry,
-        engine: IngestionEngine | None = None,
-        preference: str | None = None,
-    ) -> None:
-        self._registry = registry
-        self._preference = preference
-        self._engine = engine if engine is not None else IngestionEngine(
-            provider_resolver=self._provider
-        )
-
-    def _provider(self) -> AgentProvider | None:
-        try:
-            return self._registry.resolve(self._preference)
-        except ProviderUnavailable:
-            return None
+    def __init__(self, engine: IngestionEngine | None = None) -> None:
+        self._engine = engine if engine is not None else IngestionEngine()
 
     def run(
         self,
@@ -152,8 +142,12 @@ class IngestionAdapter:
         version_hash: str,
         knowledge: KnowledgeRepository,
         namespace: str,
+        *,
+        provider: AgentProvider | None = None,
     ) -> IngestionOutcome:
-        produced = self._engine.run(source_path, version_hash, knowledge, namespace)
+        produced = self._engine.run(
+            source_path, version_hash, knowledge, namespace, provider=provider
+        )
         return IngestionOutcome(
             source_id=produced.source_id,
             version_hash=produced.version_hash,
@@ -162,6 +156,7 @@ class IngestionAdapter:
             status=status_of(produced),
             reason=reason_of(produced),
             diagnostics=tuple(produced.diagnostics),
+            provider_used=bool(produced.provider_used),
         )
 
 
@@ -222,6 +217,7 @@ class QueryAdapter:
             answer=produced.answer,
             mode=_mode_of(produced),
             reason=reason_of(produced),
+            status=_status_value(produced),
             evidence_ids=tuple(produced.evidence_ids),
             entity_ids=tuple(produced.entity_ids),
             unresolved=tuple(produced.unresolved),
@@ -250,7 +246,7 @@ class Wiring:
         return InvestigationAdapter()
 
     def ingestion_runner(self) -> IngestionRunner:
-        return IngestionAdapter(self._registry, preference=self._provider)
+        return IngestionAdapter()
 
     def update_runner(self) -> UpdateRunner:
         return UpdateAdapter()

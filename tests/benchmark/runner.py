@@ -25,9 +25,13 @@ __all__ = [
     "EXIT_OK",
     "EXIT_ERROR",
     "EXIT_SKIPPED",
+    "EXIT_BELOW_THRESHOLD",
     "SKIP_REASON",
     "STATUS_PROVIDER_MISMATCH",
     "PROVIDER_MISMATCH_REASON",
+    "STATUS_BELOW_THRESHOLD",
+    "BELOW_THRESHOLD_REASON",
+    "failed_metrics",
     "LEVEL_CHOICES",
     "stage_providers",
     "QUESTION_BY_REPO",
@@ -45,10 +49,13 @@ ALL = "all"
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_SKIPPED = 3
+EXIT_BELOW_THRESHOLD = 5
 SKIP_REASON = "provider_binary_unavailable"
 STATUS_SKIPPED = "skipped"
 STATUS_PROVIDER_MISMATCH = "provider_mismatch"
 PROVIDER_MISMATCH_REASON = "resolved_provider_differs_from_requested"
+STATUS_BELOW_THRESHOLD = "below_threshold"
+BELOW_THRESHOLD_REASON = "metrics_below_threshold_at_level"
 PROVIDER_FIELD = "provider"
 LEVEL_CHOICES: tuple[str, ...] = thresholds.LEVELS
 
@@ -79,6 +86,7 @@ class RunResult:
     reason: str = ""
     actual_provider: str = ""
     level: str = thresholds.DEFAULT_LEVEL
+    failed_metrics: tuple[str, ...] = ()
 
     def provider_matches(self) -> bool:
         return self.actual_provider == self.provider
@@ -96,6 +104,8 @@ class RunResult:
             payload["reason"] = self.reason
         if self.stages:
             payload["stages"] = dict(self.stages)
+        if self.failed_metrics:
+            payload["failed_metrics"] = list(self.failed_metrics)
         if self.report is not None:
             rendered = self.report.to_dict()
             payload["metrics"] = thresholds.evaluate_metrics(
@@ -172,6 +182,12 @@ def _mismatch(
     )
 
 
+def failed_metrics(evaluated: Mapping[str, Mapping[str, Any]]) -> tuple[str, ...]:
+    return tuple(
+        name for name, entry in evaluated.items() if not entry.get("passed", False)
+    )
+
+
 def run_repository(
     name: str,
     provider: str,
@@ -216,14 +232,18 @@ def run_repository(
     session = Session.open(corpus.root)
     with session.open_knowledge() as knowledge:
         report = metrics.evaluate(knowledge, corpus.truth)
+    evaluated = thresholds.evaluate_metrics(report.to_dict()["metrics"], level)
+    below = failed_metrics(evaluated)
     return RunResult(
         provider=provider,
         repository=name,
-        status="ok",
+        status=STATUS_BELOW_THRESHOLD if below else "ok",
         report=report,
         stages=stages,
+        reason=BELOW_THRESHOLD_REASON if below else "",
         actual_provider=provider,
         level=level,
+        failed_metrics=below,
     )
 
 
@@ -343,6 +363,11 @@ def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int
         return EXIT_SKIPPED
     if payload.get("status") == "error":
         return EXIT_ERROR
+    if any(
+        entry.get("status") == STATUS_BELOW_THRESHOLD
+        for entry in payload.get("results", ())
+    ):
+        return EXIT_BELOW_THRESHOLD
     return EXIT_OK
 
 

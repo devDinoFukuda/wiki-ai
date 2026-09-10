@@ -66,6 +66,9 @@ def test_outcomes_are_serializable() -> None:
     assert ingestion.to_dict()["blocks"] == 4
     answer = AnswerOutcome(question="q", answer="a", evidence_ids=("e1",))
     assert answer.to_dict()["evidence_ids"] == ["e1"]
+    assert answer.to_dict()["status"] == "answered"
+    blocked = AnswerOutcome(question="q", answer="", status="blocked")
+    assert blocked.to_dict()["status"] == "blocked"
     publication = PublicationOutcome(
         publication_id="p1", artifacts=("a.docx",), manifest_hash="0" * 64
     )

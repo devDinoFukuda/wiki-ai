@@ -6,6 +6,7 @@ import pytest
 
 from tests.publishing.grounding_fixture import (
     CAPABILITY_EXCERPT,
+    INFERRED_STATEMENT,
     RULE_EXCERPT,
     GroundingGraph,
 )
@@ -152,28 +153,82 @@ def test_the_locator_is_not_a_source_of_grounding_vocabulary(
 ):
     entity, evidence = _capability(grounded)
     vocabulary = grounded_harness.grounding_vocabulary([entity], [evidence])
-    assert "codehash1" not in vocabulary
-    assert "src_repo" not in vocabulary
-    assert "line_start" not in vocabulary
+    everything = vocabulary.semantic | vocabulary.referential
+    assert "codehash1" not in everything
+    assert "src_repo" not in everything
+    assert "line_start" not in everything
 
 
-def test_the_grounding_vocabulary_is_the_excerpt_plus_the_entity_identity(
-    grounded_harness, grounded
-):
+def test_the_semantic_vocabulary_is_only_the_excerpt(grounded_harness, grounded):
     entity, evidence = _capability(grounded)
     vocabulary = grounded_harness.grounding_vocabulary([entity], [evidence])
-    assert excerpt_vocabulary(CAPABILITY_EXCERPT) <= vocabulary
-    assert "renovacao" in vocabulary
-    assert "capability" in vocabulary
+    assert vocabulary.semantic == excerpt_vocabulary(CAPABILITY_EXCERPT)
 
 
-def test_the_rule_statement_belongs_to_the_grounding_vocabulary(
+def test_the_referential_vocabulary_is_the_entity_identity(grounded_harness, grounded):
+    entity, evidence = _capability(grounded)
+    vocabulary = grounded_harness.grounding_vocabulary([entity], [evidence])
+    assert "renovacao" in vocabulary.referential
+    assert "capability" in vocabulary.referential
+
+
+def test_the_rule_statement_never_reaches_the_grounding_vocabulary(
     grounded_harness, grounded
 ):
     entity, evidence = _rule(grounded)
     vocabulary = grounded_harness.grounding_vocabulary([entity], [evidence])
-    assert excerpt_vocabulary(RULE_EXCERPT) <= vocabulary
-    assert "adimplente" in vocabulary
+    assert vocabulary.semantic == excerpt_vocabulary(RULE_EXCERPT)
+    assert "adimplente" not in vocabulary.semantic
+    assert "adimplente" not in vocabulary.referential
+
+
+def test_the_attributes_of_an_entity_never_reach_the_grounding_vocabulary(
+    grounded_harness, grounded
+):
+    entity = grounded.id("inferred").value
+    evidence = grounded.evidence_id("inferred")
+    vocabulary = grounded_harness.grounding_vocabulary([entity], [evidence])
+    everything = vocabulary.semantic | vocabulary.referential
+    for term in ("deletes", "delete", "retries", "retry", "7"):
+        assert term not in everything
+
+
+def test_an_inferred_statement_does_not_sustain_itself(grounded_harness, grounded):
+    entity = grounded.id("inferred").value
+    evidence = grounded.evidence_id("inferred")
+    claim = _claim(grounded_harness, INFERRED_STATEMENT, [entity], [evidence])
+    assert claim.verdict is ClaimVerdict.REJECTED
+    assert claim.reason is RejectionReason.NOT_GROUNDED
+    assert "7" in claim.missing_terms
+    assert "7" in claim.to_dict()["missing_terms"]
+
+
+def test_a_claim_faithful_to_the_excerpt_of_an_inferred_entity_is_valid(
+    grounded_harness, grounded
+):
+    entity = grounded.id("inferred").value
+    evidence = grounded.evidence_id("inferred")
+    claim = _claim(
+        grounded_harness,
+        "OrderService saves the order in the repository when it closes",
+        [entity],
+        [evidence],
+    )
+    assert claim.verdict is ClaimVerdict.VALID
+    assert claim.reason is RejectionReason.NONE
+
+
+def test_the_entity_name_alone_never_sustains_a_claim(grounded_harness, grounded):
+    entity = grounded.id("inferred").value
+    evidence = grounded.evidence_id("inferred")
+    claim = _claim(
+        grounded_harness,
+        "OrderService cancels the subscription",
+        [entity],
+        [evidence],
+    )
+    assert claim.verdict is ClaimVerdict.REJECTED
+    assert claim.reason is RejectionReason.NOT_GROUNDED
 
 
 def test_evidence_without_excerpt_is_reported_by_the_harness(

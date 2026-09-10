@@ -5,6 +5,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from wiki_ai.knowledge.gaps import GAP_BLOCKING, GAP_QUESTION, GAP_STATUS
 from wiki_ai.knowledge.grounding import excerpt_vocabulary
+from wiki_ai.knowledge.matching import aliases_of
 from wiki_ai.knowledge.model import Entity, EntityId, Evidence, Locator
 from wiki_ai.knowledge.query import KnowledgeQuery
 from wiki_ai.knowledge.repository import KnowledgeRepository
@@ -17,6 +18,7 @@ __all__ = [
     "QueryToolSpec",
     "QueryLimits",
     "KnowledgeQueryHarness",
+    "GroundingVocabulary",
     "MAX_EXCERPT_CHARS",
     "TOOL_SEARCH",
     "TOOL_ENTITY",
@@ -549,14 +551,10 @@ def build_specs(limits: QueryLimits) -> tuple[QueryToolSpec, ...]:
     )
 
 
-def _flatten(value: Any) -> str:
-    if isinstance(value, Mapping):
-        return " ".join(
-            f"{key} {_flatten(item)}" for key, item in sorted(value.items())
-        )
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return " ".join(_flatten(item) for item in value)
-    return str(value)
+@dataclass(frozen=True)
+class GroundingVocabulary:
+    referential: frozenset[str] = frozenset()
+    semantic: frozenset[str] = frozenset()
 
 
 def where_of(locator: Locator) -> str:
@@ -668,23 +666,25 @@ class KnowledgeQueryHarness:
 
     def grounding_vocabulary(
         self, entity_ids: Sequence[str], evidence_ids: Sequence[str]
-    ) -> frozenset[str]:
-        vocabulary: set[str] = set()
+    ) -> GroundingVocabulary:
+        semantic: set[str] = set()
         for identifier in evidence_ids:
             evidence = self.evidence_by_id(identifier)
             if evidence is None:
                 continue
-            vocabulary |= excerpt_vocabulary(evidence.excerpt)
+            semantic |= excerpt_vocabulary(evidence.excerpt)
+        referential: set[str] = set()
         for identifier in entity_ids:
             entity = self.entity_by_id(identifier)
             if entity is None:
                 continue
-            vocabulary |= excerpt_vocabulary(entity.name)
-            vocabulary |= excerpt_vocabulary(entity.kind)
-            statement = entity.attributes.get("statement")
-            if statement is not None:
-                vocabulary |= excerpt_vocabulary(_flatten(statement))
-        return frozenset(vocabulary)
+            referential |= excerpt_vocabulary(entity.name)
+            referential |= excerpt_vocabulary(entity.kind)
+            for alias in aliases_of(entity.name, entity.attributes):
+                referential |= excerpt_vocabulary(alias)
+        return GroundingVocabulary(
+            referential=frozenset(referential), semantic=frozenset(semantic)
+        )
 
     def _known(self, entity_id: Any) -> EntityId:
         identifier = EntityId(str(entity_id))

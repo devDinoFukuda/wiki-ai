@@ -6,6 +6,7 @@ from wiki_ai.publishing.answer import (
     FALLBACK_NOTE,
     AnswerMode,
     Answerer,
+    AnswerStatus,
     Intent,
     classify,
 )
@@ -159,3 +160,10 @@ def test_enricher_falling_back_keeps_the_deterministic_answer(graph):
         "Como funciona a renovação?", graph.repository, None, "ns"
     )
     assert plain.answer == fallback.answer
+
+
+def test_the_outcome_dictionary_carries_the_status_for_the_boundary(graph):
+    outcome = _answer(graph, "Como funciona a renovação?")
+    payload = outcome.to_dict()
+    assert payload["status"] == AnswerStatus.ANSWERED.value
+    assert payload["status"] in {"answered", "partial", "blocked"}

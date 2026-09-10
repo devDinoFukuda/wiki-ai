@@ -157,6 +157,7 @@ def relation_payload(**overrides: object) -> dict[str, object]:
         "target_type": "business_rule",
         "target_owner": "Billing",
         "target_id": "RULE-7",
+        "statement": "Order calls Eligibility check before persisting",
         "evidence": [
             {
                 "capture_id": "",
@@ -176,6 +177,7 @@ def test_relation_claim_carries_owner_id_and_its_own_evidence() -> None:
     claim = RelationClaim.from_dict(relation_payload())
     assert claim.target_owner == "Billing"
     assert claim.target_id == "RULE-7"
+    assert claim.statement == "Order calls Eligibility check before persisting"
     assert claim.evidence[0].path == "src/Order.java"
     assert claim.to_dict() == relation_payload()
 
@@ -202,10 +204,12 @@ def test_the_schema_offered_to_the_provider_exposes_the_relation_fields() -> Non
         "target_type",
         "target_owner",
         "target_id",
+        "statement",
         "evidence",
         "attributes",
     }
-    assert relations["required"] == ["kind"]
+    assert relations["required"] == ["kind", "statement"]
+    assert relations["properties"]["statement"] == {"type": "string"}
     assert {"required": ["target_subject"]} in relations["anyOf"]
     assert {"required": ["target_id"]} in relations["anyOf"]
     assert relations["properties"]["evidence"]["items"]["properties"]["capture_id"]
@@ -216,5 +220,6 @@ def test_a_parsed_finding_keeps_the_relation_owner_id_and_evidence() -> None:
     claim = parsed.relations[0]
     assert claim.target_owner == "Billing"
     assert claim.target_id == "RULE-7"
+    assert claim.statement == "Order calls Eligibility check before persisting"
     assert claim.evidence[0].line_start == 3
     assert parsed.to_dict()["relations"][0] == relation_payload()

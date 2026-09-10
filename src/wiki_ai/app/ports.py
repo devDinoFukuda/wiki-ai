@@ -73,6 +73,7 @@ class IngestionOutcome:
     status: OutcomeStatus = OutcomeStatus.COMPLETE
     reason: str = ""
     diagnostics: tuple[str, ...] = ()
+    provider_used: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -83,6 +84,7 @@ class IngestionOutcome:
             "status": self.status.value,
             "reason": self.reason,
             "diagnostics": list(self.diagnostics),
+            "provider_used": self.provider_used,
         }
 
 
@@ -116,6 +118,7 @@ class AnswerOutcome:
     answer: str
     mode: str = ""
     reason: str = ""
+    status: str = "answered"
     evidence_ids: tuple[str, ...] = ()
     entity_ids: tuple[str, ...] = ()
     unresolved: tuple[str, ...] = ()
@@ -126,6 +129,7 @@ class AnswerOutcome:
             "answer": self.answer,
             "mode": self.mode,
             "reason": self.reason,
+            "status": self.status,
             "evidence_ids": list(self.evidence_ids),
             "entity_ids": list(self.entity_ids),
             "unresolved": list(self.unresolved),
@@ -166,6 +170,8 @@ class IngestionRunner(Protocol):
         version_hash: str,
         knowledge: KnowledgeRepository,
         namespace: str,
+        *,
+        provider: AgentProvider | None = None,
     ) -> IngestionOutcome: ...
 
 

@@ -27,7 +27,9 @@ from wiki_ai.investigation.update import (
     UpdateEngine,
     dependency_key,
     impacted_evidence,
+    invalidate_findings,
     plan_reinvestigation,
+    reinvestigation_entities,
 )
 from wiki_ai.investigation.objective import Objective, ObjectiveKind
 from wiki_ai.repository.snapshot import diff
@@ -211,7 +213,8 @@ def test_invalidation_keeps_the_state_axis_and_deletes_nothing(analysed) -> None
     )
     assert rule.state is KnowledgeState.IMPLEMENTED
     assert knowledge.entity_count() >= before_entities
-    assert knowledge.evidence_for(rule.id)
+    assert knowledge.evidence_for(rule.id, active_only=False)
+    assert not knowledge.evidence_for(rule.id)
 
 
 def test_a_gap_is_opened_for_each_invalidated_entity(analysed) -> None:
@@ -500,3 +503,154 @@ def test_update_carries_the_reinvestigation_status(analysed) -> None:
     assert outcome.reinvestigation is not None
     assert outcome.status is outcome.reinvestigation.status
     assert outcome.to_dict()["reinvestigation"]["status"] == outcome.status.value
+
+
+WIRING = f"{BASE}/OrderWiring.java"
+
+_WIRING_V1 = """package com.acme.order;
+
+public class OrderWiring {
+    public String forward(OrderRepository repository, OrderProducer producer) {
+        String stored = repository.save("reference");
+        return producer.emit(stored);
+    }
+}
+"""
+
+_WIRING_V2 = """package com.acme.order;
+
+public class OrderWiring {
+    public String forward(OrderRepository repository, OrderProducer producer) {
+        String stored = repository.save("reference");
+        if (stored == null) {
+            return "skipped";
+        }
+        return producer.emit(stored);
+    }
+}
+"""
+
+
+def wired_repo(root: Path):
+    java_repo(root)
+    write(root, WIRING, _WIRING_V1)
+    return snapshot_of(root)
+
+
+def change_wiring(root: Path):
+    write(root, WIRING, _WIRING_V2)
+    return snapshot_of(root)
+
+
+def wiring_script() -> Script:
+    return Script(
+        steps=(
+            capture_step(REPOSITORY, 3, 4, "save"),
+            capture_step(PRODUCER, 10, 12, "emit"),
+            capture_step(WIRING, 4, 7, "forward"),
+        ),
+        findings=[
+            {
+                "type": "operation",
+                "subject": "OrderRepository save",
+                "statement": "OrderRepository save stores the order reference",
+                "attributes": {"verb": "save"},
+                "evidence": [ref(REPOSITORY, 3, 4)],
+                "confidence": "supported",
+                "relations": [
+                    {
+                        "kind": "calls",
+                        "target_subject": "OrderProducer emit",
+                        "target_type": "integration",
+                        "statement": "forward calls producer emit with the stored reference",
+                        "evidence": [ref(WIRING, 4, 7)],
+                    }
+                ],
+            },
+            {
+                "type": "integration",
+                "subject": "OrderProducer emit",
+                "statement": "OrderProducer emit sends the payload to the producer",
+                "attributes": {"direction": "outbound", "protocol": "kafka"},
+                "evidence": [ref(PRODUCER, 10, 12)],
+                "confidence": "supported",
+            },
+        ],
+    )
+
+
+@pytest.fixture()
+def wired(tmp_path: Path):
+    root = tmp_path / "repo"
+    previous = wired_repo(root)
+    knowledge = knowledge_at(tmp_path)
+    Investigator().run(
+        OBJECTIVE, previous, knowledge, FakeProvider(scripts=[wiring_script()]), NAMESPACE
+    )
+    yield root, previous, knowledge
+    knowledge.close()
+
+
+def only_relation(knowledge: KnowledgeRepository):
+    relations = knowledge.find_relations("calls")
+    assert len(relations) == 1
+    return relations[0]
+
+
+def test_the_baseline_stores_a_supported_relation_over_its_own_evidence(
+    wired,
+) -> None:
+    _root, _previous, knowledge = wired
+    relation = only_relation(knowledge)
+    assert relation.confidence is Confidence.SUPPORTED
+    assert knowledge.evidence_for_relation(relation.id)
+
+
+def test_changing_only_the_relation_evidence_file_demotes_the_relation(
+    wired,
+) -> None:
+    root, previous, knowledge = wired
+    current = change_wiring(root)
+    impacted = impacted_evidence(knowledge, previous, current, NAMESPACE)
+    assert [item.locator.path for item in impacted] == [WIRING]
+    outcome = UpdateEngine().run(previous, current, knowledge, None, NAMESPACE)
+    relation = only_relation(knowledge)
+    assert relation.confidence is not Confidence.SUPPORTED
+    assert relation.confidence in (Confidence.UNRESOLVED, Confidence.INFERRED)
+    assert relation.id in outcome.invalidated.relations
+
+
+def test_the_endpoints_of_the_demoted_relation_stay_supported(wired) -> None:
+    root, previous, knowledge = wired
+    current = change_wiring(root)
+    UpdateEngine().run(previous, current, knowledge, None, NAMESPACE)
+    for name, kind in (
+        ("OrderRepository save", EntityKind.OPERATION.value),
+        ("OrderProducer emit", EntityKind.INTEGRATION.value),
+    ):
+        assert entity_named(knowledge, kind, name).confidence is Confidence.SUPPORTED
+
+
+def test_the_demoted_relation_endpoints_enter_the_reinvestigation_scope(
+    wired,
+) -> None:
+    root, previous, knowledge = wired
+    current = change_wiring(root)
+    changes = diff(previous, current)
+    report = invalidate_findings(knowledge, impacted_evidence(
+        knowledge, previous, current, NAMESPACE
+    ), previous, current, NAMESPACE)
+    scoped = reinvestigation_entities(knowledge, report)
+    objective = plan_reinvestigation(report, changes, scoped)
+    relation = only_relation(knowledge)
+    assert relation.source_id.value in objective.scope.entities
+    assert relation.target_id.value in objective.scope.entities
+    assert WIRING in objective.scope.paths
+
+
+def test_the_gate_is_clean_after_the_relation_only_invalidation(wired) -> None:
+    root, previous, knowledge = wired
+    current = change_wiring(root)
+    UpdateEngine().run(previous, current, knowledge, None, NAMESPACE)
+    found = knowledge_gate(knowledge, {NAMESPACE: current.digest})
+    assert BLOCKING_RULES.isdisjoint({item.rule for item in found})

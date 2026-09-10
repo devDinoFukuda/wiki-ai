@@ -50,6 +50,10 @@ RELATION_RULES: tuple[str, ...] = (
     "source and the target are connected",
     "a relation without its own capture is recorded as inferred, never as supported, "
     "however well evidenced its two ends are",
+    "a relation carries a statement: the sentence the captured text states about the "
+    "connection, naming the action the source performs on the target, not only the two "
+    "names; a capture that names both ends but never states the action keeps the "
+    "relation inferred",
 )
 
 _TRANSCRIPT_TYPES: tuple[EntityKind, ...] = (

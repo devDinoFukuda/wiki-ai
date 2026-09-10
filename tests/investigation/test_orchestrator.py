@@ -693,3 +693,93 @@ def test_an_open_frontier_without_budget_exhaustion_is_also_partial(
     assert outcome.status is InvestigationStatus.PARTIAL
     assert outcome.reason == "open_frontier_or_blocking_gaps"
     assert outcome.details["task_state"] == "partial"
+
+
+RULES_PATH = "src/Rules.java"
+
+RULES_BODY = (
+    "public class Rules {\n"
+    "    public boolean check(String reference) {\n"
+    "        return reference != null;\n"
+    "    }\n"
+    "}\n"
+)
+
+
+def rules_repo(root: Path):
+    write(root, RULES_PATH, RULES_BODY)
+    return snapshot_of(root)
+
+
+def rule_payload(subject: str, owner: str, relations=()) -> dict[str, Any]:
+    return {
+        "type": "business_rule",
+        "subject": subject,
+        "statement": "check rejects a null reference",
+        "conditions": ["reference is null"],
+        "effects": ["check returns false"],
+        "owner": owner,
+        "evidence": [ref(RULES_PATH, 1, 5)],
+        "confidence": "supported",
+        "relations": list(relations),
+    }
+
+
+def ambiguity_script(relation: Mapping[str, Any]) -> Script:
+    return Script(
+        steps=(
+            ("repo.read", {"path": RULES_PATH}),
+            capture_step(RULES_PATH, 1, 5, "check"),
+        ),
+        findings=[
+            rule_payload("Eligibility", "Ordering"),
+            rule_payload("Eligibility", "Billing"),
+            rule_payload("Reference Check", "Shipping", (relation,)),
+        ],
+    )
+
+
+def run_ambiguity(tmp_path: Path, relation: Mapping[str, Any]):
+    snapshot = rules_repo(tmp_path / "repo")
+    provider = FakeProvider(scripts=[ambiguity_script(relation)] * 4)
+    with knowledge_at(tmp_path) as knowledge:
+        return Investigator().run(OBJECTIVE, snapshot, knowledge, provider, "acme")
+
+
+def test_an_ambiguous_relation_target_never_closes_the_investigation(
+    tmp_path: Path,
+) -> None:
+    outcome = run_ambiguity(
+        tmp_path,
+        {
+            "kind": "supersedes",
+            "target_subject": "Eligibility",
+            "target_type": "business_rule",
+            "statement": "Reference Check supersedes the Eligibility rule",
+        },
+    )
+    assert outcome.status is InvestigationStatus.PARTIAL
+    assert outcome.status is not InvestigationStatus.COMPLETE
+    assert outcome.details["coverage"]["unresolved_relations"] == ["Eligibility"]
+    assert outcome.unresolved
+    assert any(
+        "ambiguous_relation_target" in question
+        for question in outcome.details["gaps_opened"]
+    )
+
+
+def test_the_same_relation_disambiguated_by_target_owner_closes(
+    tmp_path: Path,
+) -> None:
+    outcome = run_ambiguity(
+        tmp_path,
+        {
+            "kind": "supersedes",
+            "target_subject": "Eligibility",
+            "target_type": "business_rule",
+            "target_owner": "Billing",
+            "statement": "Reference Check supersedes the Billing Eligibility rule",
+        },
+    )
+    assert outcome.details["coverage"]["unresolved_relations"] == []
+    assert outcome.status is InvestigationStatus.COMPLETE

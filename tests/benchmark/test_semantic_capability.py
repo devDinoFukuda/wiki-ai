@@ -22,6 +22,7 @@ requires_a_provider = pytest.mark.skipif(not ANY_PROVIDER, reason=NO_PROVIDER_RE
 
 LEVEL = thresholds.BOOTSTRAP
 BOOTSTRAP_THRESHOLDS = thresholds.THRESHOLDS[LEVEL]
+TARGET_THRESHOLDS = thresholds.THRESHOLDS[thresholds.TARGET]
 
 
 @requires_a_provider
@@ -52,6 +53,22 @@ def test_real_provider_detects_the_planted_contradiction_at_bootstrap_level(
     score = result.report.score("contradiction_detection")
     assert score.denominator == 1
     assert BOOTSTRAP_THRESHOLDS.passed("contradiction_detection", score.value)
+
+
+@requires_a_provider
+@pytest.mark.parametrize("name", corpora.CORPUS_NAMES)
+def test_real_provider_recovers_the_ground_truth_at_target_level(
+    tmp_path: Path, name: str
+) -> None:
+    provider = AVAILABLE[0]
+    result = runner.run_repository(name, provider, tmp_path / provider, thresholds.TARGET)
+    assert result.status == "ok", (result.reason, result.failed_metrics)
+    assert result.level == thresholds.TARGET
+    assert result.actual_provider == provider
+    assert result.report is not None
+    for metric in thresholds.METRIC_NAMES:
+        value = result.report.value(metric)
+        assert TARGET_THRESHOLDS.passed(metric, value), (thresholds.TARGET, metric, value)
 
 
 @requires_a_provider

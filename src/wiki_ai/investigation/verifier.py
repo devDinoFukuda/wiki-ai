@@ -16,6 +16,7 @@ from wiki_ai.investigation.finding import EvidenceRef, Finding, RelationClaim
 from wiki_ai.knowledge.grounding import (
     GroundingCheck,
     check_component,
+    check_relation_predicate,
     excerpt_vocabulary,
     symbol_defined_or_referenced,
 )
@@ -267,8 +268,11 @@ def _relation_grounding(
     source = symbol_defined_or_referenced(finding.subject, executable)
     target_text = claim.target_subject or claim.target_id or ""
     target = check_component("relation_target", target_text, executable)
-    checks = (source, target)
-    return checks, source.ok and target.ok
+    predicate = check_relation_predicate(
+        claim.kind.value, claim.statement, executable
+    )
+    checks = (source, target, predicate)
+    return checks, source.ok and target.ok and predicate.ok
 
 
 def verify_relation(
@@ -313,7 +317,8 @@ def verify_relation(
     if not grounded or not executable:
         reasons.append(
             f"relation {claim.kind.value} to {claim.label!r} is not grounded in an "
-            f"executable excerpt naming both {finding.subject!r} and the target"
+            f"executable excerpt naming {finding.subject!r}, the target and the "
+            f"{claim.kind.value} action itself"
         )
         return RelationCheck(
             index=index,

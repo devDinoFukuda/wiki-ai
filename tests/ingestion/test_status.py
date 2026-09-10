@@ -128,7 +128,7 @@ def test_an_unreadable_source_is_reported_as_failed_not_raised(
     def explode(path: Path, metadata: dict[str, object]) -> None:
         raise OSError("disk went away")
 
-    engine = IngestionEngine(provider_resolver=lambda: None, ingest=explode)
+    engine = IngestionEngine(ingest=explode)
     result = engine.run(tmp_path / "sumiu.vtt", "", knowledge, "reuniao")
     assert result.status is IngestionStatus.FAILED
     assert result.reason == StructuralFault.UNREADABLE_SOURCE.value
@@ -139,7 +139,7 @@ def test_a_transcript_without_a_provider_reports_structural_only(
 ) -> None:
     source = tmp_path / "reuniao.vtt"
     source.write_text(fixtures.VTT, encoding="utf-8")
-    result = IngestionEngine(provider_resolver=lambda: None).run(
+    result = IngestionEngine().run(
         source, "", knowledge, "reuniao"
     )
     assert result.status is IngestionStatus.STRUCTURAL_ONLY
@@ -153,8 +153,10 @@ def test_an_image_only_pdf_with_a_provider_reports_partial(
     pytest.importorskip("pypdf")
     source = tmp_path / "digitalizado.pdf"
     source.write_bytes(fixtures.image_only_pdf())
-    engine = IngestionEngine(provider_resolver=lambda: FakeProvider(scripts=[Script()]))
-    result = engine.run(source, "", knowledge, "digitalizado")
+    engine = IngestionEngine()
+    result = engine.run(
+        source, "", knowledge, "digitalizado", provider=FakeProvider(scripts=[Script()])
+    )
     assert result.status is IngestionStatus.PARTIAL
     assert result.reason in {item.value for item in PARTIAL_GAPS}
 
@@ -164,8 +166,10 @@ def test_an_unsupported_binary_with_a_provider_reports_blocked(
 ) -> None:
     source = tmp_path / "imagem.png"
     source.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
-    engine = IngestionEngine(provider_resolver=lambda: FakeProvider(scripts=[Script()]))
-    result = engine.run(source, "", knowledge, "imagem")
+    engine = IngestionEngine()
+    result = engine.run(
+        source, "", knowledge, "imagem", provider=FakeProvider(scripts=[Script()])
+    )
     assert result.status is IngestionStatus.BLOCKED
     assert result.reason == StructuralFault.UNSUPPORTED_FORMAT.value
 
@@ -175,8 +179,10 @@ def test_a_readable_transcript_with_a_provider_reports_complete(
 ) -> None:
     source = tmp_path / "reuniao.vtt"
     source.write_text(fixtures.VTT, encoding="utf-8")
-    engine = IngestionEngine(provider_resolver=lambda: FakeProvider(scripts=[Script()]))
-    result = engine.run(source, "", knowledge, "reuniao")
+    engine = IngestionEngine()
+    result = engine.run(
+        source, "", knowledge, "reuniao", provider=FakeProvider(scripts=[Script()])
+    )
     assert result.status is IngestionStatus.COMPLETE
     assert result.reason == ""
 
@@ -187,7 +193,7 @@ def test_the_serialized_result_carries_the_status_and_reason(
     source = tmp_path / "reuniao.vtt"
     source.write_text(fixtures.VTT, encoding="utf-8")
     payload = (
-        IngestionEngine(provider_resolver=lambda: None)
+        IngestionEngine()
         .run(source, "", knowledge, "reuniao")
         .to_dict()
     )

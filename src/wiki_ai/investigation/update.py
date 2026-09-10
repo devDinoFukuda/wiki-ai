@@ -36,6 +36,7 @@ __all__ = [
     "impacted_evidence",
     "invalidate_findings",
     "plan_reinvestigation",
+    "reinvestigation_entities",
 ]
 
 AUTHOR = "update"
@@ -285,7 +286,7 @@ def _report_of(
         revision_id=applied.revision_id,
         source_version_key=applied.source_version_key,
         entities=applied.entities,
-        relations=applied.relations,
+        relations=applied.relation_ids,
         evidence=applied.evidence,
         historical=applied.historical,
         carried_over_entities=applied.carried_over_entities,
@@ -295,15 +296,32 @@ def _report_of(
     )
 
 
+def reinvestigation_entities(
+    knowledge: KnowledgeRepository, report: InvalidationReport
+) -> tuple[str, ...]:
+    found = list(report.entities)
+    for relation_id in report.relations:
+        relation = knowledge.get_relation(relation_id)
+        if relation is None:
+            continue
+        for endpoint in (relation.source_id.value, relation.target_id.value):
+            if endpoint not in found:
+                found.append(endpoint)
+    return tuple(found)
+
+
 def plan_reinvestigation(
-    report: InvalidationReport, changes: SnapshotDiff
+    report: InvalidationReport,
+    changes: SnapshotDiff,
+    entities: Sequence[str] = (),
 ) -> Objective:
     paths = tuple(dict.fromkeys(changes.changed + changes.added))
     text = "reinvestigate " + (" ".join(paths) if paths else "repository")
+    scoped = tuple(entities) or report.entities
     return parse(
         text,
         kind=ObjectiveKind.TARGETED_REINVESTIGATION,
-        scope=Scope(paths=paths, entities=report.entities),
+        scope=Scope(paths=paths, entities=scoped),
     )
 
 
@@ -351,7 +369,9 @@ class UpdateEngine:
                 status=InvestigationStatus.BLOCKED,
                 reason=SKIPPED_NO_PROVIDER,
             )
-        objective = plan_reinvestigation(report, changes)
+        objective = plan_reinvestigation(
+            report, changes, reinvestigation_entities(knowledge, report)
+        )
         outcome = self._investigator.run(
             objective,
             current_snapshot,

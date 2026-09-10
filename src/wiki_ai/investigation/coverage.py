@@ -12,6 +12,7 @@ from wiki_ai.investigation.finding import RelationClaim
 from wiki_ai.investigation.verifier import VerificationReport, VerifiedFinding
 
 __all__ = [
+    "AMBIGUOUS_KIND",
     "ENTRY_LIKE_SYMBOL_KINDS",
     "ENTRY_LIKE_ENTITY_KINDS",
     "INTEGRATION_KINDS",
@@ -28,6 +29,7 @@ __all__ = [
 ]
 
 SECTION_KIND = "section"
+AMBIGUOUS_KIND = "relation"
 
 ENTRY_LIKE_SYMBOL_KINDS: tuple[SymbolKind, ...] = (
     SymbolKind.PROGRAM,
@@ -77,6 +79,7 @@ class CompletenessReport:
     unresolved_integrations: tuple[str, ...] = ()
     unresolved_branches: tuple[str, ...] = ()
     unresolved_sections: tuple[str, ...] = ()
+    unresolved_relations: tuple[str, ...] = ()
     missing_evidence: tuple[str, ...] = ()
     explicit_gaps: tuple[str, ...] = ()
     files_covered: int = 0
@@ -90,6 +93,7 @@ class CompletenessReport:
             + self.unresolved_integrations
             + self.unresolved_branches
             + self.unresolved_sections
+            + self.unresolved_relations
             + self.missing_evidence
             + self.explicit_gaps
         )
@@ -104,6 +108,7 @@ class CompletenessReport:
             "unresolved_integrations": list(self.unresolved_integrations),
             "unresolved_branches": list(self.unresolved_branches),
             "unresolved_sections": list(self.unresolved_sections),
+            "unresolved_relations": list(self.unresolved_relations),
             "missing_evidence": list(self.missing_evidence),
             "explicit_gaps": list(self.explicit_gaps),
             "files_covered": self.files_covered,
@@ -133,12 +138,14 @@ class CoverageState:
         integrations = _frontier_of(self.frontier, "integration")
         branches = _frontier_of(self.frontier, "branch")
         sections = _frontier_of(self.frontier, SECTION_KIND)
+        ambiguous = _frontier_of(self.frontier, AMBIGUOUS_KIND)
         outstanding = (
             len(calls)
             + len(effects)
             + len(integrations)
             + len(branches)
             + len(sections)
+            + len(ambiguous)
             + len(self.missing_evidence)
             + len(self.explicit_gaps)
         )
@@ -153,6 +160,7 @@ class CoverageState:
             unresolved_integrations=integrations,
             unresolved_branches=branches,
             unresolved_sections=sections,
+            unresolved_relations=ambiguous,
             missing_evidence=self.missing_evidence,
             explicit_gaps=self.explicit_gaps,
             files_covered=len(self.files_covered),
@@ -216,14 +224,16 @@ def target_identity(claim: RelationClaim, source_owner: str | None) -> str:
 
 def entity_identities(item: VerifiedFinding) -> tuple[str, ...]:
     name = canonical_name(item.finding.subject)
-    owner = canonical_name(item.finding.owner or "") or GLOBAL_OWNER
+    declared = canonical_name(item.finding.owner or "")
+    owner = declared or GLOBAL_OWNER
     kind = canonical_name(item.finding.type.value)
     found = [
         f"{kind}::{owner}::{name}",
         f"::{owner}::{name}",
-        f"{kind}::{GLOBAL_OWNER}::{name}",
-        f"::{GLOBAL_OWNER}::{name}",
     ]
+    if not declared:
+        found.append(f"{kind}::{GLOBAL_OWNER}::{name}")
+        found.append(f"::{GLOBAL_OWNER}::{name}")
     if item.finding.explicit_id:
         found.append(f"{EXPLICIT_PREFIX}{item.finding.explicit_id}")
     return tuple(dict.fromkeys(found))
@@ -253,6 +263,8 @@ EXPLICIT_PREFIX = "explicit::"
 GLOBAL_OWNER = "global"
 
 _INCOMPLETE_KINDS = frozenset({"effect", "branch"})
+
+_PERSISTENT_KINDS = frozenset({SECTION_KIND, AMBIGUOUS_KIND})
 
 
 def _effect_frontier(item: VerifiedFinding) -> list[FrontierItem]:
@@ -286,13 +298,16 @@ def update(
     state: CoverageState,
     report: VerificationReport,
     covered_paths: Sequence[str] = (),
+    *,
+    unresolved_relations: Sequence[str] = (),
+    gaps: Sequence[str] = (),
 ) -> CoverageState:
     resolved = list(state.resolved_subjects)
     entrypoints = list(state.entrypoints)
     capabilities = list(state.capabilities)
     integrations: list[str] = []
     missing = list(state.missing_evidence)
-    gaps = list(state.explicit_gaps)
+    opened = list(state.explicit_gaps)
     files = list(state.files_covered)
 
     for path in covered_paths:
@@ -318,9 +333,9 @@ def update(
             if resolved_evidence.capture.path not in files:
                 files.append(resolved_evidence.capture.path)
 
-    for question in report.gaps:
-        if question not in gaps:
-            gaps.append(question)
+    for question in tuple(report.gaps) + tuple(gaps):
+        if question not in opened:
+            opened.append(question)
 
     known = set(resolved)
     known |= {name.strip().lower() for name in entrypoints}
@@ -336,7 +351,7 @@ def update(
     frontier: list[FrontierItem] = []
     for item in state.frontier:
         subject = item.subject.strip().lower()
-        if item.kind == SECTION_KIND:
+        if item.kind in _PERSISTENT_KINDS:
             frontier.append(item)
             continue
         if item.kind in _INCOMPLETE_KINDS:
@@ -352,6 +367,12 @@ def update(
         for candidate in _effect_frontier(item) + _branch_frontier(item):
             if candidate.key not in {existing.key for existing in frontier}:
                 frontier.append(candidate)
+    for subject in _unique(unresolved_relations):
+        candidate = FrontierItem(
+            AMBIGUOUS_KIND, subject, "relation target could not be resolved"
+        )
+        if candidate.key not in {existing.key for existing in frontier}:
+            frontier.append(candidate)
 
     return replace(
         state,
@@ -362,7 +383,7 @@ def update(
         resolved_subjects=tuple(resolved),
         known_identities=tuple(sorted(identities)),
         missing_evidence=tuple(missing),
-        explicit_gaps=tuple(gaps),
+        explicit_gaps=tuple(opened),
         rounds=state.rounds + 1,
     )
 

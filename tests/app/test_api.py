@@ -11,7 +11,13 @@ from wiki_ai.agent.protocol import AgentCapabilities
 from wiki_ai.agent.registry import ProviderRegistry
 from wiki_ai.agent.session import AgentRun, BudgetUsage, RunStatus
 from wiki_ai.app import api
-from wiki_ai.app.ports import InvestigationOutcome, OutcomeStatus
+from wiki_ai.app.ports import (
+    AnswerOutcome,
+    IngestionOutcome,
+    InvestigationOutcome,
+    OutcomeStatus,
+    UpdateOutcome,
+)
 from wiki_ai.app.session import (
     ANALYSIS_CONTRACT_VERSION,
     ANALYSIS_STATE_FILE,
@@ -618,3 +624,373 @@ def test_the_stored_preference_selects_the_provider_used_by_analyze(
 
     report = api.analyze(tmp_path, "how does renewal work", _Wired(registry))
     assert report.provider == "probe"
+
+
+class _RecordingInvestigation:
+    objectives: list[str]
+
+    def __init__(self) -> None:
+        self.objectives = []
+
+    def run(
+        self,
+        objective: str,
+        snapshot: Any,
+        knowledge: Any,
+        provider: Any,
+        namespace: str,
+    ) -> InvestigationOutcome:
+        self.objectives.append(objective)
+        return InvestigationOutcome(
+            objective=objective,
+            entities_written=1,
+            relations_written=0,
+            evidence_written=1,
+        )
+
+
+class _RecordingUpdate:
+    calls: int
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(
+        self,
+        previous_snapshot: Any,
+        current_snapshot: Any,
+        knowledge: Any,
+        provider: Any,
+        namespace: str,
+    ) -> UpdateOutcome:
+        self.calls += 1
+        return UpdateOutcome(
+            diff={"changed": ["src/extra.py"]},
+            invalidated=1,
+            reinvestigated=InvestigationOutcome(
+                objective="reinvestigate",
+                entities_written=1,
+                relations_written=0,
+                evidence_written=1,
+            ).to_dict(),
+        )
+
+
+class _WiringWithRecorders(_WiringWithProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.investigation = _RecordingInvestigation()
+        self.update = _RecordingUpdate()
+
+    def investigation_runner(self) -> Any:
+        return self.investigation
+
+    def update_runner(self) -> Any:
+        return self.update
+
+
+def test_a_changed_snapshot_with_a_new_objective_runs_a_full_investigation(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    composition = _WiringWithRecorders()
+    first = api.analyze(tmp_path, "how does renewal work", composition)
+    assert first.status == "ok"
+    (tmp_path / "src" / "extra.py").write_text("other = 2\n", encoding="utf-8")
+    second = api.analyze(tmp_path, "how does billing work", composition)
+    assert second.status == "ok"
+    assert composition.update.calls == 0
+    assert composition.investigation.objectives == [
+        "how does renewal work",
+        "how does billing work",
+    ]
+    assert second.details["objective"] == "how does billing work"
+    assert second.analyzed_digest == second.snapshot_digest
+    state = Session.open(tmp_path).analysis_state()
+    assert state.analyzed_objective_hash == objective_hash("how does billing work")
+
+
+def test_repeating_the_new_objective_on_the_same_snapshot_is_up_to_date(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    composition = _WiringWithRecorders()
+    api.analyze(tmp_path, "how does renewal work", composition)
+    (tmp_path / "src" / "extra.py").write_text("other = 2\n", encoding="utf-8")
+    api.analyze(tmp_path, "how does billing work", composition)
+    repeated = api.analyze(tmp_path, "how does billing work", composition)
+    assert repeated.reason == api.UP_TO_DATE
+    assert repeated.status == "ok"
+    assert composition.investigation.objectives == [
+        "how does renewal work",
+        "how does billing work",
+    ]
+    assert composition.update.calls == 0
+
+
+def test_an_update_never_records_an_objective_it_did_not_investigate(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    composition = _WiringWithRecorders()
+    api.analyze(tmp_path, "how does renewal work", composition)
+    settled = objective_hash("how does renewal work")
+    (tmp_path / "src" / "extra.py").write_text("other = 2\n", encoding="utf-8")
+    api.analyze(tmp_path, "how does billing work", composition)
+    state = Session.open(tmp_path).analysis_state()
+    assert state.analyzed_objective_hash != settled
+    assert composition.update.calls == 0
+
+
+class _RecordingIngestion:
+    providers: list[Any]
+
+    def __init__(self) -> None:
+        self.providers = []
+
+    def run(
+        self,
+        source_path: Path,
+        version_hash: str,
+        knowledge: Any,
+        namespace: str,
+        *,
+        provider: Any = None,
+    ) -> IngestionOutcome:
+        self.providers.append(provider)
+        return IngestionOutcome(
+            source_id=Path(source_path).resolve().as_posix(),
+            version_hash="0" * 64,
+            blocks=1,
+            entities_written=1 if provider is not None else 0,
+            status=(
+                OutcomeStatus.COMPLETE
+                if provider is not None
+                else OutcomeStatus.STRUCTURAL_ONLY
+            ),
+            provider_used=provider is not None,
+        )
+
+
+class _ProviderA(_Provider):
+    def capabilities(self) -> AgentCapabilities:
+        return AgentCapabilities(tools=("repo.read",))
+
+
+class _ProviderB(_Provider):
+    def capabilities(self) -> AgentCapabilities:
+        return AgentCapabilities(tools=("repo.read", "evidence.capture"))
+
+
+def test_ingest_hands_the_runner_the_provider_the_report_names(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    source = tmp_path / "notes.md"
+    source.write_text("# renewal\n", encoding="utf-8")
+    registry = ProviderRegistry()
+    registry.register("a", _ProviderA)
+    registry.register("b", _ProviderB)
+    api.provider_set("b", repo, Wiring(registry))
+    recorder = _RecordingIngestion()
+
+    class _Wired(Wiring):
+        def ingestion_runner(self) -> Any:
+            return recorder
+
+    report = api.ingest(source, repo, _Wired(registry))
+    assert report.provider == "b"
+    assert len(recorder.providers) == 1
+    assert isinstance(recorder.providers[0], _ProviderB)
+    assert report.details["provider_used"] is True
+
+
+def test_ingest_without_a_provider_hands_the_runner_nothing(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    source = tmp_path / "notes.md"
+    source.write_text("# renewal\n", encoding="utf-8")
+    recorder = _RecordingIngestion()
+
+    class _Wired(Wiring):
+        def ingestion_runner(self) -> Any:
+            return recorder
+
+    report = api.ingest(source, repo, _Wired(ProviderRegistry()))
+    assert report.provider == ""
+    assert recorder.providers == [None]
+    assert report.status == "partial"
+    assert report.ingestion_status == OutcomeStatus.STRUCTURAL_ONLY.value
+    assert report.details["provider_used"] is False
+
+
+class _BlockedQuery:
+    def run(
+        self,
+        question: str,
+        knowledge: Any,
+        provider: Any,
+        namespace: str,
+    ) -> AnswerOutcome:
+        return AnswerOutcome(
+            question=question,
+            answer="no validated claim",
+            mode="deterministic_fallback",
+            reason="no_validated_claim",
+            status="blocked",
+            unresolved=("every claim was discarded",),
+        )
+
+
+class _PartialQuery:
+    def run(
+        self,
+        question: str,
+        knowledge: Any,
+        provider: Any,
+        namespace: str,
+    ) -> AnswerOutcome:
+        return AnswerOutcome(
+            question=question,
+            answer="half of it",
+            mode="agentic",
+            status="partial",
+        )
+
+
+def _ingested_repo(tmp_path: Path) -> Path:
+    repo = _repo(tmp_path / "repo")
+    source = tmp_path / "notes.md"
+    source.write_text("# renewal\n", encoding="utf-8")
+    api.ingest(source, repo, Wiring(ProviderRegistry()))
+    return repo
+
+
+def test_an_answer_with_every_claim_rejected_is_blocked(tmp_path: Path) -> None:
+    repo = _ingested_repo(tmp_path)
+
+    class _Wired(Wiring):
+        def query_runner(self) -> Any:
+            return _BlockedQuery()
+
+    report = api.ask("what changed", repo, _Wired(ProviderRegistry()))
+    payload = report.to_dict()
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "no_validated_claim"
+    assert payload["action"]
+
+
+def test_a_partially_validated_answer_is_partial(tmp_path: Path) -> None:
+    repo = _ingested_repo(tmp_path)
+
+    class _Wired(Wiring):
+        def query_runner(self) -> Any:
+            return _PartialQuery()
+
+    report = api.ask("what changed", repo, _Wired(ProviderRegistry()))
+    assert report.to_dict()["status"] == "partial"
+
+
+class _PartialThenComplete:
+    objectives: list[str]
+
+    def __init__(self) -> None:
+        self.objectives = []
+
+    def run(
+        self,
+        objective: str,
+        snapshot: Any,
+        knowledge: Any,
+        provider: Any,
+        namespace: str,
+    ) -> InvestigationOutcome:
+        self.objectives.append(objective)
+        if len(self.objectives) == 1:
+            return InvestigationOutcome(
+                objective=objective,
+                entities_written=1,
+                relations_written=0,
+                evidence_written=1,
+                status=OutcomeStatus.PARTIAL,
+                reason="budget_exhausted_with_open_frontier",
+            )
+        return InvestigationOutcome(
+            objective=objective,
+            entities_written=2,
+            relations_written=0,
+            evidence_written=2,
+        )
+
+
+class _WiringWithPartialBaseline(_WiringWithProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.investigation = _PartialThenComplete()
+        self.update = _RecordingUpdate()
+
+    def investigation_runner(self) -> Any:
+        return self.investigation
+
+    def update_runner(self) -> Any:
+        return self.update
+
+
+def test_a_partial_baseline_never_reaches_the_incremental_update(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    composition = _WiringWithPartialBaseline()
+    first = api.analyze(tmp_path, "how does renewal work", composition)
+    assert first.analysis_status == AnalysisStatus.PARTIAL.value
+    assert first.analyzed_digest == ""
+    (tmp_path / "src" / "extra.py").write_text("other = 2\n", encoding="utf-8")
+    second = api.analyze(tmp_path, "how does renewal work", composition)
+    assert composition.update.calls == 0
+    assert composition.investigation.objectives == [
+        "how does renewal work",
+        "how does renewal work",
+    ]
+    assert second.details["objective"] == "how does renewal work"
+    assert "diff" not in second.details
+
+
+def test_a_partial_baseline_is_never_closed_as_complete_by_a_narrow_update(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    composition = _WiringWithPartialBaseline()
+    api.analyze(tmp_path, "how does renewal work", composition)
+    (tmp_path / "src" / "extra.py").write_text("other = 2\n", encoding="utf-8")
+    second = api.analyze(tmp_path, "how does renewal work", composition)
+    assert second.analysis_status == AnalysisStatus.COMPLETE.value
+    assert second.analyzed_digest == second.snapshot_digest
+    assert composition.update.calls == 0
+    assert composition.investigation.objectives[-1] == "how does renewal work"
+
+
+def test_a_complete_baseline_with_the_same_objective_still_updates(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    composition = _WiringWithRecorders()
+    first = api.analyze(tmp_path, "how does renewal work", composition)
+    assert first.analysis_status == AnalysisStatus.COMPLETE.value
+    (tmp_path / "src" / "extra.py").write_text("other = 2\n", encoding="utf-8")
+    second = api.analyze(tmp_path, "how does renewal work", composition)
+    assert composition.update.calls == 1
+    assert composition.investigation.objectives == ["how does renewal work"]
+    assert second.details["diff"]["changed"] == ["src/extra.py"]
+
+
+def test_a_blocked_baseline_never_reaches_the_incremental_update(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    blocked = api.analyze(tmp_path, "how does renewal work", Wiring(ProviderRegistry()))
+    assert blocked.analysis_status == AnalysisStatus.BLOCKED.value
+    (tmp_path / "src" / "extra.py").write_text("other = 2\n", encoding="utf-8")
+    composition = _WiringWithRecorders()
+    report = api.analyze(tmp_path, "how does renewal work", composition)
+    assert composition.update.calls == 0
+    assert composition.investigation.objectives == ["how does renewal work"]
+    assert report.analysis_status == AnalysisStatus.COMPLETE.value
