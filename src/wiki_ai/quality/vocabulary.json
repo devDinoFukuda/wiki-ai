@@ -1,0 +1,86 @@
+{
+  "markers": [
+    "TODO",
+    "FIXME",
+    "HACK",
+    "NOTE",
+    "XXX"
+  ],
+  "directives": [
+    "type: ignore",
+    "pragma",
+    "noqa",
+    "fmt:",
+    "pylint:"
+  ],
+  "banned_terms": [
+    "legacy",
+    "legado",
+    "compat",
+    "deprecated"
+  ],
+  "external_tokens": [
+    "w:compat",
+    "compatSetting",
+    "w:compatSetting"
+  ],
+  "provider_names": [
+    "claude",
+    "codex",
+    "devin",
+    "cursor",
+    "windsurf",
+    "antigravity",
+    "anthropic",
+    "openai"
+  ],
+  "provider_adapter_package": "wiki_ai.agent.providers",
+  "application_area": "app",
+  "layers": {
+    "app": [
+      "*"
+    ],
+    "investigation": [
+      "repository",
+      "knowledge",
+      "agent"
+    ],
+    "publishing": [
+      "knowledge"
+    ],
+    "ingestion": [
+      "knowledge"
+    ],
+    "knowledge": [],
+    "repository": [],
+    "agent": [],
+    "quality": []
+  },
+  "removed_packages": [
+    "scripts",
+    "scripts/codescan",
+    "scripts/sbindex",
+    "scripts/wk"
+  ],
+  "removed_commands": [
+    "promote",
+    "compile",
+    "docx",
+    "finish",
+    "ingest-legacy",
+    "migrate",
+    "code",
+    "index",
+    "search",
+    "get",
+    "audit",
+    "lint",
+    "check",
+    "engines",
+    "store"
+  ],
+  "allowed_console_scripts": [
+    "wiki-ai"
+  ],
+  "max_production_file_lines": 1000
+}
